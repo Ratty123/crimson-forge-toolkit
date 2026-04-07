@@ -16,9 +16,12 @@ The format is intentionally simple:
 - Environment-variable overrides for archive package root detection:
   - `CRIMSON_TEXTURE_FORGE_PACKAGE_ROOT`
   - `CRIMSON_DESERT_PACKAGE_ROOT`
+- New read-only `Text Search` tab for archive or loose text-like files, with content search, highlighted preview, and export of matched files while preserving folder structure.
+- Archive text search now supports deterministic ChaCha20 decryption for supported encrypted XML entries, so those files can be searched, previewed, and exported as readable text.
 
 ### Changed
 - Archive auto-detect now reports that it is checking known install locations instead of only Steam libraries.
+- Text Search preview now uses a larger three-pane layout and shows full text for normal-sized files with clearer match highlighting.
 
 ## [0.1.0] - 2026-04-07
 

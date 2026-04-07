@@ -292,6 +292,7 @@ class QuickStartDialog(QDialog):
             <ul>
               <li><b>Archive Browser</b>: scan <b>.pamt/.paz</b>, preview supported assets, filter, and extract to normal folders.</li>
               <li><b>Workflow</b>: scan loose DDS files, optionally convert DDS to PNG with <b>texconv</b>, optionally run <b>chaiNNer</b>, rebuild DDS, and compare results.</li>
+              <li><b>Text Search</b>: search archive or loose text-like files such as <b>.xml</b>, preview matching files with highlights, and export matched files while preserving folder structure.</li>
             </ul>
             <h3>Recommended first setup</h3>
             <ol>
@@ -322,6 +323,8 @@ class QuickStartDialog(QDialog):
             </ul>
             <h3>Compare and review</h3>
             <p>Use the <b>Compare</b> tab to review original vs rebuilt DDS side by side. You can zoom, pan, inspect metadata, and refresh the compare list after new output is written.</p>
+            <h3>Text search utility</h3>
+            <p>Use the <b>Text Search</b> tab when you want to inspect text-like files outside the texture workflow. It can search archive entries or loose folders, highlight matches in preview, and export matched files with their folder structure intact.</p>
             <h3>Where settings are stored</h3>
             <p>The app auto-saves settings to a local config file beside the EXE and also keeps archive scan cache data in a local cache folder beside it.</p>
             <h3>Common causes of failure</h3>

@@ -24,6 +24,12 @@ This file is a practical notice list for repository and release packaging. For a
 - Upstream: https://github.com/python-lz4/python-lz4
 - Notes: used for supported compressed archive entry handling
 
+### cryptography
+
+- Purpose: archive XML decryption support for text search / preview / export
+- Upstream: https://github.com/pyca/cryptography
+- Notes: used for deterministic ChaCha20 archive payload decryption where supported
+
 ## External Tools
 
 ### DirectXTex / texconv

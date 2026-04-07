@@ -204,6 +204,19 @@ class ArchiveEntry:
         return (self.flags >> 4) != 0
 
     @property
+    def encryption_type(self) -> int:
+        return (self.flags >> 4) & 0x0F
+
+    @property
+    def encryption_label(self) -> str:
+        return {
+            0: "None",
+            1: "ICE",
+            2: "AES",
+            3: "ChaCha20",
+        }.get(self.encryption_type, str(self.encryption_type))
+
+    @property
     def package_label(self) -> str:
         return f"{self.pamt_path.parent.name}/{self.pamt_path.name}"
 

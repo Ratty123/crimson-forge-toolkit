@@ -74,6 +74,7 @@ def run_gui() -> int:
         PreviewScrollArea,
         QuickStartDialog,
     )
+    from crimson_texture_forge.ui.text_search_tab import TextSearchTab
 
     def resolve_settings_file_path() -> Path:
         if getattr(sys, "frozen", False):
@@ -1294,6 +1295,16 @@ def run_gui() -> int:
             self.archive_splitter.setSizes([420, 420, 760])
             self.main_tabs.addTab(self.archive_browser_tab, "Archive Browser")
 
+            self.text_search_tab = TextSearchTab(
+                settings=self.settings,
+                base_dir=self.settings_file_path.parent,
+                theme_key=self.current_theme_key,
+            )
+            self.text_search_tab.status_message_requested.connect(
+                lambda message, is_error: self.set_status_message(message, error=is_error)
+            )
+            self.main_tabs.addTab(self.text_search_tab, "Text Search")
+
             self.setCentralWidget(central)
 
             self.export_profile_action.triggered.connect(self.export_profile)
@@ -1715,6 +1726,8 @@ def run_gui() -> int:
                         archive.writestr(notices_path.name, notices_path.read_text(encoding="utf-8"))
                     if license_path.exists():
                         archive.writestr(license_path.name, license_path.read_text(encoding="utf-8"))
+                    for archive_name, archive_text in self.text_search_tab.diagnostic_entries().items():
+                        archive.writestr(archive_name, archive_text)
 
                 self.set_status_message(f"Diagnostic bundle exported to {target}")
                 self.append_log(f"Diagnostic bundle exported: {target}")
@@ -1784,6 +1797,7 @@ def run_gui() -> int:
             self._set_theme_menu_selection(self.current_theme_key)
             self.log_highlighter.set_theme(self.current_theme_key)
             self.archive_log_highlighter.set_theme(self.current_theme_key)
+            self.text_search_tab.set_theme(self.current_theme_key)
             self._save_settings()
 
         def _apply_responsive_window_defaults(self) -> None:
@@ -2186,7 +2200,7 @@ def run_gui() -> int:
             self._browse_directory(self.archive_extract_root_edit, "Select Archive Extract Root")
 
         def autodetect_archive_package_root(self) -> None:
-            if self.worker_thread is not None:
+            if self._background_task_active():
                 return
 
             def task(on_log: Callable[[str], None]) -> List[str]:
@@ -2241,7 +2255,7 @@ def run_gui() -> int:
             task: Callable[[Callable[[str], None]], object],
             on_complete: Optional[Callable[[object], None]] = None,
         ) -> None:
-            if self.worker_thread is not None:
+            if self._background_task_active():
                 return
 
             self.set_status_message(status_message)
@@ -2489,7 +2503,7 @@ def run_gui() -> int:
             return Path.cwd() / "archive_extract"
 
         def scan_archives(self, force_refresh: bool = False) -> None:
-            if self.worker_thread is not None:
+            if self._background_task_active():
                 return
             package_root_text = self.archive_package_root_edit.text().strip()
             if not package_root_text:
@@ -2555,6 +2569,7 @@ def run_gui() -> int:
         def _handle_archive_scan_complete(self, result: object) -> None:
             payload = result if isinstance(result, dict) else {}
             self.archive_entries = payload.get("entries", []) if isinstance(payload.get("entries"), list) else []
+            self.text_search_tab.set_archive_entries(self.archive_entries, self.archive_package_root_edit.text().strip())
             browser_state = payload.get("browser_state") if isinstance(payload.get("browser_state"), dict) else {}
             self.archive_structure_filter_children = (
                 browser_state.get("structure_children", {})
@@ -3511,6 +3526,14 @@ def run_gui() -> int:
             self.archive_log_view.clear()
             self.set_status_message("Archive scan log cleared.")
 
+        def _background_task_active(self) -> bool:
+            if self.worker_thread is not None:
+                return True
+            if self.text_search_tab.is_busy():
+                self.set_status_message("Text Search is still running. Stop it first before starting another task.", error=True)
+                return True
+            return False
+
         def append_log(self, message: str) -> None:
             timestamp = time.strftime("%H:%M:%S")
             self.log_view.appendPlainText(f"[{timestamp}] {message}")
@@ -3569,6 +3592,7 @@ def run_gui() -> int:
             self.archive_tree.setEnabled(not busy)
             self.archive_preview_text_edit.setEnabled(not busy)
             self.archive_preview_info_edit.setEnabled(not busy)
+            self.text_search_tab.set_external_busy(busy)
             self.archive_preview_loose_toggle_button.setEnabled(
                 not busy and self.archive_preview_loose_toggle_button.isVisible()
             )
@@ -3594,7 +3618,7 @@ def run_gui() -> int:
             self.progress_bar.setFormat("%v / %m")
 
         def start_scan(self) -> None:
-            if self.worker_thread is not None:
+            if self._background_task_active():
                 return
 
             self.set_status_message("Scanning DDS files...")
@@ -3622,7 +3646,7 @@ def run_gui() -> int:
             thread.start()
 
         def start_dds_to_png(self) -> None:
-            if self.worker_thread is not None:
+            if self._background_task_active():
                 return
 
             config = self.collect_config()
@@ -3663,7 +3687,7 @@ def run_gui() -> int:
             thread.start()
 
         def start_build(self) -> None:
-            if self.worker_thread is not None:
+            if self._background_task_active():
                 return
 
             config = self.collect_config()
@@ -4149,6 +4173,7 @@ def run_gui() -> int:
             if self.archive_preview_thread is not None:
                 self.archive_preview_thread.quit()
                 self.archive_preview_thread.wait(3000)
+            self.text_search_tab.shutdown()
             super().closeEvent(event)
 
     apply_windows_app_user_model_id()
@@ -4174,6 +4199,7 @@ def run_gui() -> int:
         window.setWindowIcon(app.windowIcon())
     window.log_view.setFont(log_font)
     window.archive_log_view.setFont(log_font)
+    window.text_search_tab.log_view.setFont(log_font)
     window.show()
     return app.exec()
 

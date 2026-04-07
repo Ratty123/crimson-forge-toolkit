@@ -23,6 +23,12 @@ try:
 except ImportError:
     winreg = None
 
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+except ImportError:
+    Cipher = None
+    algorithms = None
+
 from crimson_texture_forge.constants import *
 from crimson_texture_forge.models import *
 from crimson_texture_forge.core.common import *
@@ -32,6 +38,18 @@ _PATHC_COLLECTION_CACHE: Dict[str, Tuple[str, "PathcCollection"]] = {}
 _ARCHIVE_SCAN_CACHE_MAGIC = b"CTFARCH1"
 _ARCHIVE_SCAN_CACHE_VERSION = 2
 _ARCHIVE_SCAN_CACHE_SUPPORTED_VERSIONS = {1, 2}
+CHACHA20_HASH_INITVAL = 0x000C5EDE
+CHACHA20_IV_XOR = 0x60616263
+CHACHA20_XOR_DELTAS = (
+    0x00000000,
+    0x0A0A0A0A,
+    0x0C0C0C0C,
+    0x06060606,
+    0x0E0E0E0E,
+    0x0A0A0A0A,
+    0x06060606,
+    0x02020202,
+)
 
 def _rot32(value: int, shift: int) -> int:
     value &= 0xFFFFFFFF
@@ -98,6 +116,104 @@ def calculate_pa_checksum(value: bytes | str) -> int:
     c = _add32(c, struct.unpack_from("<I", tail, 8)[0])
     _, _, c = _finalize_lookup3(a, b, c)
     return c
+
+
+def hashlittle(data: bytes, initval: int = 0) -> int:
+    length = len(data)
+    remaining = length
+    a = b = c = _add32(0xDEADBEEF + length, initval)
+    offset = 0
+
+    while remaining > 12:
+        a = _add32(a, struct.unpack_from("<I", data, offset)[0])
+        b = _add32(b, struct.unpack_from("<I", data, offset + 4)[0])
+        c = _add32(c, struct.unpack_from("<I", data, offset + 8)[0])
+        a = _sub32(a, c)
+        a ^= _rot32(c, 4)
+        c = _add32(c, b)
+        b = _sub32(b, a)
+        b ^= _rot32(a, 6)
+        a = _add32(a, c)
+        c = _sub32(c, b)
+        c ^= _rot32(b, 8)
+        b = _add32(b, a)
+        a = _sub32(a, c)
+        a ^= _rot32(c, 16)
+        c = _add32(c, b)
+        b = _sub32(b, a)
+        b ^= _rot32(a, 19)
+        a = _add32(a, c)
+        c = _sub32(c, b)
+        c ^= _rot32(b, 4)
+        b = _add32(b, a)
+        offset += 12
+        remaining -= 12
+
+    tail = data[offset:] + (b"\x00" * 12)
+    if remaining >= 12:
+        c = _add32(c, struct.unpack_from("<I", tail, 8)[0])
+    elif remaining >= 9:
+        c = _add32(c, struct.unpack_from("<I", tail, 8)[0] & (0xFFFFFFFF >> (8 * (12 - remaining))))
+    if remaining >= 8:
+        b = _add32(b, struct.unpack_from("<I", tail, 4)[0])
+    elif remaining >= 5:
+        b = _add32(b, struct.unpack_from("<I", tail, 4)[0] & (0xFFFFFFFF >> (8 * (8 - remaining))))
+    if remaining >= 4:
+        a = _add32(a, struct.unpack_from("<I", tail, 0)[0])
+    elif remaining >= 1:
+        a = _add32(a, struct.unpack_from("<I", tail, 0)[0] & (0xFFFFFFFF >> (8 * (4 - remaining))))
+    elif remaining == 0:
+        return c
+
+    c = _sub32(c ^ b, _rot32(b, 14))
+    a = _sub32(a ^ c, _rot32(c, 11))
+    b = _sub32(b ^ a, _rot32(a, 25))
+    c = _sub32(c ^ b, _rot32(b, 16))
+    a = _sub32(a ^ c, _rot32(c, 4))
+    b = _sub32(b ^ a, _rot32(a, 14))
+    c = _sub32(c ^ b, _rot32(b, 24))
+    return c
+
+
+def derive_chacha20_key_iv(filename: str) -> Tuple[bytes, bytes]:
+    basename = Path(filename).name.lower().encode("utf-8", errors="replace")
+    seed = hashlittle(basename, CHACHA20_HASH_INITVAL)
+    nonce = struct.pack("<I", seed) * 4
+    key_base = seed ^ CHACHA20_IV_XOR
+    key = b"".join(struct.pack("<I", key_base ^ delta) for delta in CHACHA20_XOR_DELTAS)
+    return key, nonce
+
+
+def crypt_chacha20_filename(data: bytes, filename: str) -> bytes:
+    if Cipher is None or algorithms is None:
+        raise ValueError(
+            "ChaCha20 support requires the cryptography package. Install it with: pip install cryptography"
+        )
+    key, nonce = derive_chacha20_key_iv(filename)
+    cipher = Cipher(algorithms.ChaCha20(key, nonce), mode=None)
+    return cipher.encryptor().update(data)
+
+
+def _looks_like_plain_text_payload(extension: str, data: bytes) -> bool:
+    if extension != ".xml":
+        return False
+    stripped = data.lstrip()
+    if not stripped:
+        return False
+    if stripped.startswith((b"<?xml", b"<")):
+        return True
+    return b"<" in stripped[:512] and b">" in stripped[:512]
+
+
+def try_decrypt_archive_entry_data(entry: ArchiveEntry, data: bytes) -> Tuple[bytes, Optional[str]]:
+    if not entry.encrypted:
+        return data, None
+    if entry.encryption_type != 3:
+        raise ValueError(f"Unsupported archive encryption type {entry.encryption_type} for {entry.path}")
+    candidate = crypt_chacha20_filename(data, entry.basename)
+    if not _looks_like_plain_text_payload(entry.extension, candidate):
+        raise ValueError(f"ChaCha20 decryption validation failed for {entry.path}")
+    return candidate, "ChaCha20"
 
 def discover_pamt_files(package_root: Path) -> List[Path]:
     root = package_root.expanduser().resolve()
@@ -1469,21 +1585,26 @@ def read_archive_entry_data(entry: ArchiveEntry) -> Tuple[bytes, bool, str]:
 
     decompressed = False
     note = ""
+    if entry.encrypted:
+        data, decrypt_note = try_decrypt_archive_entry_data(entry, data)
+        if decrypt_note:
+            note = decrypt_note
     if entry.compressed:
         if entry.compression_type == 1 and entry.extension == ".dds":
             data = reconstruct_partial_dds(entry, data)
             decompressed = True
-            note = "PartialDDS"
+            note = ",".join(part for part in [note, "PartialDDS"] if part)
         elif entry.compression_type == 2:
             if lz4_block is None:
                 raise ValueError("This entry uses LZ4 compression, but the lz4 Python package is not installed.")
             data = lz4_block.decompress(data, uncompressed_size=entry.orig_size)
             decompressed = True
-            note = "LZ4"
+            note = ",".join(part for part in [note, "LZ4"] if part)
         else:
             reconstructed = maybe_reconstruct_sparse_dds(entry, data)
             if reconstructed is not None:
-                data, note = reconstructed
+                data, sparse_note = reconstructed
+                note = ",".join(part for part in [note, sparse_note] if part)
             else:
                 raise ValueError(f"Unsupported archive compression type {entry.compression_type} for {entry.path}")
 
@@ -1756,6 +1877,10 @@ def format_binary_header_preview(data: bytes) -> str:
     return "\n".join(lines)
 
 
+def parse_archive_note_flags(note: str) -> set[str]:
+    return {part.strip() for part in note.split(",") if part.strip()}
+
+
 def summarize_obj_text(content: str) -> str:
     vertices = 0
     texcoords = 0
@@ -1821,14 +1946,15 @@ def build_archive_preview_result(
     try:
         if extension == ".dds":
             source_path, note = ensure_archive_preview_source(entry)
+            note_flags = parse_archive_note_flags(note)
             warning_badge = ""
             warning_text = ""
             extra_detail_parts: List[str] = []
-            if note == "PartialDDS":
+            if "PartialDDS" in note_flags:
                 extra_detail_parts.append(
                     "Type 1 DDS reconstructed successfully using meta/0.pathc partial-header metadata."
                 )
-            elif note == "SparseDDS":
+            elif "SparseDDS" in note_flags:
                 warning_badge = "Type 1 DDS: Unsupported Preview"
                 warning_text = (
                     "This archive DDS is stored as truncated type 1 data. "
@@ -1837,6 +1963,8 @@ def build_archive_preview_result(
                 extra_detail_parts.append(warning_text)
                 if loose_file_path:
                     extra_detail_parts.append(f"Loose file candidate found: {loose_file_path}")
+            if "ChaCha20" in note_flags:
+                extra_detail_parts.append("Archive payload decrypted via deterministic ChaCha20 filename derivation.")
             if texconv_path is None:
                 return ArchivePreviewResult(
                     status="missing",
@@ -1887,7 +2015,9 @@ def build_archive_preview_result(
                 metadata_summary=metadata_summary,
                 detail_text=build_archive_entry_detail_text(
                     entry,
-                    "Preview fallback: sparse DDS padding was applied." if note == "SparseDDS" else "",
+                    "Preview fallback: sparse DDS padding was applied."
+                    if "SparseDDS" in parse_archive_note_flags(note)
+                    else "",
                 ),
                 preview_image_path=str(source_path),
                 preferred_view="image",
@@ -1899,22 +2029,7 @@ def build_archive_preview_result(
             )
 
         data, _decompressed, note = read_archive_entry_data(entry)
-        if entry.encrypted and extension == ".xml":
-            return ArchivePreviewResult(
-                status="ok",
-                title=entry.basename,
-                metadata_summary=metadata_summary,
-                detail_text=build_archive_entry_detail_text(
-                    entry,
-                    "This XML entry appears to be encrypted. Raw preview is not shown here.",
-                ),
-                preferred_view="info",
-                loose_file_path=loose_file_path,
-                loose_preview_image_path=loose_preview_image_path,
-                loose_preview_title=loose_preview_title,
-                loose_preview_metadata_summary=loose_preview_metadata_summary,
-                loose_preview_detail_text=loose_preview_detail_text,
-            )
+        note_flags = parse_archive_note_flags(note)
 
         if extension in ARCHIVE_TEXT_EXTENSIONS:
             preview_bytes = data[:ARCHIVE_TEXT_PREVIEW_LIMIT]
@@ -1922,16 +2037,27 @@ def build_archive_preview_result(
             extra_note = ""
             if len(data) > ARCHIVE_TEXT_PREVIEW_LIMIT:
                 extra_note = f"\n\nPreview truncated to {format_byte_size(ARCHIVE_TEXT_PREVIEW_LIMIT)}."
+            if "ChaCha20" in note_flags:
+                extra_note = "\n\n".join(
+                    part for part in ["Decrypted via deterministic ChaCha20 filename derivation.", extra_note.strip()] if part
+                )
             if extension == ".obj":
                 summary_text = summarize_obj_text(text)
-                extra_note = f"{summary_text}{extra_note}"
+                extra_note = "\n\n".join(part for part in [summary_text, extra_note.strip()] if part)
             return ArchivePreviewResult(
                 status="ok",
                 title=entry.basename,
                 metadata_summary=metadata_summary,
                 detail_text=build_archive_entry_detail_text(
                     entry,
-                    "\n".join(part for part in [("Preview fallback: sparse DDS padding was applied." if note == "SparseDDS" else ""), extra_note] if part),
+                    "\n\n".join(
+                        part
+                        for part in [
+                            ("Preview fallback: sparse DDS padding was applied." if "SparseDDS" in note_flags else ""),
+                            extra_note.strip(),
+                        ]
+                        if part
+                    ),
                 ),
                 preview_text=text,
                 preferred_view="text",
@@ -1943,8 +2069,10 @@ def build_archive_preview_result(
             )
 
         info_extra = ""
-        if note == "SparseDDS":
+        if "SparseDDS" in note_flags:
             info_extra = "Preview fallback: sparse DDS padding was applied."
+        if "ChaCha20" in note_flags:
+            info_extra = "\n".join(part for part in [info_extra, "Decrypted via deterministic ChaCha20 filename derivation."] if part)
         if extension in ARCHIVE_MODEL_EXTENSIONS:
             info_extra = "\n".join(part for part in [info_extra, "Visual preview is not available for this model format yet."] if part)
         header_preview = format_binary_header_preview(data[:ARCHIVE_BINARY_HEX_PREVIEW_LIMIT])

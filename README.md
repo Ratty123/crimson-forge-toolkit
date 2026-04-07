@@ -36,6 +36,7 @@ It is useful whether you:
 - Read-only `.pamt` / `.paz` archive browser
 - Archive extraction to normal folders
 - Archive cache for faster repeated scans
+- Read-only text search across archive or loose text-like files, with highlighted preview, export, and encrypted archive XML support where decryption succeeds
 - DDS preview and compare support through `texconv`
 - Loose DDS scanning and filtering
 - Optional DDS-to-PNG conversion before processing
@@ -134,6 +135,25 @@ Typical flow:
 6. If your chain expects PNG input, enable `Convert DDS to PNG before processing`
 7. Point the chain at `${staging_png_root}`, `${png_root}`, or another matching folder
 8. Run a small test first
+
+### 4. Text Search utility
+
+Use this if you want to inspect text-like files such as `.xml`, `.txt`, `.json`, `.cfg`, or `.lua` without leaving the app.
+
+Typical flow:
+
+1. Open `Text Search`
+2. Choose `Archive files` after scanning archives, or `Loose folder` for a normal extracted folder
+3. Enter a search string or regex
+4. Set extensions such as `.xml;.json`
+5. Run `Search`
+6. Select a result to preview it with match highlighting
+7. Export selected or all matches while preserving folder structure
+
+Notes:
+
+- archive-side XML search now attempts deterministic ChaCha20 decryption for supported encrypted XML entries
+- extremely large text files may still be preview-capped to keep the viewer responsive
 
 ## Important ChaiNNer Notes
 
