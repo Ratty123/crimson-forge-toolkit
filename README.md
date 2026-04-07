@@ -368,8 +368,8 @@ Crimson Texture Forge uses or depends on the following:
 
 Archive support and compatibility work were informed by community reverse-engineering and tool behavior around Crimson Desert packages, especially:
 
-- `lazorr410/crimson-desert-unpacker`
-- [Crimson Browser & Mod Manager](https://www.nexusmods.com/crimsondesert/mods/84)
+- [Lazorr](https://forums.nexusmods.com/profile/194233100-lazorr/) and [Crimson Desert Unpacker](https://www.nexusmods.com/crimsondesert/mods/62)
+- [IzeDev](https://www.nexusmods.com/profile/IzeDev) and [Crimson Browser & Mod Manager](https://www.nexusmods.com/crimsondesert/mods/84)
 
 Please also see:
 
