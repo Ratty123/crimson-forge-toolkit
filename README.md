@@ -48,6 +48,28 @@ It is useful whether you:
 - Profile export/import
 - Diagnostic bundle export
 
+## Screenshots
+
+### Archive Browser
+
+![Archive Browser](archive_browser.png)
+
+### Workflow: DDS To PNG / DDS Rebuild
+
+![Workflow PNG to DDS](workflow_png_to_dds.png)
+
+### Workflow: Upscaling Running
+
+![Workflow Upscaling Running](workflow_upscalingrunning.png)
+
+### Compare View
+
+![Workflow Compare](workflow_compare.png)
+
+### Compare View: Alternate Example
+
+![Workflow Compare 2](workflow_compare2.png)
+
 ## Safety And Scope
 
 What the app does:
