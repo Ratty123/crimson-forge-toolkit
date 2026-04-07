@@ -54,23 +54,23 @@ It is useful whether you:
 
 ### Archive Browser
 
-![Archive Browser](archive_browser.png)
+![Archive Browser](docs/screenshots/archive_browser.png)
 
 ### Workflow: DDS To PNG / DDS Rebuild
 
-![Workflow PNG to DDS](workflow_png_to_dds.png)
+![Workflow PNG to DDS](docs/screenshots/workflow_png_to_dds.png)
 
 ### Workflow: Upscaling Running
 
-![Workflow Upscaling Running](workflow_upscalingrunning.png)
+![Workflow Upscaling Running](docs/screenshots/workflow_upscalingrunning.png)
 
 ### Compare View
 
-![Workflow Compare](workflow_compare.png)
+![Workflow Compare](docs/screenshots/workflow_compare.png)
 
 ### Compare View: Alternate Example
 
-![Workflow Compare 2](workflow_compare2.png)
+![Workflow Compare 2](docs/screenshots/workflow_compare2.png)
 
 ## Safety And Scope
 
