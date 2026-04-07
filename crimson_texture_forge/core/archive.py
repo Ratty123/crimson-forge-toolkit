@@ -195,14 +195,47 @@ def crypt_chacha20_filename(data: bytes, filename: str) -> bytes:
 
 
 def _looks_like_plain_text_payload(extension: str, data: bytes) -> bool:
-    if extension != ".xml":
+    if extension not in {".xml", ".txt", ".html", ".thtml", ".lua", ".json", ".ini", ".cfg", ".csv", ".log"}:
         return False
-    stripped = data.lstrip()
-    if not stripped:
-        return False
-    if stripped.startswith((b"<?xml", b"<")):
+    preview_data = data[:8192]
+    for encoding in ("utf-8-sig", "utf-8", "utf-16-le", "cp1252"):
+        try:
+            if encoding in {"utf-8-sig", "utf-8"}:
+                text = preview_data.decode(encoding, errors="ignore")
+            else:
+                text = preview_data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        sample = text[:4096]
+        if not sample:
+            continue
+        printable = sum(1 for ch in sample if ch.isprintable() or ch in "\r\n\t")
+        if printable / max(1, len(sample)) < 0.85:
+            continue
+        if extension == ".xml":
+            stripped = sample.lstrip("\ufeff \t\r\n")
+            if "<" not in stripped:
+                continue
         return True
-    return b"<" in stripped[:512] and b">" in stripped[:512]
+    return False
+
+
+def _looks_like_decrypted_payload(entry: ArchiveEntry, data: bytes) -> bool:
+    if entry.compression_type == 2:
+        if lz4_block is None:
+            return False
+        try:
+            candidate = lz4_block.decompress(data, uncompressed_size=entry.orig_size)
+        except Exception:
+            return False
+        return _looks_like_plain_text_payload(entry.extension, candidate)
+    if entry.compression_type == 1 and entry.extension == ".dds":
+        try:
+            candidate = reconstruct_partial_dds(entry, data)
+        except Exception:
+            return False
+        return candidate.startswith(DDS_MAGIC)
+    return _looks_like_plain_text_payload(entry.extension, data)
 
 
 def try_decrypt_archive_entry_data(entry: ArchiveEntry, data: bytes) -> Tuple[bytes, Optional[str]]:
@@ -211,7 +244,7 @@ def try_decrypt_archive_entry_data(entry: ArchiveEntry, data: bytes) -> Tuple[by
     if entry.encryption_type != 3:
         raise ValueError(f"Unsupported archive encryption type {entry.encryption_type} for {entry.path}")
     candidate = crypt_chacha20_filename(data, entry.basename)
-    if not _looks_like_plain_text_payload(entry.extension, candidate):
+    if not _looks_like_decrypted_payload(entry, candidate):
         raise ValueError(f"ChaCha20 decryption validation failed for {entry.path}")
     return candidate, "ChaCha20"
 
