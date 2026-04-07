@@ -2,6 +2,8 @@
 
 Crimson Texture Forge is a Windows desktop tool for **Crimson Desert texture workflows**.
 
+Project changelog: [CHANGELOG.md](CHANGELOG.md)
+
 It is built for people who need one place to:
 
 - browse and extract assets from Crimson Desert archives

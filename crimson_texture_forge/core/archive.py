@@ -404,6 +404,16 @@ def parse_steam_appmanifest_installdir(appmanifest_path: Path) -> Optional[str]:
     return install_dir or None
 
 
+def _normalize_existing_path(path: Path) -> Optional[Path]:
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        resolved = path.expanduser()
+    if not resolved.exists():
+        return None
+    return resolved
+
+
 def discover_steam_roots() -> List[Path]:
     candidates: set[Path] = set()
     env_candidates = [
@@ -455,6 +465,154 @@ def discover_steam_roots() -> List[Path]:
     return sorted(resolved)
 
 
+def discover_windows_drive_roots() -> List[Path]:
+    if os.name != "nt":
+        return []
+    roots: List[Path] = []
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        candidate = Path(f"{letter}:\\")
+        if candidate.exists():
+            roots.append(candidate)
+    return roots
+
+
+def discover_non_steam_base_paths() -> List[Path]:
+    candidates: set[Path] = set()
+    env_candidates = [
+        os.environ.get("PROGRAMFILES"),
+        os.environ.get("PROGRAMFILES(X86)"),
+        os.environ.get("ProgramW6432"),
+        os.environ.get("LOCALAPPDATA"),
+        os.environ.get("USERPROFILE"),
+        r"C:\Games",
+        r"D:\Games",
+        r"E:\Games",
+        r"F:\Games",
+    ]
+    for raw in env_candidates:
+        if not raw:
+            continue
+        normalized = _normalize_existing_path(Path(raw))
+        if normalized is not None:
+            candidates.add(normalized)
+
+    for drive_root in discover_windows_drive_roots():
+        normalized_root = _normalize_existing_path(drive_root)
+        if normalized_root is None:
+            continue
+        candidates.add(normalized_root)
+        try:
+            for child in normalized_root.iterdir():
+                if child.is_dir():
+                    normalized_child = _normalize_existing_path(child)
+                    if normalized_child is not None:
+                        candidates.add(normalized_child)
+        except OSError:
+            continue
+
+    return sorted(candidates)
+
+
+def discover_non_steam_archive_package_roots(
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> List[Path]:
+    explicit_env_vars = (
+        "CRIMSON_TEXTURE_FORGE_PACKAGE_ROOT",
+        "CRIMSON_DESERT_PACKAGE_ROOT",
+    )
+    candidates: set[Path] = set()
+
+    for env_var in explicit_env_vars:
+        raw_value = os.environ.get(env_var)
+        if not raw_value:
+            continue
+        candidate = Path(raw_value)
+        if looks_like_archive_package_root(candidate):
+            normalized = _normalize_existing_path(candidate)
+            if normalized is not None:
+                candidates.add(normalized)
+                if on_log:
+                    on_log(f"Detected archive package root candidate from {env_var}: {normalized}")
+        elif on_log:
+            on_log(f"Ignoring {env_var}: path does not look like a valid Crimson Desert package root: {candidate}")
+
+    game_dir_names = ("Crimson Desert", "CrimsonDesert")
+    relative_patterns = (
+        (),
+        ("Games",),
+        ("Steam", "steamapps", "common"),
+        ("SteamLibrary", "steamapps", "common"),
+        ("steamapps", "common"),
+        ("Epic Games",),
+    )
+
+    for base_path in discover_non_steam_base_paths():
+        for relative_parts in relative_patterns:
+            for game_dir_name in game_dir_names:
+                candidate = base_path.joinpath(*relative_parts, game_dir_name)
+                if not looks_like_archive_package_root(candidate):
+                    continue
+                normalized = _normalize_existing_path(candidate)
+                if normalized is not None:
+                    candidates.add(normalized)
+
+    store_container_names = (
+        "XboxGames",
+        "ModifiableWindowsApps",
+        "WindowsApps",
+    )
+    store_candidate_suffixes = (
+        (),
+        ("Content",),
+        ("Game",),
+        ("Content", "Game"),
+    )
+
+    for drive_root in discover_windows_drive_roots():
+        for container_name in store_container_names:
+            candidate_container = drive_root / container_name
+            if not candidate_container.exists() or not candidate_container.is_dir():
+                continue
+
+            direct_name_matches: List[Path] = []
+            for game_dir_name in game_dir_names:
+                direct_name_matches.extend(
+                    [
+                        candidate_container / game_dir_name,
+                        candidate_container / f"{game_dir_name} Standard Edition",
+                        candidate_container / f"{game_dir_name} Deluxe Edition",
+                    ]
+                )
+
+            seen_container_children: set[str] = set()
+            dynamic_child_matches: List[Path] = []
+            try:
+                for child in candidate_container.iterdir():
+                    if not child.is_dir():
+                        continue
+                    child_key = child.name.lower()
+                    if child_key in seen_container_children:
+                        continue
+                    seen_container_children.add(child_key)
+                    lowered_name = child.name.lower()
+                    if "crimson" in lowered_name and "desert" in lowered_name:
+                        dynamic_child_matches.append(child)
+            except OSError:
+                continue
+
+            for game_root in [*direct_name_matches, *dynamic_child_matches]:
+                for suffix in store_candidate_suffixes:
+                    candidate = game_root.joinpath(*suffix)
+                    if not looks_like_archive_package_root(candidate):
+                        continue
+                    normalized = _normalize_existing_path(candidate)
+                    if normalized is not None:
+                        candidates.add(normalized)
+
+    return sorted(candidates)
+
+
 def looks_like_archive_package_root(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
         return False
@@ -475,6 +633,8 @@ def autodetect_archive_package_roots(
     *,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> List[Path]:
+    if on_log:
+        on_log("Checking Steam libraries and common custom install locations...")
     library_roots: set[Path] = set()
     for steam_root in discover_steam_roots():
         library_roots.add(steam_root)
@@ -501,6 +661,9 @@ def autodetect_archive_package_roots(
                 except OSError:
                     resolved_candidate = candidate
                 candidates.add(resolved_candidate)
+
+    for candidate in discover_non_steam_archive_package_roots(on_log=on_log):
+        candidates.add(candidate)
 
     if on_log:
         if candidates:

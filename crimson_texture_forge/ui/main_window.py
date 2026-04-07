@@ -2190,7 +2190,7 @@ def run_gui() -> int:
                 return
 
             def task(on_log: Callable[[str], None]) -> List[str]:
-                on_log("Auto-detecting Crimson Desert archive package roots from Steam libraries...")
+                on_log("Auto-detecting Crimson Desert archive package roots from known install locations...")
                 roots = autodetect_archive_package_roots(on_log=on_log)
                 return [str(path) for path in roots]
 
