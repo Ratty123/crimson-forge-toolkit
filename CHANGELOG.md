@@ -14,6 +14,9 @@ The format is intentionally simple:
 ### Added
 - Placeholder for future changes.
 
+### Changed
+- Windows build output now uses a versioned release-style filename pattern such as `CrimsonTextureForge-<version>-windows-portable.exe`.
+
 ## [0.2.0] - 2026-04-08
 
 ### Added

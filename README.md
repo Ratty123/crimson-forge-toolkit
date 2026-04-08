@@ -360,6 +360,7 @@ Build helper:
 Current packaging target:
 
 - `--windowed --onefile`
+- release-style output filename: `CrimsonTextureForge-<version>-windows-portable.exe`
 
 ## Development
 

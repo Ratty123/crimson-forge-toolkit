@@ -1439,7 +1439,7 @@ def run_gui() -> int:
             notices_path = Path(__file__).resolve().parents[2] / "THIRD_PARTY_NOTICES.md"
             license_path = Path(__file__).resolve().parents[2] / "LICENSE"
             return f"""
-            <h3>{APP_TITLE}</h3>
+            <h3>{APP_TITLE} v{APP_VERSION}</h3>
             <p>A Windows desktop tool for Crimson Desert texture workflows: read-only archive browsing, DDS-to-PNG conversion, optional external upscaling through <b>chaiNNer</b>, DDS rebuild with <b>texconv</b>, side-by-side compare review, and read-only text search across archive or loose files.</p>
             <h3>What It Covers</h3>
             <ul>
