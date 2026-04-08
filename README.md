@@ -73,6 +73,10 @@ It is useful whether you:
 
 ![Workflow Compare 2](docs/screenshots/workflow_compare2.png)
 
+### Text Search
+
+![Text Search](docs/screenshots/TextSearcher.png)
+
 ## Safety And Scope
 
 What the app does:
