@@ -3,16 +3,27 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QPixmap, QSyntaxHighlighter, QTextCharFormat, QColor
+from PySide6.QtCore import QRect, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QPainter,
+    QPixmap,
+    QSyntaxHighlighter,
+    QTextCharFormat,
+    QTextCursor,
+    QTextFormat,
+)
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QTextBrowser,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QFrame,
@@ -160,6 +171,321 @@ class PreviewScrollArea(QScrollArea):
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self.resized.emit()
+
+
+def _theme_is_light(theme_key: str) -> bool:
+    theme = get_theme(theme_key)
+    color = QColor(theme["window"])
+    return color.lightnessF() >= 0.55
+
+
+class PreviewSyntaxHighlighter(QSyntaxHighlighter):
+    XML_TEXT_EXTENSIONS = {".xml", ".html", ".thtml", ".material", ".shader"}
+    JSON_TEXT_EXTENSIONS = {".json", ".yaml", ".yml"}
+    INI_TEXT_EXTENSIONS = {".ini", ".cfg"}
+    LUA_TEXT_EXTENSIONS = {".lua"}
+
+    LUA_KEYWORDS = {
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
+        "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+    }
+
+    def __init__(self, document, theme_key: str):
+        super().__init__(document)
+        self.language = "plain"
+        self.comment_format = QTextCharFormat()
+        self.keyword_format = QTextCharFormat()
+        self.string_format = QTextCharFormat()
+        self.number_format = QTextCharFormat()
+        self.tag_format = QTextCharFormat()
+        self.attribute_format = QTextCharFormat()
+        self.section_format = QTextCharFormat()
+        self.key_format = QTextCharFormat()
+        self.entity_format = QTextCharFormat()
+        self.bracket_format = QTextCharFormat()
+        self.set_theme(theme_key)
+
+    def set_theme(self, theme_key: str) -> None:
+        light = _theme_is_light(theme_key)
+
+        def make(color: str, *, bold: bool = False, italic: bool = False) -> QTextCharFormat:
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(color))
+            if bold:
+                fmt.setFontWeight(QFont.Bold)
+            fmt.setFontItalic(italic)
+            return fmt
+
+        if light:
+            self.comment_format = make("#008000", italic=True)
+            self.keyword_format = make("#af00db", bold=True)
+            self.string_format = make("#a31515")
+            self.number_format = make("#098658")
+            self.tag_format = make("#0451a5", bold=True)
+            self.attribute_format = make("#001080")
+            self.section_format = make("#795e26", bold=True)
+            self.key_format = make("#001080")
+            self.entity_format = make("#795e26")
+            self.bracket_format = make("#333333")
+        else:
+            self.comment_format = make("#6a9955", italic=True)
+            self.keyword_format = make("#c586c0", bold=True)
+            self.string_format = make("#ce9178")
+            self.number_format = make("#b5cea8")
+            self.tag_format = make("#569cd6", bold=True)
+            self.attribute_format = make("#9cdcfe")
+            self.section_format = make("#4ec9b0", bold=True)
+            self.key_format = make("#9cdcfe")
+            self.entity_format = make("#d7ba7d")
+            self.bracket_format = make("#d4d4d4")
+        self.rehighlight()
+
+    def set_language_for_extension(self, extension: str) -> None:
+        suffix = (extension or "").lower()
+        if suffix in self.XML_TEXT_EXTENSIONS:
+            self.language = "xml"
+        elif suffix in self.JSON_TEXT_EXTENSIONS:
+            self.language = "json"
+        elif suffix in self.INI_TEXT_EXTENSIONS:
+            self.language = "ini"
+        elif suffix in self.LUA_TEXT_EXTENSIONS:
+            self.language = "lua"
+        else:
+            self.language = "plain"
+        self.rehighlight()
+
+    def highlightBlock(self, text: str) -> None:  # type: ignore[override]
+        if self.language == "xml":
+            self._highlight_xml(text)
+        elif self.language == "json":
+            self._highlight_json(text)
+        elif self.language == "ini":
+            self._highlight_ini(text)
+        elif self.language == "lua":
+            self._highlight_lua(text)
+
+    def _highlight_xml(self, text: str) -> None:
+        self.setCurrentBlockState(0)
+        for match in re.finditer(r"</?[\w:.-]+", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.tag_format)
+        for match in re.finditer(r"</?|/?>", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.bracket_format)
+        for match in re.finditer(r"\b[\w:.-]+(?=\s*=)", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.attribute_format)
+        for match in re.finditer(r"\"[^\"\n]*\"|'[^'\n]*'", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.string_format)
+        for match in re.finditer(r"&[#\w]+;", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.entity_format)
+
+        start_index = 0 if self.previousBlockState() == 1 else text.find("<!--")
+        while start_index >= 0:
+            end_index = text.find("-->", start_index)
+            if end_index == -1:
+                self.setCurrentBlockState(1)
+                self.setFormat(start_index, len(text) - start_index, self.comment_format)
+                break
+            length = end_index - start_index + 3
+            self.setFormat(start_index, length, self.comment_format)
+            start_index = text.find("<!--", end_index + 3)
+
+    def _highlight_json(self, text: str) -> None:
+        for match in re.finditer(r'"(?:\\.|[^"\\])*"(?=\s*:)', text):
+            self.setFormat(match.start(), match.end() - match.start(), self.key_format)
+        for match in re.finditer(r'"(?:\\.|[^"\\])*"', text):
+            self.setFormat(match.start(), match.end() - match.start(), self.string_format)
+        for match in re.finditer(r"\b(true|false|null)\b", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.keyword_format)
+        for match in re.finditer(r"(?<![\w.])-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.number_format)
+
+    def _highlight_ini(self, text: str) -> None:
+        comment_match = re.match(r"\s*[;#].*$", text)
+        if comment_match:
+            self.setFormat(comment_match.start(), comment_match.end() - comment_match.start(), self.comment_format)
+            return
+        section_match = re.match(r"\s*\[[^\]]+\]", text)
+        if section_match:
+            self.setFormat(section_match.start(), section_match.end() - section_match.start(), self.section_format)
+            return
+        key_match = re.match(r"\s*[^=:#\s][^=:#]*?(?=\s*[=:])", text)
+        if key_match:
+            self.setFormat(key_match.start(), key_match.end() - key_match.start(), self.key_format)
+        for match in re.finditer(r"\"[^\"\n]*\"|'[^'\n]*'", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.string_format)
+        for match in re.finditer(r"(?<![\w.])-?\b\d+(?:\.\d+)?\b", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.number_format)
+
+    def _highlight_lua(self, text: str) -> None:
+        comment_match = re.search(r"--.*$", text)
+        text_no_comment = text[: comment_match.start()] if comment_match else text
+        for match in re.finditer(r"\b(" + "|".join(sorted(self.LUA_KEYWORDS)) + r")\b", text_no_comment):
+            self.setFormat(match.start(), match.end() - match.start(), self.keyword_format)
+        for match in re.finditer(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'", text_no_comment):
+            self.setFormat(match.start(), match.end() - match.start(), self.string_format)
+        for match in re.finditer(r"(?<![\w.])-?\b\d+(?:\.\d+)?\b", text_no_comment):
+            self.setFormat(match.start(), match.end() - match.start(), self.number_format)
+        if comment_match:
+            self.setFormat(comment_match.start(), comment_match.end() - comment_match.start(), self.comment_format)
+
+
+class _LineNumberArea(QWidget):
+    def __init__(self, editor: "CodePreviewEditor"):
+        super().__init__(editor)
+        self.code_editor = editor
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(self.code_editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        self.code_editor.line_number_area_paint_event(event)
+
+
+class CodePreviewEditor(QPlainTextEdit):
+    def __init__(self, *, theme_key: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.theme_key = theme_key
+        self._match_selections: list[QTextEdit.ExtraSelection] = []
+        self._editor_font_size = 10
+        self.line_number_area = _LineNumberArea(self)
+        self.syntax_highlighter = PreviewSyntaxHighlighter(self.document(), theme_key)
+        self.setReadOnly(True)
+        self.setLineWrapMode(QPlainTextEdit.NoWrap)
+        font = QFont("Consolas")
+        if not font.exactMatch():
+            font = QFont("Courier New")
+        font.setPointSize(self._editor_font_size)
+        self._apply_editor_font(font)
+        self.blockCountChanged.connect(self.update_line_number_area_width)
+        self.updateRequest.connect(self.update_line_number_area)
+        self.cursorPositionChanged.connect(self._apply_combined_selections)
+        self.update_line_number_area_width(0)
+        self.set_theme(theme_key)
+
+    def line_number_area_width(self) -> int:
+        digits = max(2, len(str(max(1, self.blockCount()))))
+        return 12 + self.fontMetrics().horizontalAdvance("9") * digits
+
+    def update_line_number_area_width(self, _new_block_count: int) -> None:
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def update_line_number_area(self, rect, dy: int) -> None:
+        if dy:
+            self.line_number_area.scroll(0, dy)
+        else:
+            self.line_number_area.update(0, rect.y(), self.line_number_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self.update_line_number_area_width(0)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.line_number_area.setGeometry(QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height()))
+
+    def line_number_area_paint_event(self, event) -> None:
+        painter = QPainter(self.line_number_area)
+        painter.fillRect(event.rect(), self._gutter_background)
+
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        top = round(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom = top + round(self.blockBoundingRect(block).height())
+        current_block_number = self.textCursor().blockNumber()
+
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                number = str(block_number + 1)
+                if block_number == current_block_number:
+                    painter.setPen(self._line_number_active_color)
+                    font = painter.font()
+                    font.setBold(True)
+                    painter.setFont(font)
+                else:
+                    painter.setPen(self._line_number_color)
+                    font = painter.font()
+                    font.setBold(False)
+                    painter.setFont(font)
+                painter.drawText(
+                    0,
+                    top,
+                    self.line_number_area.width() - 6,
+                    self.fontMetrics().height(),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    number,
+                )
+            block = block.next()
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            block_number += 1
+
+    def set_match_selections(self, selections: list[QTextEdit.ExtraSelection]) -> None:
+        self._match_selections = list(selections)
+        self._apply_combined_selections()
+
+    def _apply_combined_selections(self) -> None:
+        selections = []
+        if not self.isReadOnly():
+            super().setExtraSelections(self._match_selections)
+            return
+        current_line = QTextEdit.ExtraSelection()
+        current_line.format.setBackground(self._current_line_color)
+        current_line.format.setProperty(QTextFormat.FullWidthSelection, True)
+        current_line.cursor = self.textCursor()
+        current_line.cursor.clearSelection()
+        selections.append(current_line)
+        selections.extend(self._match_selections)
+        super().setExtraSelections(selections)
+        self.line_number_area.update()
+
+    def set_theme(self, theme_key: str) -> None:
+        self.theme_key = theme_key
+        theme = get_theme(theme_key)
+        self._gutter_background = QColor(theme["surface_alt"])
+        self._line_number_color = QColor(theme["text_muted"])
+        self._line_number_active_color = QColor(theme["accent"])
+        self._current_line_color = QColor(theme["accent_soft"])
+        self.syntax_highlighter.set_theme(theme_key)
+        self.setStyleSheet(
+            f"QPlainTextEdit {{ background: {theme['preview_bg']}; color: {theme['text']}; border: 1px solid {theme['border_strong']}; border-radius: 4px; selection-background-color: {theme['accent']}; selection-color: #ffffff; }}"
+        )
+        self.viewport().update()
+        self.line_number_area.update()
+        self._apply_combined_selections()
+
+    def set_language_for_extension(self, extension: str) -> None:
+        self.syntax_highlighter.set_language_for_extension(extension)
+
+    def set_wrap_enabled(self, enabled: bool) -> None:
+        self.setLineWrapMode(QPlainTextEdit.WidgetWidth if enabled else QPlainTextEdit.NoWrap)
+
+    def adjust_font_size(self, delta: int) -> int:
+        self._editor_font_size = max(8, min(22, self._editor_font_size + delta))
+        font = self.font()
+        font.setPointSize(self._editor_font_size)
+        self._apply_editor_font(font)
+        return self._editor_font_size
+
+    def set_font_size(self, size: int) -> int:
+        self._editor_font_size = max(8, min(22, size))
+        font = self.font()
+        font.setPointSize(self._editor_font_size)
+        self._apply_editor_font(font)
+        return self._editor_font_size
+
+    def center_on_span(self, start: int, end: int) -> None:
+        cursor = self.textCursor()
+        cursor.setPosition(max(0, start))
+        cursor.setPosition(max(start, end), QTextCursor.KeepAnchor)
+        self.setTextCursor(cursor)
+        self.centerCursor()
+
+    def _apply_editor_font(self, font: QFont) -> None:
+        self.setFont(font)
+        self.document().setDefaultFont(font)
+        self.setTabStopDistance(4 * self.fontMetrics().horizontalAdvance(" "))
+        self.update_line_number_area_width(0)
+        self.viewport().update()
+        self.line_number_area.update()
+        self.syntax_highlighter.rehighlight()
 
 
 class LogHighlighter(QSyntaxHighlighter):
@@ -324,7 +650,7 @@ class QuickStartDialog(QDialog):
             <h3>Compare and review</h3>
             <p>Use the <b>Compare</b> tab to review original vs rebuilt DDS side by side. You can zoom, pan, inspect metadata, and refresh the compare list after new output is written.</p>
             <h3>Text search utility</h3>
-            <p>Use the <b>Text Search</b> tab when you want to inspect text-like files outside the texture workflow. It can search archive entries or loose folders, highlight matches in preview, and export matched files with their folder structure intact.</p>
+            <p>Use the <b>Text Search</b> tab when you want to inspect text-like files outside the texture workflow. It can search archive entries or loose folders, decrypt supported encrypted archive XML, preview matches in an editor-style view with line numbers and syntax colors, and export matched files with their folder structure intact.</p>
             <h3>Where settings are stored</h3>
             <p>The app auto-saves settings to a local config file beside the EXE and also keeps archive scan cache data in a local cache folder beside it.</p>
             <h3>Common causes of failure</h3>

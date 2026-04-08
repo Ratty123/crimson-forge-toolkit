@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
@@ -42,7 +43,8 @@ from crimson_texture_forge.core.text_search import (
     search_loose_text_files,
 )
 from crimson_texture_forge.models import ArchiveEntry, RunCancelled
-from crimson_texture_forge.ui.widgets import LogHighlighter
+from crimson_texture_forge.ui.themes import get_theme
+from crimson_texture_forge.ui.widgets import CodePreviewEditor, LogHighlighter
 
 
 class TextSearchWorker(QObject):
@@ -126,6 +128,7 @@ class TextSearchWorker(QObject):
 
 class TextSearchTab(QWidget):
     status_message_requested = Signal(str, bool)
+    SYNTAX_HIGHLIGHT_CHAR_LIMIT = 2_000_000
 
     def __init__(
         self,
@@ -142,6 +145,7 @@ class TextSearchTab(QWidget):
         self.archive_package_root_text = ""
         self.external_busy = False
         self._settings_ready = False
+        self.current_theme_key = theme_key
         self.search_thread: Optional[QThread] = None
         self.search_worker: Optional[TextSearchWorker] = None
         self.search_results: List[TextSearchResult] = []
@@ -150,6 +154,10 @@ class TextSearchTab(QWidget):
         self.last_search_case_sensitive = False
         self.last_search_regex_enabled = False
         self.last_search_stats = TextSearchRunStats(source_kind="archive", candidate_count=0, searched_count=0)
+        self.preview_search_spans: List[tuple[int, int]] = []
+        self.preview_find_spans: List[tuple[int, int]] = []
+        self.preview_find_active_index = -1
+        self.preview_text_cache = ""
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -157,6 +165,7 @@ class TextSearchTab(QWidget):
 
         main_splitter = QSplitter(Qt.Horizontal)
         main_splitter.setChildrenCollapsible(False)
+        main_splitter.setHandleWidth(8)
         root_layout.addWidget(main_splitter, stretch=1)
 
         controls_group = QGroupBox("Text Search")
@@ -276,11 +285,15 @@ class TextSearchTab(QWidget):
         self.results_tree.setAlternatingRowColors(True)
         self.results_tree.setRootIsDecorated(False)
         self.results_tree.setUniformRowHeights(True)
-        self.results_tree.setHeaderLabels(["Path", "Ext", "Matches", "Package"])
-        self.results_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.results_tree.setHeaderLabels(["File Name", "Matches", "Package", "Path", "Ext"])
+        self.results_tree.header().setStretchLastSection(False)
+        self.results_tree.header().setSectionResizeMode(0, QHeaderView.Interactive)
         self.results_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.results_tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.results_tree.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.results_tree.header().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.results_tree.header().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.results_tree.header().resizeSection(0, 260)
+        self.results_tree.header().resizeSection(3, 360)
         results_layout.addWidget(self.results_tree, stretch=1)
         main_splitter.addWidget(results_group)
 
@@ -296,21 +309,49 @@ class TextSearchTab(QWidget):
         self.preview_detail_label = QLabel("")
         self.preview_detail_label.setObjectName("HintLabel")
         self.preview_detail_label.setWordWrap(True)
-        self.preview_text_edit = QPlainTextEdit()
-        self.preview_text_edit.setReadOnly(True)
-        self.preview_text_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        preview_toolbar = QHBoxLayout()
+        preview_toolbar.setSpacing(8)
+        self.preview_find_edit = QLineEdit()
+        self.preview_find_edit.setPlaceholderText("Find in preview")
+        self.preview_find_prev_button = QPushButton("Prev")
+        self.preview_find_next_button = QPushButton("Next")
+        self.preview_find_case_checkbox = QCheckBox("Aa")
+        self.preview_find_case_checkbox.setToolTip("Case-sensitive preview search")
+        self.preview_wrap_checkbox = QCheckBox("Wrap")
+        self.preview_wrap_checkbox.setToolTip("Wrap long lines in the preview editor")
+        self.preview_font_smaller_button = QPushButton("A-")
+        self.preview_font_larger_button = QPushButton("A+")
+        self.preview_find_status_label = QLabel("No preview loaded.")
+        self.preview_find_status_label.setObjectName("HintLabel")
+        for button in (
+            self.preview_find_prev_button,
+            self.preview_find_next_button,
+            self.preview_font_smaller_button,
+            self.preview_font_larger_button,
+        ):
+            button.setMinimumWidth(42)
+        preview_toolbar.addWidget(self.preview_find_edit, stretch=1)
+        preview_toolbar.addWidget(self.preview_find_prev_button)
+        preview_toolbar.addWidget(self.preview_find_next_button)
+        preview_toolbar.addWidget(self.preview_find_case_checkbox)
+        preview_toolbar.addWidget(self.preview_wrap_checkbox)
+        preview_toolbar.addWidget(self.preview_font_smaller_button)
+        preview_toolbar.addWidget(self.preview_font_larger_button)
+        preview_toolbar.addWidget(self.preview_find_status_label)
+        self.preview_text_edit = CodePreviewEditor(theme_key=theme_key)
         preview_layout.addWidget(self.preview_title_label)
         preview_layout.addWidget(self.preview_meta_label)
         preview_layout.addWidget(self.preview_detail_label)
+        preview_layout.addLayout(preview_toolbar)
         preview_layout.addWidget(self.preview_text_edit, stretch=1)
         main_splitter.addWidget(preview_group)
-        controls_group.setMinimumWidth(420)
-        results_group.setMinimumWidth(420)
-        preview_group.setMinimumWidth(620)
+        controls_group.setMinimumWidth(360)
+        results_group.setMinimumWidth(300)
+        preview_group.setMinimumWidth(420)
         main_splitter.setStretchFactor(0, 2)
         main_splitter.setStretchFactor(1, 2)
         main_splitter.setStretchFactor(2, 4)
-        main_splitter.setSizes([520, 520, 980])
+        main_splitter.setSizes([430, 380, 860])
 
         self.log_highlighter = LogHighlighter(self.log_view.document(), theme_key)
         log_font = QFont("Consolas")
@@ -329,6 +370,14 @@ class TextSearchTab(QWidget):
         self.query_edit.returnPressed.connect(self.start_search)
         self.path_filter_edit.returnPressed.connect(self.start_search)
         self.source_combo.currentIndexChanged.connect(self._handle_source_changed)
+        self.preview_find_edit.textChanged.connect(self._handle_preview_find_changed)
+        self.preview_find_edit.returnPressed.connect(self._jump_to_next_preview_find_match)
+        self.preview_find_prev_button.clicked.connect(self._jump_to_previous_preview_find_match)
+        self.preview_find_next_button.clicked.connect(self._jump_to_next_preview_find_match)
+        self.preview_find_case_checkbox.toggled.connect(self._handle_preview_find_changed)
+        self.preview_wrap_checkbox.toggled.connect(self._handle_preview_wrap_changed)
+        self.preview_font_smaller_button.clicked.connect(lambda: self._adjust_preview_font(-1))
+        self.preview_font_larger_button.clicked.connect(lambda: self._adjust_preview_font(1))
 
         for widget in (
             self.query_edit,
@@ -336,11 +385,14 @@ class TextSearchTab(QWidget):
             self.extensions_edit,
             self.loose_root_edit,
             self.export_root_edit,
+            self.preview_find_edit,
         ):
             widget.textChanged.connect(self._save_settings)
         self.source_combo.currentIndexChanged.connect(self._save_settings)
         self.case_sensitive_checkbox.toggled.connect(self._save_settings)
         self.regex_checkbox.toggled.connect(self._save_settings)
+        self.preview_wrap_checkbox.toggled.connect(self._save_settings)
+        self.preview_find_case_checkbox.toggled.connect(self._save_settings)
 
         self._load_settings()
         self._settings_ready = True
@@ -348,7 +400,10 @@ class TextSearchTab(QWidget):
         self._update_controls()
 
     def set_theme(self, theme_key: str) -> None:
+        self.current_theme_key = theme_key
         self.log_highlighter.set_theme(theme_key)
+        self.preview_text_edit.set_theme(theme_key)
+        self._refresh_preview_selections(focus_current=False)
 
     def set_external_busy(self, busy: bool) -> None:
         self.external_busy = busy
@@ -424,6 +479,9 @@ class TextSearchTab(QWidget):
         self.settings.setValue("text_search/export_root", self.export_root_edit.text())
         self.settings.setValue("text_search/case_sensitive", self.case_sensitive_checkbox.isChecked())
         self.settings.setValue("text_search/regex_enabled", self.regex_checkbox.isChecked())
+        self.settings.setValue("text_search/preview_wrap", self.preview_wrap_checkbox.isChecked())
+        self.settings.setValue("text_search/preview_find_case_sensitive", self.preview_find_case_checkbox.isChecked())
+        self.settings.setValue("text_search/preview_font_size", self.preview_text_edit.font().pointSize())
         self.settings.sync()
 
     def _load_settings(self) -> None:
@@ -441,6 +499,15 @@ class TextSearchTab(QWidget):
         )
         self.case_sensitive_checkbox.setChecked(str(self.settings.value("text_search/case_sensitive", "false")).lower() in {"1", "true", "yes"})
         self.regex_checkbox.setChecked(str(self.settings.value("text_search/regex_enabled", "false")).lower() in {"1", "true", "yes"})
+        self.preview_wrap_checkbox.setChecked(str(self.settings.value("text_search/preview_wrap", "false")).lower() in {"1", "true", "yes"})
+        self.preview_find_case_checkbox.setChecked(
+            str(self.settings.value("text_search/preview_find_case_sensitive", "false")).lower() in {"1", "true", "yes"}
+        )
+        try:
+            preview_font_size = int(self.settings.value("text_search/preview_font_size", 10))
+        except (TypeError, ValueError):
+            preview_font_size = 10
+        self.preview_text_edit.set_font_size(preview_font_size)
 
     def _update_controls(self) -> None:
         busy = self.search_thread is not None
@@ -463,6 +530,14 @@ class TextSearchTab(QWidget):
         self.export_all_button.setEnabled(can_interact and has_results)
         self.results_tree.setEnabled(not busy)
         self.clear_log_button.setEnabled(not busy)
+        has_preview_text = bool(self.preview_text_cache)
+        self.preview_find_edit.setEnabled(has_preview_text)
+        self.preview_find_prev_button.setEnabled(has_preview_text and bool(self.preview_find_spans))
+        self.preview_find_next_button.setEnabled(has_preview_text and bool(self.preview_find_spans))
+        self.preview_find_case_checkbox.setEnabled(has_preview_text)
+        self.preview_wrap_checkbox.setEnabled(has_preview_text)
+        self.preview_font_smaller_button.setEnabled(has_preview_text)
+        self.preview_font_larger_button.setEnabled(has_preview_text)
 
     def selected_results(self) -> List[TextSearchResult]:
         results: List[TextSearchResult] = []
@@ -514,6 +589,12 @@ class TextSearchTab(QWidget):
         self.preview_meta_label.setText("Working...")
         self.preview_detail_label.setText("")
         self.preview_text_edit.setPlainText("")
+        self.preview_text_edit.set_match_selections([])
+        self.preview_search_spans = []
+        self.preview_find_spans = []
+        self.preview_find_active_index = -1
+        self.preview_text_cache = ""
+        self.preview_find_status_label.setText("Searching...")
         self.results_summary_label.setText("Search in progress...")
         self.search_progress_label.setText("Preparing search...")
         self.search_progress_bar.setRange(0, 0)
@@ -571,15 +652,20 @@ class TextSearchTab(QWidget):
         self.last_search_stats = stats if isinstance(stats, TextSearchRunStats) else TextSearchRunStats(source_kind="archive", candidate_count=0, searched_count=0)
         self.results_tree.clear()
         for index, result in enumerate(self.search_results):
+            file_name = Path(result.relative_path).name or result.relative_path
             item = QTreeWidgetItem(
                 [
-                    result.relative_path,
-                    result.extension,
+                    file_name,
                     f"{result.match_count:,}",
                     result.package_label if result.source_kind == "archive" else "Loose file",
+                    result.relative_path,
+                    result.extension,
                 ]
             )
-            item.setToolTip(0, result.snippet or result.relative_path)
+            item.setToolTip(0, file_name)
+            item.setToolTip(2, item.text(2))
+            item.setToolTip(3, result.relative_path)
+            item.setToolTip(4, result.extension)
             item.setData(0, Qt.UserRole, index)
             self.results_tree.addTopLevelItem(item)
         if self.search_results:
@@ -589,6 +675,12 @@ class TextSearchTab(QWidget):
             self.preview_meta_label.setText("No matching file was found for the current query.")
             self.preview_detail_label.setText("")
             self.preview_text_edit.setPlainText("")
+            self.preview_text_edit.set_match_selections([])
+            self.preview_text_cache = ""
+            self.preview_search_spans = []
+            self.preview_find_spans = []
+            self.preview_find_active_index = -1
+            self.preview_find_status_label.setText("No preview loaded.")
         summary = (
             f"Scanned {self.last_search_stats.candidate_count:,} candidate file(s). "
             f"Searched {self.last_search_stats.searched_count:,} readable file(s). "
@@ -650,44 +742,152 @@ class TextSearchTab(QWidget):
             self.preview_meta_label.setText("Preview failed.")
             self.preview_detail_label.setText(str(exc))
             self.preview_text_edit.setPlainText("")
-            self.preview_text_edit.setExtraSelections([])
+            self.preview_text_edit.set_match_selections([])
+            self.preview_search_spans = []
+            self.preview_find_spans = []
+            self.preview_find_active_index = -1
+            self.preview_text_cache = ""
+            self.preview_find_status_label.setText("Preview failed.")
             return
 
         self.preview_title_label.setText(preview.title)
         self.preview_meta_label.setText(preview.metadata)
-        self.preview_detail_label.setText(preview.detail_text)
+        preview_detail_text = preview.detail_text
+        syntax_extension = result.extension
+        if len(preview.preview_text) > self.SYNTAX_HIGHLIGHT_CHAR_LIMIT:
+            syntax_extension = ""
+            preview_detail_text = "\n".join(
+                part
+                for part in [
+                    preview_detail_text.strip(),
+                    "Syntax colors disabled for this very large preview to keep the editor responsive.",
+                ]
+                if part
+            )
+        self.preview_detail_label.setText(preview_detail_text)
+        self.preview_text_edit.set_language_for_extension(syntax_extension)
         self._apply_preview_content(preview)
 
     def _apply_preview_content(self, preview: TextSearchPreview) -> None:
         self.preview_text_edit.setPlainText(preview.preview_text)
-        extra_selections = []
-        highlight_format = QTextCharFormat()
-        highlight_format.setBackground(QColor("#ffcc33"))
-        highlight_format.setForeground(QColor("#111111"))
-        highlight_format.setFontWeight(QFont.Bold)
-        document = self.preview_text_edit.document()
-        for start, end in sorted(preview.match_spans, key=lambda item: item[0]):
+        self.preview_text_cache = preview.preview_text
+        self.preview_search_spans = list(preview.match_spans)
+        self.preview_find_active_index = -1
+        self._handle_preview_find_changed(reset_focus=True)
+        if not self.preview_find_spans and self.preview_search_spans:
+            first_start, first_end = self.preview_search_spans[0]
+            self.preview_text_edit.center_on_span(first_start, first_end)
+        elif not self.preview_search_spans:
+            self.preview_text_edit.moveCursor(QTextCursor.Start)
+            self.preview_text_edit.verticalScrollBar().setValue(0)
+            self.preview_text_edit.horizontalScrollBar().setValue(0)
+
+    def _adjust_preview_font(self, delta: int) -> None:
+        new_size = self.preview_text_edit.adjust_font_size(delta)
+        self.preview_find_status_label.setText(
+            f"{self._preview_match_status_text()} | Font {new_size} pt"
+            if self.preview_text_cache
+            else f"Font {new_size} pt"
+        )
+        self._save_settings()
+
+    def _handle_preview_wrap_changed(self, enabled: bool) -> None:
+        self.preview_text_edit.set_wrap_enabled(enabled)
+        self._save_settings()
+
+    def _handle_preview_find_changed(self, _text: str = "", *, reset_focus: bool = True) -> None:
+        query = self.preview_find_edit.text()
+        self.preview_find_spans = self._find_preview_spans(query, self.preview_find_case_checkbox.isChecked())
+        self.preview_find_active_index = 0 if self.preview_find_spans else -1
+        self._refresh_preview_selections(focus_current=bool(self.preview_find_spans and reset_focus))
+        self._update_preview_find_status()
+        self._update_controls()
+
+    def _find_preview_spans(self, query: str, case_sensitive: bool) -> List[tuple[int, int]]:
+        query = query or ""
+        if not query or not self.preview_text_cache:
+            return []
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern = re.compile(re.escape(query), flags)
+        return [
+            match.span()
+            for match in pattern.finditer(self.preview_text_cache)
+            if match.end() > match.start()
+        ]
+
+    def _make_selection(self, start: int, end: int, fmt: QTextCharFormat) -> QTextEdit.ExtraSelection:
+        cursor = QTextCursor(self.preview_text_edit.document())
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = cursor
+        selection.format = fmt
+        return selection
+
+    def _refresh_preview_selections(self, *, focus_current: bool) -> None:
+        selections: List[QTextEdit.ExtraSelection] = []
+        theme = get_theme(self.current_theme_key)
+        search_format = QTextCharFormat()
+        search_bg = QColor("#e3b341" if QColor(theme["window"]).lightnessF() < 0.55 else "#ffd866")
+        search_bg.setAlpha(185)
+        search_format.setBackground(search_bg)
+        search_format.setForeground(QColor("#111111"))
+        search_format.setFontWeight(QFont.DemiBold)
+
+        find_format = QTextCharFormat()
+        find_bg = QColor(theme["accent_soft"])
+        if find_bg.alpha() == 255:
+            find_bg.setAlpha(210)
+        find_format.setBackground(find_bg)
+        find_format.setForeground(QColor(theme["text_strong"]))
+
+        active_find_format = QTextCharFormat()
+        active_find_format.setBackground(QColor(theme["accent"]))
+        active_find_format.setForeground(QColor("#ffffff"))
+        active_find_format.setFontWeight(QFont.Bold)
+
+        for start, end in self.preview_search_spans:
+            if end > start:
+                selections.append(self._make_selection(start, end, search_format))
+
+        active_span: Optional[tuple[int, int]] = None
+        for index, (start, end) in enumerate(self.preview_find_spans):
             if end <= start:
                 continue
-            cursor = QTextCursor(document)
-            cursor.setPosition(start)
-            cursor.setPosition(end, QTextCursor.KeepAnchor)
-            selection = QTextEdit.ExtraSelection()
-            selection.cursor = cursor
-            selection.format = highlight_format
-            extra_selections.append(selection)
-        self.preview_text_edit.setExtraSelections(extra_selections)
-        if preview.match_spans:
-            first_start, first_end = preview.match_spans[0]
-            cursor = self.preview_text_edit.textCursor()
-            cursor.setPosition(first_start)
-            cursor.setPosition(first_end, QTextCursor.KeepAnchor)
-            self.preview_text_edit.setTextCursor(cursor)
-            self.preview_text_edit.centerCursor()
-        else:
-            self.preview_text_edit.moveCursor(QTextCursor.Start)
-        self.preview_text_edit.verticalScrollBar().setValue(0)
-        self.preview_text_edit.horizontalScrollBar().setValue(0)
+            if index == self.preview_find_active_index:
+                active_span = (start, end)
+                selections.append(self._make_selection(start, end, active_find_format))
+            else:
+                selections.append(self._make_selection(start, end, find_format))
+
+        self.preview_text_edit.set_match_selections(selections)
+        if focus_current and active_span is not None:
+            self.preview_text_edit.center_on_span(*active_span)
+
+    def _preview_match_status_text(self) -> str:
+        if not self.preview_text_cache:
+            return "No preview loaded."
+        if self.preview_find_spans:
+            return f"Find matches: {self.preview_find_active_index + 1} / {len(self.preview_find_spans):,}"
+        if self.preview_search_spans:
+            return f"Search highlights: {len(self.preview_search_spans):,}"
+        return "No highlighted matches."
+
+    def _update_preview_find_status(self) -> None:
+        self.preview_find_status_label.setText(self._preview_match_status_text())
+
+    def _jump_to_preview_find_match(self, direction: int) -> None:
+        if not self.preview_find_spans:
+            return
+        self.preview_find_active_index = (self.preview_find_active_index + direction) % len(self.preview_find_spans)
+        self._refresh_preview_selections(focus_current=True)
+        self._update_preview_find_status()
+
+    def _jump_to_previous_preview_find_match(self) -> None:
+        self._jump_to_preview_find_match(-1)
+
+    def _jump_to_next_preview_find_match(self) -> None:
+        self._jump_to_preview_find_match(1)
 
     def _resolve_export_root(self) -> Optional[Path]:
         text = self.export_root_edit.text().strip()

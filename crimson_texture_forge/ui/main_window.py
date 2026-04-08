@@ -415,7 +415,7 @@ def run_gui() -> int:
             self.current_theme_key = str(self.settings.value("appearance/theme", DEFAULT_UI_THEME))
             self.show_quick_start_on_launch = not self.settings.contains("ui/quick_start_shown")
             self.resize(1360, 840)
-            self.setMinimumSize(1180, 720)
+            self.setMinimumSize(1120, 720)
             self.worker_thread: Optional[QThread] = None
             self.scan_worker: Optional[ScanWorker] = None
             self.archive_scan_worker: Optional[ArchiveScanWorker] = None
@@ -500,7 +500,7 @@ def run_gui() -> int:
             workflow_layout.addWidget(self.workflow_splitter, stretch=1)
 
             self.left_panel = QWidget()
-            self.left_panel.setMinimumWidth(420)
+            self.left_panel.setMinimumWidth(380)
             left_layout = QVBoxLayout(self.left_panel)
             left_layout.setContentsMargins(0, 0, 0, 0)
             left_layout.setSpacing(10)
@@ -508,11 +508,11 @@ def run_gui() -> int:
             self.left_scroll_area = QScrollArea()
             self.left_scroll_area.setWidgetResizable(True)
             self.left_scroll_area.setFrameShape(QFrame.NoFrame)
-            self.left_scroll_area.setMinimumWidth(420)
+            self.left_scroll_area.setMinimumWidth(380)
             self.left_scroll_area.setWidget(self.left_panel)
 
             self.right_panel = QWidget()
-            self.right_panel.setMinimumWidth(420)
+            self.right_panel.setMinimumWidth(380)
             right_layout = QVBoxLayout(self.right_panel)
             right_layout.setContentsMargins(0, 0, 0, 0)
             right_layout.setSpacing(10)
@@ -1001,8 +1001,8 @@ def run_gui() -> int:
             archive_tab_layout.addWidget(self.archive_splitter, stretch=1)
 
             archive_controls_group = QGroupBox("Archive Controls")
-            archive_controls_group.setMinimumWidth(400)
-            archive_controls_group.setMaximumWidth(520)
+            archive_controls_group.setMinimumWidth(360)
+            archive_controls_group.setMaximumWidth(500)
             archive_controls_layout = QVBoxLayout(archive_controls_group)
             archive_controls_layout.setContentsMargins(12, 16, 12, 12)
             archive_controls_layout.setSpacing(8)
@@ -1180,7 +1180,7 @@ def run_gui() -> int:
             self.archive_controls_scroll = QScrollArea()
             self.archive_controls_scroll.setWidgetResizable(True)
             self.archive_controls_scroll.setFrameShape(QFrame.NoFrame)
-            self.archive_controls_scroll.setMinimumWidth(400)
+            self.archive_controls_scroll.setMinimumWidth(360)
             self.archive_controls_scroll.setMaximumWidth(540)
             archive_controls_wrapper = QWidget()
             archive_controls_wrapper_layout = QVBoxLayout(archive_controls_wrapper)
@@ -1192,7 +1192,7 @@ def run_gui() -> int:
             self.archive_splitter.addWidget(self.archive_controls_scroll)
 
             archive_files_group = QGroupBox("Archive Files")
-            archive_files_group.setMinimumWidth(320)
+            archive_files_group.setMinimumWidth(300)
             archive_files_layout = QVBoxLayout(archive_files_group)
             archive_files_layout.setContentsMargins(10, 12, 10, 10)
             archive_files_layout.setSpacing(0)
@@ -1215,7 +1215,7 @@ def run_gui() -> int:
             self.archive_splitter.addWidget(archive_files_group)
 
             archive_preview_group = QGroupBox("Archive Preview")
-            archive_preview_group.setMinimumWidth(360)
+            archive_preview_group.setMinimumWidth(340)
             archive_preview_container_layout = QVBoxLayout(archive_preview_group)
             archive_preview_container_layout.setContentsMargins(10, 12, 10, 10)
             archive_preview_container_layout.setSpacing(10)
@@ -1440,11 +1440,12 @@ def run_gui() -> int:
             license_path = Path(__file__).resolve().parents[2] / "LICENSE"
             return f"""
             <h3>{APP_TITLE}</h3>
-            <p>A Windows desktop tool for Crimson Desert texture workflows: read-only archive browsing, DDS-to-PNG conversion, optional external upscaling through <b>chaiNNer</b>, DDS rebuild with <b>texconv</b>, and side-by-side compare review.</p>
+            <p>A Windows desktop tool for Crimson Desert texture workflows: read-only archive browsing, DDS-to-PNG conversion, optional external upscaling through <b>chaiNNer</b>, DDS rebuild with <b>texconv</b>, side-by-side compare review, and read-only text search across archive or loose files.</p>
             <h3>What It Covers</h3>
             <ul>
               <li>Read-only <code>.pamt/.paz</code> archive browsing and selective extraction</li>
               <li>Loose DDS workflow scanning, DDS-to-PNG conversion, rebuild, and compare</li>
+              <li>Text Search with encrypted XML support, syntax-colored preview, and export of matched files</li>
               <li>Optional <b>chaiNNer</b> stage before DDS rebuild</li>
               <li>Local config and archive cache stored beside the EXE</li>
             </ul>
@@ -1822,8 +1823,8 @@ def run_gui() -> int:
             total_width = max(self.width() - 64, self.minimumWidth())
             self.workflow_splitter.setSizes(
                 [
-                    max(390, int(total_width * 0.35)),
-                    max(380, int(total_width * 0.65)),
+                    max(360, int(total_width * 0.34)),
+                    max(400, int(total_width * 0.66)),
                 ]
             )
             self.compare_splitter.setSizes(
@@ -1834,9 +1835,9 @@ def run_gui() -> int:
             )
             self.archive_splitter.setSizes(
                 [
-                    max(400, int(total_width * 0.24)),
-                    max(320, int(total_width * 0.28)),
-                    max(360, int(total_width * 0.48)),
+                    max(360, int(total_width * 0.23)),
+                    max(300, int(total_width * 0.29)),
+                    max(340, int(total_width * 0.48)),
                 ]
             )
 

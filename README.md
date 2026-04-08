@@ -36,7 +36,7 @@ It is useful whether you:
 - Read-only `.pamt` / `.paz` archive browser
 - Archive extraction to normal folders
 - Archive cache for faster repeated scans
-- Read-only text search across archive or loose text-like files, with highlighted preview, export, and encrypted archive XML support where decryption succeeds
+- Read-only text search across archive or loose text-like files, with syntax-colored preview, line numbers, local find controls, export, and encrypted archive XML support where decryption succeeds
 - DDS preview and compare support through `texconv`
 - Loose DDS scanning and filtering
 - Optional DDS-to-PNG conversion before processing
@@ -147,13 +147,15 @@ Typical flow:
 3. Enter a search string or regex
 4. Set extensions such as `.xml;.json`
 5. Run `Search`
-6. Select a result to preview it with match highlighting
+6. Select a result to preview it with syntax colors, line numbers, and highlighted matches
 7. Export selected or all matches while preserving folder structure
 
 Notes:
 
 - archive-side XML search now attempts deterministic ChaCha20 decryption for supported encrypted XML entries
-- extremely large text files may still be preview-capped to keep the viewer responsive
+- the preview pane includes local `Find`, `Prev`, `Next`, `Wrap`, and font-size controls
+- results are shown as `File Name | Matches | Package | Path | Ext` so file names stay readable while full paths remain available
+- extremely large text files may still fall back to a simpler preview mode to keep the viewer responsive
 
 ## Important ChaiNNer Notes
 
