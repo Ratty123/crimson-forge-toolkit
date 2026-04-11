@@ -349,6 +349,10 @@ It only makes direct network requests when you explicitly trigger download/open 
 
 ![Workflow Upscaling Running](docs/screenshots/workflow_upscalingrunning.png)
 
+### Workflow: NCNN Model Catalog
+
+![Workflow Catalog](docs/screenshots/workflow_catalog.png)
+
 ### Compare View
 
 ![Workflow Compare](docs/screenshots/workflow_compare.png)
@@ -360,6 +364,14 @@ It only makes direct network requests when you explicitly trigger download/open 
 ### Compare View: Focused Review
 
 ![Workflow Compare 3](docs/screenshots/workflow_compare3.png)
+
+### Compare View: Large Preview Example
+
+![Workflow Compare 4](docs/screenshots/workflow_compare4.png)
+
+### Compare View: Alternate Review Example
+
+![Workflow Compare 5](docs/screenshots/workflow_compare5.png)
 
 ### Research: Archive Insights
 
