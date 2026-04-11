@@ -37,7 +37,7 @@ This file is a practical notice list for repository and release packaging. For a
 - Purpose: DDS preview conversion, DDS staging, and final DDS rebuild
 - Upstream: https://github.com/microsoft/DirectXTex
 - Release assets: https://github.com/microsoft/DirectXTex/releases
-- Notes: Crimson Texture Forge can download `texconv.exe`, but it remains a separate upstream tool
+- Notes: Crimson Texture Forge links to the official `texconv.exe` release page, but the tool remains a separate upstream project
 
 ### chaiNNer
 
@@ -45,7 +45,7 @@ This file is a practical notice list for repository and release packaging. For a
 - Upstream: https://chainner.app/
 - Download page: https://chainner.app/download/
 - CLI documentation: https://github.com/chaiNNer-org/chaiNNer/wiki/05--CLI
-- Notes: Crimson Texture Forge can launch chaiNNer, inspect `.chn` chains, and pass override JSON, but chaiNNer remains a separate upstream application with its own dependencies and licenses
+- Notes: Crimson Texture Forge can open the official chaiNNer download page, launch chaiNNer, inspect `.chn` chains, and pass override JSON, but chaiNNer remains a separate upstream application with its own dependencies and licenses
 
 ## Archive Format References And Compatibility Validation
 

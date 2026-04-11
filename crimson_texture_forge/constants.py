@@ -132,7 +132,7 @@ ARCHIVE_BINARY_HEX_PREVIEW_LIMIT = 256
 APP_ORGANIZATION = "Ratrider"
 APP_NAME = "CrimsonTextureForge"
 APP_TITLE = "Crimson Texture Forge"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 CRIMSON_DESERT_STEAM_APP_ID = "3321460"
 DEFAULT_UI_THEME = "graphite"
 CHAINNER_SETTLE_SECONDS = 2.0
@@ -140,10 +140,6 @@ CHAINNER_ENV_VARS_TO_REMOVE = ("ELECTRON_RUN_AS_NODE",)
 CHAINNER_PROGRESS_RE = re.compile(r"Executed\s+(\d+)\s*/\s*(\d+)\s+nodes", re.IGNORECASE)
 CHAINNER_NO_VALID_IMAGES_RE = re.compile(
     r"(?P<directory>[A-Za-z]:[\\/][^\r\n]+?)\s+has\s+no\s+valid\s+images",
-    re.IGNORECASE,
-)
-CHAINNER_WINDOWS_PORTABLE_RE = re.compile(
-    r"https://github\.com/chaiNNer-org/chaiNNer/releases/download/[^\"'\s>]+/chaiNNer-windows-x64-[^\"'\s>]+-portable\.zip",
     re.IGNORECASE,
 )
 SUPPORTED_CHAINNER_LOAD_IMAGE_SUFFIXES = {
@@ -162,8 +158,9 @@ SUPPORTED_CHAINNER_LOAD_IMAGE_SUFFIXES = {
     ".tiff",
     ".webp",
 }
-DIRECTXTEX_RELEASES_API_URL = "https://api.github.com/repos/microsoft/DirectXTex/releases"
-REALESRGAN_NCNN_RELEASES_API_URL = "https://api.github.com/repos/xinntao/Real-ESRGAN-ncnn-vulkan/releases"
+CHAINNER_DOWNLOAD_PAGE_URL = "https://chainner.app/download/"
+DIRECTXTEX_RELEASES_PAGE_URL = "https://github.com/microsoft/DirectXTex/releases"
+REALESRGAN_NCNN_RELEASES_PAGE_URL = "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/releases"
 ONNXRUNTIME_INSTALL_DOCS_URL = "https://onnxruntime.ai/docs/install/"
 
 DDS_MAGIC = b"DDS "

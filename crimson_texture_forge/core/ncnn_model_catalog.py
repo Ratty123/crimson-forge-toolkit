@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
-
-from crimson_texture_forge.core.chainner import copy_url_to_file
+from typing import Dict, Optional, Sequence
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,7 +24,7 @@ NCNN_CATALOG_SOURCE_LINKS: Sequence[tuple[str, str]] = (
 
 
 def _upscayl_model_files(model_name: str) -> Dict[str, str]:
-    base_url = "https://raw.githubusercontent.com/upscayl/custom-models/main/models"
+    base_url = "https://github.com/upscayl/custom-models/blob/main/models"
     return {
         f"{model_name}.param": f"{base_url}/{model_name}.param",
         f"{model_name}.bin": f"{base_url}/{model_name}.bin",
@@ -186,21 +183,3 @@ def get_ncnn_catalog_entry(model_name: str) -> Optional[NcnnCatalogEntry]:
         if entry.model_name == lookup:
             return entry
     return None
-
-
-def download_ncnn_catalog_entry(
-    entry: NcnnCatalogEntry,
-    destination_dir: Path,
-    *,
-    on_log: Optional[Callable[[str], None]] = None,
-) -> List[Path]:
-    destination_root = destination_dir.expanduser().resolve()
-    destination_root.mkdir(parents=True, exist_ok=True)
-    downloaded: List[Path] = []
-    for file_name, url in entry.model_files.items():
-        target = destination_root / file_name
-        if on_log:
-            on_log(f"Downloading {file_name} from {entry.source_name}")
-        copy_url_to_file(url, target, on_log=on_log)
-        downloaded.append(target)
-    return downloaded

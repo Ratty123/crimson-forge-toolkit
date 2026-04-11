@@ -77,6 +77,7 @@ class SafeUpscaleWizard(QDialog):
 
         self._theme_key = theme_key or DEFAULT_UI_THEME
         self._accepted_state: Optional[SafeUpscaleWizardState] = None
+        self._footer_summary_override_text = ""
 
         self._build_ui()
         self.set_theme(theme_key)
@@ -355,8 +356,7 @@ class SafeUpscaleWizard(QDialog):
             self._coerce_bool(config.get("loose_export"), self.loose_export_checkbox.isChecked())
         )
         notes = str(config.get("notes") or config.get("summary") or "")
-        if notes:
-            self.footer_summary.setText(notes)
+        self._footer_summary_override_text = notes.strip()
         self._refresh_state_summary()
 
     def set_source_summary(self, summary: Mapping[str, Any]) -> None:
@@ -541,6 +541,10 @@ class SafeUpscaleWizard(QDialog):
             else "Loose export is disabled. The wizard will only represent the processing plan."
         )
         self.export_summary_label.setText(export_text)
+
+        if self._footer_summary_override_text:
+            self.footer_summary.setText(self._footer_summary_override_text)
+            return
 
         active_sources = [
             label.text()

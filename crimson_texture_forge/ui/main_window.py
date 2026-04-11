@@ -22,7 +22,6 @@ from crimson_texture_forge.core.realesrgan_ncnn import discover_realesrgan_ncnn_
 from crimson_texture_forge.core.ncnn_model_catalog import (
     NCNN_CATALOG_SOURCE_LINKS,
     NCNN_MODEL_CATALOG,
-    download_ncnn_catalog_entry,
     get_ncnn_catalog_entry,
 )
 from crimson_texture_forge.core.upscale_profiles import get_texture_preset_definition
@@ -163,12 +162,16 @@ def run_gui() -> int:
         def __init__(self, config: AppConfig):
             super().__init__()
             self.config = config
+            self.stop_event = threading.Event()
+
+        def stop(self) -> None:
+            self.stop_event.set()
 
         @Slot()
         def run(self) -> None:
             try:
                 self.log_message.emit("Scanning DDS files...")
-                result = scan_dds_files(self.config)
+                result = scan_dds_files(self.config, stop_event=self.stop_event)
                 self.result_ready.emit(result.total_files)
                 self.log_message.emit(f"Scan complete. Found {result.total_files} DDS files.")
             except Exception as exc:
@@ -212,6 +215,10 @@ def run_gui() -> int:
             self.exclude_common_technical_suffixes = exclude_common_technical_suffixes
             self.min_size_kb = min_size_kb
             self.previewable_only = previewable_only
+            self.stop_event = threading.Event()
+
+        def stop(self) -> None:
+            self.stop_event.set()
 
         @Slot()
         def run(self) -> None:
@@ -226,6 +233,7 @@ def run_gui() -> int:
                     force_refresh=self.force_refresh,
                     on_log=self.log_message.emit,
                     on_progress=self.progress_changed.emit,
+                    stop_event=self.stop_event,
                 )
                 self.log_message.emit("Preparing archive browser state from loaded entries...")
                 browser_state = prepare_archive_browser_state(
@@ -241,6 +249,7 @@ def run_gui() -> int:
                     previewable_only=self.previewable_only,
                     build_structure_children=True,
                     on_progress=self.progress_changed.emit,
+                    stop_event=self.stop_event,
                 )
                 self.completed.emit(
                     {
@@ -460,6 +469,7 @@ def run_gui() -> int:
             self.archive_preview_worker: Optional[ArchivePreviewWorker] = None
             self.archive_preview_request_id = 0
             self.pending_archive_preview_request: Optional[Tuple[int, Optional[ArchiveEntry]]] = None
+            self.scheduled_archive_preview_request: Optional[Tuple[int, Optional[ArchiveEntry]]] = None
             self.current_archive_preview_result: Optional[ArchivePreviewResult] = None
             self.archive_preview_showing_loose = False
             self.archive_entries: List[ArchiveEntry] = []
@@ -481,6 +491,10 @@ def run_gui() -> int:
             self.compare_preview_fit_scale = 1.25
             self.archive_preview_zoom_factor = 1.0
             self.archive_preview_fit_to_view = True
+            self.archive_preview_debounce_timer = QTimer(self)
+            self.archive_preview_debounce_timer.setSingleShot(True)
+            self.archive_preview_debounce_timer.setInterval(90)
+            self.archive_preview_debounce_timer.timeout.connect(self._flush_scheduled_archive_preview_request)
 
             icon_path = resolve_app_icon_path()
             if icon_path is not None:
@@ -587,15 +601,18 @@ def run_gui() -> int:
 
             setup_buttons_row_2 = QHBoxLayout()
             setup_buttons_row_2.setSpacing(8)
-            self.download_chainner_button = QPushButton("Download chaiNNer")
-            self.download_texconv_button = QPushButton("Download texconv")
+            self.download_chainner_button = QPushButton("Open chaiNNer Download Page")
+            self.download_chainner_button.setToolTip("Open the official chaiNNer download page in your default browser.")
+            self.download_texconv_button = QPushButton("Open texconv Download Page")
+            self.download_texconv_button.setToolTip("Open the official DirectXTex releases page in your default browser.")
             setup_buttons_row_2.addWidget(self.download_chainner_button)
             setup_buttons_row_2.addWidget(self.download_texconv_button)
             setup_layout.addLayout(setup_buttons_row_2)
 
             setup_buttons_row_3 = QHBoxLayout()
             setup_buttons_row_3.setSpacing(8)
-            self.download_ncnn_button = QPushButton("Download Real-ESRGAN NCNN")
+            self.download_ncnn_button = QPushButton("Open Real-ESRGAN NCNN Download Page")
+            self.download_ncnn_button.setToolTip("Open the official Real-ESRGAN NCNN releases page in your default browser.")
             self.install_onnx_runtime_button = QPushButton("ONNX Runtime Guide")
             setup_buttons_row_3.addWidget(self.download_ncnn_button)
             setup_buttons_row_3.addWidget(self.install_onnx_runtime_button)
@@ -616,9 +633,9 @@ def run_gui() -> int:
             setup_layout.addLayout(setup_buttons_row_4)
 
             setup_hint = QLabel(
-                "Direct backends can be prepared here. Real-ESRGAN NCNN can be downloaded and unpacked directly, "
-                "and its models can be imported into the configured model folder. ONNX Runtime support can install "
-                "Python packages for source/development runs and import local .onnx model files for the in-app backend."
+                "Direct backends can be prepared here. The setup buttons open official external download or install pages "
+                "in your browser instead of downloading files inside the app. NCNN and ONNX models can still be imported "
+                "from files you already downloaded locally."
             )
             setup_hint.setObjectName("HintLabel")
             setup_hint.setWordWrap(True)
@@ -945,7 +962,7 @@ def run_gui() -> int:
             self.ncnn_model_refresh_button = QPushButton("Refresh Models")
             self.ncnn_model_catalog_button = QPushButton("Catalog")
             self.ncnn_model_catalog_button.setToolTip(
-                "Browse grouped NCNN model recommendations with short descriptions and direct model downloads."
+                "Browse grouped NCNN model recommendations with short descriptions, source pages, and non-downloading model pages."
             )
             model_row = QHBoxLayout()
             model_row.setContentsMargins(0, 0, 0, 0)
@@ -1729,9 +1746,9 @@ def run_gui() -> int:
             self.open_output_button.clicked.connect(self.open_output_folder)
             self.init_workspace_button.clicked.connect(self.initialize_workspace)
             self.create_folders_button.clicked.connect(self.create_missing_folders)
-            self.download_chainner_button.clicked.connect(self.download_chainner)
-            self.download_texconv_button.clicked.connect(self.download_texconv)
-            self.download_ncnn_button.clicked.connect(self.download_realesrgan_ncnn)
+            self.download_chainner_button.clicked.connect(self.open_chainner_download_page)
+            self.download_texconv_button.clicked.connect(self.open_texconv_download_page)
+            self.download_ncnn_button.clicked.connect(self.open_realesrgan_ncnn_download_page)
             self.install_onnx_runtime_button.clicked.connect(self.install_onnx_runtime)
             self.import_ncnn_models_button.clicked.connect(self.import_ncnn_models)
             self.import_onnx_models_button.clicked.connect(self.import_onnx_models)
@@ -1881,7 +1898,7 @@ def run_gui() -> int:
               <li>Install the backends your chain needs inside <b>chaiNNer</b>, such as <b>PyTorch</b>, <b>NCNN</b>, or <b>ONNX Runtime</b>.</li>
               <li>Provide and test your own <code>.chn</code> chain.</li>
               <li>If DDS-to-PNG conversion is enabled, make sure the chain reads PNG input from the correct folder.</li>
-              <li><b>Real-ESRGAN NCNN</b> runs directly from the app. <b>Setup</b> can download the portable package, auto-fill the executable/model paths, and import NCNN <code>.param</code> / <code>.bin</code> model pairs. The current upstream portable package may not bundle models by default.</li>
+              <li><b>Real-ESRGAN NCNN</b> runs directly from the app after you point it at a local executable and model folder. <b>Setup</b> now opens the official download page instead of downloading the package inside the app, and it can still import NCNN <code>.param</code> / <code>.bin</code> model pairs that you downloaded yourself.</li>
               <li><b>ONNX Runtime</b> runs directly inside the app when <b>onnxruntime</b> is installed and a valid <code>.onnx</code> model folder is configured. The app currently opens the official setup guide rather than installing ONNX Runtime for you.</li>
               <li><b>Safe Wizard</b> can apply backend choice, texture presets, automatic rules, retry behavior, and mod-ready loose export in one guided step.</li>
             </ul>
@@ -3142,8 +3159,40 @@ def run_gui() -> int:
             self._apply_mod_ready_export_state()
             self._save_settings()
 
+        def _open_external_urls(self, urls: Sequence[str], *, label: str) -> None:
+            unique_urls: List[str] = []
+            seen: set[str] = set()
+            for raw_url in urls:
+                url = str(raw_url or "").strip()
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                unique_urls.append(url)
+
+            if not unique_urls:
+                self.set_status_message(f"No external URL is available for {label}.", error=True)
+                return
+
+            opened = 0
+            for url in unique_urls:
+                if QDesktopServices.openUrl(QUrl(url)):
+                    opened += 1
+                    self.append_log(f"{label}: {url}")
+                else:
+                    self.append_log(f"Could not open external URL for {label}: {url}")
+
+            if opened == len(unique_urls):
+                noun = "URL" if opened == 1 else "URLs"
+                self.set_status_message(f"Opened {opened} external {noun} for {label}.")
+                return
+            if opened > 0:
+                self.set_status_message(f"Opened some external URLs for {label}. Check the log for details.", error=True)
+                return
+            self.set_status_message(f"Could not open any external URLs for {label}.", error=True)
+
         def _format_ncnn_catalog_details(self, entry) -> str:
             file_list = "\n".join(f"- {name}" for name in sorted(entry.model_files))
+            download_urls = "\n".join(f"- {name}: {url}" for name, url in sorted(entry.model_files.items()))
             return (
                 f"Model: {entry.model_name}\n"
                 f"Native scale: {entry.native_scale}x\n"
@@ -3152,7 +3201,8 @@ def run_gui() -> int:
                 f"Short description: {entry.short_description}\n"
                 f"Source: {entry.source_name}\n"
                 f"Source page: {entry.source_page_url}\n\n"
-                f"Downloaded files:\n{file_list}\n\n"
+                f"Required files:\n{file_list}\n\n"
+                f"Model pages:\n{download_urls}\n\n"
                 f"Texture guidance: treat these built-in NCNN recommendations as visible color/albedo/UI texture models. "
                 f"Do not assume they are safe for normal maps, masks, height, displacement, or other technical DDS data."
             )
@@ -3170,36 +3220,10 @@ def run_gui() -> int:
                 f"preferred scale, or whether it is safe for normals, masks, or other technical textures."
             )
 
-        def _download_ncnn_catalog_entry(self, entry) -> None:
-            destination = self._choose_model_destination(
-                "Select NCNN Model Folder",
-                self.ncnn_model_dir_edit.text().strip(),
-            )
-            if destination is None:
-                return
-
-            def task(on_log: Callable[[str], None]) -> List[str]:
-                on_log(
-                    f"Downloading NCNN model '{entry.model_name}' "
-                    f"({entry.native_scale}x, {entry.content_type}) from {entry.source_name}"
-                )
-                downloaded = download_ncnn_catalog_entry(entry, destination, on_log=on_log)
-                return [str(path) for path in downloaded]
-
-            def on_complete(result: object) -> None:
-                downloaded = result if isinstance(result, list) else []
-                self.ncnn_model_dir_edit.setText(str(destination))
-                self._refresh_ncnn_model_picker(preferred_name=entry.model_name)
-                self.ncnn_scale_spin.setValue(
-                    max(self.ncnn_scale_spin.minimum(), min(self.ncnn_scale_spin.maximum(), int(entry.native_scale)))
-                )
-                self.set_status_message(f"Downloaded {len(downloaded)} file(s) for NCNN model '{entry.model_name}'.")
-                self.append_log(f"NCNN catalog model ready: {entry.model_name}")
-
-            self._run_utility_task(
-                status_message=f"Downloading NCNN model '{entry.model_name}'...",
-                task=task,
-                on_complete=on_complete,
+        def _open_ncnn_catalog_entry_urls(self, entry) -> None:
+            self._open_external_urls(
+                [url for _file_name, url in sorted(entry.model_files.items())],
+                label=f"NCNN model '{entry.model_name}'",
             )
 
         def open_ncnn_model_catalog(self) -> None:
@@ -3213,7 +3237,7 @@ def run_gui() -> int:
 
             intro = QLabel(
                 "Browse NCNN model categories on the left, then expand a category to review its recommended models. "
-                "Built-in entries include source links and purpose notes so users do not assume every model is interchangeable."
+                "Built-in entries include source links, non-downloading model pages, and purpose notes so users do not assume every model is interchangeable."
             )
             intro.setWordWrap(True)
             intro.setObjectName("HintLabel")
@@ -3323,12 +3347,12 @@ def run_gui() -> int:
             button_row.setSpacing(8)
             open_source_button = QPushButton("Open Source")
             use_selected_button = QPushButton("Use Selected")
-            download_button = QPushButton("Download Selected")
+            open_download_urls_button = QPushButton("Open Model Pages")
             close_button = QPushButton("Close")
             button_row.addWidget(open_source_button)
             button_row.addWidget(use_selected_button)
             button_row.addStretch(1)
-            button_row.addWidget(download_button)
+            button_row.addWidget(open_download_urls_button)
             button_row.addWidget(close_button)
             layout.addLayout(button_row)
 
@@ -3354,7 +3378,7 @@ def run_gui() -> int:
                     )
                     open_source_button.setEnabled(False)
                     use_selected_button.setEnabled(False)
-                    download_button.setEnabled(False)
+                    open_download_urls_button.setEnabled(False)
                     return
                 if item_data.get("kind") == "group":
                     group_name = str(item_data.get("group_name") or "Category")
@@ -3362,24 +3386,24 @@ def run_gui() -> int:
                     details_view.setPlainText(
                         f"Category: {group_name}\n"
                         f"Models: {count}\n\n"
-                        "Expand this category and select a model to review its purpose, source, and download options."
+                        "Expand this category and select a model to review its purpose, source, and non-downloading model pages."
                     )
                     open_source_button.setEnabled(False)
                     use_selected_button.setEnabled(False)
-                    download_button.setEnabled(False)
+                    open_download_urls_button.setEnabled(False)
                     return
                 if item_data.get("kind") == "catalog" and entry is not None:
                     details_view.setPlainText(self._format_ncnn_catalog_details(entry))
                     open_source_button.setEnabled(True)
                     use_selected_button.setEnabled(True)
-                    download_button.setEnabled(True)
+                    open_download_urls_button.setEnabled(True)
                     return
                 model_name = str(item_data.get("model_name") or "")
                 model_dir = Path(str(item_data.get("model_dir") or ""))
                 details_view.setPlainText(self._format_local_ncnn_model_details(model_name, model_dir))
                 open_source_button.setEnabled(False)
                 use_selected_button.setEnabled(bool(model_name))
-                download_button.setEnabled(False)
+                open_download_urls_button.setEnabled(False)
 
             def open_source() -> None:
                 entry = current_entry()
@@ -3404,12 +3428,11 @@ def run_gui() -> int:
                 )
                 dialog.accept()
 
-            def download_selected() -> None:
+            def open_download_urls() -> None:
                 entry = current_entry()
                 if entry is None:
                     return
-                dialog.accept()
-                self._download_ncnn_catalog_entry(entry)
+                self._open_ncnn_catalog_entry_urls(entry)
 
             def handle_tree_item_activated(item: QTreeWidgetItem, _column: int) -> None:
                 item_data = item.data(0, Qt.UserRole)
@@ -3424,7 +3447,7 @@ def run_gui() -> int:
             catalog_tree.itemActivated.connect(handle_tree_item_activated)
             open_source_button.clicked.connect(open_source)
             use_selected_button.clicked.connect(use_selected)
-            download_button.clicked.connect(download_selected)
+            open_download_urls_button.clicked.connect(open_download_urls)
             close_button.clicked.connect(dialog.reject)
 
             if catalog_tree.topLevelItemCount() > 0:
@@ -3847,121 +3870,17 @@ def run_gui() -> int:
                 on_complete=on_complete,
             )
 
-        def download_chainner(self) -> None:
-            default_dir = self.chainner_exe_path_edit.text().strip()
-            start_dir = self._pick_existing_directory(default_dir) if default_dir else self._suggest_workspace_base_dir()
-            selected = QFileDialog.getExistingDirectory(
-                self,
-                "Select chaiNNer Download Folder",
-                start_dir,
-            )
-            if not selected:
-                return
+        def open_chainner_download_page(self) -> None:
+            self._open_external_urls([CHAINNER_DOWNLOAD_PAGE_URL], label="chaiNNer")
 
-            install_dir = Path(selected)
+        def open_texconv_download_page(self) -> None:
+            self._open_external_urls([DIRECTXTEX_RELEASES_PAGE_URL], label="texconv")
 
-            def task(on_log: Callable[[str], None]) -> str:
-                on_log("Resolving the latest Windows portable chaiNNer package from the official download page...")
-                exe_path = download_chainner_portable(install_dir, on_log=on_log)
-                return str(exe_path)
-
-            def on_complete(result: object) -> None:
-                if isinstance(result, str):
-                    self.chainner_exe_path_edit.setText(result)
-                    self.set_status_message(f"chaiNNer downloaded to {result}")
-                    self.append_log(f"chaiNNer executable ready: {result}")
-
-            self._run_utility_task(
-                status_message="Downloading chaiNNer...",
-                task=task,
-                on_complete=on_complete,
-            )
-
-        def download_texconv(self) -> None:
-            current_text = self.texconv_path_edit.text().strip()
-            if current_text:
-                start_path = current_text
-            else:
-                suggested = suggested_workspace_paths(Path(self._suggest_workspace_base_dir()))
-                start_path = str(suggested["texconv_path"])
-
-            selected, _ = QFileDialog.getSaveFileName(
-                self,
-                "Save texconv.exe As",
-                start_path,
-                "Executable (*.exe);;All files (*.*)",
-            )
-            if not selected:
-                return
-
-            destination = Path(selected)
-
-            def task(on_log: Callable[[str], None]) -> str:
-                on_log("Resolving the latest official texconv.exe release asset...")
-                texconv_path = download_texconv_executable(destination, on_log=on_log)
-                return str(texconv_path)
-
-            def on_complete(result: object) -> None:
-                if isinstance(result, str):
-                    self.texconv_path_edit.setText(result)
-                    self.set_status_message(f"texconv.exe downloaded to {result}")
-                    self.append_log(f"texconv.exe ready: {result}")
-
-            self._run_utility_task(
-                status_message="Downloading texconv.exe...",
-                task=task,
-                on_complete=on_complete,
-            )
-
-        def download_realesrgan_ncnn(self) -> None:
-            default_dir = self.ncnn_exe_path_edit.text().strip() or self.ncnn_model_dir_edit.text().strip()
-            start_dir = self._pick_existing_directory(default_dir) if default_dir else self._suggest_workspace_base_dir()
-            selected = QFileDialog.getExistingDirectory(
-                self,
-                "Select Real-ESRGAN NCNN Install Folder",
-                start_dir,
-            )
-            if not selected:
-                return
-
-            install_dir = Path(selected)
-
-            def task(on_log: Callable[[str], None]) -> Dict[str, str]:
-                on_log("Resolving the latest official Real-ESRGAN NCNN Windows package...")
-                exe_path, model_dir = download_realesrgan_ncnn_portable(install_dir, on_log=on_log)
-                return {"exe_path": str(exe_path), "model_dir": str(model_dir)}
-
-            def on_complete(result: object) -> None:
-                if not isinstance(result, dict):
-                    return
-                exe_path = str(result.get("exe_path", "") or "")
-                model_dir = str(result.get("model_dir", "") or "")
-                if exe_path:
-                    self.ncnn_exe_path_edit.setText(exe_path)
-                if model_dir:
-                    self.ncnn_model_dir_edit.setText(model_dir)
-                self._refresh_ncnn_model_picker()
-                self.set_status_message("Real-ESRGAN NCNN downloaded and configured.")
-                self.append_log(f"Real-ESRGAN NCNN executable ready: {exe_path}")
-                self.append_log(f"Real-ESRGAN NCNN model folder ready: {model_dir}")
-                model_dir_path = Path(model_dir) if model_dir else None
-                if model_dir_path is not None:
-                    discovered = discover_realesrgan_ncnn_models(None, model_dir_path)
-                    if not discovered:
-                        self.append_log(
-                            "No NCNN models were found in that folder yet. Use 'Import NCNN Models' to add .param/.bin pairs."
-                        )
-
-            self._run_utility_task(
-                status_message="Downloading Real-ESRGAN NCNN...",
-                task=task,
-                on_complete=on_complete,
-            )
+        def open_realesrgan_ncnn_download_page(self) -> None:
+            self._open_external_urls([REALESRGAN_NCNN_RELEASES_PAGE_URL], label="Real-ESRGAN NCNN")
 
         def install_onnx_runtime(self) -> None:
-            self.set_status_message("Opening the official ONNX Runtime setup guide.")
-            self.append_log(f"Opening ONNX Runtime install guidance: {ONNXRUNTIME_INSTALL_DOCS_URL}")
-            QDesktopServices.openUrl(QUrl(ONNXRUNTIME_INSTALL_DOCS_URL))
+            self._open_external_urls([ONNXRUNTIME_INSTALL_DOCS_URL], label="ONNX Runtime setup guide")
 
         def _confirm_model_import_expectations(self, model_kind: str) -> bool:
             box = QMessageBox(self)
@@ -4637,6 +4556,8 @@ def run_gui() -> int:
         def _clear_archive_preview(self, message: str) -> None:
             self.archive_preview_request_id += 1
             self.pending_archive_preview_request = None
+            self.scheduled_archive_preview_request = None
+            self.archive_preview_debounce_timer.stop()
             self.current_archive_preview_result = None
             self.archive_preview_showing_loose = False
             self.archive_preview_title_label.setText("Select an archive file")
@@ -4658,6 +4579,8 @@ def run_gui() -> int:
         def _show_archive_folder_preview(self, item: Optional[QTreeWidgetItem]) -> None:
             self.archive_preview_request_id += 1
             self.pending_archive_preview_request = None
+            self.scheduled_archive_preview_request = None
+            self.archive_preview_debounce_timer.stop()
             collected_indexes: set[int] = set()
             self._collect_archive_entries_from_item(item, collected_indexes)
             entries = [self.archive_filtered_entries[index] for index in sorted(collected_indexes)]
@@ -4710,9 +4633,6 @@ def run_gui() -> int:
             self._update_archive_selection_state()
 
         def _render_archive_preview(self, entry: Optional[ArchiveEntry]) -> None:
-            texconv_text = self.texconv_path_edit.text().strip()
-            texconv_path = Path(texconv_text).expanduser() if texconv_text else None
-            loose_search_roots = self._collect_archive_preview_loose_roots()
             request_id = self.archive_preview_request_id + 1
             self.archive_preview_request_id = request_id
             self.archive_preview_title_label.setText(entry.basename if entry is not None else "Select an archive file")
@@ -4725,6 +4645,19 @@ def run_gui() -> int:
             self.archive_preview_loose_toggle_button.setEnabled(False)
             self.archive_preview_details_edit.setPlainText("Preparing archive preview...")
             self.archive_preview_info_edit.setPlainText("Preparing archive preview...")
+            self.pending_archive_preview_request = None
+            self.scheduled_archive_preview_request = (request_id, entry)
+            self.archive_preview_debounce_timer.start()
+
+        def _flush_scheduled_archive_preview_request(self) -> None:
+            if self.scheduled_archive_preview_request is None:
+                return
+            request_id, entry = self.scheduled_archive_preview_request
+            self.scheduled_archive_preview_request = None
+
+            texconv_text = self.texconv_path_edit.text().strip()
+            texconv_path = Path(texconv_text).expanduser() if texconv_text else None
+            loose_search_roots = self._collect_archive_preview_loose_roots()
 
             if self.archive_preview_thread is not None:
                 self.pending_archive_preview_request = (request_id, entry)
@@ -5968,16 +5901,18 @@ def run_gui() -> int:
         def closeEvent(self, event) -> None:  # type: ignore[override]
             self.settings.setValue("window/geometry", self.saveGeometry())
             self._save_settings()
+            if self.scan_worker is not None:
+                self.scan_worker.stop()
+            if self.archive_scan_worker is not None:
+                self.archive_scan_worker.stop()
             if self.build_worker is not None:
                 self.build_worker.stop()
-                if self.worker_thread is not None:
-                    self.worker_thread.quit()
-                    self.worker_thread.wait(3000)
             if self.dds_to_png_worker is not None:
                 self.dds_to_png_worker.stop()
-                if self.worker_thread is not None:
+            if self.worker_thread is not None:
+                if not self.worker_thread.wait(4000):
                     self.worker_thread.quit()
-                    self.worker_thread.wait(3000)
+                    self.worker_thread.wait(2000)
             if self.compare_preview_thread is not None:
                 self.compare_preview_thread.quit()
                 self.compare_preview_thread.wait(3000)

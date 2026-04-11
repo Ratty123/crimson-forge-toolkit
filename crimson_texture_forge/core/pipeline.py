@@ -69,6 +69,17 @@ _LOOSE_SEMANTIC_SIDECAR_EXTENSIONS = {
     ".yml",
 }
 _LOOSE_SIDECAR_TEXT_LIMIT = 196_608
+_PREVIEW_CACHE_LOCKS: Dict[str, threading.Lock] = {}
+_PREVIEW_CACHE_LOCKS_GUARD = threading.Lock()
+
+
+def _get_preview_cache_lock(cache_key: str) -> threading.Lock:
+    with _PREVIEW_CACHE_LOCKS_GUARD:
+        lock = _PREVIEW_CACHE_LOCKS.get(cache_key)
+        if lock is None:
+            lock = threading.Lock()
+            _PREVIEW_CACHE_LOCKS[cache_key] = lock
+        return lock
 
 
 @dataclass(slots=True)
@@ -1101,17 +1112,17 @@ def build_texture_processing_plan(
             preview_sample=preview_sample,
         )
 
-        if normalized.upscale_backend == UPSCALE_BACKEND_NONE:
+        if normalized.enable_automatic_texture_rules and decision.preserve_original_due_to_intermediate:
+            action = "preserve_original"
+            action_reason = f"automatic rules preserve {decision.texture_type}/{decision.semantic_subtype}"
+            requires_png_processing = False
+        elif normalized.upscale_backend == UPSCALE_BACKEND_NONE:
             action = "rebuild_from_png"
             action_reason = "using the existing or staged PNG as DDS rebuild input"
             requires_png_processing = True
         elif not decision.should_upscale:
             action = "preserve_original"
             action_reason = f"preset excludes {decision.texture_type}/{decision.semantic_subtype}"
-            requires_png_processing = False
-        elif normalized.enable_automatic_texture_rules and decision.preserve_original_due_to_intermediate:
-            action = "preserve_original"
-            action_reason = f"automatic rules preserve {decision.texture_type}/{decision.semantic_subtype}"
             requires_png_processing = False
         else:
             action = "upscale_then_rebuild"
@@ -1460,23 +1471,39 @@ def ensure_dds_preview_png(texconv_path: Path, dds_path: Path) -> Path:
     ).hexdigest()
     cache_dir = Path(tempfile.gettempdir()) / APP_NAME / "preview_cache" / cache_key
     preview_path = cache_dir / f"{dds_path.stem}.png"
+    preview_lock = _get_preview_cache_lock(cache_key)
 
-    if preview_path.exists():
-        return preview_path
+    with preview_lock:
+        if preview_path.exists():
+            try:
+                if preview_path.stat().st_size > 0:
+                    return preview_path
+            except OSError:
+                pass
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cmd = build_preview_png_command(texconv_path, dds_path, cache_dir)
-    return_code, stdout, stderr = run_process_with_cancellation(cmd, stop_event=None)
-    if return_code != 0:
-        detail = stderr.strip() or stdout.strip() or f"texconv failed with exit code {return_code}"
-        raise ValueError(f"Could not generate preview for {dds_path.name}: {detail}")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cmd = build_preview_png_command(texconv_path, dds_path, cache_dir)
+        return_code, stdout, stderr = run_process_with_cancellation(cmd, stop_event=None)
+        if return_code != 0:
+            detail = stderr.strip() or stdout.strip() or f"texconv failed with exit code {return_code}"
+            raise ValueError(f"Could not generate preview for {dds_path.name}: {detail}")
 
-    if preview_path.exists():
-        return preview_path
+        if preview_path.exists():
+            try:
+                if preview_path.stat().st_size > 0:
+                    return preview_path
+            except OSError:
+                pass
 
-    candidates = sorted(cache_dir.glob("*.png"))
-    if candidates:
-        return candidates[0]
+        candidates: List[Path] = []
+        for candidate in sorted(cache_dir.glob("*.png")):
+            try:
+                if candidate.stat().st_size > 0:
+                    candidates.append(candidate)
+            except OSError:
+                continue
+        if candidates:
+            return candidates[0]
 
     raise ValueError(f"texconv did not produce a PNG preview for {dds_path.name}.")
 
@@ -2361,9 +2388,7 @@ def rebuild_dds_files(
                     enable_automatic_rules=normalized.enable_automatic_texture_rules,
                 )
             )
-            if normalized.upscale_backend != UPSCALE_BACKEND_NONE and (
-                not decision.should_upscale or decision.preserve_original_due_to_intermediate
-            ):
+            if plan_entry is not None and plan_entry.action == "preserve_original":
                 target_dir.mkdir(parents=True, exist_ok=True)
                 note_parts = [
                     (

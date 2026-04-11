@@ -13,6 +13,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from crimson_texture_forge.constants import ARCHIVE_IMAGE_EXTENSIONS
 from crimson_texture_forge.core.archive import ArchiveEntry, archive_entry_role, read_archive_entry_data
+from crimson_texture_forge.core.common import raise_if_cancelled
 from crimson_texture_forge.core.pipeline import (
     collect_compare_relative_paths,
     collect_dds_files,
@@ -363,32 +364,177 @@ def derive_texture_group_key(path_value: str) -> str:
     return derive_semantic_texture_group_key(path_value)
 
 
-def classify_texture_entries(entries: Sequence[ArchiveEntry], *, limit: int = 3000) -> List[TextureClassificationRow]:
+def build_archive_research_snapshot(
+    entries: Sequence[ArchiveEntry],
+    *,
+    classification_limit: int = 3000,
+    group_limit: int = 2000,
+    heatmap_limit_per_scope: int = 24,
+) -> Dict[str, object]:
     family_members_by_group: Dict[str, List[str]] = defaultdict(list)
-    for entry in entries:
-        lowered = entry.path.lower()
-        if entry.extension in TEXTURE_IMAGE_EXTENSIONS or "/texture/" in lowered:
-            family_members_by_group[derive_texture_group_key(entry.path)].append(entry.path)
+    grouped_entries: Dict[str, List[ArchiveEntry]] = defaultdict(list)
+    entry_metadata: List[Tuple[ArchiveEntry, str, bool, bool, str, str]] = []
 
-    rows: List[TextureClassificationRow] = []
     for entry in entries:
-        if entry.extension not in TEXTURE_IMAGE_EXTENSIONS and "/texture/" not in entry.path.lower():
+        normalized_path = entry.path.replace("\\", "/")
+        lowered = normalized_path.lower()
+        is_texture = entry.extension in TEXTURE_IMAGE_EXTENSIONS or "/texture/" in lowered
+        is_sidecar = entry.extension in TEXTURE_SIDECAR_EXTENSIONS
+        group_key = derive_texture_group_key(normalized_path)
+        if is_texture:
+            family_members_by_group[group_key].append(normalized_path)
+        if is_texture or is_sidecar:
+            grouped_entries[group_key].append(entry)
+        entry_metadata.append((entry, normalized_path, is_texture, is_sidecar, lowered, group_key))
+
+    classification_rows: List[TextureClassificationRow] = []
+    classified_kinds_by_path: Dict[str, str] = {}
+    heatmap_scopes: Dict[Tuple[str, str], Dict[str, object]] = {}
+
+    for entry, normalized_path, is_texture, is_sidecar, lowered, group_key in entry_metadata:
+        if not is_texture and not is_sidecar:
             continue
+
+        family_members = tuple(family_members_by_group.get(group_key, ()))
         role_hint = archive_entry_role(entry)
-        family_members = tuple(family_members_by_group.get(derive_texture_group_key(entry.path), ()))
-        texture_type, confidence, reason = classify_texture_path(entry.path, role_hint=role_hint, family_members=family_members)
-        rows.append(
-            TextureClassificationRow(
-                path=entry.path,
-                package_label=entry.package_label,
-                texture_type=texture_type,
-                confidence=confidence,
-                reason=reason,
-                group_key=derive_texture_group_key(entry.path),
+        texture_type, confidence, reason = classify_texture_path(
+            normalized_path,
+            role_hint=role_hint,
+            family_members=family_members,
+        )
+        classified_kinds_by_path[lowered] = texture_type
+
+        if is_texture:
+            classification_rows.append(
+                TextureClassificationRow(
+                    path=entry.path,
+                    package_label=entry.package_label,
+                    texture_type=texture_type,
+                    confidence=confidence,
+                    reason=reason,
+                    group_key=group_key,
+                )
+            )
+
+        parts = _normalized_parts(normalized_path)
+        folder_label = "/".join(parts[:3]) if len(parts) >= 3 else ("/".join(parts) or entry.package_label)
+        scope_labels = (
+            ("System Area", system_area_from_path(normalized_path)),
+            ("Folder", folder_label),
+            ("Package", entry.package_label),
+        )
+
+        for scope_name, label in scope_labels:
+            bucket = heatmap_scopes.setdefault(
+                (scope_name, label),
+                {
+                    "texture_count": 0,
+                    "set_keys": set(),
+                    "normal_count": 0,
+                    "ui_count": 0,
+                    "material_count": 0,
+                    "impostor_count": 0,
+                    "sample_paths": [],
+                },
+            )
+            if is_texture:
+                bucket["texture_count"] += 1
+                bucket["set_keys"].add(group_key)
+                if texture_type == "normal":
+                    bucket["normal_count"] += 1
+                if texture_type == "ui":
+                    bucket["ui_count"] += 1
+                if texture_type == "impostor":
+                    bucket["impostor_count"] += 1
+            if is_sidecar:
+                bucket["material_count"] += 1
+            sample_paths = bucket["sample_paths"]
+            if len(sample_paths) < 3:
+                sample_paths.append(entry.path)
+
+    classification_rows.sort(key=lambda row: (-row.confidence, row.texture_type, row.path))
+
+    texture_groups: List[TextureSetGroup] = []
+    for group_key, entry_members in grouped_entries.items():
+        if len(entry_members) < 2:
+            continue
+        members: List[TextureSetMember] = []
+        for entry in sorted(entry_members, key=lambda member: member.path):
+            lowered = entry.path.replace("\\", "/").lower()
+            member_kind = classified_kinds_by_path.get(lowered, "unknown")
+            if entry.extension in TEXTURE_SIDECAR_EXTENSIONS and member_kind == "unknown":
+                member_kind = "sidecar"
+            members.append(
+                TextureSetMember(
+                    path=entry.path,
+                    package_label=entry.package_label,
+                    member_kind=member_kind,
+                    extension=entry.extension,
+                )
+            )
+        package_labels = sorted({member.package_label for member in members})
+        member_kinds = sorted({member.member_kind for member in members})
+        texture_groups.append(
+            TextureSetGroup(
+                group_key=group_key,
+                display_name=PurePosixPath(group_key).name or group_key,
+                member_count=len(members),
+                package_labels=package_labels,
+                member_kinds=member_kinds,
+                members=members,
             )
         )
-    rows.sort(key=lambda row: (-row.confidence, row.texture_type, row.path))
-    return rows[:limit]
+    texture_groups.sort(key=lambda group: (-group.member_count, group.display_name))
+
+    heatmap_rows: List[TextureUsageHeatRow] = []
+    for (scope_name, label), bucket in heatmap_scopes.items():
+        set_count = len(bucket["set_keys"])
+        heat_score = (
+            int(bucket["texture_count"])
+            + (set_count * 2)
+            + (int(bucket["normal_count"]) * 2)
+            + (int(bucket["ui_count"]) * 2)
+            + int(bucket["material_count"])
+            + (int(bucket["impostor_count"]) * 2)
+        )
+        heatmap_rows.append(
+            TextureUsageHeatRow(
+                scope=scope_name,
+                label=label,
+                texture_count=int(bucket["texture_count"]),
+                set_count=set_count,
+                normal_count=int(bucket["normal_count"]),
+                ui_count=int(bucket["ui_count"]),
+                material_count=int(bucket["material_count"]),
+                impostor_count=int(bucket["impostor_count"]),
+                heat_score=heat_score,
+                sample_paths=list(bucket["sample_paths"]),
+            )
+        )
+
+    grouped_heatmap_rows: Dict[str, List[TextureUsageHeatRow]] = defaultdict(list)
+    for row in heatmap_rows:
+        grouped_heatmap_rows[row.scope].append(row)
+
+    flattened_heatmap_rows: List[TextureUsageHeatRow] = []
+    for scope_name in ("System Area", "Folder", "Package"):
+        scope_rows = sorted(
+            grouped_heatmap_rows.get(scope_name, []),
+            key=lambda row: (-row.heat_score, -row.texture_count, row.label.lower()),
+        )
+        flattened_heatmap_rows.extend(scope_rows[:heatmap_limit_per_scope])
+
+    return {
+        "classification_rows": classification_rows[:classification_limit],
+        "texture_groups": texture_groups[:group_limit],
+        "heatmap_rows": flattened_heatmap_rows,
+    }
+
+
+def classify_texture_entries(entries: Sequence[ArchiveEntry], *, limit: int = 3000) -> List[TextureClassificationRow]:
+    snapshot = build_archive_research_snapshot(entries, classification_limit=limit, group_limit=0)
+    rows = snapshot.get("classification_rows", [])
+    return rows if isinstance(rows, list) else []
 
 
 def _build_family_members_by_relative_path(paths: Sequence[str]) -> Dict[str, Tuple[str, ...]]:
@@ -405,50 +551,9 @@ def _build_family_members_by_relative_path(paths: Sequence[str]) -> Dict[str, Tu
 
 
 def bundle_texture_sets(entries: Sequence[ArchiveEntry], *, limit: int = 2000) -> List[TextureSetGroup]:
-    grouped: Dict[str, List[ArchiveEntry]] = defaultdict(list)
-    for entry in entries:
-        lowered = entry.path.lower()
-        if entry.extension not in (TEXTURE_IMAGE_EXTENSIONS | TEXTURE_SIDECAR_EXTENSIONS) and "/texture/" not in lowered:
-            continue
-        group_key = derive_texture_group_key(entry.path)
-        grouped[group_key].append(entry)
-
-    groups: List[TextureSetGroup] = []
-    for group_key, entry_members in grouped.items():
-        if len(entry_members) < 2:
-            continue
-        family_members = tuple(member.path for member in entry_members)
-        members: List[TextureSetMember] = []
-        for entry in sorted(entry_members, key=lambda member: member.path):
-            member_kind, _confidence, _reason = classify_texture_path(
-                entry.path,
-                role_hint=archive_entry_role(entry),
-                family_members=family_members,
-            )
-            if entry.extension in TEXTURE_SIDECAR_EXTENSIONS and member_kind == "unknown":
-                member_kind = "sidecar"
-            members.append(
-                TextureSetMember(
-                    path=entry.path,
-                    package_label=entry.package_label,
-                    member_kind=member_kind,
-                    extension=entry.extension,
-                )
-            )
-        package_labels = sorted({member.package_label for member in members})
-        member_kinds = sorted({member.member_kind for member in members})
-        groups.append(
-            TextureSetGroup(
-                group_key=group_key,
-                display_name=PurePosixPath(group_key).name or group_key,
-                member_count=len(members),
-                package_labels=package_labels,
-                member_kinds=member_kinds,
-                members=members,
-            )
-        )
-    groups.sort(key=lambda group: (-group.member_count, group.display_name))
-    return groups[:limit]
+    snapshot = build_archive_research_snapshot(entries, classification_limit=0, group_limit=limit)
+    groups = snapshot.get("texture_groups", [])
+    return groups if isinstance(groups, list) else []
 
 
 def _decode_reference_text(data: bytes) -> str:
@@ -561,6 +666,7 @@ def resolve_material_texture_references(
     *,
     limit: int = 240,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
+    stop_event: Optional[object] = None,
 ) -> Tuple[List[MaterialTextureReferenceRow], Dict[str, object]]:
     normalized_target = target_path.strip().replace("\\", "/").strip("/")
     if not normalized_target:
@@ -634,6 +740,7 @@ def resolve_material_texture_references(
     target_basename = PurePosixPath(lowered_target).name
     total = len(text_entries)
     for index, entry in enumerate(text_entries, start=1):
+        raise_if_cancelled(stop_event)
         if on_progress:
             on_progress(index - 1, total, f"Searching material/sidecar references in {entry.path}")
         try:
@@ -699,6 +806,7 @@ def discover_archive_sidecars(
     target_path: str,
     *,
     limit: int = 120,
+    stop_event: Optional[object] = None,
 ) -> List[SidecarDiscoveryRow]:
     normalized_target = target_path.strip().replace("\\", "/").strip("/")
     if not normalized_target:
@@ -711,6 +819,7 @@ def discover_archive_sidecars(
 
     candidates: Dict[str, SidecarDiscoveryRow] = {}
     for entry in entries:
+        raise_if_cancelled(stop_event)
         lowered_path = entry.path.replace("\\", "/").lower()
         if lowered_path == lowered_target:
             continue
@@ -760,102 +869,14 @@ def build_texture_usage_heatmap(
     *,
     limit_per_scope: int = 24,
 ) -> List[TextureUsageHeatRow]:
-    family_members_by_group: Dict[str, List[str]] = defaultdict(list)
-    for entry in entries:
-        lowered = entry.path.replace("\\", "/").lower()
-        if entry.extension in TEXTURE_IMAGE_EXTENSIONS or "/texture/" in lowered:
-            family_members_by_group[derive_texture_group_key(entry.path)].append(entry.path)
-
-    scopes: Dict[Tuple[str, str], Dict[str, object]] = {}
-
-    for entry in entries:
-        lowered = entry.path.replace("\\", "/").lower()
-        is_texture = entry.extension in TEXTURE_IMAGE_EXTENSIONS or "/texture/" in lowered
-        is_sidecar = entry.extension in TEXTURE_SIDECAR_EXTENSIONS
-        if not is_texture and not is_sidecar:
-            continue
-
-        family_members = tuple(family_members_by_group.get(derive_texture_group_key(entry.path), ()))
-        texture_type, _confidence, _reason = classify_texture_path(
-            entry.path,
-            role_hint=archive_entry_role(entry),
-            family_members=family_members,
-        )
-        parts = _normalized_parts(entry.path)
-        folder_label = "/".join(parts[:3]) if len(parts) >= 3 else ("/".join(parts) or entry.package_label)
-        scope_labels = (
-            ("System Area", system_area_from_path(entry.path)),
-            ("Folder", folder_label),
-            ("Package", entry.package_label),
-        )
-        group_key = derive_texture_group_key(entry.path)
-
-        for scope_name, label in scope_labels:
-            bucket = scopes.setdefault(
-                (scope_name, label),
-                {
-                    "texture_count": 0,
-                    "set_keys": set(),
-                    "normal_count": 0,
-                    "ui_count": 0,
-                    "material_count": 0,
-                    "impostor_count": 0,
-                    "sample_paths": [],
-                },
-            )
-            if is_texture:
-                bucket["texture_count"] += 1
-                bucket["set_keys"].add(group_key)
-                if texture_type == "normal":
-                    bucket["normal_count"] += 1
-                if texture_type == "ui":
-                    bucket["ui_count"] += 1
-                if texture_type == "impostor":
-                    bucket["impostor_count"] += 1
-            if is_sidecar:
-                bucket["material_count"] += 1
-            sample_paths = bucket["sample_paths"]
-            if len(sample_paths) < 3:
-                sample_paths.append(entry.path)
-
-    rows: List[TextureUsageHeatRow] = []
-    for (scope_name, label), bucket in scopes.items():
-        set_count = len(bucket["set_keys"])
-        heat_score = (
-            int(bucket["texture_count"])
-            + (set_count * 2)
-            + (int(bucket["normal_count"]) * 2)
-            + (int(bucket["ui_count"]) * 2)
-            + int(bucket["material_count"])
-            + (int(bucket["impostor_count"]) * 2)
-        )
-        rows.append(
-            TextureUsageHeatRow(
-                scope=scope_name,
-                label=label,
-                texture_count=int(bucket["texture_count"]),
-                set_count=set_count,
-                normal_count=int(bucket["normal_count"]),
-                ui_count=int(bucket["ui_count"]),
-                material_count=int(bucket["material_count"]),
-                impostor_count=int(bucket["impostor_count"]),
-                heat_score=heat_score,
-                sample_paths=list(bucket["sample_paths"]),
-            )
-        )
-
-    grouped: Dict[str, List[TextureUsageHeatRow]] = defaultdict(list)
-    for row in rows:
-        grouped[row.scope].append(row)
-
-    flattened: List[TextureUsageHeatRow] = []
-    for scope_name in ("System Area", "Folder", "Package"):
-        scope_rows = sorted(
-            grouped.get(scope_name, []),
-            key=lambda row: (-row.heat_score, -row.texture_count, row.label.lower()),
-        )
-        flattened.extend(scope_rows[:limit_per_scope])
-    return flattened
+    snapshot = build_archive_research_snapshot(
+        entries,
+        classification_limit=0,
+        group_limit=0,
+        heatmap_limit_per_scope=limit_per_scope,
+    )
+    rows = snapshot.get("heatmap_rows", [])
+    return rows if isinstance(rows, list) else []
 
 
 def export_texture_analysis_report(
@@ -1379,11 +1400,13 @@ def analyze_mip_behavior(
     *,
     texconv_path: Optional[Path] = None,
     limit: int = 3000,
+    stop_event: Optional[object] = None,
 ) -> List[MipAnalysisRow]:
     rows: List[MipAnalysisRow] = []
     compare_relative_paths = [path.as_posix() for path in collect_compare_relative_paths(original_root, rebuilt_root)]
     family_members_by_path = _build_family_members_by_relative_path(compare_relative_paths)
     for relative_path_text in compare_relative_paths:
+        raise_if_cancelled(stop_event)
         relative_path = Path(relative_path_text)
         original_path = original_root / relative_path
         rebuilt_path = rebuilt_root / relative_path
@@ -1523,6 +1546,7 @@ def validate_normal_maps(
     *,
     texconv_path: Optional[Path] = None,
     limit: int = 1500,
+    stop_event: Optional[object] = None,
 ) -> List[NormalValidationRow]:
     dds_files = collect_dds_files(root, ())
     grouped_by_key: Dict[str, List[Path]] = defaultdict(list)
@@ -1542,6 +1566,7 @@ def validate_normal_maps(
 
     rows: List[NormalValidationRow] = []
     for dds_path in dds_files:
+        raise_if_cancelled(stop_event)
         relative_path = dds_path.relative_to(root).as_posix()
         group_members = grouped_by_key.get(derive_texture_group_key(relative_path), [])
         family_member_paths = tuple(member.relative_to(root).as_posix() for member in group_members)

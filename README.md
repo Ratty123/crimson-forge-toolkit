@@ -47,7 +47,7 @@ If you want the safest starting point, use this path first:
 
 1. Run `CrimsonTextureForge-<version>-windows-portable.exe`.
 2. In `Workflow > Setup`, click `Init Workspace`.
-3. Configure or download `texconv.exe`.
+3. Configure `texconv.exe` or open its official download page from `Setup`.
 4. Set `Original DDS root`, `PNG root`, and `Output root`.
 5. In `Workflow > Upscaling`, either:
    - keep the backend disabled if you only want DDS rebuild/testing
@@ -79,9 +79,9 @@ Use this when you want:
 
 Setup support in the app includes:
 
-- download and unpack the current Windows package
+- open the official Real-ESRGAN NCNN download page
 - import NCNN `.param` / `.bin` model pairs
-- browse a grouped NCNN model catalog for visible color/albedo/UI texture use cases
+- browse a grouped NCNN model catalog for visible color/albedo/UI texture use cases and open non-downloading model pages in your browser
 
 ### ONNX Runtime
 
@@ -336,15 +336,15 @@ The app also supports:
 
 ## Privacy And Network Behavior
 
-Crimson Texture Forge does **not** include built-in telemetry, analytics, auto-update checks, or background network calls for normal offline use.
+Crimson Texture Forge does **not** include built-in telemetry, analytics, auto-update checks, background network calls for normal offline use, or in-app file downloads for external tools/models.
 
-It only makes direct network requests when you explicitly trigger download/open actions such as:
+It only opens external pages in your browser when you explicitly trigger actions such as:
 
-- `Download chaiNNer`
-- `Download texconv`
-- `Download Real-ESRGAN NCNN`
+- `Open chaiNNer Download Page`
+- `Open texconv Download Page`
+- `Open Real-ESRGAN NCNN Download Page`
 - `ONNX Runtime Guide`
-- built-in NCNN model downloads
+- `Open Model Pages` in the NCNN model catalog
 
 ## Screenshots
 

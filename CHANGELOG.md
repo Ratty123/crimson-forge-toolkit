@@ -9,8 +9,30 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
-## [Unreleased/In testing]
+## [0.4.1] - 2026-04-11
 
+### Changed
+- Setup download actions for `chaiNNer`, `texconv`, and `Real-ESRGAN NCNN` now open the official external pages in the user browser instead of downloading files inside the app.
+- `NCNN Model Catalog` now exposes source/model pages and opens non-downloading external browser pages instead of downloading selected model files inside the app.
+- `Research` refresh now computes archive-side grouping, classification, and heatmap data in one shared snapshot pass, and repeated refreshes can reuse that archive snapshot while the current archive view is unchanged.
+
+### Fixed
+- Archive Browser DDS preview is less likely to freeze the app while browsing cached archives because image preview loading now avoids eagerly materializing the full preview pixmap on the UI thread.
+- Archive Browser DDS preview is more stable while rapidly browsing `.dds` entries because preview requests are now briefly debounced before worker startup.
+- DDS preview cache generation is now serialized per cached source file, reducing random crashes or invalid preview loads when multiple fast preview requests hit the same cached PNG at nearly the same time.
+- Automatic texture rules now preserve technical DDS files more reliably even when the upscale backend is disabled, instead of rebuilding some of them from staged PNGs.
+- Normal maps that appear to use alpha are now rebuilt with an alpha-capable linear format instead of dropping alpha through the default BC5 path.
+- Closing the app during long-running scans or `Research` refresh work now signals those workers to stop before thread shutdown, which makes shutdown behavior less rough.
+- `Retry with smaller tile` now steps down through real fallback tile sizes even when the configured tile size is `0`.
+- Unsupported ONNX models, including unusual `2`-channel outputs, now fail earlier with a clearer compatibility error instead of a late generic conversion failure.
+- `Compare -> Mip Details` now clears its pending target when a `Research` refresh fails, avoiding stale focus jumps on the next refresh.
+- `_ct` texture variants are now classified as color maps before loose token matching, reducing false roughness/metalness classification when the base name contains those words.
+- The `Safe Upscale Wizard` now preserves caller-provided summary or notes text instead of overwriting it with its generated footer summary.
+- `Research -> Archive Insights -> References` now drives the `Archive Files` picker to the relevant archive file when you select a reference or sidecar row, making it easier to inspect the specific `.dds` or related archive file in the current workflow.
+- `Research -> Archive Insights -> References` now resolves nested archive folder paths more reliably when focusing the `Archive Files` picker from a selected reference or sidecar row.
+- Closing the app during a long `Research` reference resolve now signals that resolver to stop before thread shutdown instead of leaving it to run to completion.
+- `Research` refresh progress now reports the current archive snapshot, mip analysis, and normal-validation stages with consistent step counts instead of jumping over missing progress indices.
+- Archive Browser refresh/scanning no longer errors when preparing the cached browser state, because `prepare_archive_browser_state` now accepts the worker cancellation token passed by the archive scan path.
 
 ## [0.4.0] - 2026-04-11
 

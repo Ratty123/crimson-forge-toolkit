@@ -230,6 +230,16 @@ class EsrganOnnxUpscaler:
         self.output_shape = tuple(outputs[0].shape or ())
         self.input_channels = self._infer_channels(self.input_shape)
         self.output_channels = self._infer_channels(self.output_shape)
+        if self.input_channels not in {1, 3, 4}:
+            raise ValueError(
+                f"Unsupported ONNX input channels: {self.input_channels or 'unknown'} "
+                f"for shape {self.input_shape!r}. Supported ESRGAN-style inputs are 1, 3, or 4 channels."
+            )
+        if self.output_channels not in {1, 3, 4}:
+            raise ValueError(
+                f"Unsupported ONNX output channels: {self.output_channels or 'unknown'} "
+                f"for shape {self.output_shape!r}. Supported ESRGAN-style outputs are 1, 3, or 4 channels."
+            )
 
     @classmethod
     def from_model_path(

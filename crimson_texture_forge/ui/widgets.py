@@ -807,7 +807,7 @@ class QuickStartDialog(QDialog):
             <h3>Recommended first run</h3>
             <ol>
               <li>Open <b>Setup</b> and click <b>Init Workspace</b>.</li>
-              <li>Configure or download <b>texconv.exe</b>. DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild depend on it.</li>
+              <li>Configure <b>texconv.exe</b> or use the external download page link in <b>Setup</b>. DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild depend on it.</li>
               <li>Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>.</li>
               <li>Choose an upscaling mode in <b>Upscaling</b>: disabled, direct <b>Real-ESRGAN NCNN</b>, direct <b>ONNX Runtime</b>, or <b>chaiNNer</b>.</li>
               <li>Keep a safer <b>Texture Policy</b> preset first and leave automatic rules enabled so risky technical DDS files are preserved instead of pushed through the PNG path.</li>

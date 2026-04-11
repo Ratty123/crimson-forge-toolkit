@@ -218,6 +218,8 @@ def classify_texture_type(path_value: str) -> str:
     normalized = path_value.replace("\\", "/")
     lowered = normalized.lower()
     stem = PurePosixPath(normalized).stem.lower()
+    if re.search(r"(?:^|[_-])ct$", stem, re.IGNORECASE):
+        return "color"
     for texture_type, pattern in _PATH_TEXTURE_TYPE_PATTERNS:
         if pattern.search(lowered):
             return texture_type
@@ -713,10 +715,16 @@ def suggest_texture_upscale_decision(
             notes.append("UI textures should avoid linear-color conversion.")
     elif texture_type == "normal":
         color_space = "linear"
-        format_strategy = "bc5_linear"
-        recommended_texconv_format = "BC5_UNORM"
-        preserve_alpha = False
-        notes.append("Normal maps should stay linear and usually compress to BC5.")
+        if has_alpha:
+            format_strategy = "normal_with_alpha_linear"
+            recommended_texconv_format = "BC7_UNORM"
+            preserve_alpha = True
+            notes.append("Normal map appears to use alpha, so an alpha-capable linear format is safer than BC5.")
+        else:
+            format_strategy = "bc5_linear"
+            recommended_texconv_format = "BC5_UNORM"
+            preserve_alpha = False
+            notes.append("Normal maps should stay linear and usually compress to BC5.")
     elif texture_type == "height":
         color_space = "linear"
         format_strategy = "preserve_linear_scalar"
@@ -847,7 +855,10 @@ def build_ncnn_retry_tile_candidates(
 ) -> NcnnRetryPlan:
     requested = max(0, int(tile_size))
     if requested <= 0:
-        return NcnnRetryPlan(requested_tile_size=requested, candidate_tile_sizes=(0,))
+        return NcnnRetryPlan(
+            requested_tile_size=requested,
+            candidate_tile_sizes=(0, 512, 256, 128, 64, 32),
+        )
 
     minimum = max(1, int(minimum_tile_size))
     candidates: List[int] = []

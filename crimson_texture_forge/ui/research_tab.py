@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import threading
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -36,6 +38,7 @@ from crimson_texture_forge.core.research import (
     TextureSetGroup,
     TextureUsageHeatRow,
     analyze_mip_behavior,
+    build_archive_research_snapshot,
     build_texture_usage_heatmap,
     build_mip_analysis_detail,
     build_normal_validation_detail,
@@ -67,6 +70,7 @@ class ResearchRefreshWorker(QObject):
         original_root: Optional[Path],
         output_root: Optional[Path],
         texconv_path: Optional[Path],
+        archive_snapshot_payload: Optional[Dict[str, object]] = None,
     ) -> None:
         super().__init__()
         self.archive_entries = list(archive_entries)
@@ -74,24 +78,28 @@ class ResearchRefreshWorker(QObject):
         self.original_root = original_root
         self.output_root = output_root
         self.texconv_path = texconv_path
+        self.archive_snapshot_payload = dict(archive_snapshot_payload or {})
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
 
     @Slot()
     def run(self) -> None:
         try:
             working_entries = self.filtered_archive_entries or self.archive_entries
             payload: Dict[str, object] = {}
-            steps = 5
+            steps = 3
 
-            self.progress_changed.emit(0, steps, "Classifying archive textures...")
-            payload["classification_rows"] = classify_texture_entries(working_entries)
+            self.progress_changed.emit(0, steps, "Building archive research snapshot...")
+            if self.archive_snapshot_payload:
+                payload.update(self.archive_snapshot_payload)
+            else:
+                payload.update(build_archive_research_snapshot(working_entries))
 
-            self.progress_changed.emit(1, steps, "Grouping related texture sets...")
-            payload["texture_groups"] = bundle_texture_sets(working_entries)
-
-            self.progress_changed.emit(2, steps, "Building texture usage heatmap...")
-            payload["heatmap_rows"] = build_texture_usage_heatmap(working_entries)
-
-            self.progress_changed.emit(3, steps, "Comparing original vs rebuilt mip behavior...")
+            if self.stop_event.is_set():
+                raise RuntimeError("Research refresh cancelled.")
+            self.progress_changed.emit(1, steps, "Comparing original vs rebuilt mip behavior...")
             mip_rows: List[MipAnalysisRow] = []
             if self.original_root is not None and self.output_root is not None:
                 if self.original_root.exists() and self.output_root.exists():
@@ -99,15 +107,30 @@ class ResearchRefreshWorker(QObject):
                         self.original_root,
                         self.output_root,
                         texconv_path=self.texconv_path,
+                        stop_event=self.stop_event,
                     )
             payload["mip_rows"] = mip_rows
 
-            self.progress_changed.emit(4, steps, "Validating normal maps...")
+            if self.stop_event.is_set():
+                raise RuntimeError("Research refresh cancelled.")
+            self.progress_changed.emit(2, steps, "Validating normal maps...")
             normal_rows: List[NormalValidationRow] = []
             if self.original_root is not None and self.original_root.exists():
-                normal_rows.extend(validate_normal_maps(self.original_root, texconv_path=self.texconv_path))
+                normal_rows.extend(
+                    validate_normal_maps(
+                        self.original_root,
+                        texconv_path=self.texconv_path,
+                        stop_event=self.stop_event,
+                    )
+                )
             if self.output_root is not None and self.output_root.exists() and self.output_root != self.original_root:
-                normal_rows.extend(validate_normal_maps(self.output_root, texconv_path=self.texconv_path))
+                normal_rows.extend(
+                    validate_normal_maps(
+                        self.output_root,
+                        texconv_path=self.texconv_path,
+                        stop_event=self.stop_event,
+                    )
+                )
             normal_rows.sort(key=lambda row: (-row.issue_count, row.path))
             payload["normal_rows"] = normal_rows[:1500]
 
@@ -134,6 +157,10 @@ class ReferenceResolveWorker(QObject):
         super().__init__()
         self.archive_entries = list(archive_entries)
         self.target_path = target_path
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
 
     @Slot()
     def run(self) -> None:
@@ -142,9 +169,16 @@ class ReferenceResolveWorker(QObject):
                 self.archive_entries,
                 self.target_path,
                 on_progress=self.progress_changed.emit,
+                stop_event=self.stop_event,
             )
+            if self.stop_event.is_set():
+                raise RuntimeError("Reference resolve cancelled.")
             self.progress_changed.emit(1, 1, "Discovering archive sidecars...")
-            sidecar_rows = discover_archive_sidecars(self.archive_entries, self.target_path)
+            sidecar_rows = discover_archive_sidecars(
+                self.archive_entries,
+                self.target_path,
+                stop_event=self.stop_event,
+            )
             extract_paths = {self.target_path.strip().replace("\\", "/").strip("/")}
             for row in rows:
                 if row.source_path:
@@ -209,7 +243,10 @@ class ResearchTab(QWidget):
         self.research_payload: Dict[str, object] = {}
         self.reference_payload: Dict[str, object] = {}
         self.pending_mip_focus_relative_path = ""
+        self.archive_snapshot_cache: Dict[str, Dict[str, object]] = {}
+        self.pending_archive_snapshot_cache_key = ""
         self.archive_picker_entries: List[ArchiveEntry] = []
+        self.archive_picker_entry_index_by_path: Dict[str, int] = {}
         self.archive_picker_child_folders: Dict[tuple[str, ...], List[tuple[str, tuple[str, ...]]]] = {}
         self.archive_picker_direct_files: Dict[tuple[str, ...], List[int]] = {}
         self.archive_picker_folder_entry_indexes: Dict[tuple[str, ...], List[int]] = {}
@@ -261,6 +298,8 @@ class ResearchTab(QWidget):
         )
         self.reference_resolve_button.clicked.connect(self.resolve_references)
         self.reference_extract_button.clicked.connect(self.extract_resolved_related_set)
+        self.reference_tree.currentItemChanged.connect(self._handle_reference_selection_changed)
+        self.sidecar_tree.currentItemChanged.connect(self._handle_sidecar_selection_changed)
         self.texture_group_extract_button.clicked.connect(self.extract_selected_group)
         self.texture_group_tree.currentItemChanged.connect(self._handle_texture_group_selection_changed)
         self.export_report_csv_button.clicked.connect(lambda: self._export_analysis_report(".csv"))
@@ -286,6 +325,10 @@ class ResearchTab(QWidget):
         return
 
     def shutdown(self) -> None:
+        if self.refresh_worker is not None:
+            self.refresh_worker.stop()
+        if self.resolve_worker is not None:
+            self.resolve_worker.stop()
         for thread in (self.refresh_thread, self.resolve_thread):
             if thread is not None:
                 thread.quit()
@@ -294,6 +337,10 @@ class ResearchTab(QWidget):
     def refresh_archive_picker(self) -> None:
         entries = list(self.get_filtered_archive_entries()) or list(self.get_archive_entries())
         self.archive_picker_entries = [entry for entry in entries if isinstance(entry, ArchiveEntry)]
+        self.archive_picker_entry_index_by_path = {
+            self._normalize_archive_path(entry.path).casefold(): index
+            for index, entry in enumerate(self.archive_picker_entries)
+        }
         self._rebuild_archive_picker_index()
         self.archive_picker_tree.blockSignals(True)
         self.archive_picker_tree.clear()
@@ -384,6 +431,61 @@ class ResearchTab(QWidget):
     def _handle_archive_picker_item_expanded(self, item: QTreeWidgetItem) -> None:
         self._ensure_archive_picker_folder_item_populated(item)
 
+    @staticmethod
+    def _normalize_archive_path(path_value: str) -> str:
+        return path_value.strip().replace("\\", "/").strip("/")
+
+    def _ensure_archive_picker_folder_path(
+        self,
+        folder_parts: tuple[str, ...],
+    ) -> Optional[QTreeWidgetItem]:
+        if not folder_parts:
+            return None
+        current_folder_key: tuple[str, ...] = ()
+        current_item: Optional[QTreeWidgetItem] = None
+        for part in folder_parts:
+            current_folder_key = (*current_folder_key, part)
+            folder_item = self.archive_picker_items_by_folder_key.get(current_folder_key)
+            if folder_item is None:
+                parent_item = self.archive_picker_items_by_folder_key.get(current_folder_key[:-1])
+                if parent_item is not None:
+                    self._ensure_archive_picker_folder_item_populated(parent_item)
+                folder_item = self.archive_picker_items_by_folder_key.get(current_folder_key)
+            if folder_item is None:
+                return None
+            self._ensure_archive_picker_folder_item_populated(folder_item)
+            folder_item.setExpanded(True)
+            current_item = folder_item
+        return current_item
+
+    def _focus_archive_picker_path(self, path_value: str) -> bool:
+        normalized = self._normalize_archive_path(path_value)
+        if not normalized:
+            return False
+        entry_index = self.archive_picker_entry_index_by_path.get(normalized.casefold())
+        if entry_index is None:
+            self.archive_picker_status_label.setText(
+                f"Reference points to {normalized}, but that file is not visible in the current Archive Files list."
+            )
+            return False
+
+        folder_parts = tuple(part for part in PurePosixPath(normalized).parts[:-1] if part)
+        container: QTreeWidget | QTreeWidgetItem
+        if folder_parts:
+            folder_item = self._ensure_archive_picker_folder_path(folder_parts)
+            if folder_item is None:
+                return False
+            container = folder_item
+        else:
+            container = self.archive_picker_tree
+        file_item = self._find_archive_picker_file_item(container, entry_index)
+        if file_item is None:
+            return False
+        self.right_panel_stack.setCurrentWidget(self.archive_picker_group)
+        self.archive_picker_tree.setCurrentItem(file_item)
+        self.archive_picker_tree.scrollToItem(file_item, QAbstractItemView.PositionAtCenter)
+        return True
+
     def _find_archive_picker_file_item(
         self,
         container: QTreeWidget | QTreeWidgetItem,
@@ -435,6 +537,17 @@ class ResearchTab(QWidget):
             self.status_message_requested.emit("Select a file in Research -> Archive Files first.", True)
             return
         self._populate_note_target("archive", entry.path)
+
+    def _build_archive_snapshot_cache_key(self, entries: Sequence[ArchiveEntry]) -> str:
+        digest = hashlib.sha256()
+        for entry in entries:
+            digest.update(self._normalize_archive_path(entry.path).casefold().encode("utf-8", errors="replace"))
+            digest.update(b"\0")
+            digest.update(str(entry.package_label).casefold().encode("utf-8", errors="replace"))
+            digest.update(b"\0")
+            digest.update(str(entry.extension).casefold().encode("utf-8", errors="replace"))
+            digest.update(b"\n")
+        return f"{len(entries)}:{digest.hexdigest()}"
 
     def _build_archive_tab(self) -> QWidget:
         tab = QWidget()
@@ -845,9 +958,12 @@ class ResearchTab(QWidget):
         self.refresh_archive_picker()
         archive_entries = list(self.get_archive_entries())
         filtered_entries = list(self.get_filtered_archive_entries())
+        working_entries = [entry for entry in (filtered_entries or archive_entries) if isinstance(entry, ArchiveEntry)]
         original_root = Path(self.get_original_root()).expanduser() if self.get_original_root().strip() else None
         output_root = Path(self.get_output_root()).expanduser() if self.get_output_root().strip() else None
         texconv_path = Path(self.get_texconv_path()).expanduser() if self.get_texconv_path().strip() else None
+        archive_snapshot_cache_key = self._build_archive_snapshot_cache_key(working_entries)
+        cached_archive_snapshot = self.archive_snapshot_cache.get(archive_snapshot_cache_key)
 
         worker = ResearchRefreshWorker(
             archive_entries=archive_entries,
@@ -855,6 +971,7 @@ class ResearchTab(QWidget):
             original_root=original_root,
             output_root=output_root,
             texconv_path=texconv_path,
+            archive_snapshot_payload=cached_archive_snapshot,
         )
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -868,11 +985,16 @@ class ResearchTab(QWidget):
         thread.finished.connect(self._cleanup_refresh_refs)
         self.refresh_worker = worker
         self.refresh_thread = thread
+        self.pending_archive_snapshot_cache_key = archive_snapshot_cache_key
         self.refresh_button.setEnabled(False)
         self.refresh_progress.setRange(0, 0)
         self.refresh_progress.setFormat("Working...")
-        self.refresh_status_label.setText("Preparing research snapshot...")
-        self.status_message_requested.emit("Refreshing research snapshot...", False)
+        if cached_archive_snapshot:
+            self.refresh_status_label.setText("Preparing research snapshot with cached archive insights...")
+            self.status_message_requested.emit("Refreshing research snapshot with cached archive insights...", False)
+        else:
+            self.refresh_status_label.setText("Preparing research snapshot...")
+            self.status_message_requested.emit("Refreshing research snapshot...", False)
         thread.start()
 
     def focus_texture_analysis_for_compare_path(
@@ -945,6 +1067,12 @@ class ResearchTab(QWidget):
 
     def _handle_refresh_complete(self, payload: object) -> None:
         self.research_payload = payload if isinstance(payload, dict) else {}
+        if self.pending_archive_snapshot_cache_key and self.research_payload:
+            self.archive_snapshot_cache[self.pending_archive_snapshot_cache_key] = {
+                "classification_rows": self.research_payload.get("classification_rows", []),
+                "texture_groups": self.research_payload.get("texture_groups", []),
+                "heatmap_rows": self.research_payload.get("heatmap_rows", []),
+            }
         self._populate_texture_groups(self.research_payload.get("texture_groups", []))
         self._populate_classifications(self.research_payload.get("classification_rows", []))
         self._populate_heatmap_rows(self.research_payload.get("heatmap_rows", []))
@@ -959,6 +1087,7 @@ class ResearchTab(QWidget):
         self._focus_pending_mip_row()
 
     def _handle_refresh_error(self, message: str) -> None:
+        self.pending_mip_focus_relative_path = ""
         self.refresh_status_label.setText(message)
         self.refresh_progress.setRange(0, 1)
         self.refresh_progress.setValue(0)
@@ -968,6 +1097,7 @@ class ResearchTab(QWidget):
     def _cleanup_refresh_refs(self) -> None:
         self.refresh_worker = None
         self.refresh_thread = None
+        self.pending_archive_snapshot_cache_key = ""
         self.refresh_button.setEnabled(True)
 
     def _handle_reference_progress(self, current: int, total: int, detail: str) -> None:
@@ -1343,9 +1473,14 @@ class ResearchTab(QWidget):
                     row.source_package_label or row.related_package_label,
                 ]
             )
+            item.setData(0, Qt.UserRole, row)
             item.setToolTip(0, row.snippet)
             item.setToolTip(1, row.related_package_label)
             self.reference_tree.addTopLevelItem(item)
+        if self.reference_tree.topLevelItemCount() > 0:
+            first = self.reference_tree.topLevelItem(0)
+            if first is not None:
+                self.reference_tree.setCurrentItem(first)
 
     def _populate_sidecar_rows(self, rows: object) -> None:
         self.sidecar_tree.clear()
@@ -1361,8 +1496,39 @@ class ResearchTab(QWidget):
                     row.reason,
                 ]
             )
+            item.setData(0, Qt.UserRole, row)
             item.setToolTip(0, row.related_path)
             self.sidecar_tree.addTopLevelItem(item)
+        if self.sidecar_tree.topLevelItemCount() > 0:
+            first = self.sidecar_tree.topLevelItem(0)
+            if first is not None:
+                self.sidecar_tree.setCurrentItem(first)
+
+    def _handle_reference_selection_changed(
+        self,
+        current: Optional[QTreeWidgetItem],
+        _previous: Optional[QTreeWidgetItem],
+    ) -> None:
+        if current is None:
+            return
+        row = current.data(0, Qt.UserRole)
+        if not isinstance(row, MaterialTextureReferenceRow):
+            return
+        if self._focus_archive_picker_path(row.related_path):
+            return
+        self._focus_archive_picker_path(row.source_path)
+
+    def _handle_sidecar_selection_changed(
+        self,
+        current: Optional[QTreeWidgetItem],
+        _previous: Optional[QTreeWidgetItem],
+    ) -> None:
+        if current is None:
+            return
+        row = current.data(0, Qt.UserRole)
+        if not isinstance(row, SidecarDiscoveryRow):
+            return
+        self._focus_archive_picker_path(row.related_path)
 
     def _populate_reference_target(self, target_path: str) -> None:
         normalized = target_path.strip().replace("\\", "/")

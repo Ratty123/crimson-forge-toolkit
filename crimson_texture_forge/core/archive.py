@@ -1442,14 +1442,17 @@ def prepare_archive_browser_state(
     previewable_only: bool,
     build_structure_children: bool = True,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> dict:
     total_steps = 3 if build_structure_children else 2
     structure_children: Dict[str, List[Tuple[str, int]]] = {}
     if build_structure_children:
+        raise_if_cancelled(stop_event)
         if on_progress:
             on_progress(1, total_steps, "Building folder filters from archive entries...")
         structure_children = build_archive_structure_children_map(entries)
 
+    raise_if_cancelled(stop_event)
     if on_progress:
         on_progress(2 if build_structure_children else 1, total_steps, "Applying archive filters...")
     filtered_entries = filter_archive_entries(
@@ -1465,6 +1468,7 @@ def prepare_archive_browser_state(
         previewable_only=previewable_only,
     )
 
+    raise_if_cancelled(stop_event)
     if on_progress:
         on_progress(total_steps, total_steps, "Indexing archive browser tree...")
     tree_child_folders, tree_direct_files, folder_entry_indexes = build_archive_tree_index(filtered_entries)
