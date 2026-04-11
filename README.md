@@ -262,6 +262,14 @@ The DDS output section now also explains the difference between:
 - final PNG output
 - rebuilt DDS output
 
+## Known Issues
+
+- Disabling the upscale backend is not yet a fully safe "preserve everything technical" mode. Some DDS files can still be rebuilt from PNG instead of being left unchanged.
+- Some normal maps that carry useful alpha data can lose that alpha channel during rebuild.
+- Closing the app during certain long-running background tasks, especially scans or `Research` refreshes, can still leave worker shutdown behavior rough.
+- `Retry with smaller tile` does not currently step down correctly when tile size is set to `0`.
+- Some unusual ONNX models, especially unsupported 2-channel outputs, fail late with a generic conversion error instead of a clearer compatibility warning.
+
 ## Troubleshooting
 
 ### Missing texconv
