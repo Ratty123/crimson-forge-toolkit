@@ -361,15 +361,15 @@ It only makes direct network requests when you explicitly trigger download/open 
 
 ![Workflow Compare 2](docs/screenshots/workflow_compare2.png)
 
-### Compare View: Focused Review
+### Compare View: Alternate Example
 
 ![Workflow Compare 3](docs/screenshots/workflow_compare3.png)
 
-### Compare View: Large Preview Example
+### Compare View: Alternate Example
 
 ![Workflow Compare 4](docs/screenshots/workflow_compare4.png)
 
-### Compare View: Alternate Review Example
+### Compare View: Alternate Example
 
 ![Workflow Compare 5](docs/screenshots/workflow_compare5.png)
 
