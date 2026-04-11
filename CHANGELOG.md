@@ -11,8 +11,6 @@ The format is intentionally simple:
 
 ## [Unreleased/In testing]
 
-### Fixed
-- Archive Browser DDS preview is less likely to freeze the app while browsing cached archives because image preview loading now avoids eagerly materializing the full preview pixmap on the UI thread.
 
 ## [0.4.0] - 2026-04-11
 
@@ -85,6 +83,7 @@ The format is intentionally simple:
 - The right-side workflow layout now remembers a normal progress-panel size separately from Compare focus mode so switching tabs does not save a broken collapsed state.
 
 ### Fixed
+- Archive Browser DDS preview is less likely to freeze the app while browsing cached archives because image preview loading now avoids eagerly materializing the full preview pixmap on the UI thread.
 - Restored the missing workspace helper functions used by `Init Workspace` and `Create Folders`, which caused `name 'create_missing_directories_for_config' is not defined` style failures in the Setup section.
 - Profile export and diagnostic bundle export now serialize config data correctly for slotted dataclasses, fixing `vars() argument must have __dict__ attribute` failures.
 - Harmless chaiNNer shutdown/deprecation noise such as `body not consumed` and `log.catchErrors is deprecated` is now filtered so successful runs do not look like hard failures.
