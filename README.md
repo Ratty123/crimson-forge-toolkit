@@ -269,6 +269,9 @@ The DDS output section now also explains the difference between:
 - Closing the app during certain long-running background tasks, especially scans or `Research` refreshes, can still leave worker shutdown behavior rough.
 - `Retry with smaller tile` does not currently step down correctly when tile size is set to `0`.
 - Some unusual ONNX models, especially unsupported 2-channel outputs, fail late with a generic conversion error instead of a clearer compatibility warning.
+- `Compare` -> `Mip Details` can keep a stale pending target if a `Research` refresh fails, which can make a later refresh jump to the wrong row.
+- Some `_ct` variants can still be misclassified if the base name contains tokens like `rough` or `metal`, which can affect filtering, policy hints, and research output.
+- The `Safe Upscale Wizard` can overwrite caller-provided summary or notes text with its own generated footer text.
 
 ## Troubleshooting
 
