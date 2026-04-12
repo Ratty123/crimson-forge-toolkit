@@ -370,18 +370,6 @@ It only opens external pages in your browser when you explicitly trigger actions
 
 ![Workflow Compare 2](docs/screenshots/workflow_compare2.png)
 
-### Compare View: Alternate Example
-
-![Workflow Compare 3](docs/screenshots/workflow_compare3.png)
-
-### Compare View: Alternate Example
-
-![Workflow Compare 4](docs/screenshots/workflow_compare4.png)
-
-### Compare View: Alternate Example
-
-![Workflow Compare 5](docs/screenshots/workflow_compare5.png)
-
 ### Research: Archive Insights
 
 ![Research Archive Insights](docs/screenshots/research_archive_insights.png)
@@ -389,6 +377,10 @@ It only opens external pages in your browser when you explicitly trigger actions
 ### Research: References
 
 ![Research References](docs/screenshots/research_references.png)
+
+### Research: Classification Review
+
+![Research Classification Review](docs/screenshots/research_classification_review.png)
 
 ### Research: Texture Analysis
 
