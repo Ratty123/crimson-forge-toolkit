@@ -405,6 +405,7 @@ class ComparePreviewPaneResult:
     title: str = ""
     message: str = ""
     preview_png_path: str = ""
+    preview_image: object = None
     metadata_summary: str = ""
 
 

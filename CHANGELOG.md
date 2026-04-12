@@ -45,6 +45,12 @@ The format is intentionally simple:
 - `Retry with smaller tile` now steps down correctly from a `tile size 0` full-frame attempt into real smaller tiles.
 - `Research -> Mip Analysis` now only reports DDS files that exist in both Original and Output roots, instead of turning unmatched files into broken comparison rows.
 - DDS preview cache invalidation now includes the active `texconv.exe`, so Compare and Research previews are refreshed when the texconv binary changes.
+- Family-aware classification now upgrades base files such as `cd_wood_planks_02.dds` to color/albedo when sibling variants like `cd_wood_planks_02b.dds` and `cd_wood_planks_02c.dds` indicate a visible color texture family.
+- Family-aware classification now also upgrades trailing-letter variant-only sets such as `cd_wood_planks_02a.dds` and `cd_wood_planks_02b.dds` to color/albedo variants even when the plain base file is missing from that package.
+- Bare `rough` in names such as `cd_wood_rough_06.dds` is no longer treated as a hard roughness-map token, so material-name families can fall back to family/preview evidence instead of being misclassified as roughness.
+- Compare preview is more defensive when browsing rebuilt DDS files because preview widgets now cache the decoded display image instead of re-reading the same preview file on every resize/zoom, and the compare display-preview cap has been lowered to reduce memory pressure on large upscaled textures.
+- Compare preview loading now preloads the decoded display image in the worker thread before applying it to the UI, further reducing main-thread PNG decode work when Compare opens right after a build or when rapidly selecting rebuilt DDS files.
+- Compare preview no longer goes blank after the worker-thread preload change, because preview widgets now correctly treat preloaded in-memory images as a valid preview source.
 
 ### Docs
 - Updated README/help/release wording to reflect `Run Summary`, browser-only external setup/model pages, automatic `Source Match` correction, the high-precision technical path, the expert unsafe technical override, and the current direct-backend workflow.

@@ -41,6 +41,7 @@ def run_gui() -> int:
             QDesktopServices,
             QFont,
             QIcon,
+            QImageReader,
             QPixmap,
         )
         from PySide6.QtWidgets import (
@@ -394,14 +395,12 @@ def run_gui() -> int:
         def run(self) -> None:
             try:
                 payload = {
-                    "original": build_compare_preview_pane_result(
-                        self.texconv_path,
+                    "original": self._build_result_with_loaded_image(
                         self.original_path,
                         "Original DDS not found.",
                         self.original_planner_summary,
                     ),
-                    "output": build_compare_preview_pane_result(
-                        self.texconv_path,
+                    "output": self._build_result_with_loaded_image(
                         self.output_path,
                         "Output DDS not found.",
                         self.output_planner_summary,
@@ -412,6 +411,26 @@ def run_gui() -> int:
                 self.error.emit(self.request_id, str(exc))
             finally:
                 self.finished.emit()
+
+        def _build_result_with_loaded_image(
+            self,
+            dds_path: Optional[Path],
+            missing_message: str,
+            planner_summary: str,
+        ) -> ComparePreviewPaneResult:
+            result = build_compare_preview_pane_result(
+                self.texconv_path,
+                dds_path,
+                missing_message,
+                planner_summary,
+            )
+            if result.status != "ok" or not result.preview_png_path:
+                return result
+            reader = QImageReader(result.preview_png_path)
+            image = reader.read()
+            if image.isNull():
+                return result
+            return dataclasses.replace(result, preview_image=image)
 
     class ArchivePreviewWorker(QObject):
         completed = Signal(int, object)
@@ -6015,6 +6034,11 @@ def run_gui() -> int:
                 return
 
             preview_image_path = str(result.preview_png_path)
+            preview_image = result.preview_image
+            if preview_image is not None:
+                meta_label.setText(result.metadata_summary)
+                label.set_preview_image(preview_image, result.title)
+                return
             if not preview_image_path:
                 meta_label.setText("")
                 label.clear_preview("Qt could not load the generated PNG preview.")

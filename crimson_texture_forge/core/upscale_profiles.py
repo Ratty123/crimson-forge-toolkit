@@ -35,7 +35,7 @@ _STEM_TEXTURE_TYPE_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
-    ("roughness", re.compile(r"(?:^|[_-])(rough|roughness|gloss|glossiness|smoothness)(?:$|[_-])", re.IGNORECASE)),
+    ("roughness", re.compile(r"(?:^|[_-])(roughness|gloss|glossiness|smoothness)(?:$|[_-])", re.IGNORECASE)),
     (
         "mask",
         re.compile(
@@ -303,6 +303,17 @@ def _infer_family_semantics(
     relaxed_stem = re.sub(r"(?<=\d)[a-z]$", "", current_stem)
     if relaxed_stem != current_stem and (relaxed_stem in sibling_stems or sibling_types):
         return "color", "albedo_variant", 68, "family-aware trailing variant suffix"
+    if relaxed_stem != current_stem:
+        sibling_relaxed_stems = {
+            re.sub(r"(?<=\d)[a-z]$", "", stem)
+            for stem in sibling_stems
+        }
+        if relaxed_stem in sibling_relaxed_stems:
+            return "color", "albedo_variant", 67, "family of trailing variant suffixes"
+
+    trailing_variant_pattern = re.compile(rf"^{re.escape(current_stem)}[a-z]$", re.IGNORECASE)
+    if any(trailing_variant_pattern.match(stem) for stem in sibling_stems):
+        return "color", "albedo", 67, "family base file beside trailing variant suffixes"
 
     if sibling_types.intersection({"normal", "height", "roughness", "mask"}) and not re.search(
         r"(?:^|[_-])(m|sp|spec|specular)$",
@@ -369,6 +380,7 @@ def infer_texture_semantics(
     packed_channels: List[str] = []
     evidence: List[str] = []
     combined_sidecar_text = "\n".join(text.lower() for text in sidecar_texts if text).lower()
+    original_upper = original_texconv_format.strip().upper()
 
     if texture_type == "height":
         semantic_subtype = "height"
@@ -627,7 +639,30 @@ def infer_texture_semantics(
             confidence = 70
             evidence.append("sidecar color hint")
 
-    original_upper = original_texconv_format.strip().upper()
+    if texture_type == "unknown" and _stem_has_token(stem_lower, "rough"):
+        sibling_types = {
+            classify_texture_type(member)
+            for member in family_members
+            if str(member).replace("\\", "/").lower() != lowered
+        }
+        sibling_types.discard("unknown")
+        visible_family_types = {"color", "ui", "emissive", "impostor"}
+        if _contains_any(combined_sidecar_text, ("roughness", "gloss", "smoothness")):
+            texture_type = "roughness"
+            semantic_subtype = "roughness"
+            confidence = max(confidence, 72)
+            evidence.append("ambiguous rough token confirmed by sidecar hint")
+        elif not sibling_types.intersection(visible_family_types) and preview_sample is not None and preview_sample.mean_chroma <= 7.0 and preview_sample.luma_range >= 18.0:
+            texture_type = "roughness"
+            semantic_subtype = "roughness"
+            confidence = max(confidence, 64)
+            evidence.append("ambiguous rough token confirmed by grayscale preview")
+        elif not sibling_types.intersection(visible_family_types) and (original_upper.startswith("BC4") or original_upper.startswith("R8")):
+            texture_type = "roughness"
+            semantic_subtype = "roughness"
+            confidence = max(confidence, 64)
+            evidence.append(f"ambiguous rough token with single-channel-like source format {original_upper}")
+
     if texture_type == "unknown":
         if original_upper.endswith("_SRGB"):
             texture_type = "color"
