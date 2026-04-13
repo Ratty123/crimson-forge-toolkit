@@ -4,6 +4,11 @@ Windows desktop tool for **Crimson Desert texture workflows**, **read-only archi
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
+Project guidelines:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [SECURITY.md](SECURITY.md)
+
 Crimson Texture Forge is built for modders who want one place to:
 
 - browse and extract files from `.pamt` / `.paz` archives
