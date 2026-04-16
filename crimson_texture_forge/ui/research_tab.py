@@ -7,7 +7,7 @@ import threading
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, List, Optional, Sequence
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QImageReader
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -320,6 +320,9 @@ class ResearchTab(QWidget):
     extract_related_set_requested = Signal(object, str)
     focus_archive_browser_requested = Signal()
     review_reference_in_text_search_requested = Signal(str, str)
+    REFRESH_POPULATION_BATCH_SIZE = 80
+    REFRESH_GROUP_BATCH_SIZE = 20
+    UNKNOWN_GROUP_BATCH_SIZE = 100
 
     def __init__(
         self,
@@ -378,6 +381,22 @@ class ResearchTab(QWidget):
         self.classification_registry_path = texture_classification_registry_path()
         self.pending_classification_review_focus_keys: set[str] = set()
         self._populating_unknown_resolver_controls = False
+        self._refresh_population_timer = QTimer(self)
+        self._refresh_population_timer.setSingleShot(True)
+        self._refresh_population_timer.setInterval(0)
+        self._refresh_population_timer.timeout.connect(self._flush_refresh_population_batch)
+        self._refresh_population_phases: List[Dict[str, object]] = []
+        self._refresh_population_phase_index = 0
+        self._refresh_population_total = 0
+        self._refresh_population_processed = 0
+        self._unknown_population_timer = QTimer(self)
+        self._unknown_population_timer.setSingleShot(True)
+        self._unknown_population_timer.setInterval(0)
+        self._unknown_population_timer.timeout.connect(self._flush_unknown_group_population_batch)
+        self._pending_unknown_groups: List[UnknownResolverGroup] = []
+        self._pending_unknown_previous_group_key = ""
+        self._pending_unknown_showing_classified = False
+        self._pending_unknown_population_total = 0
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -475,6 +494,8 @@ class ResearchTab(QWidget):
         return
 
     def shutdown(self) -> None:
+        self._refresh_population_timer.stop()
+        self._unknown_population_timer.stop()
         if self.refresh_worker is not None:
             self.refresh_worker.stop()
         if self.resolve_worker is not None:
@@ -1433,19 +1454,7 @@ class ResearchTab(QWidget):
                 "unknown_resolver_groups": self.research_payload.get("unknown_resolver_groups", []),
                 "classification_review_groups": self.research_payload.get("classification_review_groups", []),
             }
-        self._populate_texture_groups(self.research_payload.get("texture_groups", []))
-        self._populate_classifications(self.research_payload.get("classification_rows", []))
-        self._refresh_unknown_resolver_view()
-        self._populate_heatmap_rows(self.research_payload.get("heatmap_rows", []))
-        self._populate_mip_rows(self.research_payload.get("mip_rows", []))
-        self._populate_normal_rows(self.research_payload.get("normal_rows", []))
-        self._refresh_texture_analysis_summary()
-        self.refresh_status_label.setText("Research snapshot ready.")
-        self.refresh_progress.setRange(0, 1)
-        self.refresh_progress.setValue(1)
-        self.refresh_progress.setFormat("Ready")
-        self.status_message_requested.emit("Research snapshot ready.", False)
-        self._focus_pending_mip_row()
+        self._begin_refresh_population()
 
     def _handle_refresh_error(self, message: str) -> None:
         self.pending_mip_focus_relative_path = ""
@@ -1513,6 +1522,270 @@ class ResearchTab(QWidget):
         self.resolve_worker = None
         self.resolve_thread = None
         self.reference_resolve_button.setEnabled(True)
+
+    def _stop_refresh_population(self) -> None:
+        self._refresh_population_timer.stop()
+        self._refresh_population_phases = []
+        self._refresh_population_phase_index = 0
+        self._refresh_population_total = 0
+        self._refresh_population_processed = 0
+
+    def _build_texture_group_item(self, group: TextureSetGroup) -> QTreeWidgetItem:
+        parent = QTreeWidgetItem(
+            [
+                group.display_name,
+                f"{group.member_count:,}",
+                ", ".join(group.member_kinds),
+                ", ".join(group.package_labels[:3]) + ("..." if len(group.package_labels) > 3 else ""),
+            ]
+        )
+        parent.setData(0, Qt.UserRole, group.group_key)
+        parent.setToolTip(0, group.group_key)
+        for member in group.members[:40]:
+            child = QTreeWidgetItem([PurePosixPath(member.path).name, "1", member.member_kind, member.package_label])
+            child.setData(0, Qt.UserRole, group.group_key)
+            child.setToolTip(0, member.path)
+            parent.addChild(child)
+        return parent
+
+    def _build_classification_item(self, row: TextureClassificationRow) -> QTreeWidgetItem:
+        item = QTreeWidgetItem(
+            [PurePosixPath(row.path).name, row.texture_type, f"{row.confidence}%", row.package_label, row.reason]
+        )
+        item.setToolTip(0, row.path)
+        return item
+
+    def _build_heatmap_scope_item(self, scope_rows: tuple[str, List[TextureUsageHeatRow]]) -> QTreeWidgetItem:
+        scope, rows = scope_rows
+        parent = QTreeWidgetItem([scope, "", "", "", "", "", "", ""])
+        parent.setFirstColumnSpanned(True)
+        parent.setExpanded(True)
+        for row in rows:
+            item = QTreeWidgetItem(
+                [
+                    row.label,
+                    f"{row.heat_score:,}",
+                    f"{row.texture_count:,}",
+                    f"{row.set_count:,}",
+                    f"{row.normal_count:,}",
+                    f"{row.ui_count:,}",
+                    f"{row.material_count:,}",
+                    f"{row.impostor_count:,}",
+                ]
+            )
+            if row.sample_paths:
+                item.setToolTip(0, "\n".join(row.sample_paths))
+            parent.addChild(item)
+        return parent
+
+    def _build_mip_item(self, row: MipAnalysisRow) -> QTreeWidgetItem:
+        item = QTreeWidgetItem(
+            [
+                row.relative_path,
+                f"{row.original_size} | {row.original_format}",
+                f"{row.rebuilt_size} | {row.rebuilt_format}",
+                f"{row.original_mips} -> {row.rebuilt_mips}",
+                "; ".join(row.warnings[:2]) if row.warnings else "No warning",
+            ]
+        )
+        item.setData(0, Qt.UserRole, row)
+        tooltip_lines = [*row.warnings]
+        if row.planner_profile or row.planner_path_kind:
+            tooltip_lines.extend(
+                [
+                    "",
+                    f"Planner profile: {row.planner_profile or 'unavailable'}",
+                    f"Planner path: {row.planner_path_kind or 'unavailable'}",
+                    f"Planner path detail: {describe_processing_path_kind(row.planner_path_kind) if row.planner_path_kind else 'unavailable'}",
+                    f"Planner backend mode: {row.planner_backend_mode or 'unavailable'}",
+                    f"Planner alpha policy: {row.planner_alpha_policy or 'unavailable'}",
+                ]
+            )
+            if row.planner_preserve_reason:
+                tooltip_lines.append(f"Planner preserve reason: {row.planner_preserve_reason}")
+        item.setToolTip(4, "\n".join(line for line in tooltip_lines if line))
+        return item
+
+    def _build_normal_item(self, row: NormalValidationRow) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([row.path, row.root_label, row.texconv_format, row.size_text, "; ".join(row.issues[:2])])
+        item.setData(0, Qt.UserRole, row)
+        tooltip_lines = [*row.issues]
+        if row.planner_profile or row.planner_path_kind:
+            tooltip_lines.extend(
+                [
+                    "",
+                    f"Planner profile: {row.planner_profile or 'unavailable'}",
+                    f"Planner path: {row.planner_path_kind or 'unavailable'}",
+                    f"Planner path detail: {describe_processing_path_kind(row.planner_path_kind) if row.planner_path_kind else 'unavailable'}",
+                    f"Planner backend mode: {row.planner_backend_mode or 'unavailable'}",
+                    f"Planner alpha policy: {row.planner_alpha_policy or 'unavailable'}",
+                ]
+            )
+            if row.planner_preserve_reason:
+                tooltip_lines.append(f"Planner preserve reason: {row.planner_preserve_reason}")
+        item.setToolTip(4, "\n".join(line for line in tooltip_lines if line))
+        return item
+
+    def _begin_refresh_population(self) -> None:
+        self._stop_refresh_population()
+        self._refresh_unknown_resolver_view()
+        texture_groups = [group for group in self.research_payload.get("texture_groups", []) if isinstance(group, TextureSetGroup)]
+        classification_rows = [row for row in self.research_payload.get("classification_rows", []) if isinstance(row, TextureClassificationRow)]
+        grouped_heatmap: Dict[str, List[TextureUsageHeatRow]] = {}
+        heatmap_groups: List[tuple[str, List[TextureUsageHeatRow]]] = []
+        for row in self.research_payload.get("heatmap_rows", []) if isinstance(self.research_payload.get("heatmap_rows", []), list) else []:
+            if not isinstance(row, TextureUsageHeatRow):
+                continue
+            if row.scope not in grouped_heatmap:
+                grouped_heatmap[row.scope] = []
+                heatmap_groups.append((row.scope, grouped_heatmap[row.scope]))
+            grouped_heatmap[row.scope].append(row)
+        mip_rows = [row for row in self.research_payload.get("mip_rows", []) if isinstance(row, MipAnalysisRow)]
+        normal_rows = [row for row in self.research_payload.get("normal_rows", []) if isinstance(row, NormalValidationRow)]
+
+        self.texture_group_tree.clear()
+        self.classifier_tree.clear()
+        self.heatmap_tree.clear()
+        self.mip_tree.clear()
+        self.normal_tree.clear()
+
+        self._refresh_population_phases = [
+            {
+                "name": "texture groups",
+                "items": texture_groups,
+                "cursor": 0,
+                "tree": self.texture_group_tree,
+                "build": self._build_texture_group_item,
+                "finalize": self._finalize_texture_group_population,
+                "batch_size": self.REFRESH_GROUP_BATCH_SIZE,
+            },
+            {
+                "name": "classifications",
+                "items": classification_rows,
+                "cursor": 0,
+                "tree": self.classifier_tree,
+                "build": self._build_classification_item,
+                "finalize": self._finalize_classification_population,
+                "batch_size": self.REFRESH_POPULATION_BATCH_SIZE,
+            },
+            {
+                "name": "usage heatmap",
+                "items": heatmap_groups,
+                "cursor": 0,
+                "tree": self.heatmap_tree,
+                "build": self._build_heatmap_scope_item,
+                "finalize": self._finalize_heatmap_population,
+                "batch_size": self.REFRESH_GROUP_BATCH_SIZE,
+            },
+            {
+                "name": "mip analysis",
+                "items": mip_rows,
+                "cursor": 0,
+                "tree": self.mip_tree,
+                "build": self._build_mip_item,
+                "finalize": self._finalize_mip_population,
+                "batch_size": self.REFRESH_POPULATION_BATCH_SIZE,
+            },
+            {
+                "name": "normal validation",
+                "items": normal_rows,
+                "cursor": 0,
+                "tree": self.normal_tree,
+                "build": self._build_normal_item,
+                "finalize": self._finalize_normal_population,
+                "batch_size": self.REFRESH_POPULATION_BATCH_SIZE,
+            },
+        ]
+        self._refresh_population_total = sum(len(phase["items"]) for phase in self._refresh_population_phases)
+        self._refresh_population_processed = 0
+        if self._refresh_population_total <= 0:
+            self._finish_refresh_population()
+            return
+        self.refresh_status_label.setText(f"Populating research snapshot... 0 / {self._refresh_population_total:,}")
+        self.refresh_progress.setRange(0, self._refresh_population_total)
+        self.refresh_progress.setValue(0)
+        self.refresh_progress.setFormat(f"0 / {self._refresh_population_total}")
+        self._refresh_population_timer.start()
+
+    def _flush_refresh_population_batch(self) -> None:
+        while self._refresh_population_phase_index < len(self._refresh_population_phases):
+            phase = self._refresh_population_phases[self._refresh_population_phase_index]
+            items = phase["items"]
+            cursor = int(phase.get("cursor", 0))
+            if cursor >= len(items):
+                finalize = phase.get("finalize")
+                if callable(finalize):
+                    finalize()
+                self._refresh_population_phase_index += 1
+                continue
+            batch_size = max(1, int(phase.get("batch_size", self.REFRESH_POPULATION_BATCH_SIZE)))
+            end = min(cursor + batch_size, len(items))
+            build = phase.get("build")
+            tree = phase.get("tree")
+            if not callable(build) or not isinstance(tree, QTreeWidget):
+                self._refresh_population_phase_index += 1
+                continue
+            built = [build(item) for item in items[cursor:end]]
+            tree.setUpdatesEnabled(False)
+            tree.addTopLevelItems(built)
+            tree.setUpdatesEnabled(True)
+            phase["cursor"] = end
+            self._refresh_population_processed += end - cursor
+            self.refresh_status_label.setText(
+                f"Populating {phase.get('name', 'research')}... {self._refresh_population_processed:,} / {self._refresh_population_total:,}"
+            )
+            self.refresh_progress.setRange(0, self._refresh_population_total)
+            self.refresh_progress.setValue(self._refresh_population_processed)
+            self.refresh_progress.setFormat(f"{self._refresh_population_processed} / {self._refresh_population_total}")
+            if end < len(items):
+                self._refresh_population_timer.start()
+                return
+        self._finish_refresh_population()
+
+    def _finalize_texture_group_population(self) -> None:
+        first_group_item = self.texture_group_tree.topLevelItem(0)
+        if first_group_item is not None:
+            self.texture_group_tree.setCurrentItem(first_group_item)
+            self.texture_group_status_label.setText(
+                f"Selected group: {first_group_item.text(0)}. Click 'Extract Selected Set' to extract its related files and sidecars."
+            )
+            self.texture_group_extract_button.setEnabled(True)
+        else:
+            self.texture_group_status_label.setText("No grouped texture sets are available in the current Research snapshot.")
+            self.texture_group_extract_button.setEnabled(False)
+
+    def _finalize_classification_population(self) -> None:
+        return
+
+    def _finalize_heatmap_population(self) -> None:
+        return
+
+    def _finalize_mip_population(self) -> None:
+        if self.mip_tree.topLevelItemCount() > 0:
+            first = self.mip_tree.topLevelItem(0)
+            if first is not None:
+                self.mip_tree.setCurrentItem(first)
+
+    def _finalize_normal_population(self) -> None:
+        if self.normal_tree.topLevelItemCount() > 0 and self.mip_tree.topLevelItemCount() == 0:
+            first = self.normal_tree.topLevelItem(0)
+            if first is not None:
+                self.normal_tree.setCurrentItem(first)
+        if self.normal_tree.topLevelItemCount() == 0 and self.mip_tree.topLevelItemCount() == 0:
+            self.analysis_detail_label.setText(
+                "Select a row in Mip Analysis or Bulk Normal Validator to see where the result came from and what it means."
+            )
+            self.analysis_detail_edit.clear()
+
+    def _finish_refresh_population(self) -> None:
+        self._stop_refresh_population()
+        self._refresh_texture_analysis_summary()
+        self.refresh_status_label.setText("Research snapshot ready.")
+        self.refresh_progress.setRange(0, 1)
+        self.refresh_progress.setValue(1)
+        self.refresh_progress.setFormat("Ready")
+        self.status_message_requested.emit("Research snapshot ready.", False)
+        self._focus_pending_mip_row()
 
     def _populate_texture_groups(self, groups: object) -> None:
         self.texture_group_tree.setUpdatesEnabled(False)
@@ -1734,49 +2007,20 @@ class ResearchTab(QWidget):
     def _populate_unknown_resolver(self, groups: object) -> None:
         previous_group = self._current_unknown_group()
         previous_group_key = previous_group.group_key if previous_group is not None else ""
+        self._unknown_population_timer.stop()
         self.unknown_group_tree.setUpdatesEnabled(False)
         self.unknown_group_tree.clear()
-        first_item: Optional[QTreeWidgetItem] = None
-        selected_item: Optional[QTreeWidgetItem] = None
         valid_groups = [
             group
             for group in groups
             if isinstance(group, UnknownResolverGroup) and self._unknown_group_matches_filters(group)
         ]
-        showing_classified = self.unknown_show_classified_checkbox.isChecked()
-        for group in valid_groups:
-            item = QTreeWidgetItem(
-                [
-                    self._unknown_group_display_name(group),
-                    self._unknown_group_classification_text(group),
-                    self._unknown_group_package_text(group),
-                ]
-            )
-            item.setData(0, Qt.UserRole, group)
-            item.setToolTip(0, group.group_key)
-            item.setToolTip(1, self._unknown_group_classification_text(group))
-            item.setToolTip(2, ", ".join(group.package_labels))
-            self.unknown_group_tree.addTopLevelItem(item)
-            if first_item is None:
-                first_item = item
-            if previous_group_key and group.group_key == previous_group_key:
-                selected_item = item
-        if first_item is not None:
-            self.unknown_group_tree.setCurrentItem(selected_item or first_item)
-            registry_text = str(self.classification_registry_path) if self.classification_registry_path is not None else "local registry"
-            self.unknown_resolver_status_label.setText(
-                (
-                    f"{len(valid_groups):,} review item(s) are available. Approved labels are stored in {registry_text}."
-                    if showing_classified
-                    else f"{len(valid_groups):,} unresolved item(s) need review. Approved labels are stored in {registry_text}."
-                )
-            )
-            if self.pending_classification_review_focus_keys:
-                self.unknown_resolver_status_label.setText(
-                    self.unknown_resolver_status_label.text()
-                    + " Showing the current run's unclassified DDS files."
-                )
-        else:
+        self.unknown_group_tree.setUpdatesEnabled(True)
+        self._pending_unknown_groups = valid_groups
+        self._pending_unknown_previous_group_key = previous_group_key
+        self._pending_unknown_showing_classified = self.unknown_show_classified_checkbox.isChecked()
+        self._pending_unknown_population_total = len(valid_groups)
+        if not valid_groups:
             self.unknown_member_tree.clear()
             self.unknown_members_group.setVisible(False)
             self.unknown_detail_edit.clear()
@@ -1784,13 +2028,78 @@ class ResearchTab(QWidget):
             self.unknown_resolver_status_label.setText(
                 (
                     "No review items are available in the current Research snapshot."
-                    if showing_classified
+                    if self._pending_unknown_showing_classified
                     else "No unresolved review items match the current filters."
                 )
                 if not self.pending_classification_review_focus_keys
                 else "No current-run unclassified DDS files matched the current Research snapshot. Scan archives or broaden the current Archive Browser view if needed."
             )
+            self._update_unknown_resolver_controls()
+            return
+        self.unknown_resolver_status_label.setText(
+            f"Populating classification review... 0 / {self._pending_unknown_population_total:,}"
+        )
+        self._update_unknown_resolver_controls()
+        self._unknown_population_timer.start()
+
+    def _build_unknown_group_item(self, group: UnknownResolverGroup) -> QTreeWidgetItem:
+        item = QTreeWidgetItem(
+            [
+                self._unknown_group_display_name(group),
+                self._unknown_group_classification_text(group),
+                self._unknown_group_package_text(group),
+            ]
+        )
+        item.setData(0, Qt.UserRole, group)
+        item.setToolTip(0, group.group_key)
+        item.setToolTip(1, self._unknown_group_classification_text(group))
+        item.setToolTip(2, ", ".join(group.package_labels))
+        return item
+
+    def _flush_unknown_group_population_batch(self) -> None:
+        if not self._pending_unknown_groups:
+            self._finalize_unknown_group_population()
+            return
+        batch = self._pending_unknown_groups[: self.UNKNOWN_GROUP_BATCH_SIZE]
+        del self._pending_unknown_groups[: self.UNKNOWN_GROUP_BATCH_SIZE]
+        items = [self._build_unknown_group_item(group) for group in batch]
+        self.unknown_group_tree.setUpdatesEnabled(False)
+        self.unknown_group_tree.addTopLevelItems(items)
         self.unknown_group_tree.setUpdatesEnabled(True)
+        populated = self._pending_unknown_population_total - len(self._pending_unknown_groups)
+        self.unknown_resolver_status_label.setText(
+            f"Populating classification review... {populated:,} / {self._pending_unknown_population_total:,}"
+        )
+        if self._pending_unknown_groups:
+            self._unknown_population_timer.start()
+            return
+        self._finalize_unknown_group_population()
+
+    def _finalize_unknown_group_population(self) -> None:
+        selected_item: Optional[QTreeWidgetItem] = None
+        if self._pending_unknown_previous_group_key:
+            for index in range(self.unknown_group_tree.topLevelItemCount()):
+                item = self.unknown_group_tree.topLevelItem(index)
+                value = item.data(0, Qt.UserRole)
+                if isinstance(value, UnknownResolverGroup) and value.group_key == self._pending_unknown_previous_group_key:
+                    selected_item = item
+                    break
+        first_item = self.unknown_group_tree.topLevelItem(0)
+        if first_item is not None:
+            self.unknown_group_tree.setCurrentItem(selected_item or first_item)
+            registry_text = str(self.classification_registry_path) if self.classification_registry_path is not None else "local registry"
+            self.unknown_resolver_status_label.setText(
+                (
+                    f"{self._pending_unknown_population_total:,} review item(s) are available. Approved labels are stored in {registry_text}."
+                    if self._pending_unknown_showing_classified
+                    else f"{self._pending_unknown_population_total:,} unresolved item(s) need review. Approved labels are stored in {registry_text}."
+                )
+            )
+            if self.pending_classification_review_focus_keys:
+                self.unknown_resolver_status_label.setText(
+                    self.unknown_resolver_status_label.text()
+                    + " Showing the current run's unclassified DDS files."
+                )
         self._update_unknown_resolver_controls()
 
     def _current_unknown_group(self) -> Optional[UnknownResolverGroup]:

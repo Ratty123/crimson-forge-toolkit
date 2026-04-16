@@ -512,7 +512,11 @@ def _selection_mask_to_polygons(mask: np.ndarray) -> Tuple[Tuple[Tuple[float, fl
     binary = np.asarray(mask > 0, dtype=np.uint8)
     if not np.any(binary):
         return ()
-    contours, _hierarchy = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is not None and hierarchy.size:
+        flattened_hierarchy = np.asarray(hierarchy).reshape(-1, 4)
+        if np.any(flattened_hierarchy[:, 3] >= 0):
+            return ()
     polygons: List[Tuple[Tuple[float, float], ...]] = []
     for contour in contours:
         if contour.shape[0] < 3:
@@ -3114,7 +3118,12 @@ def extract_texture_editor_selection(
             if local_mask.shape[:2] == local_pixels.shape[:2]:
                 local_pixels = _apply_mask_to_src_region(local_pixels, local_mask)
     local_alpha = np.clip(layer_selection[min_y:max_y, min_x:max_x].astype(np.float32) / 255.0, 0.0, 1.0)[..., None]
-    extracted = np.clip(np.round(local_pixels.astype(np.float32) * local_alpha), 0, 255).astype(np.uint8)
+    extracted = local_pixels.copy()
+    extracted[..., 3:4] = np.clip(
+        np.round(extracted[..., 3:4].astype(np.float32) * local_alpha),
+        0,
+        255,
+    ).astype(np.uint8)
     return extracted, (dx0 + min_x, dy0 + min_y, max_x - min_x, max_y - min_y)
 
 
@@ -3191,15 +3200,59 @@ def remove_texture_editor_layer(
 ) -> Tuple[TextureEditorDocument, Dict[str, np.ndarray]]:
     if len(document.layers) <= 1:
         return document, layer_pixels
-    layers = [layer for layer in document.layers if layer.layer_id != layer_id]
-    if len(layers) == len(document.layers):
+    removed_layer = next((layer for layer in document.layers if layer.layer_id == layer_id), None)
+    if removed_layer is None:
         return document, layer_pixels
+    removed_auxiliary_ids = {layer_id}
+    if removed_layer.mask_layer_id:
+        removed_auxiliary_ids.add(removed_layer.mask_layer_id)
+    layers: List[TextureEditorLayer] = []
+    for layer in document.layers:
+        if layer.layer_id == layer_id:
+            continue
+        next_mask_layer_id = layer.mask_layer_id
+        next_revision = int(layer.revision)
+        next_thumbnail_cache_key = layer.thumbnail_cache_key
+        if next_mask_layer_id in removed_auxiliary_ids:
+            next_mask_layer_id = ""
+            next_revision += 1
+            next_thumbnail_cache_key = uuid.uuid4().hex
+        layers.append(
+            dataclasses.replace(
+                layer,
+                mask_layer_id=next_mask_layer_id,
+                revision=next_revision,
+                thumbnail_cache_key=next_thumbnail_cache_key,
+            )
+        )
     new_pixels = dict(layer_pixels)
-    new_pixels.pop(layer_id, None)
+    for removed_id in removed_auxiliary_ids:
+        new_pixels.pop(removed_id, None)
+    adjustment_layers: List[TextureEditorAdjustmentLayer] = []
+    for adjustment in document.adjustment_layers:
+        if adjustment.mask_layer_id in removed_auxiliary_ids:
+            adjustment_layers.append(
+                dataclasses.replace(
+                    adjustment,
+                    mask_layer_id="",
+                    revision=int(adjustment.revision) + 1,
+                )
+            )
+        else:
+            adjustment_layers.append(adjustment)
     active_layer_id = document.active_layer_id
     if active_layer_id == layer_id:
         active_layer_id = layers[-1].layer_id
-    return dataclasses.replace(document, layers=tuple(layers), active_layer_id=active_layer_id), new_pixels
+    return (
+        dataclasses.replace(
+            document,
+            layers=tuple(layers),
+            adjustment_layers=tuple(adjustment_layers),
+            active_layer_id=active_layer_id,
+            composite_revision=int(document.composite_revision) + 1,
+        ),
+        new_pixels,
+    )
 
 
 def merge_texture_editor_layer_down(

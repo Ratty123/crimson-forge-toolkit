@@ -4,9 +4,9 @@ Windows desktop tool for **Crimson Desert texture workflows**, **read-only archi
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-Latest prerelease: `0.6.0-beta.4`
+Latest release: `0.6.0`
 
-- expanded `Texture Editor` again with deeper packed-channel tools, navigator/rulers/guides, atlas helpers, and more advanced adjustments
+- expanded `Texture Editor` with deeper packed-channel tools, navigator/rulers/guides, atlas helpers, and more advanced adjustments
 - added stronger transform, mask, brush, and document-editing workflows for real in-app texture modification
 - improved editor stability, DDS preview behavior, text-search/research responsiveness, and heavier-session performance
 

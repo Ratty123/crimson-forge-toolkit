@@ -6706,6 +6706,21 @@ def run_gui() -> int:
             self.set_busy(False, build_mode=False)
 
         def closeEvent(self, event) -> None:  # type: ignore[override]
+            def _stop_thread(thread, worker=None, *, wait_ms: int = 1200) -> None:
+                if worker is not None:
+                    try:
+                        worker.stop()
+                    except Exception:
+                        pass
+                if thread is None:
+                    return
+                try:
+                    if thread.isRunning():
+                        thread.quit()
+                        thread.wait(wait_ms)
+                except Exception:
+                    pass
+
             self._shutting_down = True
             nonlocal _active_main_window
             _active_main_window = None
@@ -6729,20 +6744,6 @@ def run_gui() -> int:
                 self.build_worker.stop()
             if self.dds_to_png_worker is not None:
                 self.dds_to_png_worker.stop()
-            if self.worker_thread is not None:
-                if not self.worker_thread.wait(4000):
-                    self.worker_thread.quit()
-                    self.worker_thread.wait(2000)
-            if self.compare_preview_thread is not None:
-                if self.compare_preview_worker is not None:
-                    self.compare_preview_worker.stop()
-                self.compare_preview_thread.quit()
-                self.compare_preview_thread.wait(4000)
-            if self.archive_preview_thread is not None:
-                if self.archive_preview_worker is not None:
-                    self.archive_preview_worker.stop()
-                self.archive_preview_thread.quit()
-                self.archive_preview_thread.wait(4000)
             self.settings_tab.flush_settings_save()
             self.replace_assistant_tab.flush_settings_save()
             self.texture_editor_tab.flush_settings_save()
@@ -6750,6 +6751,9 @@ def run_gui() -> int:
             self.research_tab.shutdown()
             self.replace_assistant_tab.shutdown()
             self.texture_editor_tab.shutdown()
+            _stop_thread(self.worker_thread)
+            _stop_thread(self.compare_preview_thread, self.compare_preview_worker)
+            _stop_thread(self.archive_preview_thread, self.archive_preview_worker)
             super().closeEvent(event)
 
     apply_windows_app_user_model_id()

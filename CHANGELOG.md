@@ -9,6 +9,23 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.6.0] - 2026-04-16
+
+### Added
+- Promoted the expanded `Texture Editor` work from the beta cycle into the first full `0.6.0` release, including layered in-app texture editing, masks, adjustments, packed-channel helpers, navigator/rulers/guides, atlas export helpers, and a much broader visible-texture toolset than earlier builds.
+- Folded the final late-cycle editor and workflow fixes into the release build, including straighter feathered selection extraction, hole-preserving mask/selection round-trips, layer-mask cleanup on deletion, better ruler/guide behavior, and smoother `Text Search` / `Research` result population on large datasets.
+
+### Changed
+- `0.6.0` now represents the stabilized release line after the `0.6.0-beta.x` cycle, so the editor, replacement, DDS preview, research, and packaging workflows described in the current README are now part of the main release instead of being gated behind a prerelease note.
+- The app now behaves better during heavier editing/review sessions, with lighter shutdown waits, incremental large-tree population in `Text Search` / `Research`, and additional Texture Editor UI polish around guides, rulers, and atlas controls.
+
+### Fixed
+- Fixed additional correctness issues in the release pass, including soft-selection edge extraction, stale mask/adjustment references after layer removal, guide clear/apply behavior, Atlas panel text clipping, and ruler hover alignment when the canvas is centered inside the viewport.
+- Fixed more late-cycle workflow rough edges across `Texture Editor`, `Text Search`, and `Research`, so the final `0.6.0` build is more stable and less visibly hitchy than the previous `0.6.0-beta.4` prerelease.
+
+### Docs
+- Updated the README and release notes for the final `0.6.0` release and kept the beta changelog history intact underneath for users following the development cycle.
+
 ## [0.6.0-beta.4] - 2026-04-16
 
 ### Added

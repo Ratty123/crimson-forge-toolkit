@@ -213,7 +213,7 @@ class TextSearchTab(QWidget):
         self.scheduled_preview_result: Optional[TextSearchResult] = None
         self.search_results: List[TextSearchResult] = []
         self.current_preview_result: Optional[TextSearchResult] = None
-        self._pending_result_items: List[QTreeWidgetItem] = []
+        self._pending_result_indexes: List[int] = []
         self._pending_result_total = 0
         self._pending_auto_preview_enabled = False
         self.last_search_query = ""
@@ -836,7 +836,7 @@ class TextSearchTab(QWidget):
 
     def _clear_pending_result_population(self) -> None:
         self._results_population_timer.stop()
-        self._pending_result_items = []
+        self._pending_result_indexes = []
         self._pending_result_total = 0
         self._pending_auto_preview_enabled = False
 
@@ -872,8 +872,8 @@ class TextSearchTab(QWidget):
         if self.search_results and not auto_preview_enabled:
             summary += " Auto-preview was skipped because the result set is very large."
         self.results_summary_label.setText(summary)
-        self._pending_result_items = [self._build_result_item(index, result) for index, result in enumerate(self.search_results)]
-        self._pending_result_total = len(self._pending_result_items)
+        self._pending_result_indexes = list(range(len(self.search_results)))
+        self._pending_result_total = len(self._pending_result_indexes)
         self._pending_auto_preview_enabled = auto_preview_enabled
         if self._pending_result_total:
             self.search_progress_label.setText(f"Populating results... 0 / {self._pending_result_total}")
@@ -913,20 +913,21 @@ class TextSearchTab(QWidget):
         self._clear_pending_result_population()
 
     def _flush_result_population_batch(self) -> None:
-        if not self._pending_result_items:
+        if not self._pending_result_indexes:
             self._finalize_result_population()
             return
-        batch = self._pending_result_items[: self.RESULT_POPULATION_BATCH_SIZE]
-        del self._pending_result_items[: self.RESULT_POPULATION_BATCH_SIZE]
+        batch_indexes = self._pending_result_indexes[: self.RESULT_POPULATION_BATCH_SIZE]
+        del self._pending_result_indexes[: self.RESULT_POPULATION_BATCH_SIZE]
+        batch = [self._build_result_item(index, self.search_results[index]) for index in batch_indexes]
         self.results_tree.setUpdatesEnabled(False)
         self.results_tree.addTopLevelItems(batch)
         self.results_tree.setUpdatesEnabled(True)
-        populated = self._pending_result_total - len(self._pending_result_items)
+        populated = self._pending_result_total - len(self._pending_result_indexes)
         self.search_progress_label.setText(f"Populating results... {populated} / {self._pending_result_total}")
         self.search_progress_bar.setRange(0, max(1, self._pending_result_total))
         self.search_progress_bar.setValue(populated)
         self.search_progress_bar.setFormat(f"{populated} / {self._pending_result_total}")
-        if self._pending_result_items:
+        if self._pending_result_indexes:
             self._results_population_timer.start()
             return
         self._finalize_result_population()

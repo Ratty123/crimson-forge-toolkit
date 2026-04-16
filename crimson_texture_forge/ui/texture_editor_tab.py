@@ -487,6 +487,7 @@ class TextureEditorRuler(QWidget):
         self._other_length = 0
         self._display_scale = 1.0
         self._scroll_value = 0
+        self._viewport_offset = 0
         self._hover_position: Optional[int] = None
         self._guides: Tuple[int, ...] = ()
         if orientation == Qt.Horizontal:
@@ -503,6 +504,7 @@ class TextureEditorRuler(QWidget):
         other_length: int,
         display_scale: float,
         scroll_value: int,
+        viewport_offset: int,
         hover_position: Optional[int],
         guides: Sequence[int],
     ) -> None:
@@ -510,6 +512,7 @@ class TextureEditorRuler(QWidget):
         self._other_length = max(0, int(other_length))
         self._display_scale = max(0.0001, float(display_scale))
         self._scroll_value = max(0, int(scroll_value))
+        self._viewport_offset = int(viewport_offset)
         self._hover_position = None if hover_position is None else int(hover_position)
         self._guides = tuple(int(value) for value in guides)
         self.update()
@@ -539,7 +542,7 @@ class TextureEditorRuler(QWidget):
         else:
             painter.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
             visible_pixels = self.height() / self._display_scale
-        start_pixel = float(self._scroll_value) / self._display_scale
+        start_pixel = -float(self._viewport_offset) / self._display_scale
         end_pixel = min(float(self._image_length), start_pixel + visible_pixels)
         step = self._tick_step()
         first_tick = int(math.floor(start_pixel / float(step)) * step)
@@ -563,7 +566,7 @@ class TextureEditorRuler(QWidget):
         guide_pen = QPen(QColor(116, 193, 255, 140), 1)
         hover_pen = QPen(QColor("#F2C14E"), 1)
         for guide in self._guides:
-            pos = (float(guide) - start_pixel) * self._display_scale
+            pos = self._viewport_offset + (float(guide) * self._display_scale)
             painter.setPen(guide_pen)
             if self._orientation == Qt.Horizontal:
                 x = int(round(pos))
@@ -572,7 +575,7 @@ class TextureEditorRuler(QWidget):
                 y = int(round(pos))
                 painter.drawLine(0, y, self.width(), y)
         if self._hover_position is not None:
-            pos = (float(self._hover_position) - start_pixel) * self._display_scale
+            pos = self._viewport_offset + (float(self._hover_position) * self._display_scale)
             painter.setPen(hover_pen)
             if self._orientation == Qt.Horizontal:
                 x = int(round(pos))
@@ -2600,6 +2603,8 @@ class TextureEditorTab(QWidget):
         atlas_layout.setSpacing(8)
         self.atlas_help_label = QLabel("Use the current grid size for atlas slicing, or export the current selection as a padded region.")
         self.atlas_help_label.setWordWrap(True)
+        self.atlas_help_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.atlas_help_label.setMinimumHeight((self.atlas_help_label.fontMetrics().lineSpacing() * 3) + 6)
         atlas_layout.addWidget(self.atlas_help_label)
         atlas_form = QFormLayout()
         atlas_form.setContentsMargins(0, 0, 0, 0)
@@ -2889,6 +2894,8 @@ class TextureEditorTab(QWidget):
         self.show_guides_checkbox.toggled.connect(self._handle_navigation_overlay_changed)
         self.apply_guides_button.clicked.connect(self._handle_navigation_overlay_changed)
         self.clear_guides_button.clicked.connect(self.clear_guides)
+        self.vertical_guides_edit.textChanged.connect(lambda *_args: self._sync_enabled_state())
+        self.horizontal_guides_edit.textChanged.connect(lambda *_args: self._sync_enabled_state())
         self.vertical_guides_edit.editingFinished.connect(self._handle_navigation_overlay_changed)
         self.horizontal_guides_edit.editingFinished.connect(self._handle_navigation_overlay_changed)
         self.paint_color_button.clicked.connect(lambda: self._pick_color_into(self.paint_color_edit))
@@ -3772,6 +3779,7 @@ class TextureEditorTab(QWidget):
                 other_length=0,
                 display_scale=1.0,
                 scroll_value=0,
+                viewport_offset=0,
                 hover_position=None,
                 guides=(),
             )
@@ -3780,6 +3788,7 @@ class TextureEditorTab(QWidget):
                 other_length=0,
                 display_scale=1.0,
                 scroll_value=0,
+                viewport_offset=0,
                 hover_position=None,
                 guides=(),
             )
@@ -3788,6 +3797,9 @@ class TextureEditorTab(QWidget):
         scale = max(0.0001, self.canvas.current_display_scale())
         scroll_x = int(self.canvas_scroll.horizontalScrollBar().value())
         scroll_y = int(self.canvas_scroll.verticalScrollBar().value())
+        canvas_origin = self.canvas.mapTo(self.canvas_scroll.viewport(), QPoint(0, 0))
+        viewport_offset_x = int(canvas_origin.x())
+        viewport_offset_y = int(canvas_origin.y())
         hover_x = None if self._hover_pixel_info is None else int(self._hover_pixel_info.get("x", 0))
         hover_y = None if self._hover_pixel_info is None else int(self._hover_pixel_info.get("y", 0))
         self.top_ruler.set_state(
@@ -3795,6 +3807,7 @@ class TextureEditorTab(QWidget):
             other_length=int(self.document.height),
             display_scale=scale,
             scroll_value=scroll_x,
+            viewport_offset=viewport_offset_x,
             hover_position=hover_x,
             guides=vertical_guides,
         )
@@ -3803,6 +3816,7 @@ class TextureEditorTab(QWidget):
             other_length=int(self.document.width),
             display_scale=scale,
             scroll_value=scroll_y,
+            viewport_offset=viewport_offset_y,
             hover_position=hover_y,
             guides=horizontal_guides,
         )
@@ -3840,9 +3854,19 @@ class TextureEditorTab(QWidget):
             self.workspace.document_view_state[document_key] = self._capture_view_state()
 
     def clear_guides(self) -> None:
+        self._vertical_guides = ()
+        self._horizontal_guides = ()
+        self.vertical_guides_edit.blockSignals(True)
+        self.horizontal_guides_edit.blockSignals(True)
         self.vertical_guides_edit.setText("")
         self.horizontal_guides_edit.setText("")
-        self._handle_navigation_overlay_changed()
+        self.vertical_guides_edit.blockSignals(False)
+        self.horizontal_guides_edit.blockSignals(False)
+        self._refresh_navigation_overlays()
+        document_key = self._active_document_key()
+        if document_key:
+            self.workspace.document_view_state[document_key] = self._capture_view_state()
+        self._sync_enabled_state()
         self._set_status("Texture Editor guides cleared.", False)
 
     def _handle_canvas_hover_changed(self, payload: object) -> None:
@@ -6720,10 +6744,19 @@ class TextureEditorTab(QWidget):
         self.navigator_widget.setEnabled(has_doc and not busy)
         self.show_rulers_checkbox.setEnabled(has_doc and not busy)
         self.show_guides_checkbox.setEnabled(has_doc and not busy)
-        self.vertical_guides_edit.setEnabled(has_doc and not busy and self.show_guides_checkbox.isChecked())
-        self.horizontal_guides_edit.setEnabled(has_doc and not busy and self.show_guides_checkbox.isChecked())
+        self.vertical_guides_edit.setEnabled(has_doc and not busy)
+        self.horizontal_guides_edit.setEnabled(has_doc and not busy)
         self.apply_guides_button.setEnabled(has_doc and not busy)
-        self.clear_guides_button.setEnabled(has_doc and not busy and (bool(self._vertical_guides) or bool(self._horizontal_guides)))
+        self.clear_guides_button.setEnabled(
+            has_doc
+            and not busy
+            and (
+                bool(self._vertical_guides)
+                or bool(self._horizontal_guides)
+                or bool(self.vertical_guides_edit.text().strip())
+                or bool(self.horizontal_guides_edit.text().strip())
+            )
+        )
         self.canvas.setEnabled(has_doc and not busy)
         self.document_tab_bar.setEnabled(not busy)
         for button in self.tool_buttons.values():
