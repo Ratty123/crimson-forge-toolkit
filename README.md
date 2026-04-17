@@ -1,4 +1,4 @@
-# Crimson Texture Forge
+# Crimson Forge Toolkit
 
 Windows desktop tool for **Crimson Desert texture workflows**, **read-only archive browsing**, **texture research**, and **text search**.
 
