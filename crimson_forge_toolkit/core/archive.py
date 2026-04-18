@@ -2455,6 +2455,7 @@ def build_archive_preview_result(
     entry: Optional[ArchiveEntry],
     loose_search_roots: Optional[Sequence[Path]] = None,
     *,
+    include_loose_preview_assets: bool = True,
     stop_event: Optional[threading.Event] = None,
 ) -> ArchivePreviewResult:
     if entry is None:
@@ -2480,25 +2481,26 @@ def build_archive_preview_result(
             loose_candidate = loose_candidates[0]
             loose_file_path = str(loose_candidate)
             loose_preview_title = f"{entry.basename} (Loose file)"
-            try:
-                (
-                    loose_preview_image_path,
-                    loose_preview_metadata_summary,
-                    loose_preview_detail_text,
-                ) = build_loose_archive_preview_assets(
-                    texconv_path,
-                    loose_candidate,
-                    stop_event=stop_event,
-                )
-            except Exception as exc:
-                loose_preview_metadata_summary = f"Loose file | {loose_candidate.name}"
-                loose_preview_detail_text = (
-                    f"Loose file candidate found at {loose_candidate}, but preview failed: {exc}"
-                )
-            if len(loose_candidates) > 1:
-                loose_preview_detail_text += (
-                    f"\n\nAdditional loose candidates found: {len(loose_candidates) - 1}"
-                )
+            if include_loose_preview_assets:
+                try:
+                    (
+                        loose_preview_image_path,
+                        loose_preview_metadata_summary,
+                        loose_preview_detail_text,
+                    ) = build_loose_archive_preview_assets(
+                        texconv_path,
+                        loose_candidate,
+                        stop_event=stop_event,
+                    )
+                except Exception as exc:
+                    loose_preview_metadata_summary = f"Loose file | {loose_candidate.name}"
+                    loose_preview_detail_text = (
+                        f"Loose file candidate found at {loose_candidate}, but preview failed: {exc}"
+                    )
+                if len(loose_candidates) > 1:
+                    loose_preview_detail_text += (
+                        f"\n\nAdditional loose candidates found: {len(loose_candidates) - 1}"
+                    )
 
     try:
         if extension == ".dds":

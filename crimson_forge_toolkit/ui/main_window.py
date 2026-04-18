@@ -620,12 +620,14 @@ def run_gui() -> int:
             texconv_path: Optional[Path],
             entry: Optional[ArchiveEntry],
             loose_search_roots: Sequence[Path],
+            include_loose_preview_assets: bool = False,
         ):
             super().__init__()
             self.request_id = request_id
             self.texconv_path = texconv_path
             self.entry = entry
             self.loose_search_roots = list(loose_search_roots)
+            self.include_loose_preview_assets = include_loose_preview_assets
             self.stop_event = threading.Event()
 
         def stop(self) -> None:
@@ -640,8 +642,12 @@ def run_gui() -> int:
                     self.texconv_path,
                     self.entry,
                     self.loose_search_roots,
+                    include_loose_preview_assets=self.include_loose_preview_assets,
                     stop_event=self.stop_event,
                 )
+                if self.stop_event.is_set():
+                    return
+                payload = self._attach_loaded_images(payload)
                 if self.stop_event.is_set():
                     return
                 if not self.stop_event.is_set():
@@ -651,6 +657,26 @@ def run_gui() -> int:
                     self.error.emit(self.request_id, str(exc))
             finally:
                 self.finished.emit()
+
+        def _attach_loaded_images(self, result: ArchivePreviewResult) -> ArchivePreviewResult:
+            preview_image = self._load_image(result.preview_image_path)
+            loose_preview_image = self._load_image(result.loose_preview_image_path)
+            if preview_image is None and loose_preview_image is None:
+                return result
+            return dataclasses.replace(
+                result,
+                preview_image=preview_image,
+                loose_preview_image=loose_preview_image,
+            )
+
+        def _load_image(self, image_path: str) -> object:
+            if self.stop_event.is_set() or not image_path:
+                return None
+            reader = QImageReader(image_path)
+            image = reader.read()
+            if self.stop_event.is_set() or image.isNull():
+                return None
+            return image
 
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
@@ -703,9 +729,10 @@ def run_gui() -> int:
             self.archive_preview_thread: Optional[QThread] = None
             self.archive_preview_worker: Optional[ArchivePreviewWorker] = None
             self.archive_preview_request_id = 0
-            self.pending_archive_preview_request: Optional[Tuple[int, Optional[ArchiveEntry]]] = None
-            self.scheduled_archive_preview_request: Optional[Tuple[int, Optional[ArchiveEntry]]] = None
+            self.pending_archive_preview_request: Optional[Tuple[int, Optional[ArchiveEntry], bool]] = None
+            self.scheduled_archive_preview_request: Optional[Tuple[int, Optional[ArchiveEntry], bool]] = None
             self.current_archive_preview_result: Optional[ArchivePreviewResult] = None
+            self.archive_preview_requested_loose = False
             self.archive_preview_showing_loose = False
             self.archive_entries: List[ArchiveEntry] = []
             self.archive_filtered_entries: List[ArchiveEntry] = []
@@ -732,6 +759,10 @@ def run_gui() -> int:
             self.archive_preview_debounce_timer.setSingleShot(True)
             self.archive_preview_debounce_timer.setInterval(90)
             self.archive_preview_debounce_timer.timeout.connect(self._flush_scheduled_archive_preview_request)
+            self.archive_selection_state_timer = QTimer(self)
+            self.archive_selection_state_timer.setSingleShot(True)
+            self.archive_selection_state_timer.setInterval(30)
+            self.archive_selection_state_timer.timeout.connect(self._update_archive_selection_state)
             self._last_build_unknown_review_result: Optional[Dict[str, object]] = None
 
             icon_path = resolve_app_icon_path()
@@ -2122,7 +2153,7 @@ def run_gui() -> int:
             self.archive_previewable_only_checkbox.toggled.connect(self.schedule_settings_save)
             self.archive_previewable_only_checkbox.toggled.connect(self._mark_archive_filters_dirty)
             self.archive_tree.currentItemChanged.connect(self._handle_archive_current_item_change)
-            self.archive_tree.itemSelectionChanged.connect(self._update_archive_selection_state)
+            self.archive_tree.itemSelectionChanged.connect(self._schedule_archive_selection_state_update)
             self.archive_tree.itemExpanded.connect(self._handle_archive_item_expanded)
             self.archive_preview_zoom_fit_button.clicked.connect(self._set_archive_preview_fit_mode)
             self.archive_preview_zoom_100_button.clicked.connect(lambda: self._set_archive_preview_zoom_factor(1.0))
@@ -5913,6 +5944,7 @@ def run_gui() -> int:
             self.scheduled_archive_preview_request = None
             self.archive_preview_debounce_timer.stop()
             self.current_archive_preview_result = None
+            self.archive_preview_requested_loose = False
             self.archive_preview_showing_loose = False
             self.archive_preview_title_label.setText("Select an archive file")
             self.archive_preview_meta_label.setText(message)
@@ -5935,6 +5967,9 @@ def run_gui() -> int:
             self.pending_archive_preview_request = None
             self.scheduled_archive_preview_request = None
             self.archive_preview_debounce_timer.stop()
+            self.current_archive_preview_result = None
+            self.archive_preview_requested_loose = False
+            self.archive_preview_showing_loose = False
             collected_indexes: set[int] = set()
             self._collect_archive_entries_from_item(item, collected_indexes)
             entries = [self.archive_filtered_entries[index] for index in sorted(collected_indexes)]
@@ -5972,41 +6007,68 @@ def run_gui() -> int:
             previous: Optional[QTreeWidgetItem],
         ) -> None:
             del previous
-            if current is None:
-                self._clear_archive_preview("Select an archive file to preview it here.")
-                return
-            if self._archive_tree_item_kind(current) == "folder":
-                self._ensure_archive_folder_item_populated(current)
-                self._show_archive_folder_preview(current)
-            else:
-                entry = self._current_archive_entry()
-                if entry is not None:
-                    self._render_archive_preview(entry)
-                else:
+            try:
+                if current is None:
+                    self._clear_archive_preview("Select an archive file to preview it here.")
+                    self._schedule_archive_selection_state_update()
+                    return
+                if self._archive_tree_item_kind(current) == "folder":
+                    self._ensure_archive_folder_item_populated(current)
                     self._show_archive_folder_preview(current)
-            self._update_archive_selection_state()
+                else:
+                    entry = self._current_archive_entry()
+                    if entry is not None:
+                        self._render_archive_preview(entry)
+                    else:
+                        self._show_archive_folder_preview(current)
+                self._schedule_archive_selection_state_update()
+            except Exception as exc:
+                _write_crash_report(
+                    "archive_selection_error",
+                    "Archive Browser selection error",
+                    str(exc),
+                    context=_collect_crash_context(),
+                )
+                self._clear_archive_preview(f"Preview failed: {exc}")
+                self.set_status_message(f"Archive preview failed: {exc}", error=True)
 
-        def _render_archive_preview(self, entry: Optional[ArchiveEntry]) -> None:
+        def _schedule_archive_selection_state_update(self) -> None:
+            self.archive_selection_state_timer.start()
+
+        def _render_archive_preview(
+            self,
+            entry: Optional[ArchiveEntry],
+            *,
+            include_loose_preview_assets: bool = False,
+            prefer_loose_preview: bool = False,
+        ) -> None:
             request_id = self.archive_preview_request_id + 1
             self.archive_preview_request_id = request_id
+            self.archive_preview_requested_loose = bool(entry is not None and prefer_loose_preview)
             self.archive_preview_title_label.setText(entry.basename if entry is not None else "Select an archive file")
-            self.archive_preview_meta_label.setText("Loading preview...")
+            self.archive_preview_meta_label.setText(
+                "Loading loose-file preview..." if self.archive_preview_requested_loose else "Loading preview..."
+            )
             self.archive_preview_warning_badge.clear()
             self.archive_preview_warning_badge.setVisible(False)
             self.archive_preview_warning_label.clear()
             self.archive_preview_warning_label.setVisible(False)
             self.archive_preview_loose_toggle_button.setVisible(False)
             self.archive_preview_loose_toggle_button.setEnabled(False)
-            self.archive_preview_details_edit.setPlainText("Preparing archive preview...")
-            self.archive_preview_info_edit.setPlainText("Preparing archive preview...")
+            self.archive_preview_details_edit.setPlainText(
+                "Preparing loose-file preview..." if self.archive_preview_requested_loose else "Preparing archive preview..."
+            )
+            self.archive_preview_info_edit.setPlainText(
+                "Preparing loose-file preview..." if self.archive_preview_requested_loose else "Preparing archive preview..."
+            )
             self.pending_archive_preview_request = None
-            self.scheduled_archive_preview_request = (request_id, entry)
+            self.scheduled_archive_preview_request = (request_id, entry, include_loose_preview_assets)
             self.archive_preview_debounce_timer.start()
 
         def _flush_scheduled_archive_preview_request(self) -> None:
             if self.scheduled_archive_preview_request is None:
                 return
-            request_id, entry = self.scheduled_archive_preview_request
+            request_id, entry, include_loose_preview_assets = self.scheduled_archive_preview_request
             self.scheduled_archive_preview_request = None
 
             texconv_text = self.texconv_path_edit.text().strip()
@@ -6014,12 +6076,18 @@ def run_gui() -> int:
             loose_search_roots = self._collect_archive_preview_loose_roots()
 
             if self.archive_preview_thread is not None:
-                self.pending_archive_preview_request = (request_id, entry)
+                self.pending_archive_preview_request = (request_id, entry, include_loose_preview_assets)
                 if self.archive_preview_worker is not None:
                     self.archive_preview_worker.stop()
                 return
 
-            self._start_archive_preview_worker(request_id, texconv_path, entry, loose_search_roots)
+            self._start_archive_preview_worker(
+                request_id,
+                texconv_path,
+                entry,
+                loose_search_roots,
+                include_loose_preview_assets=include_loose_preview_assets,
+            )
 
         def _start_archive_preview_worker(
             self,
@@ -6027,8 +6095,16 @@ def run_gui() -> int:
             texconv_path: Optional[Path],
             entry: Optional[ArchiveEntry],
             loose_search_roots: Sequence[Path],
+            *,
+            include_loose_preview_assets: bool = False,
         ) -> None:
-            worker = ArchivePreviewWorker(request_id, texconv_path, entry, loose_search_roots)
+            worker = ArchivePreviewWorker(
+                request_id,
+                texconv_path,
+                entry,
+                loose_search_roots,
+                include_loose_preview_assets=include_loose_preview_assets,
+            )
             thread = QThread(self)
             worker.moveToThread(thread)
 
@@ -6047,8 +6123,18 @@ def run_gui() -> int:
         def _handle_archive_preview_ready(self, request_id: int, payload: object) -> None:
             if self._shutting_down or request_id != self.archive_preview_request_id:
                 return
-            if isinstance(payload, ArchivePreviewResult):
-                self._apply_archive_preview_result(payload)
+            try:
+                if isinstance(payload, ArchivePreviewResult):
+                    self._apply_archive_preview_result(payload)
+            except Exception as exc:
+                _write_crash_report(
+                    "archive_preview_ready_error",
+                    "Archive preview apply error",
+                    str(exc),
+                    context=_collect_crash_context(),
+                )
+                self._clear_archive_preview(f"Preview failed: {exc}")
+                self.set_status_message(f"Archive preview failed: {exc}", error=True)
 
         def _handle_archive_preview_error(self, request_id: int, message: str) -> None:
             if self._shutting_down or request_id != self.archive_preview_request_id:
@@ -6162,15 +6248,41 @@ def run_gui() -> int:
         def _toggle_archive_loose_preview(self) -> None:
             if self.current_archive_preview_result is None or not self.current_archive_preview_result.loose_file_path:
                 return
-            self._show_archive_preview_result(
-                self.current_archive_preview_result,
-                use_loose=not self.archive_preview_showing_loose,
+            if self.archive_preview_showing_loose:
+                self.archive_preview_requested_loose = False
+                self._show_archive_preview_result(self.current_archive_preview_result, use_loose=False)
+                return
+
+            if (
+                self.current_archive_preview_result.loose_preview_image is not None
+                or self.current_archive_preview_result.loose_preview_image_path
+            ):
+                self.archive_preview_requested_loose = True
+                self._show_archive_preview_result(self.current_archive_preview_result, use_loose=True)
+                return
+
+            entry = self._current_archive_entry()
+            if entry is None:
+                return
+            self._render_archive_preview(
+                entry,
+                include_loose_preview_assets=True,
+                prefer_loose_preview=True,
             )
 
         def _apply_archive_preview_result(self, result: ArchivePreviewResult) -> None:
-            self.current_archive_preview_result = result
-            self.archive_preview_showing_loose = False
-            self._show_archive_preview_result(result, use_loose=False)
+            try:
+                self.current_archive_preview_result = result
+                self._show_archive_preview_result(result, use_loose=self.archive_preview_requested_loose)
+            except Exception as exc:
+                _write_crash_report(
+                    "archive_preview_result_error",
+                    "Archive preview result error",
+                    str(exc),
+                    context=_collect_crash_context(),
+                )
+                self._clear_archive_preview(f"Preview failed: {exc}")
+                self.set_status_message(f"Archive preview failed: {exc}", error=True)
 
         def _cleanup_archive_preview_refs(self) -> None:
             self.archive_preview_thread = None
@@ -6181,7 +6293,7 @@ def run_gui() -> int:
                 return
             if self.pending_archive_preview_request is None:
                 return
-            request_id, entry = self.pending_archive_preview_request
+            request_id, entry, include_loose_preview_assets = self.pending_archive_preview_request
             self.pending_archive_preview_request = None
             texconv_text = self.texconv_path_edit.text().strip()
             texconv_path = Path(texconv_text).expanduser() if texconv_text else None
@@ -6190,6 +6302,7 @@ def run_gui() -> int:
                 texconv_path,
                 entry,
                 self._collect_archive_preview_loose_roots(),
+                include_loose_preview_assets=include_loose_preview_assets,
             )
 
         def _set_archive_preview_image_controls_enabled(self, enabled: bool) -> None:
@@ -6203,28 +6316,28 @@ def run_gui() -> int:
                 self._update_archive_preview_zoom_label()
 
         def _update_archive_selection_state(self) -> None:
-            selected_count = len(self._selected_archive_entries())
+            selected_entries = self._selected_archive_entries()
+            selected_count = len(selected_entries)
             has_filtered_entries = bool(self.archive_filtered_entries)
-            has_filtered_dds = any(entry.extension == ".dds" for entry in self.archive_filtered_entries)
-            selected_has_dds = any(entry.extension == ".dds" for entry in self._selected_archive_entries())
+            has_filtered_dds = self.archive_filtered_dds_count > 0
+            selected_has_dds = any(entry.extension == ".dds" for entry in selected_entries)
             workflow_extract_enabled = selected_has_dds if selected_count > 0 else has_filtered_dds
             self.archive_extract_selected_button.setEnabled(self.worker_thread is None and selected_count > 0)
             self.archive_extract_filtered_button.setEnabled(self.worker_thread is None and has_filtered_entries)
             self.archive_extract_to_workflow_button.setEnabled(self.worker_thread is None and workflow_extract_enabled)
-            self.archive_open_in_editor_button.setEnabled(
-                self.worker_thread is None and self._current_archive_entry() is not None
-            )
+            current_entry = self._current_archive_entry()
+            self.archive_open_in_editor_button.setEnabled(self.worker_thread is None and current_entry is not None)
             self.archive_resolve_in_research_button.setEnabled(
                 self.worker_thread is None
-                and self._current_archive_entry() is not None
-                and self._current_archive_entry().extension == ".dds"
+                and current_entry is not None
+                and current_entry.extension == ".dds"
             )
             if not self.archive_entries:
                 self.archive_stats_label.setText("No archives scanned.")
                 return
             self.archive_stats_label.setText(
                 f"{len(self.archive_filtered_entries):,} shown / {len(self.archive_entries):,} total entries. "
-                f"DDS in current view: {sum(1 for entry in self.archive_filtered_entries if entry.extension == '.dds'):,}. "
+                f"DDS in current view: {self.archive_filtered_dds_count:,}. "
                 f"Selected files: {selected_count:,}."
             )
 
@@ -7669,6 +7782,7 @@ def run_gui() -> int:
             self._chainner_analysis_timer.stop()
             self._compare_preview_timer.stop()
             self.archive_preview_debounce_timer.stop()
+            self.archive_selection_state_timer.stop()
             self.pending_compare_preview_selection = None
             self.pending_compare_preview_request = None
             self.pending_archive_preview_request = None

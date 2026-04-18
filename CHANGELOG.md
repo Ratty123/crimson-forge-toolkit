@@ -31,6 +31,7 @@ The format is intentionally simple:
 - Fixed classification/local-approval clarity issues so the app better distinguishes inferred roles from saved local approvals, routes workflow review to the correct DDS more reliably, and provides faster per-file local-save actions.
 - Fixed more `Texture Editor` issues around guide clearing, document metadata sizing, hidden tab close buttons, image/atlas action layout, light-theme tool icon visibility, grid visibility, and font consistency across the left and right editor panes.
 - Fixed several settings/runtime problems, including slow font-size stepping, typed font-size editing, missing imports and startup crashes, DDS-details exceptions, more accurate DDS surface estimates for arrays/cubemaps, and other late-cycle packaging/runtime errors.
+- Fixed another `Archive Browser` DDS preview hang where rapidly browsing many archive textures could eventually leave the app stuck in `Not Responding`, by avoiding eager loose-preview generation and reducing heavy per-click archive selection recomputation on the UI thread.
 
 ### Docs
 - Updated the README for `0.6.5`, refreshed the feature summary and screenshots, and replaced the old `docs/screenshots` set with current captures from the renamed and polished `Crimson Forge Toolkit` UI.
