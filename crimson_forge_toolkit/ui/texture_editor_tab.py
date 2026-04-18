@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import html
+import json
 import math
 import threading
 import time
