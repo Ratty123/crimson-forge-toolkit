@@ -15,7 +15,7 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 try:
     from PIL import Image as PilImage
@@ -82,6 +82,10 @@ _VALID_RULE_COLORSPACE_OVERRIDES = frozenset({"srgb", "linear", "match_source"})
 _VALID_RULE_ALPHA_POLICIES = frozenset({"none", "straight", "cutout_coverage", "channel_data", "premultiplied"})
 _VALID_RULE_INTERMEDIATE_OVERRIDES = frozenset(
     {"visible_color_png_path", "technical_preserve_path", "technical_high_precision_path"}
+)
+_VALID_RULE_MATCH_MODES = frozenset({"glob", "exact"})
+_VALID_WORKFLOW_PROFILE_ACTIONS = frozenset(
+    {"", "upscale_then_rebuild", "rebuild_from_png", "preserve_original", "skip"}
 )
 _SCALAR_HIGH_PRECISION_MASK_SUBTYPES = frozenset(
     {
@@ -236,6 +240,496 @@ _PROFILE_TABLE: Dict[str, TextureProcessingProfile] = {
         preserve_only=True,
     ),
 }
+
+
+def get_texture_processing_profile_keys() -> Tuple[str, ...]:
+    return tuple(sorted(_PROFILE_TABLE))
+
+
+def build_default_texture_workflow_profiles() -> Tuple[TextureWorkflowProfile, ...]:
+    return (
+        TextureWorkflowProfile(
+            profile_id="starter_color_albedo",
+            label="Starter Color / Albedo",
+            action_mode="upscale_then_rebuild",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            post_correction_mode=UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_normal_map",
+            label="Starter Normal",
+            action_mode="preserve_original",
+            format_value="BC5_UNORM",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_height_displacement",
+            label="Starter Height / Displacement",
+            action_mode="preserve_original",
+            format_value=DDS_FORMAT_MODE_MATCH_ORIGINAL,
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_specular",
+            label="Starter Specular",
+            action_mode="preserve_original",
+            format_value=DDS_FORMAT_MODE_MATCH_ORIGINAL,
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+    )
+
+
+def build_default_texture_workflow_rules() -> Tuple[TextureRule, ...]:
+    return (
+        TextureRule(
+            pattern="*.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_color_albedo",
+            colorspace_value="match_source",
+            alpha_policy_value="straight",
+            intermediate_value="visible_color_png_path",
+            source_line="default starter rule: *.dds",
+        ),
+        TextureRule(
+            pattern="*_n.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_normal_map",
+            semantic_value="normal:normal",
+            profile_value="normal_bc5",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="technical_preserve_path",
+            source_line="default starter rule: *_n.dds",
+        ),
+        TextureRule(
+            pattern="*_d.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_height_displacement",
+            semantic_value="height:displacement",
+            profile_value="scalar_high_precision_bc4",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="technical_high_precision_path",
+            source_line="default starter rule: *_d.dds",
+        ),
+        TextureRule(
+            pattern="*_disp.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_height_displacement",
+            semantic_value="height:displacement",
+            profile_value="scalar_high_precision_bc4",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="technical_high_precision_path",
+            source_line="default starter rule: *_disp.dds",
+        ),
+        TextureRule(
+            pattern="*_sp.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_specular",
+            semantic_value="mask:specular",
+            profile_value="scalar_bc4",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="technical_preserve_path",
+            source_line="default starter rule: *_sp.dds",
+        ),
+    )
+
+
+def _build_legacy_default_texture_workflow_profiles() -> Tuple[TextureWorkflowProfile, ...]:
+    return (
+        TextureWorkflowProfile(
+            profile_id="starter_color_albedo",
+            label="Starter Color / Albedo",
+            action_mode="upscale_then_rebuild",
+            format_value="BC7_UNORM_SRGB",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            ncnn_scale=4,
+            post_correction_mode=UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_normal_map",
+            label="Starter Normal",
+            action_mode="upscale_then_rebuild",
+            format_value="BC5_UNORM",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            ncnn_scale=2,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_height_displacement",
+            label="Starter Height / Displacement",
+            action_mode="upscale_then_rebuild",
+            format_value="BC4_UNORM",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            ncnn_scale=2,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_specular",
+            label="Starter Specular",
+            action_mode="upscale_then_rebuild",
+            format_value="BC4_UNORM",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            ncnn_scale=2,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+    )
+
+
+def _build_pre_conservative_specular_texture_workflow_profiles() -> Tuple[TextureWorkflowProfile, ...]:
+    profiles = list(build_default_texture_workflow_profiles())
+    for index, profile in enumerate(profiles):
+        if profile.profile_id == "starter_specular":
+            profiles[index] = replace(profile, format_value="BC4_UNORM")
+            break
+    return tuple(profiles)
+
+
+def _build_pre_inherit_scale_texture_workflow_profiles() -> Tuple[TextureWorkflowProfile, ...]:
+    return (
+        TextureWorkflowProfile(
+            profile_id="starter_color_albedo",
+            label="Starter Color / Albedo",
+            action_mode="upscale_then_rebuild",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            ncnn_scale=4,
+            post_correction_mode=UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_normal_map",
+            label="Starter Normal",
+            action_mode="upscale_then_rebuild",
+            format_value="BC5_UNORM",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            ncnn_scale=2,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_height_displacement",
+            label="Starter Height / Displacement",
+            action_mode="upscale_then_rebuild",
+            format_value="BC4_UNORM",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            ncnn_scale=2,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_specular",
+            label="Starter Specular",
+            action_mode="upscale_then_rebuild",
+            format_value=DDS_FORMAT_MODE_MATCH_ORIGINAL,
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            ncnn_scale=2,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+    )
+
+
+def _build_pre_conservative_technical_texture_workflow_profiles() -> Tuple[TextureWorkflowProfile, ...]:
+    return (
+        TextureWorkflowProfile(
+            profile_id="starter_color_albedo",
+            label="Starter Color / Albedo",
+            action_mode="upscale_then_rebuild",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            post_correction_mode=UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_normal_map",
+            label="Starter Normal",
+            action_mode="upscale_then_rebuild",
+            format_value="BC5_UNORM",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_height_displacement",
+            label="Starter Height / Displacement",
+            action_mode="upscale_then_rebuild",
+            format_value="BC4_UNORM",
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+        TextureWorkflowProfile(
+            profile_id="starter_specular",
+            label="Starter Specular",
+            action_mode="upscale_then_rebuild",
+            format_value=DDS_FORMAT_MODE_MATCH_ORIGINAL,
+            size_value=DDS_SIZE_MODE_PNG,
+            mip_value=DDS_MIP_MODE_FULL_CHAIN,
+            post_correction_mode=UPSCALE_POST_CORRECTION_NONE,
+        ),
+    )
+
+
+def _build_legacy_default_texture_workflow_rules() -> Tuple[TextureRule, ...]:
+    return (
+        TextureRule(
+            pattern="*.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_color_albedo",
+            profile_value="color_default",
+            colorspace_value="srgb",
+            alpha_policy_value="straight",
+            intermediate_value="visible_color_png_path",
+            source_line="default starter rule: *.dds",
+        ),
+        TextureRule(
+            pattern="*_n.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_normal_map",
+            semantic_value="normal:normal",
+            profile_value="normal_bc5",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="visible_color_png_path",
+            source_line="default starter rule: *_n.dds",
+        ),
+        TextureRule(
+            pattern="*_d.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_height_displacement",
+            semantic_value="height:displacement",
+            profile_value="scalar_high_precision_bc4",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="visible_color_png_path",
+            source_line="default starter rule: *_d.dds",
+        ),
+        TextureRule(
+            pattern="*_sp.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_specular",
+            semantic_value="mask:specular",
+            profile_value="scalar_bc4",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="visible_color_png_path",
+            source_line="default starter rule: *_sp.dds",
+        ),
+    )
+
+
+def _build_pre_conservative_technical_texture_workflow_rules() -> Tuple[TextureRule, ...]:
+    return (
+        TextureRule(
+            pattern="*.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_color_albedo",
+            colorspace_value="match_source",
+            alpha_policy_value="straight",
+            intermediate_value="visible_color_png_path",
+            source_line="default starter rule: *.dds",
+        ),
+        TextureRule(
+            pattern="*_n.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_normal_map",
+            semantic_value="normal:normal",
+            profile_value="normal_bc5",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="visible_color_png_path",
+            source_line="default starter rule: *_n.dds",
+        ),
+        TextureRule(
+            pattern="*_d.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_height_displacement",
+            semantic_value="height:displacement",
+            profile_value="scalar_high_precision_bc4",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="visible_color_png_path",
+            source_line="default starter rule: *_d.dds",
+        ),
+        TextureRule(
+            pattern="*_disp.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_height_displacement",
+            semantic_value="height:displacement",
+            profile_value="scalar_high_precision_bc4",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="visible_color_png_path",
+            source_line="default starter rule: *_disp.dds",
+        ),
+        TextureRule(
+            pattern="*_sp.dds",
+            enabled=True,
+            match_mode="glob",
+            workflow_profile_id="starter_specular",
+            semantic_value="mask:specular",
+            profile_value="scalar_bc4",
+            colorspace_value="linear",
+            alpha_policy_value="none",
+            intermediate_value="visible_color_png_path",
+            source_line="default starter rule: *_sp.dds",
+        ),
+    )
+
+
+def upgrade_default_texture_workflow_state(
+    workflow_profiles: Sequence[TextureWorkflowProfile],
+    texture_rules: Sequence[TextureRule],
+) -> Tuple[Tuple[TextureWorkflowProfile, ...], Tuple[TextureRule, ...]]:
+    current_profiles = {profile.profile_id: profile for profile in build_default_texture_workflow_profiles()}
+    legacy_profiles = {profile.profile_id: profile for profile in _build_legacy_default_texture_workflow_profiles()}
+    pre_conservative_specular_profiles = {
+        profile.profile_id: profile for profile in _build_pre_conservative_specular_texture_workflow_profiles()
+    }
+    pre_inherit_scale_profiles = {
+        profile.profile_id: profile for profile in _build_pre_inherit_scale_texture_workflow_profiles()
+    }
+    pre_conservative_technical_profiles = {
+        profile.profile_id: profile for profile in _build_pre_conservative_technical_texture_workflow_profiles()
+    }
+    upgraded_profiles: List[TextureWorkflowProfile] = []
+    profiles_changed = False
+    for profile in workflow_profiles:
+        replacement = current_profiles.get(profile.profile_id)
+        legacy = legacy_profiles.get(profile.profile_id)
+        pre_conservative_specular = pre_conservative_specular_profiles.get(profile.profile_id)
+        pre_inherit_scale = pre_inherit_scale_profiles.get(profile.profile_id)
+        pre_conservative_technical = pre_conservative_technical_profiles.get(profile.profile_id)
+        if replacement is not None and (
+            (legacy is not None and profile == legacy)
+            or (pre_conservative_specular is not None and profile == pre_conservative_specular)
+            or (pre_inherit_scale is not None and profile == pre_inherit_scale)
+            or (pre_conservative_technical is not None and profile == pre_conservative_technical)
+        ):
+            upgraded_profiles.append(replacement)
+            profiles_changed = True
+        else:
+            upgraded_profiles.append(profile)
+
+    current_rules = {rule.pattern: rule for rule in build_default_texture_workflow_rules()}
+    legacy_rules = {rule.pattern: rule for rule in _build_legacy_default_texture_workflow_rules()}
+    pre_conservative_technical_rules = {
+        rule.pattern: rule for rule in _build_pre_conservative_technical_texture_workflow_rules()
+    }
+    upgraded_rules: List[TextureRule] = []
+    rules_changed = False
+    for rule in texture_rules:
+        replacement = current_rules.get(rule.pattern)
+        legacy = legacy_rules.get(rule.pattern)
+        pre_conservative_technical = pre_conservative_technical_rules.get(rule.pattern)
+        if replacement is not None and (
+            (legacy is not None and rule == legacy)
+            or (pre_conservative_technical is not None and rule == pre_conservative_technical)
+        ):
+            upgraded_rules.append(replacement)
+            rules_changed = True
+        else:
+            upgraded_rules.append(rule)
+
+    upgraded_rule_by_pattern = {str(rule.pattern or "").strip().lower(): rule for rule in upgraded_rules}
+    if "*_disp.dds" not in upgraded_rule_by_pattern:
+        starter_height_rule_variants = tuple(
+            rule
+            for rule in (
+                current_rules.get("*_d.dds"),
+                legacy_rules.get("*_d.dds"),
+            )
+            if rule is not None
+        )
+        existing_height_rule = upgraded_rule_by_pattern.get("*_d.dds")
+        if existing_height_rule is not None and any(existing_height_rule == variant for variant in starter_height_rule_variants):
+            disp_rule = current_rules.get("*_disp.dds")
+            if disp_rule is not None:
+                upgraded_rules.append(disp_rule)
+                rules_changed = True
+
+    if not profiles_changed and not rules_changed:
+        return tuple(workflow_profiles), tuple(texture_rules)
+    return tuple(upgraded_profiles), tuple(upgraded_rules)
+
+
+def _is_blank_workflow_profile_placeholder(profile: TextureWorkflowProfile) -> bool:
+    if not re.fullmatch(r"Profile(?:\s+\d+)?", str(profile.label or "").strip(), flags=re.IGNORECASE):
+        return False
+    return not any(
+        [
+            str(profile.action_mode or "").strip(),
+            str(profile.format_value or "").strip(),
+            str(profile.size_value or "").strip(),
+            str(profile.mip_value or "").strip(),
+            str(profile.ncnn_model_name or "").strip(),
+            profile.ncnn_scale is not None,
+            profile.ncnn_tile_size is not None,
+            str(profile.ncnn_extra_args or "").strip(),
+            str(profile.post_correction_mode or "").strip(),
+        ]
+    )
+
+
+def _is_blank_workflow_rule_placeholder(rule: TextureRule) -> bool:
+    return (
+        str(rule.pattern or "").strip().lower() == "*.dds"
+        and bool(rule.enabled)
+        and str(rule.match_mode or "glob").strip().lower() == "glob"
+        and str(rule.action or "process").strip().lower() == "process"
+        and not any(
+            [
+                str(rule.format_value or "").strip(),
+                str(rule.size_value or "").strip(),
+                str(rule.mip_value or "").strip(),
+                str(rule.semantic_value or "").strip(),
+                str(rule.profile_value or "").strip(),
+                str(rule.colorspace_value or "").strip(),
+                str(rule.alpha_policy_value or "").strip(),
+                str(rule.intermediate_value or "").strip(),
+                str(rule.workflow_profile_id or "").strip(),
+            ]
+        )
+    )
+
+
+def should_seed_default_texture_workflow_state(
+    workflow_profiles: Sequence[TextureWorkflowProfile],
+    texture_rules: Sequence[TextureRule],
+) -> bool:
+    if not workflow_profiles and not texture_rules:
+        return True
+    if len(texture_rules) == 1 and _is_blank_workflow_rule_placeholder(texture_rules[0]):
+        if not workflow_profiles:
+            return True
+        if len(workflow_profiles) == 1 and _is_blank_workflow_profile_placeholder(workflow_profiles[0]):
+            return True
+    return False
 
 
 def _get_preview_cache_lock(cache_key: str) -> threading.Lock:
@@ -931,6 +1425,90 @@ def _is_scalar_high_precision_candidate(
     return False
 
 
+def _workflow_profile_for_rule(
+    rule: Optional[TextureRule],
+    workflow_profiles: Sequence[TextureWorkflowProfile],
+) -> Optional[TextureWorkflowProfile]:
+    if rule is None:
+        return None
+    target_id = str(getattr(rule, "workflow_profile_id", "") or "").strip()
+    if not target_id:
+        return None
+    for profile in workflow_profiles:
+        if profile.profile_id == target_id:
+            return profile
+    return None
+
+
+def _effective_output_override(
+    workflow_profile: Optional[TextureWorkflowProfile],
+    rule: Optional[TextureRule],
+) -> TextureWorkflowDdsOverride:
+    override = TextureWorkflowDdsOverride()
+    if workflow_profile is not None:
+        override = TextureWorkflowDdsOverride(
+            format_value=workflow_profile.format_value,
+            size_value=workflow_profile.size_value,
+            mip_value=workflow_profile.mip_value,
+        )
+    if rule is not None:
+        if rule.format_value:
+            override.format_value = rule.format_value
+        if rule.size_value:
+            override.size_value = rule.size_value
+        if rule.mip_value:
+            override.mip_value = rule.mip_value
+    return override
+
+
+def _effective_ncnn_settings(
+    normalized: NormalizedConfig,
+    workflow_profile: Optional[TextureWorkflowProfile],
+) -> EffectiveNcnnSettings:
+    settings = EffectiveNcnnSettings(
+        model_name=normalized.ncnn_model_name,
+        scale=normalized.ncnn_scale,
+        tile_size=normalized.ncnn_tile_size,
+        extra_args=normalized.ncnn_extra_args,
+        post_correction_mode=normalized.upscale_post_correction_mode,
+    )
+    if workflow_profile is None:
+        return settings
+    if workflow_profile.ncnn_model_name:
+        settings.model_name = workflow_profile.ncnn_model_name
+    if workflow_profile.ncnn_scale is not None:
+        settings.scale = workflow_profile.ncnn_scale
+    if workflow_profile.ncnn_tile_size is not None:
+        settings.tile_size = workflow_profile.ncnn_tile_size
+    if workflow_profile.ncnn_extra_args:
+        settings.extra_args = workflow_profile.ncnn_extra_args
+    if workflow_profile.post_correction_mode:
+        settings.post_correction_mode = workflow_profile.post_correction_mode
+    return settings
+
+
+def _apply_workflow_profile_action_override(
+    workflow_profile: Optional[TextureWorkflowProfile],
+    *,
+    action: str,
+    action_reason: str,
+    requires_png_processing: bool,
+) -> Tuple[str, str, bool]:
+    if workflow_profile is None or not workflow_profile.action_mode:
+        return action, action_reason, requires_png_processing
+
+    profile_reason = f"workflow profile '{workflow_profile.label}' forces {workflow_profile.action_mode}"
+    if workflow_profile.action_mode == "skip":
+        return "skip_by_rule", profile_reason, False
+    if workflow_profile.action_mode == "preserve_original":
+        return "preserve_original", profile_reason, False
+    if workflow_profile.action_mode == "rebuild_from_png":
+        return "rebuild_from_png", profile_reason, True
+    if workflow_profile.action_mode == "upscale_then_rebuild":
+        return "upscale_then_rebuild", profile_reason, True
+    return action, action_reason, requires_png_processing
+
+
 def _decision_with_texture_rule_overrides(
     decision: TextureUpscaleDecision,
     rule: Optional[TextureRule],
@@ -1208,6 +1786,9 @@ def _build_texture_processing_plan_entry(
         and is_technical_texture_type(decision.texture_type)
         and not (rule is not None and (rule.action == "skip" or rule_intermediate in {"technical_preserve_path", "technical_high_precision_path"}))
     )
+    workflow_profile = _workflow_profile_for_rule(rule, normalized.workflow_profiles)
+    effective_output_override = _effective_output_override(workflow_profile, rule)
+    effective_ncnn_settings = _effective_ncnn_settings(normalized, workflow_profile)
     base_alpha_policy = _normalize_alpha_policy(decision.alpha_mode)
     profile = _profile_for_key(_infer_profile_key(decision, base_alpha_policy, dds_info, rule.profile_value if rule else None))
     alpha_policy = str(rule.alpha_policy_value).strip().lower() if rule and rule.alpha_policy_value else profile.alpha_policy or base_alpha_policy
@@ -1265,6 +1846,15 @@ def _build_texture_processing_plan_entry(
         action_reason = backend_capability.reason
         requires_png_processing = action in {"rebuild_from_png", "rebuild_from_high_precision_png", "upscale_then_rebuild"}
 
+    action, action_reason, requires_png_processing = _apply_workflow_profile_action_override(
+        workflow_profile,
+        action=action,
+        action_reason=action_reason,
+        requires_png_processing=requires_png_processing,
+    )
+    if action in {"preserve_original", "skip_by_rule"} and action_reason:
+        preserve_reason = action_reason
+
     return TextureProcessingPlan(
         dds_path=dds_path,
         relative_path=rel_path,
@@ -1281,6 +1871,9 @@ def _build_texture_processing_plan_entry(
         preserve_reason=preserve_reason,
         lossy_intermediate_warning=lossy_warning,
         matched_rule=rule,
+        workflow_profile=workflow_profile,
+        effective_output_override=effective_output_override,
+        effective_ncnn_settings=effective_ncnn_settings,
         semantic_evidence=TextureSemanticEvidence(tuple(decision.source_evidence)),
     )
 
@@ -1315,6 +1908,57 @@ def build_single_texture_processing_plan(
     )
 
 
+def apply_texture_workflow_output_override(
+    settings: DdsOutputSettings,
+    override: TextureWorkflowDdsOverride,
+    *,
+    dds_info: DdsInfo,
+    note_label: str,
+) -> DdsOutputSettings:
+    next_settings = DdsOutputSettings(
+        texconv_format=settings.texconv_format,
+        mip_count=settings.mip_count,
+        width=settings.width,
+        height=settings.height,
+        resize_to_dimensions=settings.resize_to_dimensions,
+        notes=list(settings.notes),
+        texconv_color_args=list(settings.texconv_color_args),
+        texconv_extra_args=list(settings.texconv_extra_args),
+    )
+
+    if override.format_value:
+        if override.format_value == DDS_FORMAT_MODE_MATCH_ORIGINAL:
+            next_settings.texconv_format = dds_info.texconv_format
+        else:
+            next_settings.texconv_format = override.format_value
+    if override.size_value:
+        if override.size_value == DDS_SIZE_MODE_PNG:
+            next_settings.resize_to_dimensions = False
+        elif override.size_value == DDS_SIZE_MODE_ORIGINAL:
+            next_settings.width = dds_info.width
+            next_settings.height = dds_info.height
+            next_settings.resize_to_dimensions = True
+        else:
+            width_text, height_text = override.size_value.lower().split("x", 1)
+            next_settings.width = int(width_text)
+            next_settings.height = int(height_text)
+            next_settings.resize_to_dimensions = True
+    if override.mip_value:
+        max_possible_mips = max_mips_for_size(next_settings.width, next_settings.height)
+        if override.mip_value == DDS_MIP_MODE_MATCH_ORIGINAL:
+            next_settings.mip_count = min(dds_info.mip_count, max_possible_mips)
+        elif override.mip_value == DDS_MIP_MODE_FULL_CHAIN:
+            next_settings.mip_count = max_mips_for_size(next_settings.width, next_settings.height)
+        elif override.mip_value == DDS_MIP_MODE_SINGLE:
+            next_settings.mip_count = 1
+        elif override.mip_value not in {DDS_MIP_MODE_MATCH_ORIGINAL, DDS_MIP_MODE_FULL_CHAIN, DDS_MIP_MODE_SINGLE}:
+            next_settings.mip_count = int(override.mip_value)
+
+    if override.format_value or override.size_value or override.mip_value:
+        next_settings.notes.append(note_label)
+    return next_settings
+
+
 def _resolve_plan_output_settings(
     normalized: NormalizedConfig,
     plan: TextureProcessingPlan,
@@ -1324,15 +1968,25 @@ def _resolve_plan_output_settings(
     has_alpha: bool,
 ) -> DdsOutputSettings:
     output_settings = resolve_dds_output_settings(normalized, plan.dds_info, png_width, png_height)
-    if plan.matched_rule is not None:
-        updated_settings, _ = apply_texture_rule_to_output_settings(output_settings, plan.matched_rule)
-        if updated_settings is not None:
-            output_settings = updated_settings
-    explicit_rule_format = (
-        str(plan.matched_rule.format_value or "").strip().lower()
-        if plan.matched_rule is not None and plan.matched_rule.format_value
-        else ""
-    )
+    explicit_output_format_override = str(plan.effective_output_override.format_value or "").strip().lower()
+    if plan.workflow_profile is not None and (
+        plan.effective_output_override.format_value
+        or plan.effective_output_override.size_value
+        or plan.effective_output_override.mip_value
+    ):
+        output_settings = apply_texture_workflow_output_override(
+            output_settings,
+            plan.effective_output_override,
+            dds_info=plan.dds_info,
+            note_label=f"workflow profile matched: {plan.workflow_profile.label}",
+        )
+    elif plan.effective_output_override.format_value or plan.effective_output_override.size_value or plan.effective_output_override.mip_value:
+        output_settings = apply_texture_workflow_output_override(
+            output_settings,
+            plan.effective_output_override,
+            dds_info=plan.dds_info,
+            note_label="workflow override applied",
+        )
     explicit_profile_override = bool(
         plan.matched_rule is not None and str(plan.matched_rule.profile_value or "").strip()
     )
@@ -1345,17 +1999,19 @@ def _resolve_plan_output_settings(
             preset=normalized.upscale_texture_preset,
             intermediate_kind=plan.path_kind,
             semantic_decision=plan.decision,
-            allow_auto_format_override=(plan.path_kind == "technical_high_precision_path"),
+            allow_auto_format_override=(
+                plan.path_kind == "technical_high_precision_path" and explicit_output_format_override == ""
+            ),
             prefer_manual_visible_format=(
                 normalized.dds_format_mode == DDS_FORMAT_MODE_MATCH_ORIGINAL
-                and explicit_rule_format == ""
+                and explicit_output_format_override == ""
                 and not explicit_profile_override
             ),
         )
 
     allow_profile_format_override = (
         plan.profile.preferred_texconv_format not in {"", "MATCH_ORIGINAL"}
-        and explicit_rule_format == ""
+        and explicit_output_format_override == ""
         and (
             explicit_profile_override
             or plan.path_kind == "technical_high_precision_path"
@@ -1367,7 +2023,7 @@ def _resolve_plan_output_settings(
         plan.profile.preferred_texconv_format not in {"", "MATCH_ORIGINAL"}
         and normalized.dds_format_mode == DDS_FORMAT_MODE_MATCH_ORIGINAL
         and not normalized.enable_automatic_texture_rules
-        and explicit_rule_format == ""
+        and explicit_output_format_override == ""
         and not explicit_profile_override
     ):
         output_settings.notes.append(
@@ -1376,7 +2032,7 @@ def _resolve_plan_output_settings(
     elif (
         plan.profile.preferred_texconv_format not in {"", "MATCH_ORIGINAL"}
         and plan.path_kind != "technical_high_precision_path"
-        and explicit_rule_format == ""
+        and explicit_output_format_override == ""
         and not explicit_profile_override
         and output_settings.texconv_format != plan.profile.preferred_texconv_format
     ):
@@ -1644,18 +2300,22 @@ def apply_texture_rule_to_output_settings(
     return next_settings, f"texture rule matched: {rule.pattern}"
 
 
-def _rule_matches_path(pattern: str, relative_path: Path) -> bool:
+def _rule_matches_path(pattern: str, relative_path: Path, *, match_mode: str = "glob") -> bool:
     rel_posix = relative_path.as_posix().lower()
     basename = relative_path.name.lower()
     normalized_pattern = pattern.replace("\\", "/").strip().lower()
     if not normalized_pattern:
         return False
+    if match_mode == "exact":
+        return rel_posix == normalized_pattern
     return fnmatch.fnmatch(rel_posix, normalized_pattern) or fnmatch.fnmatch(basename, normalized_pattern)
 
 
 def find_matching_texture_rule(relative_path: Path, rules: Sequence[TextureRule]) -> Optional[TextureRule]:
-    for rule in rules:
-        if _rule_matches_path(rule.pattern, relative_path):
+    for rule in reversed(tuple(rules)):
+        if not bool(getattr(rule, "enabled", True)):
+            continue
+        if _rule_matches_path(rule.pattern, relative_path, match_mode=str(getattr(rule, "match_mode", "glob") or "glob")):
             return rule
     return None
 
@@ -1731,6 +2391,237 @@ def parse_texture_rules(raw_text: str) -> Tuple[TextureRule, ...]:
         rules.append(rule)
 
     return tuple(rules)
+
+
+def _normalize_rule_match_mode(value: object) -> str:
+    normalized = str(value or "").strip().lower() or "glob"
+    if normalized not in _VALID_RULE_MATCH_MODES:
+        raise ValueError(f"Unsupported texture rule match mode: {value}")
+    return normalized
+
+
+def _normalize_workflow_action_mode(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == "inherit":
+        normalized = ""
+    if normalized not in _VALID_WORKFLOW_PROFILE_ACTIONS:
+        raise ValueError(f"Unsupported workflow profile action mode: {value}")
+    return normalized
+
+
+def _coerce_optional_positive_int(value: object, field_name: str) -> Optional[int]:
+    if value in (None, "", False):
+        return None
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be 0 or greater.")
+    return parsed
+
+
+def coerce_texture_workflow_profiles(raw_value: object) -> Tuple[TextureWorkflowProfile, ...]:
+    if raw_value in (None, "", ()):
+        return ()
+    items = raw_value
+    if isinstance(items, TextureWorkflowProfile):
+        items = (items,)
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        raise ValueError("Workflow profiles must be a sequence.")
+
+    profiles: List[TextureWorkflowProfile] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(items, start=1):
+        if isinstance(item, TextureWorkflowProfile):
+            profile = TextureWorkflowProfile(
+                profile_id=str(item.profile_id or "").strip(),
+                label=str(item.label or "").strip(),
+                action_mode=_normalize_workflow_action_mode(item.action_mode),
+                format_value=str(item.format_value or "").strip() or None,
+                size_value=str(item.size_value or "").strip().lower() or None,
+                mip_value=str(item.mip_value or "").strip().lower() or None,
+                ncnn_model_name=str(item.ncnn_model_name or "").strip(),
+                ncnn_scale=_coerce_optional_positive_int(item.ncnn_scale, "Workflow profile NCNN scale"),
+                ncnn_tile_size=_coerce_optional_positive_int(item.ncnn_tile_size, "Workflow profile NCNN tile size"),
+                ncnn_extra_args=str(item.ncnn_extra_args or "").strip(),
+                post_correction_mode=str(item.post_correction_mode or "").strip().lower(),
+            )
+        elif isinstance(item, Mapping):
+            profile = TextureWorkflowProfile(
+                profile_id=str(item.get("profile_id", "") or "").strip(),
+                label=str(item.get("label", "") or "").strip(),
+                action_mode=_normalize_workflow_action_mode(item.get("action_mode", "")),
+                format_value=str(item.get("format_value", "") or "").strip() or None,
+                size_value=str(item.get("size_value", "") or "").strip().lower() or None,
+                mip_value=str(item.get("mip_value", "") or "").strip().lower() or None,
+                ncnn_model_name=str(item.get("ncnn_model_name", "") or "").strip(),
+                ncnn_scale=_coerce_optional_positive_int(item.get("ncnn_scale"), "Workflow profile NCNN scale"),
+                ncnn_tile_size=_coerce_optional_positive_int(item.get("ncnn_tile_size"), "Workflow profile NCNN tile size"),
+                ncnn_extra_args=str(item.get("ncnn_extra_args", "") or "").strip(),
+                post_correction_mode=str(item.get("post_correction_mode", "") or "").strip().lower(),
+            )
+        else:
+            raise ValueError(f"Workflow profile {index} is invalid.")
+
+        if not profile.profile_id:
+            raise ValueError(f"Workflow profile {index} is missing profile_id.")
+        if not profile.label:
+            raise ValueError(f"Workflow profile {index} is missing label.")
+        if profile.profile_id in seen_ids:
+            raise ValueError(f"Workflow profile id '{profile.profile_id}' is duplicated.")
+        if profile.format_value and profile.format_value not in {DDS_FORMAT_MODE_MATCH_ORIGINAL, *SUPPORTED_TEXCONV_FORMAT_CHOICES}:
+            raise ValueError(f"Workflow profile '{profile.label}' has an unsupported DDS format override: {profile.format_value}")
+        if profile.size_value:
+            if profile.size_value not in {DDS_SIZE_MODE_PNG, DDS_SIZE_MODE_ORIGINAL} and not re.match(r"^\d+x\d+$", profile.size_value):
+                raise ValueError(f"Workflow profile '{profile.label}' has an invalid DDS size override: {profile.size_value}")
+        if profile.mip_value:
+            if profile.mip_value not in {DDS_MIP_MODE_MATCH_ORIGINAL, DDS_MIP_MODE_FULL_CHAIN, DDS_MIP_MODE_SINGLE} and not (profile.mip_value.isdigit() and int(profile.mip_value) >= 1):
+                raise ValueError(f"Workflow profile '{profile.label}' has an invalid DDS mip override: {profile.mip_value}")
+        if profile.ncnn_scale is not None and profile.ncnn_scale not in {2, 3, 4}:
+            raise ValueError(f"Workflow profile '{profile.label}' has an invalid NCNN scale override: {profile.ncnn_scale}")
+        if profile.post_correction_mode:
+            _validate_choice(
+                profile.post_correction_mode,
+                (
+                    UPSCALE_POST_CORRECTION_NONE,
+                    UPSCALE_POST_CORRECTION_MATCH_MEAN_LUMA,
+                    UPSCALE_POST_CORRECTION_MATCH_LEVELS,
+                    UPSCALE_POST_CORRECTION_MATCH_HISTOGRAM,
+                    UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED,
+                    UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXTENDED,
+                    UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXPERIMENTAL,
+                ),
+                "workflow profile post-upscale correction mode",
+            )
+        profiles.append(profile)
+        seen_ids.add(profile.profile_id)
+    return tuple(profiles)
+
+
+def coerce_texture_workflow_rules(raw_value: object) -> Tuple[TextureRule, ...]:
+    if raw_value in (None, "", ()):
+        return ()
+    items = raw_value
+    if isinstance(items, TextureRule):
+        items = (items,)
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        raise ValueError("Texture workflow rules must be a sequence.")
+
+    rules: List[TextureRule] = []
+    for index, item in enumerate(items, start=1):
+        if isinstance(item, TextureRule):
+            rule = TextureRule(
+                pattern=str(item.pattern or "").strip(),
+                action=str(item.action or "process").strip().lower() or "process",
+                format_value=str(item.format_value or "").strip() or None,
+                size_value=str(item.size_value or "").strip().lower() or None,
+                mip_value=str(item.mip_value or "").strip().lower() or None,
+                semantic_value=str(item.semantic_value or "").strip().lower() or None,
+                profile_value=str(item.profile_value or "").strip().lower() or None,
+                colorspace_value=str(item.colorspace_value or "").strip().lower() or None,
+                alpha_policy_value=str(item.alpha_policy_value or "").strip().lower() or None,
+                intermediate_value=str(item.intermediate_value or "").strip().lower() or None,
+                enabled=bool(getattr(item, "enabled", True)),
+                match_mode=_normalize_rule_match_mode(getattr(item, "match_mode", "glob")),
+                workflow_profile_id=str(getattr(item, "workflow_profile_id", "") or "").strip(),
+                source_line=str(item.source_line or "").strip(),
+            )
+        elif isinstance(item, Mapping):
+            rule = TextureRule(
+                pattern=str(item.get("pattern", "") or "").strip(),
+                action=str(item.get("action", "process") or "process").strip().lower() or "process",
+                format_value=str(item.get("format_value", "") or "").strip() or None,
+                size_value=str(item.get("size_value", "") or "").strip().lower() or None,
+                mip_value=str(item.get("mip_value", "") or "").strip().lower() or None,
+                semantic_value=str(item.get("semantic_value", "") or "").strip().lower() or None,
+                profile_value=str(item.get("profile_value", "") or "").strip().lower() or None,
+                colorspace_value=str(item.get("colorspace_value", "") or "").strip().lower() or None,
+                alpha_policy_value=str(item.get("alpha_policy_value", "") or "").strip().lower() or None,
+                intermediate_value=str(item.get("intermediate_value", "") or "").strip().lower() or None,
+                enabled=bool(item.get("enabled", True)),
+                match_mode=_normalize_rule_match_mode(item.get("match_mode", "glob")),
+                workflow_profile_id=str(item.get("workflow_profile_id", "") or "").strip(),
+                source_line=str(item.get("source_line", "") or "").strip(),
+            )
+        else:
+            raise ValueError(f"Texture workflow rule {index} is invalid.")
+
+        if not rule.pattern:
+            raise ValueError(f"Texture workflow rule {index} is missing a pattern.")
+        if rule.action not in {"process", "skip"}:
+            raise ValueError(f"Texture workflow rule '{rule.pattern}' has an invalid legacy action: {rule.action}")
+        if rule.semantic_value:
+            _semantic_override_components(rule.semantic_value)
+        if rule.profile_value:
+            _profile_for_key(rule.profile_value)
+        if rule.colorspace_value and rule.colorspace_value not in _VALID_RULE_COLORSPACE_OVERRIDES:
+            raise ValueError(f"Texture workflow rule '{rule.pattern}' has an invalid colorspace override: {rule.colorspace_value}")
+        if rule.alpha_policy_value and rule.alpha_policy_value not in _VALID_RULE_ALPHA_POLICIES:
+            raise ValueError(f"Texture workflow rule '{rule.pattern}' has an invalid alpha policy override: {rule.alpha_policy_value}")
+        if rule.intermediate_value and rule.intermediate_value not in _VALID_RULE_INTERMEDIATE_OVERRIDES:
+            raise ValueError(f"Texture workflow rule '{rule.pattern}' has an invalid intermediate override: {rule.intermediate_value}")
+        rules.append(rule)
+    return tuple(rules)
+
+
+def _make_unique_workflow_profile_id(seed: str, existing_ids: set[str], *, fallback_prefix: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(seed or "").strip().lower()).strip("_") or fallback_prefix
+    candidate = normalized
+    suffix = 2
+    while candidate in existing_ids:
+        candidate = f"{normalized}_{suffix}"
+        suffix += 1
+    existing_ids.add(candidate)
+    return candidate
+
+
+def migrate_legacy_texture_rules_to_structured(raw_text: str) -> Tuple[Tuple[TextureWorkflowProfile, ...], Tuple[TextureRule, ...]]:
+    legacy_rules = parse_texture_rules(raw_text)
+    if not legacy_rules:
+        return (), ()
+
+    profiles: List[TextureWorkflowProfile] = []
+    rules: List[TextureRule] = []
+    existing_profile_ids: set[str] = set()
+
+    for index, legacy_rule in enumerate(legacy_rules, start=1):
+        workflow_profile_id = ""
+        if (
+            legacy_rule.action == "skip"
+            or legacy_rule.format_value
+            or legacy_rule.size_value
+            or legacy_rule.mip_value
+        ):
+            label_seed = legacy_rule.pattern or f"Imported Rule {index}"
+            workflow_profile_id = _make_unique_workflow_profile_id(
+                f"imported_{label_seed}",
+                existing_profile_ids,
+                fallback_prefix=f"imported_rule_{index}",
+            )
+            profiles.append(
+                TextureWorkflowProfile(
+                    profile_id=workflow_profile_id,
+                    label=f"Imported Rule {index}",
+                    action_mode="skip" if legacy_rule.action == "skip" else "",
+                    format_value=legacy_rule.format_value,
+                    size_value=legacy_rule.size_value,
+                    mip_value=legacy_rule.mip_value,
+                )
+            )
+        rules.append(
+            TextureRule(
+                pattern=legacy_rule.pattern,
+                semantic_value=legacy_rule.semantic_value,
+                profile_value=legacy_rule.profile_value,
+                colorspace_value=legacy_rule.colorspace_value,
+                alpha_policy_value=legacy_rule.alpha_policy_value,
+                intermediate_value=legacy_rule.intermediate_value,
+                enabled=True,
+                match_mode="glob",
+                workflow_profile_id=workflow_profile_id,
+                source_line=legacy_rule.source_line or legacy_rule.pattern,
+            )
+        )
+
+    return tuple(profiles), tuple(rules)
 
 
 def resolve_default_staging_png_root(png_root: Path, use_separate_output_root: bool) -> Path:
@@ -2016,10 +2907,11 @@ def _summarize_policy_size(
         return f"{dds_info.width}x{dds_info.height} (match original)"
     if normalized.dds_size_mode == DDS_SIZE_MODE_CUSTOM:
         return f"{normalized.dds_custom_width}x{normalized.dds_custom_height} (custom)"
-    if normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN and entry.requires_png_processing:
-        estimated_width = max(1, dds_info.width * max(1, normalized.ncnn_scale))
-        estimated_height = max(1, dds_info.height * max(1, normalized.ncnn_scale))
-        return f"{estimated_width}x{estimated_height} (estimated {normalized.ncnn_scale}x direct backend PNG)"
+    if normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN and entry.action == "upscale_then_rebuild":
+        effective_scale = max(1, int(getattr(entry.effective_ncnn_settings, "scale", normalized.ncnn_scale) or normalized.ncnn_scale))
+        estimated_width = max(1, dds_info.width * effective_scale)
+        estimated_height = max(1, dds_info.height * effective_scale)
+        return f"{estimated_width}x{estimated_height} (estimated {effective_scale}x direct backend PNG)"
     if entry.action == "rebuild_from_high_precision_png" and normalized.enable_dds_staging:
         return "staged high-precision PNG size (resolved from DDS-to-PNG conversion)"
     if entry.action == "rebuild_from_high_precision_png":
@@ -2043,6 +2935,43 @@ def _summarize_policy_mips(
     if normalized.dds_mip_mode == DDS_MIP_MODE_CUSTOM:
         return f"{normalized.dds_custom_mip_count} (custom)"
     return "full chain"
+
+
+def summarize_texture_workflow_rule(rule: Optional[TextureRule]) -> str:
+    if rule is None:
+        return "(none)"
+    match_mode = "Exact" if str(getattr(rule, "match_mode", "glob") or "glob").strip().lower() == "exact" else "Glob"
+    return f"{match_mode}: {rule.pattern}"
+
+
+def summarize_effective_dds_override(entry: TextureProcessingPlan) -> str:
+    parts: List[str] = []
+    if entry.effective_output_override.format_value:
+        parts.append(f"fmt={entry.effective_output_override.format_value}")
+    if entry.effective_output_override.size_value:
+        parts.append(f"size={entry.effective_output_override.size_value}")
+    if entry.effective_output_override.mip_value:
+        parts.append(f"mips={entry.effective_output_override.mip_value}")
+    return ", ".join(parts) if parts else "Inherit main DDS Output"
+
+
+def summarize_effective_ncnn_settings(
+    normalized: NormalizedConfig,
+    entry: TextureProcessingPlan,
+) -> str:
+    if normalized.upscale_backend != UPSCALE_BACKEND_REALESRGAN_NCNN:
+        return "Ignored unless direct NCNN is selected"
+    settings = entry.effective_ncnn_settings
+    parts = [
+        settings.model_name or "(inherit)",
+        f"{settings.scale}x",
+        f"tile {settings.tile_size}",
+    ]
+    if settings.post_correction_mode:
+        parts.append(settings.post_correction_mode)
+    if settings.extra_args:
+        parts.append("extra args")
+    return " | ".join(parts)
 
 
 def build_texture_policy_preview_payload(
@@ -2069,8 +2998,13 @@ def build_texture_policy_preview_payload(
         final_reason = entry.action_reason
         output_format = entry.dds_info.texconv_format
         detail_notes = list(entry.decision.notes)
+        effective_correction_mode = (
+            entry.effective_ncnn_settings.post_correction_mode
+            if normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN
+            else normalized.upscale_post_correction_mode
+        )
         correction_plan = build_source_match_plan_for_decision(
-            normalized.upscale_post_correction_mode,
+            effective_correction_mode,
             entry.decision,
             direct_backend_supported=direct_backend_supported,
             planner_path_kind=entry.path_kind,
@@ -2078,11 +3012,15 @@ def build_texture_policy_preview_payload(
         )
         detail_notes.append(
             "post-correction: "
-            f"{describe_post_upscale_correction_mode(normalized.upscale_post_correction_mode)} -> "
+            f"{describe_post_upscale_correction_mode(effective_correction_mode)} -> "
             f"{correction_plan.correction_action} ({correction_plan.correction_reason})"
         )
+        if entry.workflow_profile is not None:
+            detail_notes.append(f"workflow profile: {entry.workflow_profile.label} ({entry.workflow_profile.profile_id})")
+            detail_notes.append(f"workflow DDS override: {summarize_effective_dds_override(entry)}")
+            detail_notes.append(f"workflow NCNN override: {summarize_effective_ncnn_settings(normalized, entry)}")
         if entry.matched_rule is not None:
-            detail_notes.append(f"matched texture rule: {entry.matched_rule.source_line or entry.matched_rule.pattern}")
+            detail_notes.append(f"matched texture rule: {summarize_texture_workflow_rule(entry.matched_rule)}")
         if entry.preserve_reason:
             detail_notes.append(f"preserve reason: {entry.preserve_reason}")
         if entry.lossy_intermediate_warning:
@@ -2115,6 +3053,16 @@ def build_texture_policy_preview_payload(
                 "path_description": describe_processing_path_kind(entry.path_kind),
                 "profile_key": entry.profile.key,
                 "profile_label": entry.profile.label,
+                "workflow_profile_id": entry.workflow_profile.profile_id if entry.workflow_profile is not None else "",
+                "workflow_profile_label": entry.workflow_profile.label if entry.workflow_profile is not None else "(none)",
+                "matched_rule": summarize_texture_workflow_rule(entry.matched_rule),
+                "effective_dds_override": summarize_effective_dds_override(entry),
+                "effective_ncnn_summary": summarize_effective_ncnn_settings(normalized, entry),
+                "effective_ncnn_model": entry.effective_ncnn_settings.model_name,
+                "effective_ncnn_scale": entry.effective_ncnn_settings.scale,
+                "effective_ncnn_tile": entry.effective_ncnn_settings.tile_size,
+                "effective_ncnn_extra_args": entry.effective_ncnn_settings.extra_args,
+                "effective_ncnn_correction": entry.effective_ncnn_settings.post_correction_mode,
                 "backend_compatible": entry.backend_capability.compatible,
                 "backend_execution_mode": entry.backend_capability.execution_mode,
                 "backend_reason": entry.backend_capability.reason,
@@ -2126,7 +3074,7 @@ def build_texture_policy_preview_payload(
                 "action_reason": final_reason,
                 "requires_png_processing": entry.requires_png_processing,
                 "preserve_reason": entry.preserve_reason,
-                "correction_mode": describe_post_upscale_correction_mode(normalized.upscale_post_correction_mode),
+                "correction_mode": describe_post_upscale_correction_mode(effective_correction_mode),
                 "correction_eligibility": correction_plan.correction_eligibility,
                 "correction_action": correction_plan.correction_action,
                 "correction_reason": correction_plan.correction_reason,
@@ -2832,6 +3780,32 @@ def build_compare_preview_pane_result(
         return ComparePreviewPaneResult(status="error", message=str(exc))
 
 
+def _resolve_workflow_profiles_and_rules_from_config(
+    config: AppConfig,
+) -> Tuple[str, Tuple[TextureWorkflowProfile, ...], Tuple[TextureRule, ...]]:
+    raw_text = str(getattr(config, "texture_rules_text", "") or "")
+    workflow_profiles = coerce_texture_workflow_profiles(getattr(config, "workflow_profiles", ()))
+    texture_rules = coerce_texture_workflow_rules(getattr(config, "texture_rules", ()))
+    if not workflow_profiles and not texture_rules and raw_text.strip():
+        workflow_profiles, texture_rules = migrate_legacy_texture_rules_to_structured(raw_text)
+    elif should_seed_default_texture_workflow_state(workflow_profiles, texture_rules):
+        workflow_profiles = build_default_texture_workflow_profiles()
+        texture_rules = build_default_texture_workflow_rules()
+    workflow_profiles, texture_rules = upgrade_default_texture_workflow_state(workflow_profiles, texture_rules)
+    return raw_text, workflow_profiles, texture_rules
+
+
+def _validate_workflow_rule_profile_links(
+    workflow_profiles: Sequence[TextureWorkflowProfile],
+    texture_rules: Sequence[TextureRule],
+) -> None:
+    valid_ids = {profile.profile_id for profile in workflow_profiles}
+    for rule in texture_rules:
+        target_id = str(getattr(rule, "workflow_profile_id", "") or "").strip()
+        if target_id and target_id not in valid_ids:
+            raise ValueError(f"Texture workflow rule '{rule.pattern}' references unknown workflow profile id '{target_id}'.")
+
+
 def normalize_config_for_planning(config: AppConfig) -> NormalizedConfig:
     upscale_backend = str(getattr(config, "upscale_backend", "") or "").strip().lower()
     if upscale_backend not in {
@@ -2840,6 +3814,8 @@ def normalize_config_for_planning(config: AppConfig) -> NormalizedConfig:
         UPSCALE_BACKEND_REALESRGAN_NCNN,
     }:
         upscale_backend = UPSCALE_BACKEND_CHAINNER if config.enable_chainner else UPSCALE_BACKEND_NONE
+    texture_rules_text, workflow_profiles, texture_rules = _resolve_workflow_profiles_and_rules_from_config(config)
+    _validate_workflow_rule_profile_links(workflow_profiles, texture_rules)
 
     original_dds_root = ensure_existing_dir(
         normalize_required_path(config.original_dds_root, "Original DDS root"),
@@ -2881,8 +3857,9 @@ def normalize_config_for_planning(config: AppConfig) -> NormalizedConfig:
         dds_custom_mip_count=int(config.dds_custom_mip_count),
         enable_dds_staging=bool(config.enable_dds_staging),
         enable_incremental_resume=bool(config.enable_incremental_resume),
-        texture_rules_text=str(config.texture_rules_text or ""),
-        texture_rules=parse_texture_rules(str(config.texture_rules_text or "")),
+        texture_rules_text=texture_rules_text,
+        texture_rules=texture_rules,
+        workflow_profiles=workflow_profiles,
         dry_run=bool(config.dry_run),
         csv_log_path=csv_log_path,
         allow_unique_basename_fallback=bool(config.allow_unique_basename_fallback),
@@ -2921,6 +3898,8 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
         upscale_backend = UPSCALE_BACKEND_CHAINNER if config.enable_chainner else UPSCALE_BACKEND_NONE
     use_chainner = upscale_backend == UPSCALE_BACKEND_CHAINNER
     use_ncnn = upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN
+    texture_rules_text, workflow_profiles, texture_rules = _resolve_workflow_profiles_and_rules_from_config(config)
+    _validate_workflow_rule_profile_links(workflow_profiles, texture_rules)
 
     original_dds_root = ensure_existing_dir(
         normalize_required_path(config.original_dds_root, "Original DDS root"),
@@ -3006,6 +3985,11 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
                 raise ValueError(
                     f"Real-ESRGAN NCNN model '{ncnn_model_name}' was not found in {ncnn_model_dir}."
                 )
+            for workflow_profile in workflow_profiles:
+                if workflow_profile.ncnn_model_name and workflow_profile.ncnn_model_name not in available_model_names:
+                    raise ValueError(
+                        f"Workflow profile '{workflow_profile.label}' references missing Real-ESRGAN NCNN model '{workflow_profile.ncnn_model_name}'."
+                    )
         else:
             ncnn_exe_path = normalize_optional_path(config.ncnn_exe_path)
             ncnn_model_dir = resolve_ncnn_model_dir(ncnn_exe_path, explicit_model_dir) or explicit_model_dir
@@ -3078,8 +4062,6 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
     if dds_mip_mode == DDS_MIP_MODE_CUSTOM and dds_custom_mip_count < 1:
         raise ValueError("Custom DDS mip count must be at least 1.")
 
-    parsed_texture_rules = parse_texture_rules(config.texture_rules_text)
-
     return NormalizedConfig(
         original_dds_root=original_dds_root,
         png_root=png_root,
@@ -3096,7 +4078,7 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
         dds_custom_mip_count=dds_custom_mip_count,
         enable_dds_staging=config.enable_dds_staging,
         enable_incremental_resume=config.enable_incremental_resume,
-        texture_rules_text=config.texture_rules_text,
+        texture_rules_text=texture_rules_text,
         dry_run=config.dry_run,
         csv_log_path=csv_log_path,
         allow_unique_basename_fallback=config.allow_unique_basename_fallback,
@@ -3122,7 +4104,8 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
         mod_ready_export_root=mod_ready_export_root,
         mod_ready_create_no_encrypt_file=bool(getattr(config, "mod_ready_create_no_encrypt_file", MOD_READY_CREATE_NO_ENCRYPT)),
         mod_ready_package_info=mod_ready_package_info,
-        texture_rules=parsed_texture_rules,  # type: ignore[call-arg]
+        texture_rules=texture_rules,
+        workflow_profiles=workflow_profiles,
     )
 
 

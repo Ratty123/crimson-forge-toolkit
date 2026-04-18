@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import zipfile
+from html import escape
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -773,12 +774,11 @@ def run_gui() -> int:
             self.profile_menu = menu_bar.addMenu("Profile")
             self.export_profile_action = self.profile_menu.addAction("Export Profile...")
             self.import_profile_action = self.profile_menu.addAction("Import Profile...")
-            self.tools_menu = menu_bar.addMenu("Tools")
-            self.validate_chainner_menu_action = self.tools_menu.addAction("Validate chaiNNer Chain")
-            self.export_diagnostics_action = self.tools_menu.addAction("Export Diagnostics...")
-            self.help_menu = menu_bar.addMenu("Help")
-            self.quick_start_menu_action = self.help_menu.addAction("Quick Start")
-            self.about_menu_action = self.help_menu.addAction("About")
+            self.quick_start_menu_action = menu_bar.addAction("Quick Start")
+            self.documentation_menu = menu_bar.addMenu("Documentation")
+            self.open_documentation_action = self.documentation_menu.addAction("Open Documentation")
+            self.documentation_menu.addSeparator()
+            self.export_diagnostics_action = self.documentation_menu.addAction("Export Diagnostics...")
 
             central = QWidget()
             central.setObjectName("AppRoot")
@@ -1048,7 +1048,7 @@ def run_gui() -> int:
             self.dds_output_section.body_layout.addWidget(dds_output_group)
             left_layout.addWidget(self.dds_output_section)
 
-            self.filters_section = CollapsibleSection("Filters & Rules", expanded=False)
+            self.filters_section = CollapsibleSection("Workflow Profiles, Rules & Matches", expanded=False)
             filters_group = QWidget()
             filters_layout = QVBoxLayout(filters_group)
             filters_layout.setContentsMargins(0, 0, 0, 0)
@@ -1063,37 +1063,322 @@ def run_gui() -> int:
             self.filters_edit.setMaximumHeight(96)
             self.filters_edit.document().setMaximumBlockCount(200)
 
-            texture_rules_label = QLabel("Texture rules")
+            texture_rules_label = QLabel("Per-file workflow matching")
             texture_rules_hint = QLabel(
-                "Optional per-pattern overrides. Hover for the rule syntax."
+                "Build reusable per-file workflow profiles, assign them with ordered rules, and inspect the live matched DDS set."
             )
             texture_rules_hint.setObjectName("HintLabel")
             texture_rules_hint.setWordWrap(True)
             texture_rules_hint.setToolTip(
-                "One rule per line: pattern ; action=skip/process ; format=BC7_UNORM ; "
-                "size=original/png/2048x2048 ; mips=match_original/full/single/1 ; "
-                "semantic=color:albedo ; profile=color_default ; colorspace=srgb/linear/match_source ; "
-                "alpha=cutout_coverage/straight/channel_data/premultiplied ; "
-                "intermediate=visible_color_png_path/technical_preserve_path/technical_high_precision_path"
+                "Rules are evaluated top-to-bottom with last match wins. "
+                "Use profiles for DDS output and direct NCNN overrides, and use rules to assign profiles by glob or exact relative path."
             )
-            self.texture_rules_edit = QPlainTextEdit()
-            self.texture_rules_edit.setPlaceholderText(
-                "# examples\n"
-                "*_n.dds; action=skip\n"
-                "ui/**/*.dds; mips=single; profile=ui_alpha\n"
-                "*_height.dds; profile=scalar_high_precision_bc4; intermediate=technical_high_precision_path\n"
-                "*_mask.dds; semantic=mask:opacity_mask; alpha=channel_data; intermediate=technical_preserve_path"
+
+            self.texture_rules_legacy_text = ""
+            self.workflow_profiles_state: List[TextureWorkflowProfile] = []
+            self.texture_rules_state: List[TextureRule] = []
+            self.workflow_matched_processing_plan: List[TextureProcessingPlan] = []
+            self._workflow_editor_syncing = False
+            self._workflow_match_refresh_timer = QTimer(self)
+            self._workflow_match_refresh_timer.setSingleShot(True)
+            self._workflow_match_refresh_timer.setInterval(300)
+            self._workflow_match_refresh_timer.timeout.connect(self._refresh_workflow_matched_files_view)
+
+            profiles_group = QGroupBox("Workflow Profiles")
+            profiles_layout = QVBoxLayout(profiles_group)
+            profiles_layout.setContentsMargins(10, 10, 10, 10)
+            profiles_layout.setSpacing(8)
+            profiles_button_row = QHBoxLayout()
+            profiles_button_row.setSpacing(6)
+            self.workflow_profile_add_button = QPushButton("Add")
+            self.workflow_profile_duplicate_button = QPushButton("Duplicate")
+            self.workflow_profile_delete_button = QPushButton("Delete")
+            profiles_button_row.addWidget(self.workflow_profile_add_button)
+            profiles_button_row.addWidget(self.workflow_profile_duplicate_button)
+            profiles_button_row.addWidget(self.workflow_profile_delete_button)
+            profiles_button_row.addStretch(1)
+            profiles_layout.addLayout(profiles_button_row)
+
+            self.workflow_profiles_tree = QTreeWidget()
+            self.workflow_profiles_tree.setRootIsDecorated(False)
+            self.workflow_profiles_tree.setAlternatingRowColors(True)
+            self.workflow_profiles_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+            self.workflow_profiles_tree.setHeaderLabels(["Name", "Action", "DDS Output", "NCNN"])
+            self.workflow_profiles_tree.header().setStretchLastSection(False)
+            self.workflow_profiles_tree.header().resizeSection(0, 180)
+            self.workflow_profiles_tree.header().resizeSection(1, 130)
+            self.workflow_profiles_tree.header().resizeSection(2, 220)
+            self.workflow_profiles_tree.header().resizeSection(3, 240)
+            profiles_layout.addWidget(self.workflow_profiles_tree)
+
+            profile_detail_group = QGroupBox("Selected Profile")
+            profile_detail_layout = QGridLayout(profile_detail_group)
+            profile_detail_layout.setHorizontalSpacing(10)
+            profile_detail_layout.setVerticalSpacing(8)
+            self.workflow_profile_name_edit = QLineEdit()
+            self.workflow_profile_action_combo = QComboBox()
+            self._add_combo_choice(self.workflow_profile_action_combo, "Inherit Planner", "")
+            self._add_combo_choice(self.workflow_profile_action_combo, "Upscale Then Rebuild", "upscale_then_rebuild")
+            self._add_combo_choice(self.workflow_profile_action_combo, "Rebuild From PNG", "rebuild_from_png")
+            self._add_combo_choice(self.workflow_profile_action_combo, "Preserve Original", "preserve_original")
+            self._add_combo_choice(self.workflow_profile_action_combo, "Skip", "skip")
+            self.workflow_profile_format_combo = QComboBox()
+            self._add_combo_choice(self.workflow_profile_format_combo, "Inherit Main DDS Output", "")
+            self._add_combo_choice(self.workflow_profile_format_combo, "Match Original DDS", DDS_FORMAT_MODE_MATCH_ORIGINAL)
+            for texconv_format in SUPPORTED_TEXCONV_FORMAT_CHOICES:
+                self._add_combo_choice(self.workflow_profile_format_combo, texconv_format, texconv_format)
+            self.workflow_profile_size_combo = QComboBox()
+            self._add_combo_choice(self.workflow_profile_size_combo, "Inherit Main DDS Output", "")
+            self._add_combo_choice(self.workflow_profile_size_combo, "Match PNG Size", DDS_SIZE_MODE_PNG)
+            self._add_combo_choice(self.workflow_profile_size_combo, "Match Original DDS", DDS_SIZE_MODE_ORIGINAL)
+            self._add_combo_choice(self.workflow_profile_size_combo, "Custom Size", "__custom__")
+            self.workflow_profile_custom_width_spin = QSpinBox()
+            self.workflow_profile_custom_width_spin.setRange(1, 65535)
+            self.workflow_profile_custom_height_spin = QSpinBox()
+            self.workflow_profile_custom_height_spin.setRange(1, 65535)
+            self.workflow_profile_custom_size_widget = QWidget()
+            workflow_profile_custom_size_row = QHBoxLayout(self.workflow_profile_custom_size_widget)
+            workflow_profile_custom_size_row.setContentsMargins(0, 0, 0, 0)
+            workflow_profile_custom_size_row.setSpacing(6)
+            workflow_profile_custom_size_row.addWidget(self.workflow_profile_custom_width_spin)
+            workflow_profile_custom_size_row.addWidget(QLabel("x"))
+            workflow_profile_custom_size_row.addWidget(self.workflow_profile_custom_height_spin)
+            workflow_profile_custom_size_row.addStretch(1)
+            self.workflow_profile_mip_combo = QComboBox()
+            self._add_combo_choice(self.workflow_profile_mip_combo, "Inherit Main DDS Output", "")
+            self._add_combo_choice(self.workflow_profile_mip_combo, "Match Original DDS", DDS_MIP_MODE_MATCH_ORIGINAL)
+            self._add_combo_choice(self.workflow_profile_mip_combo, "Full Chain", DDS_MIP_MODE_FULL_CHAIN)
+            self._add_combo_choice(self.workflow_profile_mip_combo, "Single Mip", DDS_MIP_MODE_SINGLE)
+            self._add_combo_choice(self.workflow_profile_mip_combo, "Custom Mip Count", "__custom__")
+            self.workflow_profile_custom_mip_spin = QSpinBox()
+            self.workflow_profile_custom_mip_spin.setRange(1, 32)
+            self.workflow_profile_ncnn_model_combo = QComboBox()
+            self._add_combo_choice(self.workflow_profile_ncnn_model_combo, "Inherit Direct NCNN Model", "")
+            self.workflow_profile_ncnn_scale_combo = QComboBox()
+            self._add_combo_choice(self.workflow_profile_ncnn_scale_combo, "Inherit Direct NCNN Scale", "")
+            self._add_combo_choice(self.workflow_profile_ncnn_scale_combo, "2x", "2")
+            self._add_combo_choice(self.workflow_profile_ncnn_scale_combo, "3x", "3")
+            self._add_combo_choice(self.workflow_profile_ncnn_scale_combo, "4x", "4")
+            self.workflow_profile_ncnn_tile_override_checkbox = QCheckBox("Override tile")
+            self.workflow_profile_ncnn_tile_spin = QSpinBox()
+            self.workflow_profile_ncnn_tile_spin.setRange(0, 65535)
+            self.workflow_profile_ncnn_extra_args_edit = QLineEdit()
+            self.workflow_profile_post_correction_combo = QComboBox()
+            self._add_combo_choice(self.workflow_profile_post_correction_combo, "Inherit Direct NCNN Correction", "")
+            self._add_combo_choice(self.workflow_profile_post_correction_combo, "Off", UPSCALE_POST_CORRECTION_NONE)
+            self._add_combo_choice(self.workflow_profile_post_correction_combo, "Match Mean Luma", UPSCALE_POST_CORRECTION_MATCH_MEAN_LUMA)
+            self._add_combo_choice(self.workflow_profile_post_correction_combo, "Match Levels", UPSCALE_POST_CORRECTION_MATCH_LEVELS)
+            self._add_combo_choice(self.workflow_profile_post_correction_combo, "Match Histogram", UPSCALE_POST_CORRECTION_MATCH_HISTOGRAM)
+            self._add_combo_choice(self.workflow_profile_post_correction_combo, "Source Match Balanced", UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED)
+            self._add_combo_choice(self.workflow_profile_post_correction_combo, "Source Match Extended", UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXTENDED)
+            self._add_combo_choice(self.workflow_profile_post_correction_combo, "Source Match Experimental", UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXPERIMENTAL)
+            profile_detail_layout.addWidget(QLabel("Name"), 0, 0)
+            profile_detail_layout.addWidget(self.workflow_profile_name_edit, 0, 1)
+            profile_detail_layout.addWidget(QLabel("Action"), 0, 2)
+            profile_detail_layout.addWidget(self.workflow_profile_action_combo, 0, 3)
+            profile_detail_layout.addWidget(QLabel("DDS Format"), 1, 0)
+            profile_detail_layout.addWidget(self.workflow_profile_format_combo, 1, 1)
+            profile_detail_layout.addWidget(QLabel("DDS Size"), 1, 2)
+            profile_detail_layout.addWidget(self.workflow_profile_size_combo, 1, 3)
+            profile_detail_layout.addWidget(QLabel("Custom Size"), 2, 0)
+            profile_detail_layout.addWidget(self.workflow_profile_custom_size_widget, 2, 1)
+            profile_detail_layout.addWidget(QLabel("Mipmaps"), 2, 2)
+            profile_detail_layout.addWidget(self.workflow_profile_mip_combo, 2, 3)
+            profile_detail_layout.addWidget(QLabel("Custom Mips"), 3, 0)
+            profile_detail_layout.addWidget(self.workflow_profile_custom_mip_spin, 3, 1)
+            profile_detail_layout.addWidget(QLabel("Direct NCNN Model"), 4, 0)
+            profile_detail_layout.addWidget(self.workflow_profile_ncnn_model_combo, 4, 1)
+            profile_detail_layout.addWidget(QLabel("Direct NCNN Scale"), 4, 2)
+            profile_detail_layout.addWidget(self.workflow_profile_ncnn_scale_combo, 4, 3)
+            profile_detail_layout.addWidget(self.workflow_profile_ncnn_tile_override_checkbox, 5, 0)
+            profile_detail_layout.addWidget(self.workflow_profile_ncnn_tile_spin, 5, 1)
+            profile_detail_layout.addWidget(QLabel("NCNN Extra Args"), 5, 2)
+            profile_detail_layout.addWidget(self.workflow_profile_ncnn_extra_args_edit, 5, 3)
+            profile_detail_layout.addWidget(QLabel("Post Correction"), 6, 0)
+            profile_detail_layout.addWidget(self.workflow_profile_post_correction_combo, 6, 1)
+            profiles_layout.addWidget(profile_detail_group)
+
+            rules_group = QGroupBox("Ordered Rules")
+            rules_layout = QVBoxLayout(rules_group)
+            rules_layout.setContentsMargins(10, 10, 10, 10)
+            rules_layout.setSpacing(8)
+            rules_button_row = QHBoxLayout()
+            rules_button_row.setSpacing(6)
+            self.workflow_rule_add_button = QPushButton("Add")
+            self.workflow_rule_duplicate_button = QPushButton("Duplicate")
+            self.workflow_rule_delete_button = QPushButton("Delete")
+            self.workflow_rule_move_up_button = QPushButton("Move Up")
+            self.workflow_rule_move_down_button = QPushButton("Move Down")
+            rules_button_row.addWidget(self.workflow_rule_add_button)
+            rules_button_row.addWidget(self.workflow_rule_duplicate_button)
+            rules_button_row.addWidget(self.workflow_rule_delete_button)
+            rules_button_row.addWidget(self.workflow_rule_move_up_button)
+            rules_button_row.addWidget(self.workflow_rule_move_down_button)
+            rules_button_row.addStretch(1)
+            rules_layout.addLayout(rules_button_row)
+
+            self.workflow_rules_tree = QTreeWidget()
+            self.workflow_rules_tree.setRootIsDecorated(False)
+            self.workflow_rules_tree.setAlternatingRowColors(True)
+            self.workflow_rules_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+            self.workflow_rules_tree.setHeaderLabels(
+                ["On", "Match", "Pattern", "Workflow", "Semantic", "Planner", "Color", "Alpha", "Path"]
             )
-            self.texture_rules_edit.setMinimumHeight(90)
-            self.texture_rules_edit.setMaximumHeight(120)
-            self.texture_rules_edit.document().setMaximumBlockCount(300)
+            self.workflow_rules_tree.header().resizeSection(0, 50)
+            self.workflow_rules_tree.header().resizeSection(1, 60)
+            self.workflow_rules_tree.header().resizeSection(2, 210)
+            self.workflow_rules_tree.header().resizeSection(3, 120)
+            self.workflow_rules_tree.header().resizeSection(4, 140)
+            self.workflow_rules_tree.header().resizeSection(5, 120)
+            self.workflow_rules_tree.header().resizeSection(6, 90)
+            self.workflow_rules_tree.header().resizeSection(7, 120)
+            self.workflow_rules_tree.header().resizeSection(8, 150)
+            rules_layout.addWidget(self.workflow_rules_tree)
+
+            rule_detail_group = QGroupBox("Selected Rule")
+            rule_detail_layout = QGridLayout(rule_detail_group)
+            rule_detail_layout.setHorizontalSpacing(10)
+            rule_detail_layout.setVerticalSpacing(8)
+            self.workflow_rule_enabled_checkbox = QCheckBox("Enabled")
+            self.workflow_rule_match_mode_combo = QComboBox()
+            self._add_combo_choice(self.workflow_rule_match_mode_combo, "Glob", "glob")
+            self._add_combo_choice(self.workflow_rule_match_mode_combo, "Exact Path", "exact")
+            self.workflow_rule_pattern_edit = QLineEdit()
+            self.workflow_rule_profile_combo = QComboBox()
+            self._add_combo_choice(self.workflow_rule_profile_combo, "No Workflow Profile", "")
+            self.workflow_rule_semantic_combo = QComboBox()
+            self.workflow_rule_semantic_combo.setEditable(True)
+            self.workflow_rule_semantic_combo.addItems(
+                [
+                    "",
+                    "color:albedo",
+                    "normal:normal",
+                    "mask:packed_mask",
+                    "mask:opacity_mask",
+                    "height:height",
+                    "roughness:roughness",
+                    "ui:ui",
+                    "emissive:emissive",
+                ]
+            )
+            self.workflow_rule_planner_profile_combo = QComboBox()
+            self._add_combo_choice(self.workflow_rule_planner_profile_combo, "Inherit Planner Profile", "")
+            for planner_profile_key in get_texture_processing_profile_keys():
+                self._add_combo_choice(self.workflow_rule_planner_profile_combo, planner_profile_key, planner_profile_key)
+            self.workflow_rule_planner_profile_combo.setToolTip(
+                "Optional processing-profile override for this rule. Use the Docs button for an explanation of each planner profile."
+            )
+            self.workflow_rule_colorspace_combo = QComboBox()
+            self._add_combo_choice(self.workflow_rule_colorspace_combo, "Inherit Colorspace", "")
+            self._add_combo_choice(self.workflow_rule_colorspace_combo, "sRGB", "srgb")
+            self._add_combo_choice(self.workflow_rule_colorspace_combo, "Linear", "linear")
+            self._add_combo_choice(self.workflow_rule_colorspace_combo, "Match Source", "match_source")
+            self.workflow_rule_alpha_combo = QComboBox()
+            self._add_combo_choice(self.workflow_rule_alpha_combo, "Inherit Alpha Policy", "")
+            self._add_combo_choice(self.workflow_rule_alpha_combo, "None", "none")
+            self._add_combo_choice(self.workflow_rule_alpha_combo, "Straight", "straight")
+            self._add_combo_choice(self.workflow_rule_alpha_combo, "Cutout Coverage", "cutout_coverage")
+            self._add_combo_choice(self.workflow_rule_alpha_combo, "Channel Data", "channel_data")
+            self._add_combo_choice(self.workflow_rule_alpha_combo, "Premultiplied", "premultiplied")
+            self.workflow_rule_intermediate_combo = QComboBox()
+            self._add_combo_choice(self.workflow_rule_intermediate_combo, "Inherit Planner Path", "")
+            self._add_combo_choice(self.workflow_rule_intermediate_combo, "Visible Color PNG", "visible_color_png_path")
+            self._add_combo_choice(self.workflow_rule_intermediate_combo, "Technical Preserve", "technical_preserve_path")
+            self._add_combo_choice(self.workflow_rule_intermediate_combo, "Technical High Precision", "technical_high_precision_path")
+            self.workflow_rule_intermediate_combo.setToolTip(
+                "Optional planner-path override for this rule. Use the Docs button for path meanings and backend notes."
+            )
+            planner_profile_label_widget = QWidget()
+            planner_profile_label_layout = QHBoxLayout(planner_profile_label_widget)
+            planner_profile_label_layout.setContentsMargins(0, 0, 0, 0)
+            planner_profile_label_layout.setSpacing(6)
+            planner_profile_label_layout.addWidget(QLabel("Planner Profile"))
+            self.workflow_rule_planner_profile_help_button = QPushButton("Docs")
+            self.workflow_rule_planner_profile_help_button.setMaximumWidth(56)
+            self.workflow_rule_planner_profile_help_button.setToolTip(
+                "Open the in-app documentation topic that explains planner profiles."
+            )
+            planner_profile_label_layout.addWidget(self.workflow_rule_planner_profile_help_button)
+            planner_profile_label_layout.addStretch(1)
+            planner_path_label_widget = QWidget()
+            planner_path_label_layout = QHBoxLayout(planner_path_label_widget)
+            planner_path_label_layout.setContentsMargins(0, 0, 0, 0)
+            planner_path_label_layout.setSpacing(6)
+            planner_path_label_layout.addWidget(QLabel("Planner Path"))
+            self.workflow_rule_planner_path_help_button = QPushButton("Docs")
+            self.workflow_rule_planner_path_help_button.setMaximumWidth(56)
+            self.workflow_rule_planner_path_help_button.setToolTip(
+                "Open the in-app documentation topic that explains planner paths."
+            )
+            planner_path_label_layout.addWidget(self.workflow_rule_planner_path_help_button)
+            planner_path_label_layout.addStretch(1)
+            rule_detail_layout.addWidget(self.workflow_rule_enabled_checkbox, 0, 0)
+            rule_detail_layout.addWidget(QLabel("Match"), 0, 1)
+            rule_detail_layout.addWidget(self.workflow_rule_match_mode_combo, 0, 2)
+            rule_detail_layout.addWidget(QLabel("Pattern"), 1, 0)
+            rule_detail_layout.addWidget(self.workflow_rule_pattern_edit, 1, 1, 1, 3)
+            rule_detail_layout.addWidget(QLabel("Workflow Profile"), 2, 0)
+            rule_detail_layout.addWidget(self.workflow_rule_profile_combo, 2, 1)
+            rule_detail_layout.addWidget(QLabel("Semantic"), 2, 2)
+            rule_detail_layout.addWidget(self.workflow_rule_semantic_combo, 2, 3)
+            rule_detail_layout.addWidget(planner_profile_label_widget, 3, 0)
+            rule_detail_layout.addWidget(self.workflow_rule_planner_profile_combo, 3, 1)
+            rule_detail_layout.addWidget(QLabel("Colorspace"), 3, 2)
+            rule_detail_layout.addWidget(self.workflow_rule_colorspace_combo, 3, 3)
+            rule_detail_layout.addWidget(QLabel("Alpha Policy"), 4, 0)
+            rule_detail_layout.addWidget(self.workflow_rule_alpha_combo, 4, 1)
+            rule_detail_layout.addWidget(planner_path_label_widget, 4, 2)
+            rule_detail_layout.addWidget(self.workflow_rule_intermediate_combo, 4, 3)
+            self.workflow_rule_planner_profile_help_button.clicked.connect(
+                lambda: self.show_about_dialog(topic_id="workflow_planner_profiles")
+            )
+            self.workflow_rule_planner_path_help_button.clicked.connect(
+                lambda: self.show_about_dialog(topic_id="workflow_planner_paths")
+            )
+            rules_layout.addWidget(rule_detail_group)
+
+            matched_group = QGroupBox("Matched Files")
+            matched_layout = QVBoxLayout(matched_group)
+            matched_layout.setContentsMargins(10, 10, 10, 10)
+            matched_layout.setSpacing(8)
+            matched_button_row = QHBoxLayout()
+            matched_button_row.setSpacing(6)
+            self.workflow_matched_refresh_button = QPushButton("Refresh")
+            self.workflow_assign_profile_button = QPushButton("Assign Profile")
+            matched_button_row.addWidget(self.workflow_matched_refresh_button)
+            matched_button_row.addWidget(self.workflow_assign_profile_button)
+            matched_button_row.addStretch(1)
+            matched_layout.addLayout(matched_button_row)
+            self.workflow_matched_summary_label = QLabel(
+                "This table follows the current Original DDS root and workflow filter. Exact-path assignments append new last-match rules."
+            )
+            self.workflow_matched_summary_label.setObjectName("HintLabel")
+            self.workflow_matched_summary_label.setWordWrap(True)
+            matched_layout.addWidget(self.workflow_matched_summary_label)
+            self.workflow_matched_files_tree = QTreeWidget()
+            self.workflow_matched_files_tree.setRootIsDecorated(False)
+            self.workflow_matched_files_tree.setAlternatingRowColors(True)
+            self.workflow_matched_files_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            self.workflow_matched_files_tree.setHeaderLabels(
+                ["Path", "Semantic", "Rule", "Workflow", "DDS Output", "NCNN", "Action"]
+            )
+            self.workflow_matched_files_tree.header().resizeSection(0, 300)
+            self.workflow_matched_files_tree.header().resizeSection(1, 150)
+            self.workflow_matched_files_tree.header().resizeSection(2, 200)
+            self.workflow_matched_files_tree.header().resizeSection(3, 150)
+            self.workflow_matched_files_tree.header().resizeSection(4, 200)
+            self.workflow_matched_files_tree.header().resizeSection(5, 220)
+            self.workflow_matched_files_tree.header().resizeSection(6, 150)
+            matched_layout.addWidget(self.workflow_matched_files_tree)
 
             filters_layout.addWidget(filters_label)
             filters_layout.addWidget(filters_hint)
             filters_layout.addWidget(self.filters_edit)
             filters_layout.addWidget(texture_rules_label)
             filters_layout.addWidget(texture_rules_hint)
-            filters_layout.addWidget(self.texture_rules_edit)
+            filters_layout.addWidget(profiles_group)
+            filters_layout.addWidget(rules_group)
+            filters_layout.addWidget(matched_group)
             self.filters_section.body_layout.addWidget(filters_group)
             left_layout.addWidget(self.filters_section)
 
@@ -2102,10 +2387,9 @@ def run_gui() -> int:
 
             self.export_profile_action.triggered.connect(self.export_profile)
             self.import_profile_action.triggered.connect(self.import_profile)
-            self.validate_chainner_menu_action.triggered.connect(self.validate_chainner_chain)
             self.export_diagnostics_action.triggered.connect(self.export_diagnostic_bundle)
             self.quick_start_menu_action.triggered.connect(self.show_quick_start_dialog)
-            self.about_menu_action.triggered.connect(self.show_about_dialog)
+            self.open_documentation_action.triggered.connect(self.show_about_dialog)
             self.scan_button.clicked.connect(self.start_scan)
             self.preview_policy_button.clicked.connect(self.preview_texture_policy)
             self.clear_workflow_roots_button.clicked.connect(self.clear_workflow_roots)
@@ -2221,6 +2505,7 @@ def run_gui() -> int:
             self._update_compare_navigation_state()
             self.refresh_compare_list()
             self._settings_ready = True
+            self._schedule_workflow_match_refresh()
             self._save_settings()
 
             geometry = self.settings.value("window/geometry")
@@ -2244,90 +2529,380 @@ def run_gui() -> int:
             dialog = QuickStartDialog(self)
             dialog.exec()
 
-        def _build_about_html(self) -> str:
+        def _build_about_intro_html(self) -> str:
+            return f"""
+            <p><b>{APP_TITLE} v{APP_VERSION}</b> is a Windows desktop tool for Crimson Desert archive browsing, texture workflow planning, DDS rebuild, visible-texture editing, replacement packaging, research, and text search.</p>
+            <p>Use the search box and topic list on the left, or jump straight to:
+            <a href="topic:workflow_overview">Texture Workflow</a>,
+            <a href="topic:workflow_profiles">Workflow Profiles</a>,
+            <a href="topic:workflow_rules">Ordered Rules</a>,
+            <a href="topic:workflow_planner_profiles">Planner Profiles</a>,
+            <a href="topic:workflow_planner_paths">Planner Paths</a>,
+            <a href="topic:archive_browser">Archive Browser</a>,
+            <a href="topic:texture_editor">Texture Editor</a>,
+            <a href="topic:replace_assistant">Replace Assistant</a>,
+            <a href="topic:research">Research</a>,
+            <a href="topic:text_search">Text Search</a>.
+            </p>
+            """
+
+        def _build_about_sections(self) -> List[Dict[str, str]]:
             readme_path = Path(__file__).resolve().parents[2] / "README.md"
             notices_path = Path(__file__).resolve().parents[2] / "THIRD_PARTY_NOTICES.md"
             license_path = Path(__file__).resolve().parents[2] / "LICENSE"
-            return f"""
-            <h3>{APP_TITLE} v{APP_VERSION}</h3>
-            <p>A Windows desktop tool for Crimson Desert texture workflows, guided replacement builds, archive research, and texture editing.</p>
-            <h3>What It Covers</h3>
-            <ul>
-              <li>Read-only <code>.pamt/.paz</code> archive browsing and selective extraction</li>
-              <li><b>Texture Workflow</b> for loose DDS scanning, DDS-to-PNG conversion, DDS rebuild, compare, and optional mod-ready package export</li>
-              <li><b>Replace Assistant</b> for matching edited PNG/DDS files back to the original game DDS and building ready mod folders</li>
-              <li><b>Texture Editor</b> for layered visible-texture editing with selections, floating paste/move, masks, adjustments, channel locks, custom brush presets, and quick handoff back into the rebuild workflow</li>
-              <li>Text Search with encrypted XML support, syntax-colored preview, and export of matched files</li>
-              <li>Optional <b>chaiNNer</b> or <b>Real-ESRGAN NCNN</b> stage before DDS rebuild</li>
-              <li>Persistent global settings, local config, and archive cache stored beside the EXE</li>
-            </ul>
-            <h3>External Requirements</h3>
-            <ul>
-              <li><b>texconv</b> is required for DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild.</li>
-              <li><b>chaiNNer</b> and <b>Real-ESRGAN NCNN</b> support are optional.</li>
-            </ul>
-            <h3>Important Upscaling Notes</h3>
-            <ul>
-              <li>Install and maintain <b>chaiNNer</b> separately.</li>
-              <li>Install the backends your chain needs inside <b>chaiNNer</b>, such as <b>PyTorch</b> or <b>NCNN</b>.</li>
-              <li>Provide and test your own <code>.chn</code> chain.</li>
-              <li>If DDS-to-PNG conversion is enabled, make sure the chain reads PNG input from the correct folder.</li>
-              <li><b>Real-ESRGAN NCNN</b> runs directly from the app after you point it at a local executable and model folder. <b>Setup</b> now opens the official download page instead of downloading the package inside the app, and it can still import NCNN <code>.param</code> / <code>.bin</code> model pairs that you downloaded yourself.</li>
-              <li><b>Run Summary</b> shows the current sources, backend, and policy before you start, without duplicating the workflow controls.</li>
-            </ul>
-            <h3>Texture Editor Highlights</h3>
-            <ul>
-              <li>Layered visible-texture editing with paint, erase, fill, gradient, clone, heal, smudge, dodge/burn, patch, sharpen, and soften tools, plus brush presets, custom saved presets, brush tips, and patterned brush footprints.</li>
-              <li>Selections, floating paste/move workflow, masks, RGBA channel locks, and non-destructive document-top adjustments.</li>
-              <li>RGBA/original/split views, grid guides, and direct handoff to <b>Compare</b>, <b>Replace Assistant</b>, and <b>Texture Workflow</b>.</li>
-              <li>Designed for visible-color texture work. Technical textures still show warnings and need extra care.</li>
-            </ul>
-            <h3>Dependencies</h3>
-            <ul>
-              <li><a href=\"https://doc.qt.io/qtforpython-6/\">PySide6 / Qt for Python</a></li>
-              <li><a href=\"https://pyinstaller.org/\">PyInstaller</a></li>
-              <li><a href=\"https://github.com/python-lz4/python-lz4\">python-lz4</a></li>
-              <li><a href=\"https://cryptography.io/\">cryptography</a></li>
-              <li><a href=\"https://numpy.org/\">NumPy</a></li>
-              <li><a href=\"https://opencv.org/\">OpenCV</a></li>
-              <li><a href=\"https://github.com/microsoft/DirectXTex\">DirectXTex / texconv</a></li>
-              <li><a href=\"https://chainner.app/download/\">chaiNNer</a></li>
-              <li><a href=\"https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan\">Real-ESRGAN NCNN Vulkan</a></li>
-            </ul>
-            <h3>Credits and References</h3>
-            <ul>
-              <li><a href=\"https://www.nexusmods.com/crimsondesert/mods/62\">Crimson Desert Unpacker</a> for archive format reference and behavior comparison.</li>
-              <li><a href=\"https://www.nexusmods.com/crimsondesert/mods/84\">Crimson Browser &amp; Mod Manager</a> for archive behavior and compatibility reference.</li>
-              <li><a href=\"https://github.com/microsoft/DirectXTex/releases\">Microsoft DirectXTex releases</a> for texconv.</li>
-              <li><a href=\"https://chainner.app/\">chaiNNer</a> for the optional upscaling stage.</li>
-            </ul>
-            <h3>Project Files</h3>
-            <p>License: <b>{license_path}</b></p>
-            <p>Third-party notices: <b>{notices_path}</b></p>
-            <p>Config file: <b>{self.settings_file_path}</b></p>
-            <p>Archive cache: <b>{self.archive_cache_root}</b></p>
-            <p>README: <b>{readme_path}</b></p>
-            <h3>Known Limitations</h3>
-            <ul>
-              <li>Archive previews are best-effort for unusual or game-specific DDS cases.</li>
-              <li><b>chaiNNer</b> remains an external dependency and chain behavior is only as reliable as the chain you provide.</li>
-              <li><b>Real-ESRGAN NCNN</b> support assumes the standard command-line executable and supported model folder layout.</li>
-              <li>Large archive sets still take noticeable time to prepare, even after the recent refresh/cache optimizations.</li>
-              <li>The editor is texture-first, not a full Photoshop replacement. Visible-color texture work is the main focus today.</li>
-            </ul>
-            <h3>Notes</h3>
-            <p>The archive browser is read-only. It extracts to loose files only and never writes back to <code>.pamt</code> or <code>.paz</code>.</p>
-            <p>For full setup flow, usage notes, and troubleshooting guidance, open the Quick Start guide or the README.</p>
-            """
+            readme_text = escape(str(readme_path))
+            notices_text = escape(str(notices_path))
+            license_text = escape(str(license_path))
+            settings_text = escape(str(self.settings_file_path))
+            cache_text = escape(str(self.archive_cache_root))
+            return [
+                {
+                    "id": "overview",
+                    "title": "Overview",
+                    "summary": "High-level tour of the app and its main surfaces.",
+                    "keywords": "overview about features tabs archive workflow editor replace assistant research text search settings",
+                    "html": """
+                    <p>The app is split into major work areas rather than one single pipeline.</p>
+                    <ul>
+                      <li><b>Texture Workflow</b>: batch loose DDS processing, optional upscaling, DDS rebuild, compare, and mod-ready loose export.</li>
+                      <li><b>Archive Browser</b>: read-only scanning, filtering, preview, extraction, workflow handoff, and Research/Editor handoff.</li>
+                      <li><b>Texture Editor</b>: layered visible-texture editing and direct workflow handoff.</li>
+                      <li><b>Replace Assistant</b>: guided one-off replacement packaging for edited PNG/DDS files.</li>
+                      <li><b>Research</b>: grouped texture families, unknown-resolution work, DDS analysis, references, reports, and notes.</li>
+                      <li><b>Text Search</b>: text-like archive/loose-file search with preview and export.</li>
+                      <li><b>Settings</b>: appearance, cache/startup behavior, and persistent local preferences.</li>
+                    </ul>
+                    <p>If you are new to the app, start with <a href="topic:workflow_overview">Texture Workflow</a> and then review <a href="topic:compare_review">Compare &amp; Review</a>.</p>
+                    """,
+                },
+                {
+                    "id": "workflow_overview",
+                    "title": "Texture Workflow",
+                    "summary": "Main batch-processing tab for loose DDS files.",
+                    "keywords": "texture workflow batch dds png rebuild compare start scan preview policy run summary",
+                    "html": """
+                    <p><b>Texture Workflow</b> is the main batch-processing tab. It scans loose DDS files under <b>Original DDS root</b>, plans what to do per file, optionally creates/stages PNG intermediates, optionally upscales them, rebuilds DDS output, and lets you review the result in Compare.</p>
+                    <h4>Typical run</h4>
+                    <ol>
+                      <li>Configure <b>Setup</b>, <b>Paths</b>, and <b>DDS Output</b>.</li>
+                      <li>Review <a href="topic:workflow_profiles">Workflow Profiles</a>, <a href="topic:workflow_rules">Ordered Rules</a>, and <a href="topic:workflow_matched_files">Matched Files</a>.</li>
+                      <li>Choose your backend in <a href="topic:upscaling_backends">Upscaling</a>.</li>
+                      <li>Use <b>Preview Policy</b> to inspect the current per-file plan.</li>
+                      <li>Run <b>Scan</b> and then <b>Start</b>.</li>
+                      <li>Review output in <a href="topic:compare_review">Compare</a>.</li>
+                    </ol>
+                    <h4>Main sections inside Texture Workflow</h4>
+                    <ul>
+                      <li><b>Setup</b>: workspace initialization, external tools, help links, and import helpers.</li>
+                      <li><b>Paths</b>: source, PNG, staging, output, and optional mod-export roots.</li>
+                      <li><b>DDS Output</b>: global default output format/size/mip behavior.</li>
+                      <li><b>Workflow Profiles, Rules &amp; Matches</b>: per-file planning surface.</li>
+                      <li><b>Upscaling</b>: backend, texture preset, direct NCNN controls, and policy notes.</li>
+                      <li><b>Progress / Live Log / Compare</b>: runtime feedback and review.</li>
+                    </ul>
+                    """,
+                },
+                {
+                    "id": "workflow_profiles",
+                    "title": "Workflow Profiles",
+                    "summary": "Reusable named per-file override sets for DDS output and direct NCNN settings.",
+                    "keywords": "workflow profile selected profile action dds format size mips ncnn scale tile post correction",
+                    "html": """
+                    <p><b>Workflow Profiles</b> are reusable named override sets. They are assigned by ordered rules and only override the fields you fill in. Blank fields inherit the current global workflow settings.</p>
+                    <h4>Selected Profile fields</h4>
+                    <ul>
+                      <li><b>Name</b>: display name used in the rules table and matched-files table.</li>
+                      <li><b>Action</b>: force one action mode for matching files. <code>Inherit Planner</code> lets the planner decide; <code>Upscale Then Rebuild</code>, <code>Rebuild From PNG</code>, <code>Preserve Original</code>, and <code>Skip</code> force that result.</li>
+                      <li><b>DDS Format / DDS Size / Mipmaps</b>: optional DDS output overrides applied after the file is matched.</li>
+                      <li><b>Direct NCNN Model / Scale / Tile / Extra Args / Post Correction</b>: optional per-file direct-NCNN overrides. These matter only when the selected backend is direct <b>Real-ESRGAN NCNN</b>.</li>
+                    </ul>
+                    <h4>Starter profiles</h4>
+                    <ul>
+                      <li><b>Starter Color / Albedo</b>: batch-upscale baseline for visible color-style textures.</li>
+                      <li><b>Starter Normal</b>: preserve-first baseline for normal maps.</li>
+                      <li><b>Starter Height / Displacement</b>: preserve-first baseline for scalar height/displacement maps.</li>
+                      <li><b>Starter Specular</b>: preserve-first baseline for specular-like scalar masks.</li>
+                    </ul>
+                    <p>The starters are meant to be sane defaults, not universal “best” answers. If a file family really should be pushed through rebuild or direct NCNN, duplicate the starter and make a more aggressive variant.</p>
+                    """,
+                },
+                {
+                    "id": "workflow_rules",
+                    "title": "Ordered Rules",
+                    "summary": "Last-match-wins assignment table that maps files to workflow behavior.",
+                    "keywords": "ordered rules selected rule match glob exact path workflow profile semantic planner profile colorspace alpha planner path last match wins",
+                    "html": """
+                    <p><b>Ordered Rules</b> are evaluated from top to bottom with <b>last match wins</b>. Exact-path rules and glob rules share one list.</p>
+                    <h4>Selected Rule fields</h4>
+                    <ul>
+                      <li><b>Enabled</b>: disabled rules stay in the list but are ignored.</li>
+                      <li><b>Match</b>: <code>Glob</code> matches basename or relative path patterns; <code>Exact Path</code> targets one exact relative path.</li>
+                      <li><b>Pattern</b>: the glob or exact relative path to match.</li>
+                      <li><b>Workflow Profile</b>: assigns one of the reusable workflow profiles above.</li>
+                      <li><b>Semantic</b>: optional manual semantic override such as <code>normal:normal</code> or <code>height:displacement</code>.</li>
+                      <li><b>Planner Profile</b>: optional processing-profile override that changes planner assumptions such as preferred compression, colorspace, and preserve behavior. See <a href="topic:workflow_planner_profiles">Planner Profiles</a>.</li>
+                      <li><b>Colorspace</b>: optional rule-level colorspace override.</li>
+                      <li><b>Alpha Policy</b>: optional rule-level alpha handling override.</li>
+                      <li><b>Planner Path</b>: optional path override that tells the planner which intermediate route to prefer. See <a href="topic:workflow_planner_paths">Planner Paths</a>.</li>
+                    </ul>
+                    <h4>Authoring notes</h4>
+                    <ul>
+                      <li>Put broad family rules near the top and one-off exact-path fixes near the bottom.</li>
+                      <li>Use the <a href="topic:workflow_matched_files">Matched Files</a> table when you want to turn selected rows into exact-path assignment rules quickly.</li>
+                      <li>If you are unsure, inspect the result in <b>Preview Policy</b> before running <b>Start</b>.</li>
+                    </ul>
+                    """,
+                },
+                {
+                    "id": "workflow_planner_profiles",
+                    "title": "Planner Profiles",
+                    "summary": "Meaning of planner-profile values under Selected Rule.",
+                    "keywords": "planner profiles selected rule color_default normal_bc5 scalar_bc4 scalar_high_precision_bc4 packed mask premultiplied float vector",
+                    "html": """
+                    <p><b>Planner Profile</b> is a low-level processing profile used by the planner. It influences preferred texture format, colorspace, alpha policy, mip hint, allowed path kinds, and preserve-first behavior.</p>
+                    <ul>
+                      <li><code>color_default</code>: visible color textures. Prefers sRGB-aware color handling and color-style mip treatment.</li>
+                      <li><code>color_cutout_alpha</code>: visible textures with cutout alpha where alpha coverage should be preserved more carefully.</li>
+                      <li><code>ui_alpha</code>: UI-style visible textures with alpha.</li>
+                      <li><code>normal_bc5</code>: normal maps. Linear, BC5-oriented, preserve-first.</li>
+                      <li><code>scalar_bc4</code>: generic single-channel scalar/mask data. Linear, BC4-oriented, preserve-first.</li>
+                      <li><code>scalar_high_precision_bc4</code>: eligible scalar technical maps that may use the high-precision technical path instead of the generic visible PNG path.</li>
+                      <li><code>packed_mask_preserve_layout</code>: packed-channel masks and response maps. Preserve-first to avoid channel drift.</li>
+                      <li><code>premultiplied_alpha_review_required</code>: premultiplied-alpha content that should be reviewed manually.</li>
+                      <li><code>float_or_vector_preserve_only</code>: float, vector, or other precision-sensitive technical data that should stay preserve-only.</li>
+                    </ul>
+                    <p>In practice, use workflow profiles for the user-facing batch behavior and use planner profiles only when you specifically need to change the planner’s technical assumptions for a matched file or file family.</p>
+                    """,
+                },
+                {
+                    "id": "workflow_planner_paths",
+                    "title": "Planner Paths",
+                    "summary": "Meaning of planner-path values under Selected Rule.",
+                    "keywords": "planner paths selected rule visible_color_png_path technical_preserve_path technical_high_precision_path",
+                    "html": f"""
+                    <p><b>Planner Path</b> chooses the intermediate route the planner should prefer for a matched file.</p>
+                    <ul>
+                      <li><code>visible_color_png_path</code>: {escape(describe_processing_path_kind("visible_color_png_path"))}</li>
+                      <li><code>technical_preserve_path</code>: {escape(describe_processing_path_kind("technical_preserve_path"))}</li>
+                      <li><code>technical_high_precision_path</code>: {escape(describe_processing_path_kind("technical_high_precision_path"))}</li>
+                    </ul>
+                    <h4>Backend behavior</h4>
+                    <ul>
+                      <li><b>Disabled backend</b>: visible-color path rebuilds from current PNG inputs. The high-precision path can rebuild from valid high-bit-depth PNG data if present.</li>
+                      <li><b>Direct Real-ESRGAN NCNN</b>: visible-color path is supported. Technical high-precision path is not supported in the current tranche, so preserve behavior wins when that path is chosen.</li>
+                      <li><b>chaiNNer</b>: only the visible-color path is trusted in the current tranche. Technical preserve/high-precision paths stay preserve-first.</li>
+                    </ul>
+                    <p>Use planner-path overrides carefully. Forcing technical textures onto <code>visible_color_png_path</code> is intentionally treated as a higher-risk choice.</p>
+                    """,
+                },
+                {
+                    "id": "workflow_matched_files",
+                    "title": "Matched Files",
+                    "summary": "Live current-match view for the workflow file set.",
+                    "keywords": "matched files assign profile exact path rules action effective dds ncnn summary current filter",
+                    "html": """
+                    <p><b>Matched Files</b> is a live table for the current workflow match set: DDS files under <b>Original DDS root</b> that also match the current folder/file filter.</p>
+                    <h4>Columns</h4>
+                    <ul>
+                      <li><b>Path</b>: relative path inside the current Original DDS root.</li>
+                      <li><b>Semantic</b>: current inferred or overridden semantic type/subtype.</li>
+                      <li><b>Rule</b>: the last matching ordered rule.</li>
+                      <li><b>Workflow</b>: the assigned workflow profile, if any.</li>
+                      <li><b>DDS Output</b>: effective DDS output override summary.</li>
+                      <li><b>NCNN</b>: effective direct-NCNN summary for that file.</li>
+                      <li><b>Action</b>: final planned action after planner, rule, profile, backend, and safety logic are combined.</li>
+                    </ul>
+                    <p><b>Assign Profile</b> creates new exact-path rules for the selected rows. Because ordered rules are last-match-wins, these one-off assignment rules are appended at the end of the current rule list.</p>
+                    """,
+                },
+                {
+                    "id": "dds_output",
+                    "title": "DDS Output & Staging",
+                    "summary": "Global DDS rebuild defaults used by the workflow.",
+                    "keywords": "dds output format size mipmaps staging texconv png size match original custom",
+                    "html": """
+                    <p><b>DDS Output</b> defines the global rebuild defaults for files that do not receive a workflow-profile override.</p>
+                    <ul>
+                      <li><b>Format</b>: match the original DDS or force one texconv format.</li>
+                      <li><b>Size</b>: rebuild to PNG size, original DDS size, or a custom size.</li>
+                      <li><b>Mipmaps</b>: keep original count, generate a full chain, use a single mip, or force a custom count.</li>
+                      <li><b>DDS staging</b>: when enabled with an upscaling backend, the app first converts matched DDS files to a staging PNG root before the backend runs.</li>
+                    </ul>
+                    <p>Workflow profiles can override these per file. That is why DDS Output should be thought of as the global default layer, not always the final result.</p>
+                    """,
+                },
+                {
+                    "id": "upscaling_backends",
+                    "title": "Upscaling & Backends",
+                    "summary": "How disabled mode, direct NCNN, and chaiNNer behave.",
+                    "keywords": "upscaling backend ncnn chainner disabled scale tile retry post correction source match direct backend",
+                    "html": """
+                    <p>The app supports three high-level modes in <b>Upscaling</b>.</p>
+                    <ul>
+                      <li><b>Disabled</b>: no upscale backend. The workflow can still rebuild DDS from existing PNG inputs.</li>
+                      <li><b>Real-ESRGAN NCNN</b>: direct in-app backend with global model, scale, tile, extra args, retry/fallback behavior, and optional post correction.</li>
+                      <li><b>chaiNNer</b>: external chain-based backend. The chain remains the source of truth for what actually happens.</li>
+                    </ul>
+                    <h4>Important notes</h4>
+                    <ul>
+                      <li>Per-file direct-NCNN overrides only apply when the selected backend is direct <b>Real-ESRGAN NCNN</b>.</li>
+                      <li>Automatic texture rules and planner behavior still matter even when an upscale backend is enabled.</li>
+                      <li><b>Run Summary</b> is the read-only preflight view for current sources, backend, texture preset, and export behavior.</li>
+                      <li><b>Preview Policy</b> is the per-file plan view for the current workflow match set.</li>
+                    </ul>
+                    """,
+                },
+                {
+                    "id": "compare_review",
+                    "title": "Compare & Review",
+                    "summary": "Side-by-side original/output DDS review.",
+                    "keywords": "compare review side by side sync pan preview size mip details open in texture editor",
+                    "html": """
+                    <p><b>Compare</b> is the final review surface for the current loose output set.</p>
+                    <ul>
+                      <li>Preview original DDS and output DDS side by side.</li>
+                      <li>Change fit/zoom level, pan each side, or enable <b>Sync Pan</b>.</li>
+                      <li>Open the current texture in <b>Texture Editor</b> or jump to mip details in Research.</li>
+                      <li>Use this before large runs or before packaging output for a mod-ready folder.</li>
+                    </ul>
+                    """,
+                },
+                {
+                    "id": "archive_browser",
+                    "title": "Archive Browser",
+                    "summary": "Read-only archive scan, preview, filter, and extraction surface.",
+                    "keywords": "archive browser pamt paz scan preview filter extract workflow research texture editor read only",
+                    "html": """
+                    <p><b>Archive Browser</b> is read-only. It never writes back to <code>.pamt</code> or <code>.paz</code>.</p>
+                    <ul>
+                      <li>Scan package roots and cache the discovered archive index locally.</li>
+                      <li>Filter by path, package, folder, likely role, size, and previewability.</li>
+                      <li>Preview supported DDS/images, text-like files, and other supported assets.</li>
+                      <li>Extract selected or filtered content to loose folders.</li>
+                      <li>Send DDS content into Texture Workflow, open supported images in Texture Editor, or resolve items in Research.</li>
+                    </ul>
+                    """,
+                },
+                {
+                    "id": "texture_editor",
+                    "title": "Texture Editor",
+                    "summary": "Layered editor for visible-texture work.",
+                    "keywords": "texture editor layers masks selections brush clone heal smudge patch gradient dodge burn channels compare",
+                    "html": """
+                    <p><b>Texture Editor</b> is built for visible-color texture work rather than general-purpose technical-map authoring.</p>
+                    <ul>
+                      <li>Layered document with paint, erase, fill, gradient, clone, heal, smudge, patch, dodge/burn, sharpen, and soften tools.</li>
+                      <li>Selections, floating paste/move workflow, masks, channel locks, and non-destructive adjustments.</li>
+                      <li>RGBA/original/split preview modes and direct handoff to Compare, Replace Assistant, and Texture Workflow.</li>
+                      <li>Warnings are shown for technical textures because the editor is not the safest place to rebuild those blindly.</li>
+                    </ul>
+                    """,
+                },
+                {
+                    "id": "replace_assistant",
+                    "title": "Replace Assistant",
+                    "summary": "Guided one-off replacement flow for edited PNG/DDS files.",
+                    "keywords": "replace assistant replace edited png dds original match mod ready loose export package",
+                    "html": """
+                    <p><b>Replace Assistant</b> is the best route when you already have an edited PNG or DDS and want to match it back to the correct original texture, rebuild it safely, and export a ready loose mod folder.</p>
+                    <ul>
+                      <li>Match edited assets to original DDS files or archive entries.</li>
+                      <li>Apply correction and rebuild logic with current output settings.</li>
+                      <li>Export a mod-ready loose folder structure for the matched results.</li>
+                    </ul>
+                    """,
+                },
+                {
+                    "id": "research",
+                    "title": "Research",
+                    "summary": "Texture-family inspection, unknown-resolution, DDS QA, reports, and notes.",
+                    "keywords": "research unknown resolver grouped families dds qa reports heatmaps notes references",
+                    "html": """
+                    <p><b>Research</b> is the analysis surface for grouped texture families and metadata-heavy review.</p>
+                    <ul>
+                      <li>Inspect grouped DDS families and their inferred semantic roles.</li>
+                      <li>Use <b>Unknown Resolver</b> to review and assign uncertain classifications.</li>
+                      <li>Open DDS analysis, reports, references, and local notes.</li>
+                      <li>Review planner/path/profile summaries and family-level context before committing to risky workflow overrides.</li>
+                    </ul>
+                    """,
+                },
+                {
+                    "id": "text_search",
+                    "title": "Text Search",
+                    "summary": "Search archive and loose text-like files with preview and export.",
+                    "keywords": "text search xml json cfg lua regex export preview encrypted xml archive loose",
+                    "html": """
+                    <p><b>Text Search</b> is for archive or loose-file search across text-like assets such as <code>.xml</code>, <code>.json</code>, <code>.cfg</code>, <code>.lua</code>, and similar formats.</p>
+                    <ul>
+                      <li>Search with preview and syntax-colored match context.</li>
+                      <li>Work against archive data or loose folders.</li>
+                      <li>Export matched results while preserving folder structure.</li>
+                    </ul>
+                    """,
+                },
+                {
+                    "id": "settings_files",
+                    "title": "Settings, Files & Dependencies",
+                    "summary": "Local config, cache, project files, and external dependencies.",
+                    "keywords": "settings files config cache dependency texconv ncnn chainner license readme notices",
+                    "html": f"""
+                    <p>The app stores its local settings and archive cache beside the executable or local source checkout.</p>
+                    <ul>
+                      <li><b>Config file</b>: <code>{settings_text}</code></li>
+                      <li><b>Archive cache</b>: <code>{cache_text}</code></li>
+                      <li><b>README</b>: <code>{readme_text}</code></li>
+                      <li><b>License</b>: <code>{license_text}</code></li>
+                      <li><b>Third-party notices</b>: <code>{notices_text}</code></li>
+                    </ul>
+                    <h4>External requirements</h4>
+                    <ul>
+                      <li><b>texconv</b> is required for DDS preview, DDS-to-PNG conversion, compare preview, and DDS rebuild.</li>
+                      <li><b>Real-ESRGAN NCNN</b> and <b>chaiNNer</b> are optional backends.</li>
+                    </ul>
+                    <h4>References</h4>
+                    <ul>
+                      <li><a href="https://github.com/microsoft/DirectXTex/releases">Microsoft DirectXTex releases</a></li>
+                      <li><a href="https://chainner.app/download/">chaiNNer download page</a></li>
+                      <li><a href="https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan">Real-ESRGAN NCNN Vulkan</a></li>
+                      <li><a href="https://www.nexusmods.com/crimsondesert/mods/62">Crimson Desert Unpacker</a></li>
+                      <li><a href="https://www.nexusmods.com/crimsondesert/mods/84">Crimson Browser &amp; Mod Manager</a></li>
+                    </ul>
+                    """,
+                },
+                {
+                    "id": "troubleshooting",
+                    "title": "Troubleshooting & Limits",
+                    "summary": "Common failure cases and current limitations.",
+                    "keywords": "troubleshooting limits texconv ncnn chainner png output brightness drift preview archive cache",
+                    "html": """
+                    <ul>
+                      <li><b>Missing texconv</b>: DDS preview, DDS-to-PNG conversion, compare preview, and DDS rebuild all depend on it.</li>
+                      <li><b>Missing NCNN models</b>: direct NCNN requires a valid executable and matching <code>.param</code> / <code>.bin</code> models.</li>
+                      <li><b>No matching PNG outputs</b>: if the selected backend produces no usable PNG output, DDS rebuild has nothing to convert.</li>
+                      <li><b>Wrong chaiNNer paths</b>: hardcoded chain paths can make the chain read from or write to the wrong directory.</li>
+                      <li><b>Brightness or detail drift</b>: compare outputs carefully, test another model, or change direct-NCNN post correction.</li>
+                      <li><b>Archive preview limits</b>: unusual DDS layouts and very large archive scans are still best-effort cases.</li>
+                      <li><b>Technical textures</b>: preserve-first handling is still the safer default for normals, masks, packed channels, vectors, and other precision-sensitive maps.</li>
+                    </ul>
+                    """,
+                },
+            ]
 
-        def show_about_dialog(self) -> None:
-            dialog = AboutDialog(self, title=f"About {APP_TITLE}", html=self._build_about_html())
+        def show_about_dialog(self, _checked: bool = False, topic_id: str = "") -> None:
+            dialog = AboutDialog(
+                self,
+                title=f"{APP_TITLE} Documentation",
+                intro_html=self._build_about_intro_html(),
+                sections=self._build_about_sections(),
+                initial_section_id=topic_id or "overview",
+            )
             dialog.exec()
 
         def _collect_profile_payload(self) -> Dict[str, object]:
             return {
                 "app": APP_TITLE,
-                "profile_format": 1,
+                "profile_format": 2,
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "theme": self.current_theme_key,
                 "config": dataclasses.asdict(self.collect_config()),
@@ -2395,7 +2970,6 @@ def run_gui() -> int:
                 self.dds_custom_mip_spin.setValue(int(config.dds_custom_mip_count))
                 self.enable_dds_staging_checkbox.setChecked(bool(config.enable_dds_staging))
                 self.enable_incremental_resume_checkbox.setChecked(bool(config.enable_incremental_resume))
-                self.texture_rules_edit.setPlainText(config.texture_rules_text)
                 self.dry_run_checkbox.setChecked(bool(config.dry_run))
                 self.csv_log_enabled_checkbox.setChecked(bool(config.csv_log_enabled))
                 self.csv_log_path_edit.setText(config.csv_log_path)
@@ -2465,6 +3039,7 @@ def run_gui() -> int:
                 )
                 self.archive_min_size_spin.setValue(int(config.archive_min_size_kb))
                 self.archive_previewable_only_checkbox.setChecked(bool(config.archive_previewable_only))
+                self._apply_workflow_state_from_config(config)
             finally:
                 self._settings_ready = previous_ready
 
@@ -2474,6 +3049,7 @@ def run_gui() -> int:
             self._apply_dds_staging_enabled_state()
             self._apply_dds_output_state()
             self._refresh_chainner_chain_info()
+            self._schedule_workflow_match_refresh()
             if theme_key and theme_key in UI_THEME_SCHEMES:
                 self._handle_theme_changed(theme_key)
             self.flush_settings_save()
@@ -2913,6 +3489,563 @@ def run_gui() -> int:
             if index >= 0:
                 combo.setCurrentIndex(index)
 
+        def _next_workflow_profile_id(self) -> str:
+            existing_ids = {profile.profile_id for profile in self.workflow_profiles_state}
+            index = 1
+            while True:
+                candidate = f"profile_{index}"
+                if candidate not in existing_ids:
+                    return candidate
+                index += 1
+
+        def _selected_workflow_profile_index(self) -> int:
+            item = self.workflow_profiles_tree.currentItem()
+            if item is None:
+                return -1
+            try:
+                return int(item.data(0, Qt.UserRole))
+            except (TypeError, ValueError):
+                return -1
+
+        def _selected_workflow_rule_index(self) -> int:
+            item = self.workflow_rules_tree.currentItem()
+            if item is None:
+                return -1
+            try:
+                return int(item.data(0, Qt.UserRole))
+            except (TypeError, ValueError):
+                return -1
+
+        def _workflow_profile_by_id(self, profile_id: str) -> Optional[TextureWorkflowProfile]:
+            target = str(profile_id or "").strip()
+            for profile in self.workflow_profiles_state:
+                if profile.profile_id == target:
+                    return profile
+            return None
+
+        def _workflow_profile_label(self, profile_id: str) -> str:
+            profile = self._workflow_profile_by_id(profile_id)
+            return profile.label if profile is not None else ""
+
+        def _workflow_profile_dds_summary(self, profile: TextureWorkflowProfile) -> str:
+            parts: List[str] = []
+            if profile.format_value:
+                parts.append(f"fmt={profile.format_value}")
+            if profile.size_value:
+                parts.append(f"size={profile.size_value}")
+            if profile.mip_value:
+                parts.append(f"mips={profile.mip_value}")
+            return ", ".join(parts) if parts else "Inherit"
+
+        def _workflow_profile_ncnn_summary(self, profile: TextureWorkflowProfile) -> str:
+            parts: List[str] = []
+            if profile.ncnn_model_name:
+                parts.append(profile.ncnn_model_name)
+            if profile.ncnn_scale is not None:
+                parts.append(f"{profile.ncnn_scale}x")
+            if profile.ncnn_tile_size is not None:
+                parts.append(f"tile {profile.ncnn_tile_size}")
+            if profile.post_correction_mode:
+                parts.append(profile.post_correction_mode)
+            if profile.ncnn_extra_args:
+                parts.append("extra args")
+            return " | ".join(parts) if parts else "Inherit"
+
+        def _workflow_rule_summary(self, rule: TextureRule) -> Tuple[str, str, str, str, str, str, str, str, str]:
+            return (
+                "Yes" if rule.enabled else "No",
+                "Exact" if str(rule.match_mode or "glob").strip().lower() == "exact" else "Glob",
+                rule.pattern,
+                self._workflow_profile_label(rule.workflow_profile_id) or "(none)",
+                rule.semantic_value or "",
+                rule.profile_value or "",
+                rule.colorspace_value or "",
+                rule.alpha_policy_value or "",
+                rule.intermediate_value or "",
+            )
+
+        def _refresh_workflow_profile_ncnn_model_combo(self) -> None:
+            current_value = self._combo_value(self.workflow_profile_ncnn_model_combo)
+            models = [self.ncnn_model_combo.itemData(index) for index in range(self.ncnn_model_combo.count())]
+            self.workflow_profile_ncnn_model_combo.blockSignals(True)
+            self.workflow_profile_ncnn_model_combo.clear()
+            self._add_combo_choice(self.workflow_profile_ncnn_model_combo, "Inherit Direct NCNN Model", "")
+            seen: set[str] = set()
+            for model_name in models:
+                normalized = str(model_name or "").strip()
+                if not normalized or normalized in seen:
+                    continue
+                self._add_combo_choice(self.workflow_profile_ncnn_model_combo, normalized, normalized)
+                seen.add(normalized)
+            if current_value and current_value not in seen:
+                self._add_combo_choice(
+                    self.workflow_profile_ncnn_model_combo,
+                    f"{current_value} (missing)",
+                    current_value,
+                )
+            self._set_combo_by_value(self.workflow_profile_ncnn_model_combo, current_value)
+            self.workflow_profile_ncnn_model_combo.blockSignals(False)
+
+        def _refresh_workflow_rule_profile_combo(self, preferred_profile_id: str = "") -> None:
+            current_value = preferred_profile_id or self._combo_value(self.workflow_rule_profile_combo)
+            self.workflow_rule_profile_combo.blockSignals(True)
+            self.workflow_rule_profile_combo.clear()
+            self._add_combo_choice(self.workflow_rule_profile_combo, "No Workflow Profile", "")
+            for profile in self.workflow_profiles_state:
+                self._add_combo_choice(self.workflow_rule_profile_combo, profile.label, profile.profile_id)
+            self._set_combo_by_value(self.workflow_rule_profile_combo, current_value)
+            self.workflow_rule_profile_combo.blockSignals(False)
+
+        def _set_workflow_profile_custom_controls_state(self, *_args) -> None:
+            size_value = self._combo_value(self.workflow_profile_size_combo)
+            size_custom = size_value == "__custom__"
+            self.workflow_profile_custom_size_widget.setVisible(size_custom)
+            self.workflow_profile_custom_width_spin.setEnabled(size_custom)
+            self.workflow_profile_custom_height_spin.setEnabled(size_custom)
+            mip_value = self._combo_value(self.workflow_profile_mip_combo)
+            mip_custom = mip_value == "__custom__"
+            self.workflow_profile_custom_mip_spin.setVisible(mip_custom)
+            self.workflow_profile_custom_mip_spin.setEnabled(mip_custom)
+            tile_enabled = self.workflow_profile_ncnn_tile_override_checkbox.isChecked()
+            self.workflow_profile_ncnn_tile_spin.setEnabled(tile_enabled and self._current_upscale_backend() == UPSCALE_BACKEND_REALESRGAN_NCNN)
+
+        def _sync_workflow_editor_state(self, *_args) -> None:
+            profile_index = self._selected_workflow_profile_index()
+            rule_index = self._selected_workflow_rule_index()
+            has_profile = 0 <= profile_index < len(self.workflow_profiles_state)
+            has_rule = 0 <= rule_index < len(self.texture_rules_state)
+            self.workflow_profile_duplicate_button.setEnabled(has_profile)
+            self.workflow_profile_delete_button.setEnabled(has_profile)
+            self.workflow_rule_duplicate_button.setEnabled(has_rule)
+            self.workflow_rule_delete_button.setEnabled(has_rule)
+            self.workflow_rule_move_up_button.setEnabled(has_rule and rule_index > 0)
+            self.workflow_rule_move_down_button.setEnabled(has_rule and rule_index < len(self.texture_rules_state) - 1)
+            self.workflow_assign_profile_button.setEnabled(
+                bool(self.workflow_profiles_state) and bool(self.workflow_matched_files_tree.selectedItems())
+            )
+            direct_backend_enabled = self._current_upscale_backend() == UPSCALE_BACKEND_REALESRGAN_NCNN
+            for widget in (
+                self.workflow_profile_ncnn_model_combo,
+                self.workflow_profile_ncnn_scale_combo,
+                self.workflow_profile_ncnn_tile_override_checkbox,
+                self.workflow_profile_ncnn_extra_args_edit,
+                self.workflow_profile_post_correction_combo,
+            ):
+                widget.setEnabled(has_profile and direct_backend_enabled)
+            self.workflow_profile_ncnn_tile_spin.setEnabled(
+                has_profile and direct_backend_enabled and self.workflow_profile_ncnn_tile_override_checkbox.isChecked()
+            )
+            self._set_workflow_profile_custom_controls_state()
+
+        def _refresh_workflow_profiles_tree(self, *, select_profile_id: str = "") -> None:
+            if not select_profile_id:
+                current_index = self._selected_workflow_profile_index()
+                if 0 <= current_index < len(self.workflow_profiles_state):
+                    select_profile_id = self.workflow_profiles_state[current_index].profile_id
+            self._workflow_editor_syncing = True
+            try:
+                self.workflow_profiles_tree.clear()
+                selected_item = None
+                for index, profile in enumerate(self.workflow_profiles_state):
+                    item = QTreeWidgetItem(
+                        [
+                            profile.label,
+                            profile.action_mode or "inherit",
+                            self._workflow_profile_dds_summary(profile),
+                            self._workflow_profile_ncnn_summary(profile),
+                        ]
+                    )
+                    item.setData(0, Qt.UserRole, index)
+                    item.setData(0, Qt.UserRole + 1, profile.profile_id)
+                    self.workflow_profiles_tree.addTopLevelItem(item)
+                    if profile.profile_id == select_profile_id:
+                        selected_item = item
+                if selected_item is None and self.workflow_profiles_tree.topLevelItemCount() > 0:
+                    selected_item = self.workflow_profiles_tree.topLevelItem(0)
+                if selected_item is not None:
+                    self.workflow_profiles_tree.setCurrentItem(selected_item)
+            finally:
+                self._workflow_editor_syncing = False
+            self._refresh_workflow_rule_profile_combo()
+            self._update_workflow_profile_detail_widgets()
+            self._refresh_workflow_rules_tree()
+
+        def _refresh_workflow_rules_tree(self, *, select_index: Optional[int] = None) -> None:
+            if select_index is None:
+                current_index = self._selected_workflow_rule_index()
+                select_index = current_index if current_index >= 0 else None
+            self._workflow_editor_syncing = True
+            try:
+                self.workflow_rules_tree.clear()
+                selected_item = None
+                for index, rule in enumerate(self.texture_rules_state):
+                    item = QTreeWidgetItem(list(self._workflow_rule_summary(rule)))
+                    item.setData(0, Qt.UserRole, index)
+                    self.workflow_rules_tree.addTopLevelItem(item)
+                    if select_index is not None and index == select_index:
+                        selected_item = item
+                if selected_item is None and self.workflow_rules_tree.topLevelItemCount() > 0:
+                    selected_item = self.workflow_rules_tree.topLevelItem(0)
+                if selected_item is not None:
+                    self.workflow_rules_tree.setCurrentItem(selected_item)
+            finally:
+                self._workflow_editor_syncing = False
+            self._update_workflow_rule_detail_widgets()
+
+        def _update_workflow_profile_detail_widgets(self, *_args) -> None:
+            index = self._selected_workflow_profile_index()
+            has_profile = 0 <= index < len(self.workflow_profiles_state)
+            profile = self.workflow_profiles_state[index] if has_profile else None
+            self._workflow_editor_syncing = True
+            try:
+                for widget in (
+                    self.workflow_profile_name_edit,
+                    self.workflow_profile_action_combo,
+                    self.workflow_profile_format_combo,
+                    self.workflow_profile_size_combo,
+                    self.workflow_profile_mip_combo,
+                    self.workflow_profile_ncnn_model_combo,
+                    self.workflow_profile_ncnn_scale_combo,
+                    self.workflow_profile_ncnn_tile_override_checkbox,
+                    self.workflow_profile_ncnn_extra_args_edit,
+                    self.workflow_profile_post_correction_combo,
+                ):
+                    widget.setEnabled(has_profile)
+                self.workflow_profile_custom_width_spin.setEnabled(has_profile)
+                self.workflow_profile_custom_height_spin.setEnabled(has_profile)
+                self.workflow_profile_custom_mip_spin.setEnabled(has_profile)
+                if profile is None:
+                    self.workflow_profile_name_edit.clear()
+                    self._set_combo_by_value(self.workflow_profile_action_combo, "")
+                    self._set_combo_by_value(self.workflow_profile_format_combo, "")
+                    self._set_combo_by_value(self.workflow_profile_size_combo, "")
+                    self.workflow_profile_custom_width_spin.setValue(2048)
+                    self.workflow_profile_custom_height_spin.setValue(2048)
+                    self._set_combo_by_value(self.workflow_profile_mip_combo, "")
+                    self.workflow_profile_custom_mip_spin.setValue(1)
+                    self._refresh_workflow_profile_ncnn_model_combo()
+                    self._set_combo_by_value(self.workflow_profile_ncnn_scale_combo, "")
+                    self.workflow_profile_ncnn_tile_override_checkbox.setChecked(False)
+                    self.workflow_profile_ncnn_tile_spin.setValue(max(0, self.ncnn_tile_size_spin.value()))
+                    self.workflow_profile_ncnn_extra_args_edit.clear()
+                    self._set_combo_by_value(self.workflow_profile_post_correction_combo, "")
+                else:
+                    self.workflow_profile_name_edit.setText(profile.label)
+                    self._set_combo_by_value(self.workflow_profile_action_combo, profile.action_mode)
+                    self._set_combo_by_value(self.workflow_profile_format_combo, profile.format_value or "")
+                    size_value = profile.size_value or ""
+                    if "x" in size_value:
+                        self._set_combo_by_value(self.workflow_profile_size_combo, "__custom__")
+                        width_text, height_text = size_value.split("x", 1)
+                        self.workflow_profile_custom_width_spin.setValue(int(width_text))
+                        self.workflow_profile_custom_height_spin.setValue(int(height_text))
+                    else:
+                        self._set_combo_by_value(self.workflow_profile_size_combo, size_value)
+                    mip_value = profile.mip_value or ""
+                    if mip_value.isdigit():
+                        self._set_combo_by_value(self.workflow_profile_mip_combo, "__custom__")
+                        self.workflow_profile_custom_mip_spin.setValue(int(mip_value))
+                    else:
+                        self._set_combo_by_value(self.workflow_profile_mip_combo, mip_value)
+                    self._refresh_workflow_profile_ncnn_model_combo()
+                    self._set_combo_by_value(self.workflow_profile_ncnn_model_combo, profile.ncnn_model_name)
+                    self._set_combo_by_value(
+                        self.workflow_profile_ncnn_scale_combo,
+                        str(profile.ncnn_scale) if profile.ncnn_scale is not None else "",
+                    )
+                    self.workflow_profile_ncnn_tile_override_checkbox.setChecked(profile.ncnn_tile_size is not None)
+                    self.workflow_profile_ncnn_tile_spin.setValue(
+                        int(profile.ncnn_tile_size) if profile.ncnn_tile_size is not None else max(0, self.ncnn_tile_size_spin.value())
+                    )
+                    self.workflow_profile_ncnn_extra_args_edit.setText(profile.ncnn_extra_args)
+                    self._set_combo_by_value(self.workflow_profile_post_correction_combo, profile.post_correction_mode or "")
+            finally:
+                self._workflow_editor_syncing = False
+            self._sync_workflow_editor_state()
+
+        def _update_workflow_rule_detail_widgets(self, *_args) -> None:
+            index = self._selected_workflow_rule_index()
+            has_rule = 0 <= index < len(self.texture_rules_state)
+            rule = self.texture_rules_state[index] if has_rule else None
+            self._workflow_editor_syncing = True
+            try:
+                for widget in (
+                    self.workflow_rule_enabled_checkbox,
+                    self.workflow_rule_match_mode_combo,
+                    self.workflow_rule_pattern_edit,
+                    self.workflow_rule_profile_combo,
+                    self.workflow_rule_semantic_combo,
+                    self.workflow_rule_planner_profile_combo,
+                    self.workflow_rule_colorspace_combo,
+                    self.workflow_rule_alpha_combo,
+                    self.workflow_rule_intermediate_combo,
+                ):
+                    widget.setEnabled(has_rule)
+                if rule is None:
+                    self.workflow_rule_enabled_checkbox.setChecked(False)
+                    self._set_combo_by_value(self.workflow_rule_match_mode_combo, "glob")
+                    self.workflow_rule_pattern_edit.clear()
+                    self._refresh_workflow_rule_profile_combo("")
+                    self.workflow_rule_semantic_combo.setCurrentText("")
+                    self._set_combo_by_value(self.workflow_rule_planner_profile_combo, "")
+                    self._set_combo_by_value(self.workflow_rule_colorspace_combo, "")
+                    self._set_combo_by_value(self.workflow_rule_alpha_combo, "")
+                    self._set_combo_by_value(self.workflow_rule_intermediate_combo, "")
+                else:
+                    self.workflow_rule_enabled_checkbox.setChecked(rule.enabled)
+                    self._set_combo_by_value(self.workflow_rule_match_mode_combo, rule.match_mode)
+                    self.workflow_rule_pattern_edit.setText(rule.pattern)
+                    self._refresh_workflow_rule_profile_combo(rule.workflow_profile_id)
+                    self.workflow_rule_semantic_combo.setCurrentText(rule.semantic_value or "")
+                    self._set_combo_by_value(self.workflow_rule_planner_profile_combo, rule.profile_value or "")
+                    self._set_combo_by_value(self.workflow_rule_colorspace_combo, rule.colorspace_value or "")
+                    self._set_combo_by_value(self.workflow_rule_alpha_combo, rule.alpha_policy_value or "")
+                    self._set_combo_by_value(self.workflow_rule_intermediate_combo, rule.intermediate_value or "")
+            finally:
+                self._workflow_editor_syncing = False
+            self._sync_workflow_editor_state()
+
+        def _schedule_workflow_match_refresh(self, *_args) -> None:
+            if not self._settings_ready or self._shutting_down or self._workflow_editor_syncing:
+                return
+            self._workflow_match_refresh_timer.start()
+
+        def _refresh_workflow_matched_files_view(self, *_args) -> None:
+            self.workflow_matched_files_tree.clear()
+            self.workflow_matched_processing_plan = []
+            try:
+                config = self.collect_config()
+                normalized = normalize_config_for_planning(config)
+                dds_files = collect_dds_files(
+                    normalized.original_dds_root,
+                    normalized.include_filter_patterns,
+                )
+                if not dds_files:
+                    self.workflow_matched_summary_label.setText(
+                        "No DDS files matched the current Original DDS root and filter."
+                    )
+                    self._sync_workflow_editor_state()
+                    return
+                processing_plan = build_texture_processing_plan(normalized, dds_files)
+                self.workflow_matched_processing_plan = list(processing_plan)
+                self.workflow_matched_summary_label.setText(
+                    f"{len(processing_plan):,} matched DDS file(s). Last matching rule wins. "
+                    "Use Assign Profile to append exact-path rules for the selected rows."
+                )
+                for entry in processing_plan:
+                    item = QTreeWidgetItem(
+                        [
+                            entry.relative_path.as_posix(),
+                            f"{entry.decision.texture_type}/{entry.decision.semantic_subtype}",
+                            summarize_texture_workflow_rule(entry.matched_rule),
+                            entry.workflow_profile.label if entry.workflow_profile is not None else "(none)",
+                            summarize_effective_dds_override(entry),
+                            summarize_effective_ncnn_settings(normalized, entry),
+                            f"{entry.action} | {entry.action_reason}",
+                        ]
+                    )
+                    item.setData(0, Qt.UserRole, entry.relative_path.as_posix())
+                    self.workflow_matched_files_tree.addTopLevelItem(item)
+            except Exception as exc:
+                self.workflow_matched_summary_label.setText(f"Matched files preview unavailable: {exc}")
+            self._sync_workflow_editor_state()
+
+        def _apply_selected_workflow_profile_edits(self, *_args) -> None:
+            if self._workflow_editor_syncing:
+                return
+            index = self._selected_workflow_profile_index()
+            if not (0 <= index < len(self.workflow_profiles_state)):
+                return
+            current = self.workflow_profiles_state[index]
+            size_value = self._combo_value(self.workflow_profile_size_combo)
+            if size_value == "__custom__":
+                size_value = f"{self.workflow_profile_custom_width_spin.value()}x{self.workflow_profile_custom_height_spin.value()}"
+            mip_value = self._combo_value(self.workflow_profile_mip_combo)
+            if mip_value == "__custom__":
+                mip_value = str(self.workflow_profile_custom_mip_spin.value())
+            updated = TextureWorkflowProfile(
+                profile_id=current.profile_id,
+                label=self.workflow_profile_name_edit.text().strip() or current.label,
+                action_mode=self._combo_value(self.workflow_profile_action_combo),
+                format_value=self._combo_value(self.workflow_profile_format_combo) or None,
+                size_value=size_value or None,
+                mip_value=mip_value or None,
+                ncnn_model_name=self._combo_value(self.workflow_profile_ncnn_model_combo),
+                ncnn_scale=int(self._combo_value(self.workflow_profile_ncnn_scale_combo)) if self._combo_value(self.workflow_profile_ncnn_scale_combo) else None,
+                ncnn_tile_size=self.workflow_profile_ncnn_tile_spin.value() if self.workflow_profile_ncnn_tile_override_checkbox.isChecked() else None,
+                ncnn_extra_args=self.workflow_profile_ncnn_extra_args_edit.text().strip(),
+                post_correction_mode=self._combo_value(self.workflow_profile_post_correction_combo),
+            )
+            self.workflow_profiles_state[index] = updated
+            self._refresh_workflow_profiles_tree(select_profile_id=updated.profile_id)
+            self.schedule_settings_save()
+            self._schedule_workflow_match_refresh()
+
+        def _apply_selected_workflow_rule_edits(self, *_args) -> None:
+            if self._workflow_editor_syncing:
+                return
+            index = self._selected_workflow_rule_index()
+            if not (0 <= index < len(self.texture_rules_state)):
+                return
+            current = self.texture_rules_state[index]
+            pattern_text = self.workflow_rule_pattern_edit.text().strip() or current.pattern
+            updated = TextureRule(
+                pattern=pattern_text,
+                action=current.action,
+                format_value=current.format_value,
+                size_value=current.size_value,
+                mip_value=current.mip_value,
+                semantic_value=self.workflow_rule_semantic_combo.currentText().strip().lower() or None,
+                profile_value=self._combo_value(self.workflow_rule_planner_profile_combo) or None,
+                colorspace_value=self._combo_value(self.workflow_rule_colorspace_combo) or None,
+                alpha_policy_value=self._combo_value(self.workflow_rule_alpha_combo) or None,
+                intermediate_value=self._combo_value(self.workflow_rule_intermediate_combo) or None,
+                enabled=self.workflow_rule_enabled_checkbox.isChecked(),
+                match_mode=self._combo_value(self.workflow_rule_match_mode_combo) or "glob",
+                workflow_profile_id=self._combo_value(self.workflow_rule_profile_combo),
+                source_line=current.source_line or pattern_text,
+            )
+            self.texture_rules_state[index] = updated
+            self._refresh_workflow_rules_tree(select_index=index)
+            self.schedule_settings_save()
+            self._schedule_workflow_match_refresh()
+
+        def _add_workflow_profile(self, *_args) -> None:
+            new_profile = TextureWorkflowProfile(
+                profile_id=self._next_workflow_profile_id(),
+                label=f"Profile {len(self.workflow_profiles_state) + 1}",
+            )
+            self.workflow_profiles_state.append(new_profile)
+            self._refresh_workflow_profiles_tree(select_profile_id=new_profile.profile_id)
+            self.schedule_settings_save()
+            self._schedule_workflow_match_refresh()
+
+        def _duplicate_workflow_profile(self, *_args) -> None:
+            index = self._selected_workflow_profile_index()
+            if not (0 <= index < len(self.workflow_profiles_state)):
+                return
+            current = self.workflow_profiles_state[index]
+            duplicated = dataclasses.replace(
+                current,
+                profile_id=self._next_workflow_profile_id(),
+                label=f"{current.label} Copy",
+            )
+            self.workflow_profiles_state.insert(index + 1, duplicated)
+            self._refresh_workflow_profiles_tree(select_profile_id=duplicated.profile_id)
+            self.schedule_settings_save()
+            self._schedule_workflow_match_refresh()
+
+        def _delete_workflow_profile(self, *_args) -> None:
+            index = self._selected_workflow_profile_index()
+            if not (0 <= index < len(self.workflow_profiles_state)):
+                return
+            profile_id = self.workflow_profiles_state[index].profile_id
+            del self.workflow_profiles_state[index]
+            for rule_index, rule in enumerate(self.texture_rules_state):
+                if rule.workflow_profile_id == profile_id:
+                    self.texture_rules_state[rule_index] = dataclasses.replace(rule, workflow_profile_id="")
+            self._refresh_workflow_profiles_tree()
+            self._refresh_workflow_rules_tree()
+            self.schedule_settings_save()
+            self._schedule_workflow_match_refresh()
+
+        def _add_workflow_rule(self, *_args) -> None:
+            rule = TextureRule(pattern="*.dds", enabled=True, match_mode="glob")
+            self.texture_rules_state.append(rule)
+            self._refresh_workflow_rules_tree(select_index=len(self.texture_rules_state) - 1)
+            self.schedule_settings_save()
+            self._schedule_workflow_match_refresh()
+
+        def _duplicate_workflow_rule(self, *_args) -> None:
+            index = self._selected_workflow_rule_index()
+            if not (0 <= index < len(self.texture_rules_state)):
+                return
+            duplicated = dataclasses.replace(self.texture_rules_state[index])
+            self.texture_rules_state.insert(index + 1, duplicated)
+            self._refresh_workflow_rules_tree(select_index=index + 1)
+            self.schedule_settings_save()
+            self._schedule_workflow_match_refresh()
+
+        def _delete_workflow_rule(self, *_args) -> None:
+            index = self._selected_workflow_rule_index()
+            if not (0 <= index < len(self.texture_rules_state)):
+                return
+            del self.texture_rules_state[index]
+            next_index = min(index, len(self.texture_rules_state) - 1)
+            self._refresh_workflow_rules_tree(select_index=next_index if next_index >= 0 else None)
+            self.schedule_settings_save()
+            self._schedule_workflow_match_refresh()
+
+        def _move_workflow_rule(self, offset: int, *_args) -> None:
+            index = self._selected_workflow_rule_index()
+            target_index = index + offset
+            if not (0 <= index < len(self.texture_rules_state)):
+                return
+            if not (0 <= target_index < len(self.texture_rules_state)):
+                return
+            self.texture_rules_state[index], self.texture_rules_state[target_index] = (
+                self.texture_rules_state[target_index],
+                self.texture_rules_state[index],
+            )
+            self._refresh_workflow_rules_tree(select_index=target_index)
+            self.schedule_settings_save()
+            self._schedule_workflow_match_refresh()
+
+        def _assign_profile_to_selected_workflow_matches(self, *_args) -> None:
+            selected_items = self.workflow_matched_files_tree.selectedItems()
+            if not selected_items or not self.workflow_profiles_state:
+                return
+            profile_labels = [profile.label for profile in self.workflow_profiles_state]
+            selected_label, accepted = QInputDialog.getItem(
+                self,
+                "Assign Workflow Profile",
+                "Choose a workflow profile for the selected files:",
+                profile_labels,
+                0,
+                False,
+            )
+            if not accepted or not selected_label:
+                return
+            selected_profile = next((profile for profile in self.workflow_profiles_state if profile.label == selected_label), None)
+            if selected_profile is None:
+                return
+            for item in selected_items:
+                relative_path = str(item.data(0, Qt.UserRole) or "").strip()
+                if not relative_path:
+                    continue
+                self.texture_rules_state.append(
+                    TextureRule(
+                        pattern=relative_path,
+                        enabled=True,
+                        match_mode="exact",
+                        workflow_profile_id=selected_profile.profile_id,
+                        source_line=relative_path,
+                    )
+                )
+            self._refresh_workflow_rules_tree(select_index=len(self.texture_rules_state) - 1)
+            self.schedule_settings_save()
+            self._schedule_workflow_match_refresh()
+
+        def _apply_workflow_state_from_config(self, config: AppConfig) -> None:
+            legacy_text = str(getattr(config, "texture_rules_text", "") or "")
+            workflow_profiles = list(coerce_texture_workflow_profiles(getattr(config, "workflow_profiles", ())))
+            texture_rules = list(coerce_texture_workflow_rules(getattr(config, "texture_rules", ())))
+            if not workflow_profiles and not texture_rules and legacy_text.strip():
+                migrated_profiles, migrated_rules = migrate_legacy_texture_rules_to_structured(legacy_text)
+                workflow_profiles = list(migrated_profiles)
+                texture_rules = list(migrated_rules)
+            elif should_seed_default_texture_workflow_state(workflow_profiles, texture_rules):
+                workflow_profiles = list(build_default_texture_workflow_profiles())
+                texture_rules = list(build_default_texture_workflow_rules())
+            workflow_profiles_tuple, texture_rules_tuple = upgrade_default_texture_workflow_state(workflow_profiles, texture_rules)
+            self.texture_rules_legacy_text = legacy_text
+            self.workflow_profiles_state = list(workflow_profiles_tuple)
+            self.texture_rules_state = list(texture_rules_tuple)
+            self._refresh_workflow_profile_ncnn_model_combo()
+            self._refresh_workflow_profiles_tree()
+            self._refresh_workflow_rules_tree()
+            self._schedule_workflow_match_refresh()
+
         def _connect_auto_save(self) -> None:
             line_edits = [
                 self.original_dds_edit,
@@ -3020,10 +4153,84 @@ def run_gui() -> int:
             self.filters_section.toggled.connect(self.schedule_settings_save)
             self.chainner_section.toggled.connect(self.schedule_settings_save)
             self.filters_edit.textChanged.connect(self.schedule_settings_save)
-            self.texture_rules_edit.textChanged.connect(self.schedule_settings_save)
             self.chainner_override_edit.textChanged.connect(self.schedule_settings_save)
             self.chainner_chain_path_edit.textChanged.connect(self._schedule_chainner_chain_info_refresh)
             self.chainner_override_edit.textChanged.connect(self._schedule_chainner_chain_info_refresh)
+            self.workflow_profiles_tree.currentItemChanged.connect(lambda *_args: self._update_workflow_profile_detail_widgets())
+            self.workflow_rules_tree.currentItemChanged.connect(lambda *_args: self._update_workflow_rule_detail_widgets())
+            self.workflow_matched_files_tree.itemSelectionChanged.connect(self._sync_workflow_editor_state)
+            self.workflow_profile_add_button.clicked.connect(self._add_workflow_profile)
+            self.workflow_profile_duplicate_button.clicked.connect(self._duplicate_workflow_profile)
+            self.workflow_profile_delete_button.clicked.connect(self._delete_workflow_profile)
+            self.workflow_rule_add_button.clicked.connect(self._add_workflow_rule)
+            self.workflow_rule_duplicate_button.clicked.connect(self._duplicate_workflow_rule)
+            self.workflow_rule_delete_button.clicked.connect(self._delete_workflow_rule)
+            self.workflow_rule_move_up_button.clicked.connect(lambda: self._move_workflow_rule(-1))
+            self.workflow_rule_move_down_button.clicked.connect(lambda: self._move_workflow_rule(1))
+            self.workflow_matched_refresh_button.clicked.connect(self._refresh_workflow_matched_files_view)
+            self.workflow_assign_profile_button.clicked.connect(self._assign_profile_to_selected_workflow_matches)
+            self.workflow_profile_name_edit.editingFinished.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_action_combo.currentIndexChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_format_combo.currentIndexChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_size_combo.currentIndexChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_size_combo.currentIndexChanged.connect(self._set_workflow_profile_custom_controls_state)
+            self.workflow_profile_custom_width_spin.valueChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_custom_height_spin.valueChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_mip_combo.currentIndexChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_mip_combo.currentIndexChanged.connect(self._set_workflow_profile_custom_controls_state)
+            self.workflow_profile_custom_mip_spin.valueChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_ncnn_model_combo.currentIndexChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_ncnn_scale_combo.currentIndexChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_ncnn_tile_override_checkbox.toggled.connect(self._set_workflow_profile_custom_controls_state)
+            self.workflow_profile_ncnn_tile_override_checkbox.toggled.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_ncnn_tile_spin.valueChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_ncnn_extra_args_edit.editingFinished.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_profile_post_correction_combo.currentIndexChanged.connect(self._apply_selected_workflow_profile_edits)
+            self.workflow_rule_enabled_checkbox.toggled.connect(self._apply_selected_workflow_rule_edits)
+            self.workflow_rule_match_mode_combo.currentIndexChanged.connect(self._apply_selected_workflow_rule_edits)
+            self.workflow_rule_pattern_edit.editingFinished.connect(self._apply_selected_workflow_rule_edits)
+            self.workflow_rule_profile_combo.currentIndexChanged.connect(self._apply_selected_workflow_rule_edits)
+            self.workflow_rule_semantic_combo.currentTextChanged.connect(self._apply_selected_workflow_rule_edits)
+            self.workflow_rule_semantic_combo.lineEdit().editingFinished.connect(self._apply_selected_workflow_rule_edits)
+            self.workflow_rule_planner_profile_combo.currentIndexChanged.connect(self._apply_selected_workflow_rule_edits)
+            self.workflow_rule_colorspace_combo.currentIndexChanged.connect(self._apply_selected_workflow_rule_edits)
+            self.workflow_rule_alpha_combo.currentIndexChanged.connect(self._apply_selected_workflow_rule_edits)
+            self.workflow_rule_intermediate_combo.currentIndexChanged.connect(self._apply_selected_workflow_rule_edits)
+            for widget in (
+                self.original_dds_edit,
+                self.filters_edit,
+                self.png_root_edit,
+                self.texture_editor_png_root_edit,
+                self.dds_staging_root_edit,
+                self.output_root_edit,
+                self.texconv_path_edit,
+            ):
+                widget.textChanged.connect(self._schedule_workflow_match_refresh)
+            for checkbox in (
+                self.enable_automatic_texture_rules_checkbox,
+                self.enable_unsafe_technical_override_checkbox,
+                self.enable_dds_staging_checkbox,
+            ):
+                checkbox.toggled.connect(self._schedule_workflow_match_refresh)
+            for combo in (
+                self.dds_format_mode_combo,
+                self.dds_custom_format_combo,
+                self.dds_size_mode_combo,
+                self.dds_mip_mode_combo,
+                self.upscale_backend_combo,
+                self.ncnn_model_combo,
+                self.upscale_post_correction_combo,
+                self.upscale_texture_preset_combo,
+            ):
+                combo.currentIndexChanged.connect(self._schedule_workflow_match_refresh)
+            for spin in (
+                self.dds_custom_width_spin,
+                self.dds_custom_height_spin,
+                self.dds_custom_mip_spin,
+                self.ncnn_scale_spin,
+                self.ncnn_tile_size_spin,
+            ):
+                spin.valueChanged.connect(self._schedule_workflow_match_refresh)
 
         def _handle_main_tab_changed(self, index: int) -> None:
             if 0 <= index < self.main_tabs.count() and self.main_tabs.widget(index) is self.workflow_tab:
@@ -3135,7 +4342,15 @@ def run_gui() -> int:
                 self.overwrite_existing_checkbox.isChecked(),
             )
             self.settings.setValue("settings/include_filters", self.filters_edit.toPlainText())
-            self.settings.setValue("settings/texture_rules_text", self.texture_rules_edit.toPlainText())
+            self.settings.setValue("settings/texture_rules_text", self.texture_rules_legacy_text)
+            self.settings.setValue(
+                "settings/workflow_profiles_json",
+                json.dumps([dataclasses.asdict(profile) for profile in self.workflow_profiles_state], indent=2),
+            )
+            self.settings.setValue(
+                "settings/workflow_rules_json",
+                json.dumps([dataclasses.asdict(rule) for rule in self.texture_rules_state], indent=2),
+            )
             current_upscale_backend = self._current_upscale_backend()
             self.settings.setValue("upscale/backend", current_upscale_backend)
             self.settings.setValue("chainner/enabled", current_upscale_backend == UPSCALE_BACKEND_CHAINNER)
@@ -3328,9 +4543,44 @@ def run_gui() -> int:
             self.filters_edit.setPlainText(
                 self.settings.value("settings/include_filters", defaults.include_filters)
             )
-            self.texture_rules_edit.setPlainText(
-                self.settings.value("settings/texture_rules_text", defaults.texture_rules_text)
+            legacy_texture_rules_text = str(
+                self.settings.value("settings/texture_rules_text", getattr(defaults, "texture_rules_text", ""))
+                or ""
             )
+            workflow_profiles_json = str(self.settings.value("settings/workflow_profiles_json", "") or "")
+            workflow_rules_json = str(self.settings.value("settings/workflow_rules_json", "") or "")
+            loaded_workflow_profiles: Sequence[object] = ()
+            loaded_workflow_rules: Sequence[object] = ()
+            if workflow_profiles_json.strip():
+                try:
+                    parsed_profiles = json.loads(workflow_profiles_json)
+                    if isinstance(parsed_profiles, list):
+                        loaded_workflow_profiles = parsed_profiles
+                except Exception:
+                    loaded_workflow_profiles = ()
+            if workflow_rules_json.strip():
+                try:
+                    parsed_rules = json.loads(workflow_rules_json)
+                    if isinstance(parsed_rules, list):
+                        loaded_workflow_rules = parsed_rules
+                except Exception:
+                    loaded_workflow_rules = ()
+            self.texture_rules_legacy_text = legacy_texture_rules_text
+            self.workflow_profiles_state = list(coerce_texture_workflow_profiles(loaded_workflow_profiles))
+            self.texture_rules_state = list(coerce_texture_workflow_rules(loaded_workflow_rules))
+            if not self.workflow_profiles_state and not self.texture_rules_state and legacy_texture_rules_text.strip():
+                migrated_profiles, migrated_rules = migrate_legacy_texture_rules_to_structured(legacy_texture_rules_text)
+                self.workflow_profiles_state = list(migrated_profiles)
+                self.texture_rules_state = list(migrated_rules)
+            elif should_seed_default_texture_workflow_state(self.workflow_profiles_state, self.texture_rules_state):
+                self.workflow_profiles_state = list(build_default_texture_workflow_profiles())
+                self.texture_rules_state = list(build_default_texture_workflow_rules())
+            upgraded_profiles, upgraded_rules = upgrade_default_texture_workflow_state(
+                self.workflow_profiles_state,
+                self.texture_rules_state,
+            )
+            self.workflow_profiles_state = list(upgraded_profiles)
+            self.texture_rules_state = list(upgraded_rules)
             saved_backend = str(self.settings.value("upscale/backend", "") or "").strip()
             if saved_backend not in {
                 UPSCALE_BACKEND_NONE,
@@ -3482,6 +4732,10 @@ def run_gui() -> int:
             self.filters_section.set_expanded(self._read_bool("sections/filters_expanded", False))
             self.chainner_section.set_expanded(self._read_bool("sections/chainner_expanded", False))
             self._apply_mod_ready_export_state()
+            self._refresh_workflow_profile_ncnn_model_combo()
+            self._refresh_workflow_profiles_tree()
+            self._refresh_workflow_rules_tree()
+            self._schedule_workflow_match_refresh()
 
         def _read_bool(self, key: str, default: bool) -> bool:
             value = self.settings.value(key, default)
@@ -3547,6 +4801,8 @@ def run_gui() -> int:
             self.mod_ready_export_root_edit.setEnabled(self.enable_mod_ready_loose_export_checkbox.isChecked())
             self.mod_ready_export_browse_button.setEnabled(self.enable_mod_ready_loose_export_checkbox.isChecked())
             self.mod_ready_package_group.setVisible(self.enable_mod_ready_loose_export_checkbox.isChecked())
+            self._refresh_workflow_profile_ncnn_model_combo()
+            self._sync_workflow_editor_state()
             self._update_ncnn_preset_hint()
             self._refresh_dds_output_hints()
             self._sync_upscale_backend_stack_height()
@@ -6640,7 +7896,9 @@ def run_gui() -> int:
                 dds_custom_mip_count=self.dds_custom_mip_spin.value(),
                 enable_dds_staging=self.enable_dds_staging_checkbox.isChecked(),
                 enable_incremental_resume=self.enable_incremental_resume_checkbox.isChecked(),
-                texture_rules_text=self.texture_rules_edit.toPlainText(),
+                texture_rules_text=self.texture_rules_legacy_text,
+                texture_rules=tuple(self.texture_rules_state),
+                workflow_profiles=tuple(self.workflow_profiles_state),
                 dry_run=self.dry_run_checkbox.isChecked(),
                 csv_log_enabled=self.csv_log_enabled_checkbox.isChecked(),
                 csv_log_path=self.csv_log_path_edit.text().strip(),
@@ -6721,10 +7979,9 @@ def run_gui() -> int:
         def set_busy(self, busy: bool, build_mode: bool = False) -> None:
             self.export_profile_action.setEnabled(not busy)
             self.import_profile_action.setEnabled(not busy)
-            self.validate_chainner_menu_action.setEnabled(not busy)
             self.export_diagnostics_action.setEnabled(not busy)
             self.quick_start_menu_action.setEnabled(not busy)
-            self.about_menu_action.setEnabled(not busy)
+            self.open_documentation_action.setEnabled(not busy)
             self.left_panel.setEnabled(not busy)
             self.scan_button.setEnabled(not busy)
             self.preview_policy_button.setEnabled(not busy)

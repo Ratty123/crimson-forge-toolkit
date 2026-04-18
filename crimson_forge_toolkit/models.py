@@ -117,7 +117,25 @@ class TextureRule:
     colorspace_value: Optional[str] = None
     alpha_policy_value: Optional[str] = None
     intermediate_value: Optional[str] = None
+    enabled: bool = True
+    match_mode: str = "glob"
+    workflow_profile_id: str = ""
     source_line: str = ""
+
+
+@dataclass(slots=True)
+class TextureWorkflowProfile:
+    profile_id: str
+    label: str
+    action_mode: str = ""
+    format_value: Optional[str] = None
+    size_value: Optional[str] = None
+    mip_value: Optional[str] = None
+    ncnn_model_name: str = ""
+    ncnn_scale: Optional[int] = None
+    ncnn_tile_size: Optional[int] = None
+    ncnn_extra_args: str = ""
+    post_correction_mode: str = ""
 
 
 @dataclass(slots=True)
@@ -138,6 +156,8 @@ class AppConfig:
     enable_dds_staging: bool = ENABLE_DDS_STAGING
     enable_incremental_resume: bool = ENABLE_INCREMENTAL_RESUME
     texture_rules_text: str = TEXTURE_RULES_TEXT
+    texture_rules: Tuple[TextureRule, ...] = field(default_factory=tuple)
+    workflow_profiles: Tuple[TextureWorkflowProfile, ...] = field(default_factory=tuple)
     dry_run: bool = DRY_RUN
     csv_log_enabled: bool = bool(LOG_CSV.strip())
     csv_log_path: str = LOG_CSV
@@ -200,6 +220,7 @@ class NormalizedConfig:
     enable_incremental_resume: bool
     texture_rules_text: str
     texture_rules: Tuple[TextureRule, ...]
+    workflow_profiles: Tuple[TextureWorkflowProfile, ...]
     dry_run: bool
     csv_log_path: Optional[Path]
     allow_unique_basename_fallback: bool
@@ -266,6 +287,22 @@ class TextureProcessingProfile:
 
 
 @dataclass(slots=True)
+class TextureWorkflowDdsOverride:
+    format_value: Optional[str] = None
+    size_value: Optional[str] = None
+    mip_value: Optional[str] = None
+
+
+@dataclass(slots=True)
+class EffectiveNcnnSettings:
+    model_name: str = ""
+    scale: int = 0
+    tile_size: int = 0
+    extra_args: str = ""
+    post_correction_mode: str = ""
+
+
+@dataclass(slots=True)
 class BackendCapabilityDecision:
     backend: str
     path_kind: IntermediateKind | str
@@ -310,6 +347,9 @@ class TextureProcessingPlan:
     preserve_reason: str = ""
     lossy_intermediate_warning: str = ""
     matched_rule: Optional[TextureRule] = None
+    workflow_profile: Optional[TextureWorkflowProfile] = None
+    effective_output_override: TextureWorkflowDdsOverride = field(default_factory=TextureWorkflowDdsOverride)
+    effective_ncnn_settings: EffectiveNcnnSettings = field(default_factory=EffectiveNcnnSettings)
     semantic_evidence: TextureSemanticEvidence = field(default_factory=TextureSemanticEvidence)
 
 

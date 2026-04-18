@@ -70,14 +70,14 @@ class TexturePolicyPreviewDialog(QDialog):
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setHeaderLabels(
-            ["Path", "Action", "Profile", "Original", "Planned", "Semantic", "Alpha", "Path"]
+            ["Path", "Action", "Workflow", "Rule", "Planned DDS", "NCNN", "Semantic", "Path"]
         )
         self.tree.header().resizeSection(0, 360)
         self.tree.header().resizeSection(1, 140)
         self.tree.header().resizeSection(2, 170)
-        self.tree.header().resizeSection(3, 150)
-        self.tree.header().resizeSection(4, 170)
-        self.tree.header().resizeSection(5, 160)
+        self.tree.header().resizeSection(3, 220)
+        self.tree.header().resizeSection(4, 200)
+        self.tree.header().resizeSection(5, 240)
         self.tree.header().resizeSection(6, 110)
         self.tree.header().resizeSection(7, 150)
         list_layout.addWidget(self.tree, stretch=1)
@@ -193,11 +193,11 @@ class TexturePolicyPreviewDialog(QDialog):
                 [
                     str(row.get("path", "")),
                     str(row.get("action", "")),
-                    str(row.get("profile_key", "")),
-                    str(row.get("original_format", "")),
-                    str(row.get("planned_format", "")),
+                    str(row.get("workflow_profile_label", "")),
+                    str(row.get("matched_rule", "")),
+                    str(row.get("effective_dds_override", "")),
+                    str(row.get("effective_ncnn_summary", "")),
                     f"{row.get('texture_type', '')}/{row.get('semantic_subtype', '')}",
-                    str(row.get("alpha_policy", "")),
                     str(row.get("path_kind", "")),
                 ]
             )
@@ -243,8 +243,11 @@ class TexturePolicyPreviewDialog(QDialog):
                     f"Path: {row.get('path', '')}",
                     f"Action: {row.get('action', '')}",
                     f"Reason: {row.get('action_reason', '')}",
+                    f"Workflow profile: {row.get('workflow_profile_label', '')} ({row.get('workflow_profile_id', '')})",
+                    f"Matched rule: {row.get('matched_rule', '')}",
                     f"Original format: {row.get('original_format', '')}",
                     f"Planned format: {row.get('planned_format', '')}",
+                    f"Workflow DDS override: {row.get('effective_dds_override', '')}",
                     f"Profile: {row.get('profile_key', '')} ({row.get('profile_label', '')})",
                     f"Planner path: {row.get('path_kind', '')}",
                     f"Planner path detail: {row.get('path_description', '')}",
@@ -255,8 +258,14 @@ class TexturePolicyPreviewDialog(QDialog):
                     f"Backend execution: {row.get('backend_execution_mode', '')}",
                     f"Backend compatibility: {'yes' if row.get('backend_compatible', False) else 'no'}",
                     f"Backend reason: {row.get('backend_reason', '')}",
+                    f"Effective NCNN: {row.get('effective_ncnn_summary', '')}",
+                    f"NCNN model: {row.get('effective_ncnn_model', '')}",
+                    f"NCNN scale: {row.get('effective_ncnn_scale', '')}",
+                    f"NCNN tile: {row.get('effective_ncnn_tile', '')}",
+                    f"NCNN extra args: {row.get('effective_ncnn_extra_args', '')}",
                     f"Preserve reason: {row.get('preserve_reason', '')}",
                     f"Correction mode: {row.get('correction_mode', '')}",
+                    f"NCNN correction override: {row.get('effective_ncnn_correction', '')}",
                     f"Correction action: {row.get('correction_action', '')}",
                     f"Correction eligibility: {row.get('correction_eligibility', '')}",
                     f"Correction reason: {row.get('correction_reason', '')}",

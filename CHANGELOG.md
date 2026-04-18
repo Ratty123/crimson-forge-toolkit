@@ -17,6 +17,9 @@ The format is intentionally simple:
 - Expanded the archive-side DDS inspector with much richer metadata, including additional header flags, resource/cubemap/DX10 details, mip completeness, estimated surface bytes, hashes, and lower-level DDS header fields for deeper inspection.
 - Added simple `Texture Editor` grid visibility controls for color and opacity so the grid can stay readable on bright or low-contrast textures.
 - Added clearer ambiguous original selection during `Replace Assistant` auto-match when multiple archive DDS candidates share the same basename and no strong path context is available.
+- Added a structured per-file workflow profile system to `Texture Workflow`, including reusable named workflow profiles, ordered glob/exact-path rules, a live `Matched Files` view, exact-path profile assignment from selected files, effective per-file DDS/NCNN previews, and export/import support for the new structured profile format.
+- Added built-in starter workflow profiles and starter rules for `*.dds`, `*_n.dds`, `*_d.dds`, `*_disp.dds`, and `*_sp.dds` so common color, normal, height/displacement, and specular map families have immediate baseline assignments.
+- Added a searchable in-app documentation browser with topic navigation for workflow features, planner profiles, planner paths, Archive Browser, Texture Editor, Replace Assistant, Research, Text Search, and troubleshooting.
 
 ### Changed
 - Refined the overall app UI to be denser and more coherent, with smaller controls, more consistent section headers, tighter spacing, better font application, and broader column autofit behavior when the app opens or appearance settings change.
@@ -24,6 +27,9 @@ The format is intentionally simple:
 - Improved workflow handoff behavior again so `Texture Editor -> Send to Texture Workflow` and `DDS To Workflow` make root-clear decisions at handoff time, stage the required source files more predictably, and keep the intended file focused when you move into `Texture Workflow`.
 - `Replace Assistant` queue and matching flows now use stronger path-aware `.png -> .dds` matching, clearer overflow handling in the queue columns, and better guidance when exact archive-path evidence is missing.
 - Research/archive-related preview panels, Archive Browser details, and section containers now share a more consistent presentation instead of mixing multiple header/box patterns that felt visually disconnected.
+- Replaced the old freeform `Texture rules` authoring surface with a visual `Workflow Profiles`, `Ordered Rules`, and `Matched Files` manager, and expanded `Preview Policy` so it shows matched workflow profiles, matched rules, effective DDS overrides, and effective direct-NCNN settings per file.
+- Rebalanced the starter workflow defaults so color/albedo stays enabled on the visible-color path by default while normal, specular, and height/displacement starters now begin as preserve-first or technical-path baselines until explicitly overridden.
+- Simplified the top-level app navigation by promoting `Quick Start` to its own menu entry, renaming the old `About` surface into `Documentation`, moving `Export Diagnostics...` under `Documentation`, and removing the redundant `Tools` menu.
 
 ### Fixed
 - Fixed a long list of workflow and review regressions across `Texture Workflow`, `Replace Assistant`, `Texture Editor`, `Compare`, `Research`, `Text Search`, and `Archive Browser`, including frozen or delayed preview handoff, fit-mode compare flicker, distorted compare previews, stale workflow root contents causing misleading compare lists, and several archive/preview UI stalls.
@@ -32,9 +38,12 @@ The format is intentionally simple:
 - Fixed more `Texture Editor` issues around guide clearing, document metadata sizing, hidden tab close buttons, image/atlas action layout, light-theme tool icon visibility, grid visibility, and font consistency across the left and right editor panes.
 - Fixed several settings/runtime problems, including slow font-size stepping, typed font-size editing, missing imports and startup crashes, DDS-details exceptions, more accurate DDS surface estimates for arrays/cubemaps, and other late-cycle packaging/runtime errors.
 - Fixed another `Archive Browser` DDS preview hang where rapidly browsing many archive textures could eventually leave the app stuck in `Not Responding`, by avoiding eager loose-preview generation and reducing heavy per-click archive selection recomputation on the UI thread.
+- Fixed direct `Real-ESRGAN NCNN` runs that could silently accept invalid flat PNG output or Vulkan/OOM-like failures at large tile sizes, by validating the output and retrying smaller tile sizes automatically before DDS rebuild continues.
+- Fixed starter workflow profile defaults that could previously force unsafe per-profile NCNN scales or generic visible-path handling for technical maps, which could lead to broken mixed-batch results or black/flat rebuilt DDS output.
 
 ### Docs
 - Updated the README for `0.6.5`, refreshed the feature summary and screenshots, and replaced the old `docs/screenshots` set with current captures from the renamed and polished `Crimson Forge Toolkit` UI.
+- Expanded `Quick Start` and the in-app documentation for `0.6.5` so the shipped help now covers the current workflow/profile system, planner-path and planner-profile meanings, all major tabs, backend behavior, review flow, and troubleshooting.
 
 ## [0.6.0] - 2026-04-16
 

@@ -3,9 +3,10 @@ from __future__ import annotations
 import re
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
+    QDesktopServices,
     QFont,
     QImage,
     QImageReader,
@@ -23,11 +24,15 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSlider,
     QSizePolicy,
+    QSplitter,
     QTextBrowser,
     QTextEdit,
     QToolButton,
@@ -1191,7 +1196,7 @@ class QuickStartDialog(QDialog):
         layout.addWidget(title_label)
 
         intro_label = QLabel(
-            "This app is a workspace manager for archive extraction, texture editing, optional PNG upscaling, DDS rebuild, and mod-ready loose export."
+            "This app is a workspace manager for archive extraction, texture workflows, guided replacement builds, research, text search, and visible-texture editing."
         )
         intro_label.setObjectName("HintLabel")
         intro_label.setWordWrap(True)
@@ -1202,69 +1207,80 @@ class QuickStartDialog(QDialog):
         self.browser.setReadOnly(True)
         self.browser.setHtml(
             """
-            <h3>Overview</h3>
-            <p><b>Crimson Forge Toolkit</b> is a read-only archive and loose-file workflow tool for Crimson Desert. Its main jobs are archive extraction, texture editing, DDS-to-PNG conversion, optional upscaling, DDS rebuild, compare review, texture research, and text search.</p>
+            <h3>What This App Covers</h3>
+            <p><b>Crimson Forge Toolkit</b> is a read-only archive and loose-file workflow tool for Crimson Desert. It is built around extraction, research, editing, DDS rebuild, optional upscaling, comparison, and mod-ready loose export.</p>
             <ul>
-              <li><b>Archive Browser</b>: scan <b>.pamt/.paz</b>, preview supported assets, filter, and extract to normal folders.</li>
-              <li><b>Texture Workflow</b>: scan loose DDS files, optionally convert DDS to PNG with <b>texconv</b>, optionally upscale with <b>chaiNNer</b> or <b>Real-ESRGAN NCNN</b>, rebuild DDS, and compare results.</li>
-              <li><b>Replace Assistant</b>: take edited PNG/DDS files, match them to the original game texture, rebuild corrected DDS output, and export a ready mod folder.</li>
-              <li><b>Texture Editor</b>: open DDS or other image files directly for visible-texture editing. DDS sources are decoded into a layered editing document here, and the editor can send a flattened PNG intermediate back into the rebuild workflow.</li>
-              <li><b>Research</b>: inspect grouped texture sets, classification, unknown-family review, references, DDS QA results, exported reports, and local notes.</li>
-              <li><b>Text Search</b>: search archive or loose text-like files such as <b>.xml</b>, preview matches with syntax colors, and export results while preserving folder structure.</li>
-              <li><b>Settings</b>: store persistent global preferences such as theme, startup cache behavior, remembered layouts, and cleanup confirmations.</li>
+              <li><b>Archive Browser</b>: scan <b>.pamt/.paz</b>, preview supported assets, filter, classify, and extract to loose folders.</li>
+              <li><b>Texture Workflow</b>: scan loose DDS files, convert DDS to PNG when needed, optionally upscale, rebuild DDS, compare results, and export loose mod output.</li>
+              <li><b>Texture Editor</b>: open images directly for layered visible-texture editing and send flattened output back into the rebuild flow.</li>
+              <li><b>Replace Assistant</b>: take edited PNG/DDS files, match them to the original game DDS, rebuild corrected output, and prepare mod-ready folders.</li>
+              <li><b>Research</b>: inspect grouped texture families, unknown classifications, references, DDS analysis, reports, and local notes.</li>
+              <li><b>Text Search</b>: search archive or loose text-like files such as <b>.xml</b>, <b>.json</b>, <b>.cfg</b>, and <b>.lua</b>.</li>
+              <li><b>Settings</b>: store theme, density, cache behavior, remembered layout state, confirmations, and startup preferences beside the EXE.</li>
             </ul>
-            <h3>Recommended first run</h3>
+            <h3>Recommended First Run</h3>
             <ol>
               <li>Open <b>Setup</b> and click <b>Init Workspace</b>.</li>
-              <li>Configure <b>texconv.exe</b> or use the external download page link in <b>Setup</b>. DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild depend on it.</li>
-              <li>Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>.</li>
-              <li>Choose an upscaling mode in <b>Upscaling</b>: disabled, direct <b>Real-ESRGAN NCNN</b>, or <b>chaiNNer</b>.</li>
-              <li>Keep a safer <b>Texture Policy</b> preset first and leave automatic rules enabled so risky technical DDS files are preserved instead of pushed through the PNG path.</li>
+              <li>Configure <b>texconv.exe</b>. DDS preview, DDS-to-PNG conversion, compare previews, and DDS rebuild all depend on it.</li>
+              <li>Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>. Enable DDS staging only if you want a separate pre-upscale PNG staging folder.</li>
+              <li>Choose an upscaling backend in <b>Upscaling</b>: disabled, direct <b>Real-ESRGAN NCNN</b>, or <b>chaiNNer</b>.</li>
+              <li>Keep a safer <b>Texture Policy</b> preset first and leave automatic rules enabled so risky technical DDS files are preserved instead of pushed through the visible PNG path.</li>
+              <li>Open <b>Profiles, Rules &amp; Matches</b> and review the starter workflow assignments before running a batch.</li>
               <li>Use <b>Preview Policy</b> before <b>Start</b> if you want to inspect the planned per-texture action.</li>
               <li>Click <b>Scan</b> in the Texture Workflow tab.</li>
               <li>Run a small subset first, then review the output in <b>Compare</b> before trying a larger batch.</li>
               <li>If you already edited a texture outside the app, use <b>Replace Assistant</b> instead of the batch workflow.</li>
               <li>If you want to edit visible textures inside the app, open them in <b>Texture Editor</b> and then send the flattened result back into <b>Replace Assistant</b> or <b>Texture Workflow</b>.</li>
             </ol>
-            <h3>Backend chooser</h3>
+            <h3>Main Workflow Areas</h3>
+            <ul>
+              <li><b>Setup</b>: workspace creation, external tools, app links, and optional downloads/import helpers.</li>
+              <li><b>Paths</b>: source, staging, PNG, output, and mod-ready export roots.</li>
+              <li><b>DDS Output</b>: global format, size, mip, and staging behavior used unless a workflow profile overrides them.</li>
+              <li><b>Profiles, Rules &amp; Matches</b>: reusable per-file workflow profiles, ordered matching rules, and a live matched DDS table.</li>
+              <li><b>Upscaling</b>: backend choice, policy preset, direct NCNN controls, and backend-specific notes.</li>
+              <li><b>Compare</b>: side-by-side original/output review for the current loose output set.</li>
+            </ul>
+            <h3>Profiles, Rules &amp; Matches</h3>
+            <p>This area controls per-file planning inside Texture Workflow.</p>
+            <ul>
+              <li><b>Workflow Profiles</b>: reusable named override sets for DDS output and direct NCNN behavior.</li>
+              <li><b>Ordered Rules</b>: top-to-bottom match list with last-match-wins behavior. Rules can assign a workflow profile and also override semantic, planner profile, colorspace, alpha policy, and planner path.</li>
+              <li><b>Matched Files</b>: live list of files under the current Original DDS root and folder/file filter. You can multi-select rows and create exact-path rules with <b>Assign Profile</b>.</li>
+              <li>Starter profiles are meant as sensible baselines, not universal best answers. Technical maps often need preserve-first handling.</li>
+            </ul>
+            <h3>Backend Choice</h3>
             <p><b>Run Summary</b> gives you a read-only overview of the current sources, backend, texture policy, direct-backend settings, and export behavior before you start.</p>
             <ul>
               <li><b>Disabled</b>: rebuild DDS from existing PNGs or test DDS output settings without upscaling.</li>
-              <li><b>Real-ESRGAN NCNN</b>: easiest direct in-app route if you want scale, tile, retry, and optional post correction controlled from the app.</li>
-              <li><b>chaiNNer</b>: use only if you already have a tested chain. The chain remains the source of truth; direct NCNN controls do not override it.</li>
+              <li><b>Real-ESRGAN NCNN</b>: direct in-app route if you want scale, tile, retry, and optional post correction controlled inside the app.</li>
+              <li><b>chaiNNer</b>: use only with a tested chain. The chain remains the source of truth; direct NCNN controls do not override it.</li>
             </ul>
-            <h3>Before you upscale</h3>
+            <h3>Technical Texture Warning</h3>
             <p>Visible color textures are not the same as technical maps. Height, displacement, normals, masks, vectors, and other precision-sensitive DDS files are riskier to push through PNG intermediates.</p>
             <ul>
               <li>Start with a safer preset.</li>
               <li>Keep automatic rules enabled.</li>
-              <li>Remember that presets decide what enters the upscale path, but model choice can still shift brightness, contrast, and detail.</li>
-              <li>Source Match post correction only applies to direct NCNN runs, and the app decides per texture whether to apply visible RGB correction, grayscale correction, limited RGB-only correction, or a full skip.</li>
+              <li>Review planner profiles and planner paths before forcing technical maps through the visible PNG path.</li>
+              <li>Source Match correction only applies to direct NCNN runs and only where the app decides it is appropriate.</li>
             </ul>
-            <h3>Compare and review</h3>
-            <p><b>Compare</b> is meant to be the review step before large runs. When the Compare tab is active, the layout gives more room to the previews.</p>
+            <h3>Other App Areas</h3>
+            <ul>
+              <li><b>Archive Browser</b>: read-only scan, filter, preview, extract, send DDS to workflow, or open matching files in Texture Editor/Research.</li>
+              <li><b>Texture Editor</b>: layered visible-texture editing with selections, masks, channels, brushes, gradients, clone/heal/smudge, patch, dodge/burn, and compare handoff.</li>
+              <li><b>Replace Assistant</b>: best route for one-off edited replacements and mod-ready folder output.</li>
+              <li><b>Research</b>: grouped texture families, DDS QA and metadata, unknown resolver, reports, references, and notes.</li>
+              <li><b>Text Search</b>: archive or loose text search with preview and export.</li>
+            </ul>
+            <h3>Compare and Review</h3>
+            <p><b>Compare</b> is the review step before larger runs.</p>
             <ul>
               <li>Use <b>Preview size</b> to scale both panes together.</li>
               <li>Use the mouse wheel while hovering a preview to zoom.</li>
               <li>Drag to pan when a preview is larger than the viewport.</li>
               <li>Use <b>Sync Pan</b> to keep both previews aligned.</li>
             </ul>
-            <h3>Research and Text Search</h3>
-            <ul>
-              <li>Use <b>Research</b> for grouped texture sets, classifier output, <b>Unknown Resolver</b> approval, references, DDS analysis, reports, heatmaps, and local notes.</li>
-              <li>Use <b>Text Search</b> for archive or loose text-like files such as <b>.xml</b>, <b>.json</b>, <b>.cfg</b>, and <b>.lua</b>, including preview, regex search, and export.</li>
-            </ul>
-            <h3>Texture Editor tips</h3>
-            <ul>
-              <li><b>Texture Editor</b> is built for visible-color texture work, not technical-map authoring.</li>
-              <li>Use selections, masks, and adjustment layers to keep edits reversible.</li>
-              <li>Brush presets, custom saved presets, brush tips, roundness/angle/smoothing controls, and patterned brush footprints are there to make paint/erase/clone/heal/smudge/dodge-burn work feel more like a real texture editor instead of one fixed round brush.</li>
-              <li><b>Gradient</b>, <b>Patch</b>, <b>Smudge</b>, and <b>Dodge/Burn</b> are meant for common texture cleanup and blending tasks that would otherwise push you into Photoshop.</li>
-              <li>Use the <b>Channels</b> section when you only want to paint/fill/recolor into `RGB`, `Alpha`, or a subset of channels.</li>
-              <li>When you want to review results, use the main <b>Compare</b> tab after sending the edited output into <b>Replace Assistant</b> or <b>Texture Workflow</b>.</li>
-              <li>When you are happy with the edit, send it to <b>Replace Assistant</b> for one-off replacement packaging or <b>Texture Workflow</b> for the wider DDS rebuild pipeline.</li>
-            </ul>
-            <h3>Common failure causes</h3>
+            <h3>Common Failure Causes</h3>
             <ul>
               <li><b>Missing texconv</b>: previews, DDS-to-PNG conversion, compare previews, and DDS rebuild all depend on <b>texconv.exe</b>.</li>
               <li><b>Missing NCNN models</b>: the direct NCNN backend needs a working executable plus compatible models.</li>
@@ -1272,7 +1288,9 @@ class QuickStartDialog(QDialog):
               <li><b>Wrong chaiNNer paths</b>: hardcoded chain folders can make chaiNNer read from or write to the wrong place.</li>
               <li><b>Brightness drift</b>: review in <b>Compare</b>, try a different model, or test a Source Match correction mode.</li>
             </ul>
-            <h3>Local state</h3>
+            <h3>Documentation</h3>
+            <p>The top-level <b>Documentation</b> menu now opens a searchable in-app documentation browser with deeper workflow topics, including planner profiles and planner paths.</p>
+            <h3>Local State</h3>
             <p>The app auto-saves its settings beside the EXE and also stores archive scan cache beside it.</p>
             """
         )
@@ -1282,15 +1300,18 @@ class QuickStartDialog(QDialog):
         button_row.setSpacing(8)
         self.open_setup_button = QPushButton("Open Setup")
         self.open_chainner_button = QPushButton("Open chaiNNer Setup")
+        self.open_docs_button = QPushButton("Open Documentation")
         self.close_button = QPushButton("Close")
         button_row.addWidget(self.open_setup_button)
         button_row.addWidget(self.open_chainner_button)
+        button_row.addWidget(self.open_docs_button)
         button_row.addStretch(1)
         button_row.addWidget(self.close_button)
         layout.addLayout(button_row)
 
         self.open_setup_button.clicked.connect(self._open_setup)
         self.open_chainner_button.clicked.connect(self._open_chainner_setup)
+        self.open_docs_button.clicked.connect(self._open_docs)
         self.close_button.clicked.connect(self.accept)
 
     def _open_setup(self) -> None:
@@ -1301,13 +1322,28 @@ class QuickStartDialog(QDialog):
         self.parent_window.focus_quick_start_sections(include_chainner=True)
         self.accept()
 
+    def _open_docs(self) -> None:
+        self.accept()
+        self.parent_window.show_about_dialog(topic_id="workflow_overview")
+
 
 class AboutDialog(QDialog):
-    def __init__(self, parent, *, title: str, html: str):
+    def __init__(
+        self,
+        parent,
+        *,
+        title: str,
+        intro_html: str,
+        sections: Sequence[Dict[str, str]],
+        initial_section_id: str = "",
+    ):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setMinimumSize(540, 440)
-        self.resize(720, 560)
+        self.setMinimumSize(840, 560)
+        self.resize(1080, 720)
+        self._sections: List[Dict[str, str]] = [dict(section) for section in sections]
+        self._filtered_sections: List[Dict[str, str]] = list(self._sections)
+        self._initial_section_id = initial_section_id.strip()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -1319,11 +1355,44 @@ class AboutDialog(QDialog):
         title_label.setFont(title_font)
         layout.addWidget(title_label)
 
-        browser = QTextBrowser()
-        browser.setReadOnly(True)
-        browser.setOpenExternalLinks(True)
-        browser.setHtml(html)
-        layout.addWidget(browser, stretch=1)
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+        search_label = QLabel("Search")
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search topics, fields, tabs, planner paths, planner profiles...")
+        self.topic_count_label = QLabel("")
+        self.topic_count_label.setObjectName("HintLabel")
+        search_row.addWidget(search_label)
+        search_row.addWidget(self.search_edit, stretch=1)
+        search_row.addWidget(self.topic_count_label)
+        layout.addLayout(search_row)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        layout.addWidget(splitter, stretch=1)
+
+        topic_panel = QWidget()
+        topic_layout = QVBoxLayout(topic_panel)
+        topic_layout.setContentsMargins(0, 0, 0, 0)
+        topic_layout.setSpacing(8)
+        topic_hint = QLabel("Choose a documentation topic or search by feature name.")
+        topic_hint.setObjectName("HintLabel")
+        topic_hint.setWordWrap(True)
+        topic_layout.addWidget(topic_hint)
+        self.topic_list = QListWidget()
+        self.topic_list.setAlternatingRowColors(True)
+        topic_layout.addWidget(self.topic_list, stretch=1)
+        splitter.addWidget(topic_panel)
+
+        self.browser = QTextBrowser()
+        self.browser.setReadOnly(True)
+        self.browser.setOpenLinks(False)
+        self.browser.setOpenExternalLinks(False)
+        self.browser.setHtml(self._build_document_html(title, intro_html))
+        splitter.addWidget(self.browser)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([260, 760])
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
@@ -1331,3 +1400,111 @@ class AboutDialog(QDialog):
         close_button.clicked.connect(self.accept)
         button_row.addWidget(close_button)
         layout.addLayout(button_row)
+
+        self.search_edit.textChanged.connect(self._refresh_topic_list)
+        self.topic_list.currentItemChanged.connect(self._handle_topic_changed)
+        self.browser.anchorClicked.connect(self._handle_anchor_clicked)
+
+        self._refresh_topic_list()
+        if self._initial_section_id:
+            self.select_section(self._initial_section_id)
+        elif self.topic_list.count() > 0:
+            self.topic_list.setCurrentRow(0)
+
+    def _build_document_html(self, title: str, intro_html: str) -> str:
+        section_html: List[str] = []
+        for section in self._sections:
+            section_id = str(section.get("id", "") or "").strip()
+            section_title = str(section.get("title", "") or "").strip()
+            section_body = str(section.get("html", "") or "")
+            if not section_id or not section_title:
+                continue
+            section_html.append(
+                f"<a name=\"{section_id}\"></a><h2>{section_title}</h2>{section_body}"
+            )
+        return (
+            f"<h3>{title}</h3>{intro_html}"
+            "<hr/>"
+            + "<hr/>".join(section_html)
+        )
+
+    @staticmethod
+    def _topic_search_text(section: Dict[str, str]) -> str:
+        title = str(section.get("title", "") or "")
+        keywords = str(section.get("keywords", "") or "")
+        body = str(section.get("html", "") or "")
+        plain_body = re.sub(r"<[^>]+>", " ", body)
+        return f"{title}\n{keywords}\n{plain_body}".lower()
+
+    def _refresh_topic_list(self) -> None:
+        query = self.search_edit.text().strip().lower()
+        current_section_id = self.current_section_id()
+        self._filtered_sections = [
+            section
+            for section in self._sections
+            if not query or query in self._topic_search_text(section)
+        ]
+        self.topic_list.blockSignals(True)
+        self.topic_list.clear()
+        for section in self._filtered_sections:
+            item = QListWidgetItem(str(section.get("title", "") or "Untitled"))
+            item.setData(Qt.UserRole, str(section.get("id", "") or ""))
+            summary = str(section.get("summary", "") or "")
+            if summary:
+                item.setToolTip(summary)
+            self.topic_list.addItem(item)
+        self.topic_list.blockSignals(False)
+        self.topic_count_label.setText(f"{len(self._filtered_sections)} topic(s)")
+        if not self._filtered_sections:
+            return
+        if current_section_id:
+            for index in range(self.topic_list.count()):
+                item = self.topic_list.item(index)
+                if str(item.data(Qt.UserRole) or "") == current_section_id:
+                    self.topic_list.setCurrentItem(item)
+                    return
+        self.topic_list.setCurrentRow(0)
+
+    def current_section_id(self) -> str:
+        item = self.topic_list.currentItem()
+        if item is None:
+            return ""
+        return str(item.data(Qt.UserRole) or "")
+
+    def select_section(self, section_id: str) -> None:
+        target_id = section_id.strip()
+        if not target_id:
+            return
+        for index in range(self.topic_list.count()):
+            item = self.topic_list.item(index)
+            if str(item.data(Qt.UserRole) or "") == target_id:
+                self.topic_list.setCurrentItem(item)
+                self._scroll_to_section(target_id)
+                return
+        self.search_edit.clear()
+        for index in range(self.topic_list.count()):
+            item = self.topic_list.item(index)
+            if str(item.data(Qt.UserRole) or "") == target_id:
+                self.topic_list.setCurrentItem(item)
+                self._scroll_to_section(target_id)
+                return
+
+    def _handle_topic_changed(self, current: Optional[QListWidgetItem], _previous: Optional[QListWidgetItem]) -> None:
+        if current is None:
+            return
+        self._scroll_to_section(str(current.data(Qt.UserRole) or ""))
+
+    def _scroll_to_section(self, section_id: str) -> None:
+        if not section_id:
+            return
+        QTimer.singleShot(0, lambda: self.browser.scrollToAnchor(section_id))
+
+    def _handle_anchor_clicked(self, url: QUrl) -> None:
+        if url.scheme() in {"http", "https"}:
+            QDesktopServices.openUrl(url)
+            return
+        target_id = url.fragment().strip()
+        if not target_id and url.scheme() == "topic":
+            target_id = url.path().strip("/").strip()
+        if target_id:
+            self.select_section(target_id)
