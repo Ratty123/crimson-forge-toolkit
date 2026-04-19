@@ -100,10 +100,23 @@ ARCHIVE_IMAGE_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
+ARCHIVE_AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".ogg",
+    ".wem",
+    ".wav",
+}
+ARCHIVE_VIDEO_EXTENSIONS = {
+    ".bk2",
+    ".mp4",
+}
 ARCHIVE_TEXT_EXTENSIONS = {
+    ".bnk",
     ".cfg",
+    ".css",
     ".csv",
     ".dae",
+    ".html",
     ".gltf",
     ".h",
     ".hpp",
@@ -114,7 +127,10 @@ ARCHIVE_TEXT_EXTENSIONS = {
     ".material",
     ".mtl",
     ".obj",
+    ".paloc",
+    ".pami",
     ".shader",
+    ".thtml",
     ".txt",
     ".xml",
     ".yaml",
@@ -131,9 +147,12 @@ ARCHIVE_MODEL_EXTENSIONS = {
     ".model",
     ".obj",
     ".pac",
+    ".pab",
     ".pam",
+    ".pamlod",
     ".pat",
     ".patx",
+    ".hkx",
 }
 ARCHIVE_TEXT_PREVIEW_LIMIT = 240_000
 ARCHIVE_BINARY_HEX_PREVIEW_LIMIT = 256
@@ -142,7 +161,7 @@ APP_ORGANIZATION = "Ratrider"
 APP_NAME = "CrimsonForgeToolkit"
 APP_TITLE = "Crimson Forge Toolkit"
 LEGACY_APP_NAMES = ("CrimsonTextureForge", "DDSRebuildApp")
-APP_VERSION = "0.6.5"
+APP_VERSION = "0.7.0"
 CRIMSON_DESERT_STEAM_APP_ID = "3321460"
 DEFAULT_UI_THEME = "graphite"
 DEFAULT_UI_FONT_FAMILY = "Segoe UI"

@@ -1,5 +1,6 @@
 .venv/
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -14,6 +15,7 @@ archive_cache/
 .tmp_*/
 tmp_*/
 
+.tools/
 *.zip
 build_importtime.log
 pyinstaller_importtime.log

@@ -1,14 +1,14 @@
 # Crimson Forge Toolkit
 
-Windows desktop tool for **Crimson Desert texture workflows**, **read-only archive browsing**, **texture research**, and **text search**.
+Windows desktop tool for **Crimson Desert texture workflows**, **archive browsing and patching**, **3D mesh preview/modding**, **media preview**, **texture research**, and **text search**.
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-Latest release: `0.6.5`
+Latest release: `0.7.0`
 
-- added broader appearance/font controls, denser UI tuning, and cleaner cross-tab panel/layout behavior
-- expanded archive-side inspection with richer DDS metadata and in-place archive preview/details inside `Research`
-- improved workflow handoff, matching, classification clarity, preview stability, and overall app responsiveness
+- added patch-capable archive workflows for supported mesh and audio entries, including backups, restore, and mod-ready export paths
+- added real `.pam` / `.pamlod` / `.pac` model preview, OBJ/FBX export, OBJ import preview, texture reference tools, and in-app textured shading
+- expanded archive media/text coverage with `.wem` playback, `.mp4` playback, `.bnk` inspection, richer binary/text preview, and stronger archive-browser responsiveness
 
 Project guidelines:
 
@@ -17,7 +17,7 @@ Project guidelines:
 
 Crimson Forge Toolkit is built for modders who want one place to:
 
-- browse and extract files from `.pamt` / `.paz` archives
+- browse, preview, extract, and selectively patch files from `.pamt` / `.paz` archives
 - scan loose DDS files and rebuild controlled DDS output with `texconv`
 - optionally convert DDS to PNG before processing
 - optionally upscale through `chaiNNer` or direct `Real-ESRGAN NCNN`
@@ -27,8 +27,10 @@ Crimson Forge Toolkit is built for modders who want one place to:
 - review results in a side-by-side compare view with zoom, pan, and preview-size controls
 - inspect texture sets, references, classification, DDS QA results, and notes in `Research`
 - search archive or loose text-like files such as `.xml`, `.json`, `.cfg`, and `.lua`
+- preview `.pam`, `.pamlod`, and `.pac` meshes in 3D with orbit/zoom, optional textures, referenced-texture actions, OBJ/FBX export, and OBJ import preview / patch workflows
+- preview `.wem` audio, `.mp4` / `.bk2` video, `.bnk` soundbank structure, `.pab` skeleton summaries, and richer text/binary archive formats without leaving the browser
 
-The app is intentionally focused on **read-only archive access** and **loose-file workflows**. It does **not** repack or modify game archives in place.
+The app still keeps archive mutation explicit and separate from normal browsing. Loose-file DDS workflows remain available, while supported archive mesh/audio replacement paths now run through confirm-before-write patch flows with backup/restore support instead of silent in-place edits.
 
 ## At A Glance
 
@@ -38,15 +40,18 @@ The app is intentionally focused on **read-only archive access** and **loose-fil
 - `Texture Workflow` can also emit an additional ready mod package after rebuild without changing the normal `dds_final` output
 - `Replace Assistant`: import edited `PNG` / `DDS`, match them to the original game texture, optionally upscale with direct `NCNN`, rebuild corrected DDS output, and write a mod-ready loose package
 - `Texture Editor`: open visible textures from loose files, Archive Browser, Compare, or Replace Assistant, edit them in layers with selections, masks, adjustments, channel-aware brush/retouch tools, and custom brush presets, then save/export the flattened PNG back into the rebuild pipeline
-- `Archive Browser`: scan archives, filter entries, preview supported assets, and extract files to normal folders
+- `Archive Browser`: scan archives, switch between flat or tree view, preview supported assets, extract files, inspect referenced mesh textures, export/import supported meshes, and run supported archive patch/restore flows
 - `Research`: group related textures, resolve references, inspect DDS QA results, preview archive files, export analysis reports, and store notes
 - `Text Search`: search archive or loose text-like files, preview results with syntax colors, and export matched files
 - `Settings`: persistent theme, font, density, startup, layout, log/code, and safety preferences
 
 ### Main workflow features
 
-- read-only archive browser for Crimson Desert `.pamt` / `.paz`
+- archive browser for Crimson Desert `.pamt` / `.paz` with flat/tree browsing, cache reuse, extraction, and supported patch workflows
 - archive cache for faster repeated scans
+- real 3D archive preview for supported `.pam`, `.pamlod`, and `.pac` meshes, including optional textured shading and referenced-texture inspection/actions
+- mesh export/import workflows for supported archive meshes, including OBJ export/import preview, FBX export, backup/restore, and paired PAM/PAMLOD handling where possible
+- archive media preview for `.wem`, `.wav`, `.ogg`, `.mp3`, `.mp4`, and `.bk2`, plus Wwise soundbank summaries for `.bnk`
 - DDS-to-PNG conversion with `texconv`
 - DDS rebuild with configurable format, size, and mip behavior
 - direct backend support for `Real-ESRGAN NCNN`
@@ -256,17 +261,20 @@ Notes are stored locally beside the EXE.
 
 ## Archive Browser
 
-The archive browser is read-only. Use it to:
+Use the archive browser to:
 
 - scan or refresh `.pamt` / `.paz`
 - reuse the archive cache when available
+- switch between flat and tree view for large package sets
 - filter by path, package, extension, role, structure, and size
 - use exclude filters and common technical-suffix hiding to isolate likely base/color DDS files more quickly
 - preview supported assets
 - extract selected files or filtered sets to normal folders
+- inspect referenced textures for supported mesh previews and open/export/replace resolved DDS entries
+- export supported meshes as `OBJ` / `FBX`
+- import `OBJ` for preview or patch supported archive meshes, with backup/restore support for archive writes
+- export `WAV` from supported audio entries and patch supported `.wem` entries from `WAV`
 - send DDS files directly into the `Texture Workflow` with `DDS To Texture Workflow`
-
-The app does **not** repack archives.
 
 ## Text Search
 

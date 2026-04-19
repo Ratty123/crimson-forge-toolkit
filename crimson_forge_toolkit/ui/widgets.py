@@ -1,22 +1,42 @@
 from __future__ import annotations
 
+from array import array
+from dataclasses import dataclass
 import re
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QFont,
     QImage,
     QImageReader,
+    QMatrix4x4,
+    QOpenGLFunctions,
     QPainter,
     QPixmap,
+    QVector3D,
     QSyntaxHighlighter,
     QTextCharFormat,
     QTextCursor,
     QTextFormat,
 )
+from PySide6.QtOpenGL import (
+    QOpenGLBuffer,
+    QOpenGLShader,
+    QOpenGLShaderProgram,
+    QOpenGLTexture,
+    QOpenGLVertexArrayObject,
+)
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
+try:
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+except ImportError:
+    QAudioOutput = None
+    QMediaPlayer = None
+    QVideoWidget = None
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -42,6 +62,24 @@ from PySide6.QtWidgets import (
 )
 
 from crimson_forge_toolkit.ui.themes import get_theme
+
+_GL_COLOR_BUFFER_BIT = 0x00004000
+_GL_DEPTH_BUFFER_BIT = 0x00000100
+_GL_DEPTH_TEST = 0x0B71
+_GL_CULL_FACE = 0x0B44
+_GL_FLOAT = 0x1406
+_GL_FALSE = 0
+_GL_TRIANGLES = 0x0004
+
+
+@dataclass(slots=True)
+class _ModelPreviewDrawBatch:
+    first_vertex: int
+    vertex_count: int
+    texture_key: str = ""
+    has_texture_coordinates: bool = False
+    texture_wrap_repeat: bool = False
+    texture_flip_vertical: bool = True
 
 
 class NonIntrusiveWheelGuard(QObject):
@@ -623,12 +661,726 @@ class PreviewLabel(QLabel):
         return True
 
 
+class ModelPreviewWidget(QOpenGLWidget):
+    view_state_changed = Signal(float, bool)
+
+    _DEFAULT_YAW = -35.0
+    _DEFAULT_PITCH = 20.0
+    _FIT_DISTANCE = 3.25
+    _ZOOM_STEPS = (0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0)
+    _PALETTE = (
+        (201 / 255.0, 111 / 255.0, 81 / 255.0),
+        (94 / 255.0, 133 / 255.0, 168 / 255.0),
+        (156 / 255.0, 167 / 255.0, 98 / 255.0),
+        (198 / 255.0, 176 / 255.0, 92 / 255.0),
+        (147 / 255.0, 112 / 255.0, 166 / 255.0),
+    )
+
+    def __init__(self, title: str, *, theme_key: str):
+        super().__init__()
+        self.setMinimumSize(280, 220)
+        self.setMouseTracking(True)
+        self._message = title
+        self._theme_key = theme_key
+        self._background_color = QColor(get_theme(theme_key)["preview_bg"])
+        self._overlay_text_color = QColor(get_theme(theme_key)["text_muted"])
+        self._model_summary = ""
+        self._vertex_blob = b""
+        self._vertex_count = 0
+        self._gl_ready = False
+        self._program: Optional[QOpenGLShaderProgram] = None
+        self._functions: Optional[QOpenGLFunctions] = None
+        self._vertex_buffer = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._vertex_array = QOpenGLVertexArrayObject(self)
+        self._mvp_uniform_location = -1
+        self._model_uniform_location = -1
+        self._light_uniform_location = -1
+        self._ambient_uniform_location = -1
+        self._texture_sampler_uniform_location = -1
+        self._use_texture_uniform_location = -1
+        self._fit_to_view = True
+        self._zoom_factor = 1.0
+        self._distance = self._FIT_DISTANCE
+        self._yaw = self._DEFAULT_YAW
+        self._pitch = self._DEFAULT_PITCH
+        self._drag_active = False
+        self._last_mouse_pos = QPoint()
+        self._current_model = None
+        self._mesh_batches: List[_ModelPreviewDrawBatch] = []
+        self._texture_objects: Dict[Tuple[str, bool, bool], QOpenGLTexture] = {}
+        self._use_textures = False
+
+    def set_theme(self, theme_key: str) -> None:
+        self._theme_key = theme_key
+        theme = get_theme(theme_key)
+        self._background_color = QColor(theme["preview_bg"])
+        self._overlay_text_color = QColor(theme["text_muted"])
+        self.update()
+
+    def clear_model(self, message: str) -> None:
+        self._message = message
+        self._model_summary = ""
+        self._vertex_blob = b""
+        self._vertex_count = 0
+        self._current_model = None
+        self._mesh_batches = []
+        self._drag_active = False
+        self.unsetCursor()
+        self._upload_geometry()
+        self.update()
+
+    def set_model(self, model) -> None:
+        self._current_model = model
+        self._model_summary = getattr(model, "summary", "") or ""
+        self._message = self._model_summary or "Model preview ready."
+        self._vertex_blob, self._vertex_count, self._mesh_batches = self._build_vertex_blob(model)
+        self._yaw = self._DEFAULT_YAW
+        self._pitch = self._DEFAULT_PITCH
+        self._fit_to_view = True
+        self._zoom_factor = 1.0
+        self._distance = self._FIT_DISTANCE
+        self._upload_geometry()
+        self.view_state_changed.emit(self._zoom_factor, self._fit_to_view)
+        self.update()
+
+    def set_use_textures(self, use_textures: bool) -> None:
+        self._use_textures = bool(use_textures)
+        self.update()
+
+    def textures_available(self) -> bool:
+        return any(batch.texture_key and batch.has_texture_coordinates for batch in self._mesh_batches)
+
+    def set_zoom_factor(self, zoom_factor: float) -> None:
+        self._zoom_factor = min(max(float(zoom_factor), 0.1), 16.0)
+        if not self._fit_to_view:
+            self._distance = self._FIT_DISTANCE / self._zoom_factor
+        self.view_state_changed.emit(self._zoom_factor, self._fit_to_view)
+        self.update()
+
+    def set_fit_to_view(self, fit_to_view: bool) -> None:
+        self._fit_to_view = bool(fit_to_view)
+        self._distance = self._FIT_DISTANCE if self._fit_to_view else self._FIT_DISTANCE / self._zoom_factor
+        self.view_state_changed.emit(self._zoom_factor, self._fit_to_view)
+        self.update()
+
+    def current_display_scale(self) -> float:
+        return max(0.1, self._FIT_DISTANCE / max(self._distance, 0.01))
+
+    def initializeGL(self) -> None:  # type: ignore[override]
+        self._functions = self.context().functions() if self.context() is not None else None
+        if self._functions is None:
+            return
+        self._functions.glEnable(_GL_DEPTH_TEST)
+        self._functions.glDisable(_GL_CULL_FACE)
+
+        program = QOpenGLShaderProgram(self.context())
+        if not program.addShaderFromSourceCode(
+            QOpenGLShader.Vertex,
+            """
+            #version 120
+            attribute vec3 position;
+            attribute vec3 normal;
+            attribute vec3 color;
+            attribute vec2 texcoord;
+            uniform mat4 mvp_matrix;
+            uniform mat4 model_matrix;
+            varying vec3 frag_normal;
+            varying vec3 frag_color;
+            varying vec2 frag_texcoord;
+            void main() {
+                frag_normal = normalize((model_matrix * vec4(normal, 0.0)).xyz);
+                frag_color = color;
+                frag_texcoord = texcoord;
+                gl_Position = mvp_matrix * vec4(position, 1.0);
+            }
+            """,
+        ):
+            raise RuntimeError(f"Model preview vertex shader failed: {program.log()}")
+        if not program.addShaderFromSourceCode(
+            QOpenGLShader.Fragment,
+            """
+            #version 120
+            varying vec3 frag_normal;
+            varying vec3 frag_color;
+            varying vec2 frag_texcoord;
+            uniform vec3 light_direction;
+            uniform float ambient_strength;
+            uniform int use_texture;
+            uniform sampler2D diffuse_texture;
+            void main() {
+                vec3 normal = normalize(frag_normal);
+                float diffuse = abs(dot(normal, normalize(light_direction)));
+                float lighting = max(ambient_strength, diffuse);
+                vec4 base_color = vec4(frag_color, 1.0);
+                if (use_texture != 0) {
+                    base_color = texture2D(diffuse_texture, frag_texcoord);
+                    if (base_color.a <= 0.01) {
+                        discard;
+                    }
+                }
+                gl_FragColor = vec4(base_color.rgb * lighting, base_color.a);
+            }
+            """,
+        ):
+            raise RuntimeError(f"Model preview fragment shader failed: {program.log()}")
+        program.bindAttributeLocation("position", 0)
+        program.bindAttributeLocation("normal", 1)
+        program.bindAttributeLocation("color", 2)
+        program.bindAttributeLocation("texcoord", 3)
+        if not program.link():
+            raise RuntimeError(f"Model preview shader link failed: {program.log()}")
+
+        self._program = program
+        self._mvp_uniform_location = program.uniformLocation("mvp_matrix")
+        self._model_uniform_location = program.uniformLocation("model_matrix")
+        self._light_uniform_location = program.uniformLocation("light_direction")
+        self._ambient_uniform_location = program.uniformLocation("ambient_strength")
+        self._texture_sampler_uniform_location = program.uniformLocation("diffuse_texture")
+        self._use_texture_uniform_location = program.uniformLocation("use_texture")
+        self._vertex_array.create()
+        self._vertex_buffer.create()
+        self._vertex_buffer.setUsagePattern(QOpenGLBuffer.StaticDraw)
+        self._gl_ready = True
+        self._upload_geometry()
+
+    def paintGL(self) -> None:  # type: ignore[override]
+        if self._functions is None:
+            return
+        self._functions.glEnable(_GL_DEPTH_TEST)
+        self._functions.glClearColor(
+            self._background_color.redF(),
+            self._background_color.greenF(),
+            self._background_color.blueF(),
+            1.0,
+        )
+        self._functions.glClear(_GL_COLOR_BUFFER_BIT | _GL_DEPTH_BUFFER_BIT)
+        if self._program is None or self._vertex_count <= 0:
+            return
+
+        width = max(1, self.width())
+        height = max(1, self.height())
+        projection = QMatrix4x4()
+        projection.perspective(45.0, width / float(height), 0.1, 100.0)
+        view = QMatrix4x4()
+        view.translate(0.0, 0.0, -self._distance)
+        model = QMatrix4x4()
+        model.rotate(self._pitch, 1.0, 0.0, 0.0)
+        model.rotate(self._yaw, 0.0, 1.0, 0.0)
+        mvp = projection * view * model
+
+        self._program.bind()
+        self._program.setUniformValue(self._mvp_uniform_location, mvp)
+        self._program.setUniformValue(self._model_uniform_location, model)
+        self._program.setUniformValue(self._light_uniform_location, QVector3D(0.45, 0.65, 1.0))
+        self._program.setUniformValue(self._ambient_uniform_location, 0.28)
+        self._program.setUniformValue(self._texture_sampler_uniform_location, 0)
+        self._vertex_array.bind()
+        for batch in self._mesh_batches:
+            texture = self._texture_objects.get(
+                (batch.texture_key, batch.texture_wrap_repeat, batch.texture_flip_vertical)
+            )
+            use_texture = int(
+                bool(
+                    self._use_textures
+                    and batch.has_texture_coordinates
+                    and bool(batch.texture_key)
+                    and texture is not None
+                )
+            )
+            self._program.setUniformValue(self._use_texture_uniform_location, use_texture)
+            if use_texture and texture is not None:
+                texture.bind(0)
+            self._functions.glDrawArrays(_GL_TRIANGLES, batch.first_vertex, batch.vertex_count)
+            if use_texture and texture is not None:
+                texture.release()
+        self._vertex_array.release()
+        self._program.release()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(self._overlay_text_color)
+        if self._vertex_count <= 0:
+            painter.drawText(self.rect().adjusted(24, 24, -24, -24), Qt.AlignCenter | Qt.TextWordWrap, self._message)
+        else:
+            painter.drawText(
+                QRect(12, 10, max(120, self.width() - 24), 22),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                "Drag: orbit | Wheel: zoom | Double-click: reset",
+            )
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if self._vertex_count > 0 and event.button() == Qt.LeftButton:
+            self._drag_active = True
+            self._last_mouse_pos = event.position().toPoint()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._drag_active:
+            current_pos = event.position().toPoint()
+            delta = current_pos - self._last_mouse_pos
+            self._last_mouse_pos = current_pos
+            self._yaw += delta.x() * 0.6
+            self._pitch = min(max(self._pitch + delta.y() * 0.6, -89.0), 89.0)
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self._drag_active and event.button() == Qt.LeftButton:
+            self._drag_active = False
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        if self._vertex_count > 0 and event.button() == Qt.LeftButton:
+            self._yaw = self._DEFAULT_YAW
+            self._pitch = self._DEFAULT_PITCH
+            self._fit_to_view = True
+            self._zoom_factor = 1.0
+            self._distance = self._FIT_DISTANCE
+            self.view_state_changed.emit(self._zoom_factor, self._fit_to_view)
+            self.update()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        if self._vertex_count <= 0 or event.angleDelta().y() == 0:
+            super().wheelEvent(event)
+            return
+        step = 1 if event.angleDelta().y() > 0 else -1
+        current_zoom = self.current_display_scale() if self._fit_to_view else self._zoom_factor
+        closest_index = min(
+            range(len(self._ZOOM_STEPS)),
+            key=lambda index: abs(self._ZOOM_STEPS[index] - current_zoom),
+        )
+        next_index = min(max(closest_index + step, 0), len(self._ZOOM_STEPS) - 1)
+        self._fit_to_view = False
+        self._zoom_factor = self._ZOOM_STEPS[next_index]
+        self._distance = self._FIT_DISTANCE / self._zoom_factor
+        self.view_state_changed.emit(self._zoom_factor, self._fit_to_view)
+        self.update()
+        event.accept()
+
+    def _upload_geometry(self) -> None:
+        if not self._gl_ready or self.context() is None or self._program is None:
+            return
+        self.makeCurrent()
+        self._clear_gl_textures()
+        self._program.bind()
+        self._vertex_array.bind()
+        self._vertex_buffer.bind()
+        self._vertex_buffer.allocate(self._vertex_blob, len(self._vertex_blob))
+        stride = 11 * 4
+        self._program.enableAttributeArray(0)
+        self._program.setAttributeBuffer(0, _GL_FLOAT, 0, 3, stride)
+        self._program.enableAttributeArray(1)
+        self._program.setAttributeBuffer(1, _GL_FLOAT, 3 * 4, 3, stride)
+        self._program.enableAttributeArray(2)
+        self._program.setAttributeBuffer(2, _GL_FLOAT, 6 * 4, 3, stride)
+        self._program.enableAttributeArray(3)
+        self._program.setAttributeBuffer(3, _GL_FLOAT, 9 * 4, 2, stride)
+        self._vertex_buffer.release()
+        self._vertex_array.release()
+        self._program.release()
+        self._rebuild_gl_textures()
+        self.doneCurrent()
+
+    def _build_vertex_blob(self, model) -> Tuple[bytes, int, List[_ModelPreviewDrawBatch]]:
+        meshes = getattr(model, "meshes", None)
+        if not meshes:
+            return b"", 0, []
+        vertex_data = array("f")
+        vertex_count = 0
+        batches: List[_ModelPreviewDrawBatch] = []
+        for mesh_index, mesh in enumerate(meshes):
+            positions = list(getattr(mesh, "positions", []) or [])
+            normals = list(getattr(mesh, "normals", []) or [])
+            indices = list(getattr(mesh, "indices", []) or [])
+            if not positions or not indices:
+                continue
+            if len(normals) != len(positions):
+                normals = [(0.0, 0.0, 1.0)] * len(positions)
+            texture_coordinates = list(getattr(mesh, "texture_coordinates", []) or [])
+            has_texture_coordinates = len(texture_coordinates) == len(positions)
+            texture_wrap_repeat = False
+            if has_texture_coordinates:
+                us = [uv[0] for uv in texture_coordinates]
+                vs = [uv[1] for uv in texture_coordinates]
+                texture_wrap_repeat = (
+                    min(us) < -0.05
+                    or max(us) > 1.05
+                    or min(vs) < -0.05
+                    or max(vs) > 1.05
+                )
+            color = self._PALETTE[mesh_index % len(self._PALETTE)]
+            batch_first_vertex = vertex_count
+            for triangle_index in range(0, len(indices) - 2, 3):
+                a = indices[triangle_index]
+                b = indices[triangle_index + 1]
+                c = indices[triangle_index + 2]
+                if (
+                    a < 0
+                    or b < 0
+                    or c < 0
+                    or a >= len(positions)
+                    or b >= len(positions)
+                    or c >= len(positions)
+                ):
+                    continue
+                for vertex_index in (a, b, c):
+                    px, py, pz = positions[vertex_index]
+                    nx, ny, nz = normals[vertex_index]
+                    if has_texture_coordinates:
+                        tu, tv = texture_coordinates[vertex_index]
+                    else:
+                        tu, tv = 0.0, 0.0
+                    vertex_data.extend((px, py, pz, nx, ny, nz, color[0], color[1], color[2], tu, tv))
+                vertex_count += 3
+            batch_vertex_count = vertex_count - batch_first_vertex
+            if batch_vertex_count <= 0:
+                continue
+            texture_key = str(getattr(mesh, "preview_texture_path", "") or "").strip()
+            if not texture_key and getattr(mesh, "preview_texture_image", None) is not None:
+                texture_key = f"in_memory:{mesh_index}"
+            texture_flip_vertical = self._should_flip_texture_vertically(mesh)
+            batches.append(
+                _ModelPreviewDrawBatch(
+                    first_vertex=batch_first_vertex,
+                    vertex_count=batch_vertex_count,
+                    texture_key=texture_key,
+                    has_texture_coordinates=has_texture_coordinates,
+                    texture_wrap_repeat=texture_wrap_repeat,
+                    texture_flip_vertical=texture_flip_vertical,
+                )
+            )
+        return vertex_data.tobytes(), vertex_count, batches
+
+    @staticmethod
+    def _sample_texture_orientation_metrics(
+        texture_image: QImage,
+        texture_coordinates: Sequence[Tuple[float, float]],
+        *,
+        flip_vertical: bool,
+        max_samples: int = 384,
+    ) -> Tuple[int, int, int, int]:
+        if texture_image.isNull() or not texture_coordinates:
+            return 0, 0, 0, 0
+        image = texture_image
+        if image.format() != QImage.Format_RGBA8888:
+            image = image.convertToFormat(QImage.Format_RGBA8888)
+        width = image.width()
+        height = image.height()
+        if width <= 0 or height <= 0:
+            return 0, 0, 0, 0
+        total_coordinates = len(texture_coordinates)
+        sample_step = max(1, total_coordinates // max_samples)
+        opaque_black = 0
+        transparent = 0
+        colored = 0
+        total = 0
+        for index in range(0, total_coordinates, sample_step):
+            try:
+                u, v = texture_coordinates[index]
+                uu = max(0.0, min(1.0, float(u)))
+                vv = max(0.0, min(1.0, float(v)))
+            except (TypeError, ValueError):
+                continue
+            if flip_vertical:
+                vv = 1.0 - vv
+            x = min(width - 1, max(0, int(round(uu * (width - 1)))))
+            y = min(height - 1, max(0, int(round(vv * (height - 1)))))
+            color = image.pixelColor(x, y)
+            alpha = color.alpha()
+            total += 1
+            if alpha <= 8:
+                transparent += 1
+                continue
+            if color.red() <= 12 and color.green() <= 12 and color.blue() <= 12:
+                opaque_black += 1
+                continue
+            colored += 1
+        return opaque_black, transparent, colored, total
+
+    def _should_flip_texture_vertically(self, mesh) -> bool:
+        texture_image = getattr(mesh, "preview_texture_image", None)
+        if not isinstance(texture_image, QImage) or texture_image.isNull():
+            return True
+        texture_coordinates = list(getattr(mesh, "texture_coordinates", []) or [])
+        positions = list(getattr(mesh, "positions", []) or [])
+        if not texture_coordinates or len(texture_coordinates) != len(positions):
+            return True
+        flipped_black, flipped_transparent, flipped_colored, flipped_total = self._sample_texture_orientation_metrics(
+            texture_image,
+            texture_coordinates,
+            flip_vertical=True,
+        )
+        unflipped_black, unflipped_transparent, unflipped_colored, unflipped_total = self._sample_texture_orientation_metrics(
+            texture_image,
+            texture_coordinates,
+            flip_vertical=False,
+        )
+        if flipped_total <= 0 or unflipped_total <= 0:
+            return True
+        black_improvement = flipped_black - unflipped_black
+        meaningful_black_delta = max(24, flipped_total // 10)
+        if black_improvement >= meaningful_black_delta and unflipped_colored >= flipped_colored:
+            return False
+        transparent_improvement = flipped_transparent - unflipped_transparent
+        meaningful_transparent_delta = max(48, flipped_total // 6)
+        if (
+            flipped_black == 0
+            and unflipped_black == 0
+            and transparent_improvement >= meaningful_transparent_delta
+            and unflipped_colored >= flipped_colored
+        ):
+            return False
+        return True
+
+    def _clear_gl_textures(self) -> None:
+        for texture in self._texture_objects.values():
+            try:
+                texture.destroy()
+            except Exception:
+                continue
+        self._texture_objects.clear()
+
+    def _rebuild_gl_textures(self) -> None:
+        if not self._gl_ready:
+            return
+        source_images: Dict[str, QImage] = {}
+        current_meshes = getattr(getattr(self, "_current_model", None), "meshes", None)
+        if current_meshes:
+            for mesh_index, mesh in enumerate(current_meshes):
+                texture_key = str(getattr(mesh, "preview_texture_path", "") or "").strip()
+                if not texture_key and getattr(mesh, "preview_texture_image", None) is not None:
+                    texture_key = f"in_memory:{mesh_index}"
+                texture_image = getattr(mesh, "preview_texture_image", None)
+                if not texture_key or texture_key in source_images or texture_image is None:
+                    continue
+                if not isinstance(texture_image, QImage) or texture_image.isNull():
+                    continue
+                source_images[texture_key] = texture_image
+        for batch in self._mesh_batches:
+            if not batch.texture_key:
+                continue
+            texture_image = source_images.get(batch.texture_key)
+            if texture_image is None:
+                continue
+            cache_key = (batch.texture_key, bool(batch.texture_wrap_repeat), bool(batch.texture_flip_vertical))
+            if cache_key in self._texture_objects:
+                continue
+            image = texture_image
+            texture_image = image.convertToFormat(QImage.Format_RGBA8888)
+            if batch.texture_flip_vertical:
+                texture_image = texture_image.mirrored(False, True)
+            if texture_image.isNull():
+                continue
+            texture = QOpenGLTexture(texture_image)
+            texture.setMinMagFilters(QOpenGLTexture.LinearMipMapLinear, QOpenGLTexture.Linear)
+            texture.setWrapMode(QOpenGLTexture.Repeat if batch.texture_wrap_repeat else QOpenGLTexture.ClampToEdge)
+            self._texture_objects[cache_key] = texture
+
+
 class PreviewScrollArea(QScrollArea):
     resized = Signal()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self.resized.emit()
+
+
+def _format_media_preview_time(value_ms: int) -> str:
+    total_seconds = max(0, int(value_ms // 1000))
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:d}:{seconds:02d}"
+
+
+class MediaPreviewWidget(QWidget):
+    def __init__(self, message: str, *, theme_key: str):
+        super().__init__()
+        self._message = message
+        self._theme_key = theme_key
+        self._media_path = ""
+        self._media_kind = ""
+        self._ignore_slider_update = False
+        self._media_supported = bool(QMediaPlayer is not None and QAudioOutput is not None and QVideoWidget is not None)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        self.info_label = QLabel(message)
+        self.info_label.setWordWrap(True)
+        self.info_label.setObjectName("HintLabel")
+        layout.addWidget(self.info_label)
+
+        if self._media_supported:
+            self.video_widget = QVideoWidget()
+            self.video_widget.setMinimumHeight(220)
+            layout.addWidget(self.video_widget, stretch=1)
+
+            controls_row = QHBoxLayout()
+            controls_row.setSpacing(8)
+            self.play_button = QPushButton("Play")
+            self.stop_button = QPushButton("Stop")
+            self.position_slider = QSlider(Qt.Horizontal)
+            self.position_slider.setRange(0, 0)
+            self.time_label = QLabel("0:00 / 0:00")
+            self.time_label.setObjectName("HintLabel")
+            controls_row.addWidget(self.play_button)
+            controls_row.addWidget(self.stop_button)
+            controls_row.addWidget(self.position_slider, stretch=1)
+            controls_row.addWidget(self.time_label)
+            layout.addLayout(controls_row)
+
+            self.audio_output = QAudioOutput(self)
+            self.audio_output.setVolume(1.0)
+            self.player = QMediaPlayer(self)
+            self.player.setAudioOutput(self.audio_output)
+            self.player.setVideoOutput(self.video_widget)
+            self.player.positionChanged.connect(self._handle_position_changed)
+            self.player.durationChanged.connect(self._handle_duration_changed)
+            self.player.playbackStateChanged.connect(self._handle_playback_state_changed)
+            self.player.mediaStatusChanged.connect(self._handle_media_status_changed)
+            self.player.errorOccurred.connect(self._handle_error)
+
+            self.play_button.clicked.connect(self._toggle_play_pause)
+            self.stop_button.clicked.connect(self._stop_playback)
+            self.position_slider.sliderPressed.connect(self._handle_slider_pressed)
+            self.position_slider.sliderReleased.connect(self._handle_slider_released)
+            self.position_slider.sliderMoved.connect(self._handle_slider_moved)
+        else:
+            self.video_widget = None
+            self.play_button = QPushButton("Play")
+            self.stop_button = QPushButton("Stop")
+            self.position_slider = QSlider(Qt.Horizontal)
+            self.time_label = QLabel("0:00 / 0:00")
+            self.audio_output = None
+            self.player = None
+
+        self.clear_media(message)
+
+    def set_theme(self, theme_key: str) -> None:
+        self._theme_key = theme_key
+
+    def clear_media(self, message: str) -> None:
+        self._message = message
+        self._media_path = ""
+        self._media_kind = ""
+        if self.player is not None:
+            self.player.stop()
+            self.player.setSource(QUrl())
+        if self.video_widget is not None:
+            self.video_widget.setVisible(False)
+        self.info_label.setText(message)
+        self.play_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.position_slider.setEnabled(False)
+        self.position_slider.setRange(0, 0)
+        self.position_slider.setValue(0)
+        self.time_label.setText("0:00 / 0:00")
+
+    def shutdown(self) -> None:
+        self.clear_media(self._message)
+
+    def set_media(self, media_path: str, *, media_kind: str, detail_text: str = "") -> None:
+        normalized_path = str(media_path or "").strip()
+        normalized_kind = str(media_kind or "").strip().lower()
+        if not normalized_path:
+            self.clear_media(detail_text or "No media preview available.")
+            return
+
+        self._media_path = normalized_path
+        self._media_kind = normalized_kind
+
+        if not self._media_supported:
+            self.info_label.setText(
+                "Qt Multimedia is not available in this build.\n\n"
+                + (detail_text or normalized_path)
+            )
+            self.play_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            self.position_slider.setEnabled(False)
+            return
+
+        self.info_label.setText(detail_text or normalized_path)
+        if self.video_widget is not None:
+            self.video_widget.setVisible(normalized_kind == "video")
+        self.play_button.setEnabled(True)
+        self.stop_button.setEnabled(True)
+        self.position_slider.setEnabled(True)
+        self.position_slider.setRange(0, 0)
+        self.position_slider.setValue(0)
+        self.time_label.setText("0:00 / 0:00")
+        self.player.stop()
+        self.player.setSource(QUrl.fromLocalFile(normalized_path))
+        self.player.play()
+
+    def _toggle_play_pause(self) -> None:
+        if self.player is None:
+            return
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def _stop_playback(self) -> None:
+        if self.player is None:
+            return
+        self.player.stop()
+
+    def _handle_slider_pressed(self) -> None:
+        self._ignore_slider_update = True
+
+    def _handle_slider_released(self) -> None:
+        if self.player is not None:
+            self.player.setPosition(int(self.position_slider.value()))
+        self._ignore_slider_update = False
+
+    def _handle_slider_moved(self, value: int) -> None:
+        duration = self.position_slider.maximum()
+        self.time_label.setText(f"{_format_media_preview_time(value)} / {_format_media_preview_time(duration)}")
+
+    def _handle_position_changed(self, position: int) -> None:
+        if not self._ignore_slider_update:
+            self.position_slider.setValue(int(position))
+        duration = self.position_slider.maximum()
+        self.time_label.setText(f"{_format_media_preview_time(position)} / {_format_media_preview_time(duration)}")
+
+    def _handle_duration_changed(self, duration: int) -> None:
+        self.position_slider.setRange(0, max(0, int(duration)))
+        position = self.position_slider.value()
+        self.time_label.setText(f"{_format_media_preview_time(position)} / {_format_media_preview_time(duration)}")
+
+    def _handle_playback_state_changed(self, state) -> None:
+        if QMediaPlayer is None:
+            return
+        self.play_button.setText("Pause" if state == QMediaPlayer.PlayingState else "Play")
+
+    def _handle_media_status_changed(self, status) -> None:
+        if QMediaPlayer is None:
+            return
+        if status == QMediaPlayer.EndOfMedia:
+            self.play_button.setText("Play")
+
+    def _handle_error(self, _error, error_text: str) -> None:
+        message = str(error_text or "").strip() or "The multimedia backend could not open this file."
+        if self._media_kind == "audio":
+            message += "\n\nSome Wwise `.wem` variants are not supported by the local Qt Multimedia backend."
+        self.info_label.setText(message + (f"\n\nSource: {self._media_path}" if self._media_path else ""))
 
 
 def _theme_is_light(theme_key: str) -> bool:
@@ -638,9 +1390,11 @@ def _theme_is_light(theme_key: str) -> bool:
 
 
 class PreviewSyntaxHighlighter(QSyntaxHighlighter):
+    CSS_TEXT_EXTENSIONS = {".css"}
     XML_TEXT_EXTENSIONS = {".xml", ".html", ".thtml", ".material", ".shader"}
     JSON_TEXT_EXTENSIONS = {".json", ".yaml", ".yml"}
     INI_TEXT_EXTENSIONS = {".ini", ".cfg"}
+    PALOC_TEXT_EXTENSIONS = {".paloc"}
     LUA_TEXT_EXTENSIONS = {".lua"}
 
     LUA_KEYWORDS = {
@@ -700,11 +1454,13 @@ class PreviewSyntaxHighlighter(QSyntaxHighlighter):
 
     def set_language_for_extension(self, extension: str) -> None:
         suffix = (extension or "").lower()
-        if suffix in self.XML_TEXT_EXTENSIONS:
+        if suffix in self.CSS_TEXT_EXTENSIONS:
+            self.language = "css"
+        elif suffix in self.XML_TEXT_EXTENSIONS:
             self.language = "xml"
         elif suffix in self.JSON_TEXT_EXTENSIONS:
             self.language = "json"
-        elif suffix in self.INI_TEXT_EXTENSIONS:
+        elif suffix in self.INI_TEXT_EXTENSIONS or suffix in self.PALOC_TEXT_EXTENSIONS:
             self.language = "ini"
         elif suffix in self.LUA_TEXT_EXTENSIONS:
             self.language = "lua"
@@ -713,7 +1469,9 @@ class PreviewSyntaxHighlighter(QSyntaxHighlighter):
         self.rehighlight()
 
     def highlightBlock(self, text: str) -> None:  # type: ignore[override]
-        if self.language == "xml":
+        if self.language == "css":
+            self._highlight_css(text)
+        elif self.language == "xml":
             self._highlight_xml(text)
         elif self.language == "json":
             self._highlight_json(text)
@@ -745,6 +1503,30 @@ class PreviewSyntaxHighlighter(QSyntaxHighlighter):
             length = end_index - start_index + 3
             self.setFormat(start_index, length, self.comment_format)
             start_index = text.find("<!--", end_index + 3)
+
+    def _highlight_css(self, text: str) -> None:
+        self.setCurrentBlockState(0)
+
+        start_index = 0 if self.previousBlockState() == 1 else text.find("/*")
+        while start_index >= 0:
+            end_index = text.find("*/", start_index + 2)
+            if end_index == -1:
+                self.setCurrentBlockState(1)
+                self.setFormat(start_index, len(text) - start_index, self.comment_format)
+                break
+            length = end_index - start_index + 2
+            self.setFormat(start_index, length, self.comment_format)
+            start_index = text.find("/*", end_index + 2)
+
+        selector_match = re.match(r"\s*([^{]+?)(?=\s*\{)", text)
+        if selector_match:
+            self.setFormat(selector_match.start(1), selector_match.end(1) - selector_match.start(1), self.tag_format)
+        for match in re.finditer(r"(?<=\{|;)\s*([-\w]+)(?=\s*:)", text):
+            self.setFormat(match.start(1), match.end(1) - match.start(1), self.attribute_format)
+        for match in re.finditer(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.string_format)
+        for match in re.finditer(r"#[0-9A-Fa-f]{3,8}\b|(?<![\w.])-?\b\d+(?:\.\d+)?(?:px|em|rem|vh|vw|%)?\b", text):
+            self.setFormat(match.start(), match.end() - match.start(), self.number_format)
 
     def _highlight_json(self, text: str) -> None:
         for match in re.finditer(r'"(?:\\.|[^"\\])*"(?=\s*:)', text):

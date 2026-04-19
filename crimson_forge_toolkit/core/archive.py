@@ -9,6 +9,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 from collections import defaultdict
@@ -34,12 +35,38 @@ except ImportError:
 from crimson_forge_toolkit.constants import *
 from crimson_forge_toolkit.models import *
 from crimson_forge_toolkit.core.common import *
+from crimson_forge_toolkit.core.model_preview import (
+    build_pam_model_preview,
+    build_pamlod_model_preview,
+    ensure_model_preview_is_reasonable,
+)
+from crimson_forge_toolkit.core.archive_modding import (
+    build_hkx_preview,
+    build_mesh_preview_from_bytes,
+    build_pab_preview,
+)
 from crimson_forge_toolkit.core.pipeline import ensure_dds_display_preview_png, parse_dds
-from crimson_forge_toolkit.core.upscale_profiles import classify_texture_type
+from crimson_forge_toolkit.core.upscale_profiles import (
+    classify_texture_type,
+    derive_texture_group_key,
+    infer_texture_semantics,
+)
 
 _PATHC_COLLECTION_CACHE: Dict[str, Tuple[str, "PathcCollection"]] = {}
 _ARCHIVE_SCAN_CACHE_MAGIC = b"CTFARCH1"
 _ARCHIVE_SCAN_CACHE_VERSION = 2
+_ARCHIVE_SCAN_CACHE_LEGACY_DIRNAMES: Tuple[str, ...] = ("cache", "archive_scan_cache")
+_MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION = 4096
+_MODEL_TEXTURE_VISIBLE_FAMILY_SUFFIXES: Tuple[str, ...] = (
+    "",
+    "_ct",
+    "_color",
+    "_col",
+    "_albedo",
+    "_basecolor",
+    "_base_color",
+    "_diffuse",
+)
 
 _COMMON_TECHNICAL_DDS_EXCLUDE_PATTERNS: Tuple[str, ...] = (
     "*_n.dds",
@@ -93,6 +120,29 @@ _COMMON_TECHNICAL_DDS_EXCLUDE_PATTERNS: Tuple[str, ...] = (
     "*_mask_amg.dds",
     "*_d.dds",
 )
+_ARCHIVE_STRUCTURED_BINARY_PREVIEW_EXTENSIONS: Tuple[str, ...] = (
+    ".bnk",
+    ".binarygimmick",
+    ".hkx",
+    ".levelinfo",
+    ".meshinfo",
+    ".motionblending",
+    ".paa",
+    ".paa_metabin",
+    ".pabgb",
+    ".paem",
+    ".pagbg",
+    ".pampg",
+    ".paseq",
+    ".paschedule",
+    ".paschedulepath",
+    ".pastage",
+    ".uianiminit",
+    ".pamlod",
+    ".prefab",
+    ".seqmt",
+    ".wem",
+)
 _ARCHIVE_SCAN_CACHE_SUPPORTED_VERSIONS = {1, 2}
 CHACHA20_HASH_INITVAL = 0x000C5EDE
 CHACHA20_IV_XOR = 0x60616263
@@ -106,6 +156,8 @@ CHACHA20_XOR_DELTAS = (
     0x06060606,
     0x02020202,
 )
+_PRINTABLE_BINARY_STRING_RE = re.compile(rb"[\x20-\x7E]{4,}")
+_TEXT_DDS_REFERENCE_RE = re.compile(r"[A-Za-z0-9_./\\-]{3,255}\.dds", re.IGNORECASE)
 
 def _rot32(value: int, shift: int) -> int:
     value &= 0xFFFFFFFF
@@ -250,33 +302,25 @@ def crypt_chacha20_filename(data: bytes, filename: str) -> bytes:
     return cipher.encryptor().update(data)
 
 
-def _looks_like_plain_text_payload(extension: str, data: bytes) -> bool:
-    if extension not in {".xml", ".txt", ".html", ".thtml", ".lua", ".json", ".ini", ".cfg", ".csv", ".log"}:
-        return False
-    preview_data = data[:8192]
-    for encoding in ("utf-8-sig", "utf-8", "utf-16-le", "cp1252"):
-        try:
-            if encoding in {"utf-8-sig", "utf-8"}:
-                text = preview_data.decode(encoding, errors="ignore")
-            else:
-                text = preview_data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-        sample = text[:4096]
-        if not sample:
-            continue
-        printable = sum(1 for ch in sample if ch.isprintable() or ch in "\r\n\t")
-        if printable / max(1, len(sample)) < 0.85:
-            continue
-        if extension == ".xml":
-            stripped = sample.lstrip("\ufeff \t\r\n")
-            if "<" not in stripped:
-                continue
+def _looks_like_plain_text_payload(data: bytes) -> bool:
+    return try_decode_text_like_archive_data(data) is not None
+
+
+def _looks_like_structured_binary_payload(extension: str, data: bytes) -> bool:
+    head4 = data[:4]
+    if extension == ".dds" and data.startswith(DDS_MAGIC):
         return True
-    return False
+    if head4 in {b"PAR ", b"PARC"}:
+        return True
+    if len(data) >= 16 and data[4:8] == b"TAG0" and data[12:16] == b"SDKV":
+        return True
+    if data.startswith(b"RIFF") and data[8:12] == b"WAVE":
+        return True
+    return len(extract_binary_strings(data, sample_limit=16_384, max_strings=10)) >= 3
 
 
 def _looks_like_decrypted_payload(entry: ArchiveEntry, data: bytes) -> bool:
+    candidate = data
     if entry.compression_type == 2:
         if lz4_block is None:
             return False
@@ -284,14 +328,16 @@ def _looks_like_decrypted_payload(entry: ArchiveEntry, data: bytes) -> bool:
             candidate = lz4_block.decompress(data, uncompressed_size=entry.orig_size)
         except Exception:
             return False
-        return _looks_like_plain_text_payload(entry.extension, candidate)
-    if entry.compression_type == 1 and entry.extension == ".dds":
+    elif entry.compression_type == 1 and entry.extension == ".dds":
         try:
             candidate = reconstruct_partial_dds(entry, data)
         except Exception:
             return False
-        return candidate.startswith(DDS_MAGIC)
-    return _looks_like_plain_text_payload(entry.extension, data)
+    if _looks_like_plain_text_payload(candidate):
+        return True
+    if entry.extension in _ARCHIVE_STRUCTURED_BINARY_PREVIEW_EXTENSIONS or entry.extension in ARCHIVE_MODEL_EXTENSIONS:
+        return _looks_like_structured_binary_payload(entry.extension, candidate)
+    return entry.extension == ".dds" and candidate.startswith(DDS_MAGIC)
 
 
 def try_decrypt_archive_entry_data(entry: ArchiveEntry, data: bytes) -> Tuple[bytes, Optional[str]]:
@@ -321,6 +367,31 @@ def resolve_archive_scan_cache_path(package_root: Path, cache_root: Path) -> Pat
         resolved_root = package_root.expanduser()
     digest = hashlib.sha256(str(resolved_root).lower().encode("utf-8", errors="replace")).hexdigest()[:24]
     return cache_root / f"archive_scan_{digest}.bin"
+
+
+def _candidate_archive_scan_cache_paths(package_root: Path, cache_root: Path) -> List[Path]:
+    try:
+        resolved_cache_root = cache_root.expanduser().resolve()
+    except OSError:
+        resolved_cache_root = cache_root.expanduser()
+
+    root_candidates = [resolved_cache_root]
+    sibling_parent = resolved_cache_root.parent
+    for dirname in _ARCHIVE_SCAN_CACHE_LEGACY_DIRNAMES:
+        root_candidates.append(sibling_parent / dirname)
+
+    cache_paths: List[Path] = []
+    seen: set[str] = set()
+    for candidate_root in root_candidates:
+        normalized_root = str(candidate_root).strip()
+        if not normalized_root:
+            continue
+        lowered_root = normalized_root.lower()
+        if lowered_root in seen:
+            continue
+        seen.add(lowered_root)
+        cache_paths.append(resolve_archive_scan_cache_path(package_root, candidate_root))
+    return cache_paths
 
 
 def _archive_base_dir(package_root: Path) -> Path:
@@ -453,8 +524,10 @@ def load_archive_scan_cache(
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> Optional[List[ArchiveEntry]]:
-    cache_path = resolve_archive_scan_cache_path(package_root, cache_root)
-    if not cache_path.exists():
+    candidate_paths = _candidate_archive_scan_cache_paths(package_root, cache_root)
+    preferred_cache_path = candidate_paths[0]
+    existing_candidate_paths = [candidate for candidate in candidate_paths if candidate.exists()]
+    if not existing_candidate_paths:
         return None
 
     if on_progress:
@@ -466,80 +539,112 @@ def load_archive_scan_cache(
             on_log(f"Archive cache check failed; will rescan instead: {exc}")
         return None
 
-    try:
-        data = _deserialize_archive_scan_cache_payload(cache_path.read_bytes())
-    except Exception as exc:
-        if on_log:
-            on_log(f"Archive cache could not be read; will rescan instead: {exc}")
-        return None
+    last_failure_message = "Archive cache is unavailable; performing a full rescan."
+    for cache_path in existing_candidate_paths:
+        cache_label = "archive cache" if cache_path == preferred_cache_path else f"legacy archive cache at {cache_path.parent}"
+        if cache_path != preferred_cache_path and on_log:
+            on_log(f"Trying {cache_label}: {cache_path.name}")
 
-    if int(data.get("version", 0)) not in _ARCHIVE_SCAN_CACHE_SUPPORTED_VERSIONS:
-        if on_log:
-            on_log("Archive cache format changed; performing a full rescan.")
-        return None
+        try:
+            data = _deserialize_archive_scan_cache_payload(cache_path.read_bytes())
+        except Exception as exc:
+            last_failure_message = f"{cache_label.capitalize()} could not be read; will try another cache or rescan: {exc}"
+            if on_log:
+                on_log(last_failure_message)
+            continue
 
-    cached_sources = data.get("sources")
-    if not isinstance(cached_sources, list):
-        if on_log:
-            on_log("Archive cache is missing source metadata; performing a full rescan.")
-        return None
+        if int(data.get("version", 0)) not in _ARCHIVE_SCAN_CACHE_SUPPORTED_VERSIONS:
+            last_failure_message = f"{cache_label.capitalize()} format changed; will try another cache or rescan."
+            if on_log:
+                on_log(last_failure_message)
+            continue
 
-    if cached_sources != current_sources:
-        if on_log:
-            on_log("Archive cache is out of date; archive indexes changed since the last scan.")
-        return None
+        cached_sources = data.get("sources")
+        if not isinstance(cached_sources, list):
+            last_failure_message = f"{cache_label.capitalize()} is missing source metadata; will try another cache or rescan."
+            if on_log:
+                on_log(last_failure_message)
+            continue
 
-    raw_rows = data.get("rows")
-    if not isinstance(raw_rows, list):
-        if on_log:
-            on_log("Archive cache is missing entry rows; performing a full rescan.")
-        return None
+        if cached_sources != current_sources:
+            last_failure_message = f"{cache_label.capitalize()} is out of date; archive indexes changed since the last scan."
+            if on_log:
+                on_log(last_failure_message)
+            continue
 
-    total_rows = len(raw_rows)
+        raw_rows = data.get("rows")
+        if not isinstance(raw_rows, list):
+            last_failure_message = f"{cache_label.capitalize()} is missing entry rows; will try another cache or rescan."
+            if on_log:
+                on_log(last_failure_message)
+            continue
+
+        total_rows = len(raw_rows)
+        if on_log:
+            on_log(f"Loading {total_rows:,} archive entries from cache...")
+        if total_rows == 0:
+            if on_progress:
+                on_progress(1, 1, "Archive cache loaded. No entries were cached.")
+            return []
+
+        try:
+            update_every = 50_000 if total_rows >= 500_000 else 10_000 if total_rows >= 100_000 else 2_000
+            pamt_path_cache: Dict[str, Path] = {}
+            paz_path_cache: Dict[Tuple[str, int], Path] = {}
+            entries: List[ArchiveEntry] = []
+            for index, row in enumerate(raw_rows, start=1):
+                raise_if_cancelled(stop_event)
+                if not isinstance(row, tuple) or len(row) != 7:
+                    raise ValueError("Archive cache row shape is invalid.")
+                path, pamt_rel, offset, comp_size, orig_size, flags, paz_index = row
+                pamt_rel_text = str(pamt_rel)
+                pamt_path = pamt_path_cache.get(pamt_rel_text)
+                if pamt_path is None:
+                    pamt_path = base_dir / pamt_rel_text
+                    pamt_path_cache[pamt_rel_text] = pamt_path
+                paz_key = (pamt_rel_text, int(paz_index))
+                paz_path = paz_path_cache.get(paz_key)
+                if paz_path is None:
+                    paz_path = pamt_path.parent / f"{int(paz_index)}.paz"
+                    paz_path_cache[paz_key] = paz_path
+                entries.append(
+                    ArchiveEntry(
+                        path=str(path),
+                        pamt_path=pamt_path,
+                        paz_file=paz_path,
+                        offset=int(offset),
+                        comp_size=int(comp_size),
+                        orig_size=int(orig_size),
+                        flags=int(flags),
+                        paz_index=int(paz_index),
+                    )
+                )
+                if on_progress and (index == 1 or index % update_every == 0 or index == total_rows):
+                    on_progress(index, total_rows, f"Loading archive cache... {index:,} / {total_rows:,} entries")
+        except Exception as exc:
+            last_failure_message = f"{cache_label.capitalize()} could not be loaded; will try another cache or rescan: {exc}"
+            if on_log:
+                on_log(last_failure_message)
+            continue
+
+        if cache_path != preferred_cache_path:
+            try:
+                preferred_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                if not preferred_cache_path.exists():
+                    shutil.copy2(cache_path, preferred_cache_path)
+                if on_log:
+                    on_log(f"Migrated archive cache to preferred location: {preferred_cache_path}")
+            except Exception as exc:
+                if on_log:
+                    on_log(f"Loaded archive cache from legacy location, but migration failed: {exc}")
+
+        if on_log:
+            on_log(f"Loaded {len(entries):,} archive entries from cache.")
+        return entries
+
     if on_log:
-        on_log(f"Loading {total_rows:,} archive entries from cache...")
-    if total_rows == 0:
-        if on_progress:
-            on_progress(1, 1, "Archive cache loaded. No entries were cached.")
-        return []
-
-    update_every = 50_000 if total_rows >= 500_000 else 10_000 if total_rows >= 100_000 else 2_000
-    pamt_path_cache: Dict[str, Path] = {}
-    paz_path_cache: Dict[Tuple[str, int], Path] = {}
-    entries: List[ArchiveEntry] = []
-    for index, row in enumerate(raw_rows, start=1):
-        raise_if_cancelled(stop_event)
-        if not isinstance(row, tuple) or len(row) != 7:
-            raise ValueError("Archive cache row shape is invalid.")
-        path, pamt_rel, offset, comp_size, orig_size, flags, paz_index = row
-        pamt_rel_text = str(pamt_rel)
-        pamt_path = pamt_path_cache.get(pamt_rel_text)
-        if pamt_path is None:
-            pamt_path = base_dir / pamt_rel_text
-            pamt_path_cache[pamt_rel_text] = pamt_path
-        paz_key = (pamt_rel_text, int(paz_index))
-        paz_path = paz_path_cache.get(paz_key)
-        if paz_path is None:
-            paz_path = pamt_path.parent / f"{int(paz_index)}.paz"
-            paz_path_cache[paz_key] = paz_path
-        entries.append(
-            ArchiveEntry(
-                path=str(path),
-                pamt_path=pamt_path,
-                paz_file=paz_path,
-                offset=int(offset),
-                comp_size=int(comp_size),
-                orig_size=int(orig_size),
-                flags=int(flags),
-                paz_index=int(paz_index),
-            )
-        )
-        if on_progress and (index == 1 or index % update_every == 0 or index == total_rows):
-            on_progress(index, total_rows, f"Loading archive cache... {index:,} / {total_rows:,} entries")
-
-    if on_log:
-        on_log(f"Loaded {len(entries):,} archive entries from cache.")
-    return entries
+        on_log(last_failure_message)
+    return None
 
 
 def scan_archive_entries_cached(
@@ -1125,6 +1230,10 @@ def archive_entry_role(entry: ArchiveEntry) -> str:
 
     if extension in ARCHIVE_MODEL_EXTENSIONS or extension in {".hkx"}:
         return "model"
+    if extension in ARCHIVE_VIDEO_EXTENSIONS:
+        return "video"
+    if extension in ARCHIVE_AUDIO_EXTENSIONS:
+        return "audio"
     if "/ui/" in path_lower or entry.basename.lower().startswith("ui_"):
         return "ui"
     if "impostor" in path_lower:
@@ -1143,7 +1252,14 @@ def archive_entry_role(entry: ArchiveEntry) -> str:
 
 def archive_entry_is_previewable(entry: ArchiveEntry) -> bool:
     extension = entry.extension
-    return extension in ARCHIVE_IMAGE_EXTENSIONS or extension in ARCHIVE_TEXT_EXTENSIONS or extension in ARCHIVE_MODEL_EXTENSIONS or extension in {".hkx"}
+    return (
+        extension in ARCHIVE_IMAGE_EXTENSIONS
+        or extension in ARCHIVE_AUDIO_EXTENSIONS
+        or extension in ARCHIVE_VIDEO_EXTENSIONS
+        or extension in ARCHIVE_TEXT_EXTENSIONS
+        or extension in ARCHIVE_MODEL_EXTENSIONS
+        or extension in _ARCHIVE_STRUCTURED_BINARY_PREVIEW_EXTENSIONS
+    )
 
 
 def archive_entry_matches_advanced_filters(
@@ -1210,6 +1326,8 @@ def filter_archive_entries(
     exclude_common_technical_suffixes: bool,
     min_size_kb: int,
     previewable_only: bool,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> List[ArchiveEntry]:
     normalized_extension = normalize_archive_extension_filter(extension_filter)
     text = filter_text.strip().lower()
@@ -1224,59 +1342,68 @@ def filter_archive_entries(
     normalized_structure = normalize_archive_structure_filter_value(structure_filter)
     normalized_role = role_filter.strip().lower()
     require_role = bool(normalized_role and normalized_role != "all")
+    total_entries = len(entries)
+    progress_total = max(total_entries, 1)
+    update_every = 50_000 if total_entries >= 500_000 else 10_000 if total_entries >= 100_000 else 2_000
+
+    if on_progress:
+        on_progress(0 if total_entries > 0 else 1, progress_total, f"Applying archive filters... 0 / {total_entries:,} entries")
 
     filtered: List[ArchiveEntry] = []
-    for entry in entries:
+    for index, entry in enumerate(entries, start=1):
+        if stop_event is not None and (index == 1 or index % 2048 == 0):
+            raise_if_cancelled(stop_event)
         if normalized_extension and normalized_extension not in {"*", "all", ".*"} and entry.extension != normalized_extension:
-            continue
+            matched = False
+        else:
+            matched = True
 
-        if text:
+        if matched and text:
             path_lower = entry.path.lower()
             basename_lower = entry.basename.lower()
             if len(include_patterns) > 1:
-                if not any(_archive_entry_matches_text_pattern(path_lower, basename_lower, pattern) for pattern in include_patterns):
-                    continue
+                matched = any(_archive_entry_matches_text_pattern(path_lower, basename_lower, pattern) for pattern in include_patterns)
             elif wildcard_filter:
-                if not (fnmatch.fnmatch(path_lower, wildcard_pattern) or fnmatch.fnmatch(basename_lower, wildcard_pattern)):
-                    continue
-            elif text not in path_lower and text not in basename_lower:
-                continue
+                matched = fnmatch.fnmatch(path_lower, wildcard_pattern) or fnmatch.fnmatch(basename_lower, wildcard_pattern)
+            else:
+                matched = text in path_lower or text in basename_lower
 
-            if exclude_patterns and any(
-                _archive_entry_matches_text_pattern(path_lower, basename_lower, pattern)
-                for pattern in exclude_patterns
-            ):
-                continue
-        elif exclude_patterns:
+            if matched and exclude_patterns:
+                matched = not any(
+                    _archive_entry_matches_text_pattern(path_lower, basename_lower, pattern)
+                    for pattern in exclude_patterns
+                )
+        elif matched and exclude_patterns:
             path_lower = entry.path.lower()
             basename_lower = entry.basename.lower()
-            if any(_archive_entry_matches_text_pattern(path_lower, basename_lower, pattern) for pattern in exclude_patterns):
-                continue
+            matched = not any(_archive_entry_matches_text_pattern(path_lower, basename_lower, pattern) for pattern in exclude_patterns)
 
-        if package_filter:
+        if matched and package_filter:
             package_label_lower = entry.package_label.lower()
             pamt_path_lower = str(entry.pamt_path).lower()
-            if package_filter not in package_label_lower and package_filter not in pamt_path_lower:
-                continue
+            matched = package_filter in package_label_lower or package_filter in pamt_path_lower
 
-        if min_size_bytes and entry.orig_size < min_size_bytes:
-            continue
+        if matched and min_size_bytes and entry.orig_size < min_size_bytes:
+            matched = False
 
-        if previewable_only and not archive_entry_is_previewable(entry):
-            continue
+        if matched and previewable_only and not archive_entry_is_previewable(entry):
+            matched = False
 
-        if normalized_structure and normalized_structure not in archive_entry_structure_prefixes(entry):
-            continue
+        if matched and normalized_structure and normalized_structure not in archive_entry_structure_prefixes(entry):
+            matched = False
 
-        if require_role:
+        if matched and require_role:
             entry_role = archive_entry_role(entry)
             if normalized_role == "texture":
-                if entry_role not in {"image", "normal", "material", "impostor", "ui"}:
-                    continue
-            elif entry_role != normalized_role:
-                continue
+                matched = entry_role in {"image", "normal", "material", "impostor", "ui"}
+            else:
+                matched = entry_role == normalized_role
 
-        filtered.append(entry)
+        if matched:
+            filtered.append(entry)
+
+        if on_progress and (index == 1 or index % update_every == 0 or index == total_entries):
+            on_progress(index, progress_total, f"Applying archive filters... {index:,} / {total_entries:,} entries")
 
     return filtered
 
@@ -1321,29 +1448,64 @@ def archive_entry_structure_prefixes(entry: ArchiveEntry) -> Tuple[str, ...]:
     return tuple("/".join(parts[: index + 1]) for index in range(len(parts)))
 
 
+def build_archive_entry_path_index(entries: Sequence[ArchiveEntry]) -> Dict[str, List[ArchiveEntry]]:
+    index: Dict[str, List[ArchiveEntry]] = {}
+    for archive_entry in entries:
+        normalized_path = archive_entry.path.replace("\\", "/").strip().lower()
+        index.setdefault(normalized_path, []).append(archive_entry)
+    return index
+
+
+def build_archive_entry_basename_index(entries: Sequence[ArchiveEntry]) -> Dict[str, List[ArchiveEntry]]:
+    index: Dict[str, List[ArchiveEntry]] = {}
+    for archive_entry in entries:
+        basename = PurePosixPath(archive_entry.path.replace("\\", "/")).name.strip().lower()
+        if not basename:
+            continue
+        index.setdefault(basename, []).append(archive_entry)
+    return index
+
+
+def build_archive_entry_extension_index(entries: Sequence[ArchiveEntry]) -> Dict[str, List[ArchiveEntry]]:
+    index: Dict[str, List[ArchiveEntry]] = {}
+    for archive_entry in entries:
+        extension = normalize_archive_extension_filter(archive_entry.extension)
+        if not extension:
+            continue
+        index.setdefault(extension, []).append(archive_entry)
+    return index
+
+
 def build_archive_structure_children_map(entries: Sequence[ArchiveEntry]) -> Dict[str, List[Tuple[str, int]]]:
     child_counts: Dict[str, Dict[str, int]] = defaultdict(dict)
+    folder_counts: Dict[Tuple[str, ...], int] = defaultdict(int)
     package_dir_cache: Dict[Path, str] = {}
+    folder_parts_cache: Dict[str, Tuple[str, ...]] = {"": ()}
 
     for entry in entries:
         package_dir = package_dir_cache.get(entry.pamt_path)
         if package_dir is None:
             package_dir = entry.pamt_path.parent.name.strip().lower() or "package"
             package_dir_cache[entry.pamt_path] = package_dir
-        raw_parts = [
-            part.lower()
-            for part in entry.path.replace("\\", "/").split("/")
-            if part not in {"", ".", ".."}
-        ]
-        if raw_parts:
-            raw_parts.pop()
-        parts = [package_dir, *raw_parts]
+        normalized_path = entry.path.replace("\\", "/").lower()
+        folder_text, _, _basename = normalized_path.rpartition("/")
+        raw_parts = folder_parts_cache.get(folder_text)
+        if raw_parts is None:
+            raw_parts = tuple(
+                part
+                for part in folder_text.split("/")
+                if part not in {"", ".", ".."}
+            )
+            folder_parts_cache[folder_text] = raw_parts
+        folder_counts[(package_dir, *raw_parts)] += 1
+
+    for parts, count in folder_counts.items():
         parent = ""
         child_value = ""
         for part in parts:
             child_value = f"{child_value}/{part}" if child_value else part
             parent_counts = child_counts[parent]
-            parent_counts[child_value] = parent_counts.get(child_value, 0) + 1
+            parent_counts[child_value] = parent_counts.get(child_value, 0) + count
             parent = child_value
 
     def leaf_sort_key(value: str) -> Tuple[int, int, str]:
@@ -1360,6 +1522,9 @@ def build_archive_structure_children_map(entries: Sequence[ArchiveEntry]) -> Dic
 
 def build_archive_tree_index(
     entries: Sequence[ArchiveEntry],
+    *,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> Tuple[
     Dict[Tuple[str, ...], List[Tuple[str, Tuple[str, ...]]]],
     Dict[Tuple[str, ...], List[int]],
@@ -1370,8 +1535,17 @@ def build_archive_tree_index(
     folder_entry_indexes: Dict[Tuple[str, ...], List[int]] = defaultdict(list)
     folder_key_cache: Dict[str, Tuple[str, ...]] = {"": ()}
     folder_hierarchy_cache: Dict[Tuple[str, ...], Tuple[Tuple[Tuple[str, ...], Tuple[str, ...], str], ...]] = {(): ()}
+    total_entries = len(entries)
+    progress_total = max(total_entries, 1)
+    update_every = 50_000 if total_entries >= 500_000 else 10_000 if total_entries >= 100_000 else 2_000
+
+    if on_progress:
+        on_progress(0 if total_entries > 0 else 1, progress_total, f"Indexing archive browser tree... 0 / {total_entries:,} entries")
 
     for index, entry in enumerate(entries):
+        current = index + 1
+        if stop_event is not None and (current == 1 or current % 2048 == 0):
+            raise_if_cancelled(stop_event)
         normalized_path = entry.path.replace("\\", "/")
         folder_text, _, basename = normalized_path.rpartition("/")
         if not basename:
@@ -1404,6 +1578,9 @@ def build_archive_tree_index(
         for parent_key, child_key, part in hierarchy:
             child_folder_sets[parent_key][child_key] = part
             folder_entry_indexes[child_key].append(index)
+
+        if on_progress and (current == 1 or current % update_every == 0 or current == total_entries):
+            on_progress(current, progress_total, f"Indexing archive browser tree... {current:,} / {total_entries:,} entries")
 
     def folder_sort_key(item: Tuple[Tuple[str, ...], str]) -> Tuple[int, int, str]:
         _child_key, leaf = item
@@ -1445,20 +1622,24 @@ def prepare_archive_browser_state(
     min_size_kb: int,
     previewable_only: bool,
     build_structure_children: bool = True,
+    build_tree_index: bool = True,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> dict:
-    total_steps = 3 if build_structure_children else 2
+    total_steps = 1 + (1 if build_structure_children else 0) + (1 if build_tree_index else 0)
+    current_step = 0
     structure_children: Dict[str, List[Tuple[str, int]]] = {}
     if build_structure_children:
         raise_if_cancelled(stop_event)
+        current_step += 1
         if on_progress:
-            on_progress(1, total_steps, "Building folder filters from archive entries...")
+            on_progress(current_step, total_steps, "Building folder filters from archive entries...")
         structure_children = build_archive_structure_children_map(entries)
 
     raise_if_cancelled(stop_event)
+    current_step += 1
     if on_progress:
-        on_progress(2 if build_structure_children else 1, total_steps, "Applying archive filters...")
+        on_progress(current_step, total_steps, "Applying archive filters...")
     filtered_entries = filter_archive_entries(
         entries,
         filter_text=filter_text,
@@ -1470,12 +1651,23 @@ def prepare_archive_browser_state(
         exclude_common_technical_suffixes=exclude_common_technical_suffixes,
         min_size_kb=min_size_kb,
         previewable_only=previewable_only,
+        on_progress=on_progress,
+        stop_event=stop_event,
     )
 
-    raise_if_cancelled(stop_event)
-    if on_progress:
-        on_progress(total_steps, total_steps, "Indexing archive browser tree...")
-    tree_child_folders, tree_direct_files, folder_entry_indexes = build_archive_tree_index(filtered_entries)
+    tree_child_folders: Dict[Tuple[str, ...], List[Tuple[str, Tuple[str, ...]]]] = {}
+    tree_direct_files: Dict[Tuple[str, ...], List[int]] = {}
+    folder_entry_indexes: Dict[Tuple[str, ...], List[int]] = {}
+    if build_tree_index:
+        raise_if_cancelled(stop_event)
+        current_step += 1
+        if on_progress:
+            on_progress(current_step, total_steps, "Indexing archive browser tree...")
+        tree_child_folders, tree_direct_files, folder_entry_indexes = build_archive_tree_index(
+            filtered_entries,
+            on_progress=on_progress,
+            stop_event=stop_event,
+        )
     dds_count = sum(1 for entry in filtered_entries if entry.extension == ".dds")
 
     return {
@@ -1484,6 +1676,7 @@ def prepare_archive_browser_state(
         "tree_child_folders": tree_child_folders,
         "tree_direct_files": tree_direct_files,
         "tree_folder_entry_indexes": folder_entry_indexes,
+        "tree_index_ready": build_tree_index,
         "dds_count": dds_count,
     }
 
@@ -1794,7 +1987,11 @@ def find_available_output_path(target_path: Path, reserved_paths: Optional[set[s
         counter += 1
 
 
-def read_archive_entry_raw_data(entry: ArchiveEntry) -> bytes:
+def read_archive_entry_raw_data(
+    entry: ArchiveEntry,
+    stop_event: Optional[threading.Event] = None,
+) -> bytes:
+    raise_if_cancelled(stop_event)
     if not entry.paz_file.exists():
         raise ValueError(f"Missing PAZ file: {entry.paz_file}")
 
@@ -1802,6 +1999,7 @@ def read_archive_entry_raw_data(entry: ArchiveEntry) -> bytes:
     with entry.paz_file.open("rb") as handle:
         handle.seek(entry.offset)
         data = handle.read(read_size)
+    raise_if_cancelled(stop_event)
     return data
 
 
@@ -1816,23 +2014,114 @@ def maybe_reconstruct_sparse_dds(entry: ArchiveEntry, data: bytes) -> Optional[T
     return padded, "SparseDDS"
 
 
-def read_archive_entry_data(entry: ArchiveEntry) -> Tuple[bytes, bool, str]:
-    data = read_archive_entry_raw_data(entry)
+def _maybe_decompress_partial_par_container(
+    entry: ArchiveEntry,
+    data: bytes,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Optional[Tuple[bytes, str]]:
+    if lz4_block is None:
+        return None
+    if entry.compression_type != 1 or len(data) < 0x50 or not data.startswith(b"PAR "):
+        return None
+
+    slots: List[Tuple[int, int, int]] = []
+    file_offset = 0x50
+    rebuilt_size = 0x50
+    saw_compressed_section = False
+
+    for slot in range(8):
+        raise_if_cancelled(stop_event)
+        slot_offset = 0x10 + slot * 8
+        comp_size = struct.unpack_from("<I", data, slot_offset)[0]
+        decomp_size = struct.unpack_from("<I", data, slot_offset + 4)[0]
+        if decomp_size <= 0:
+            continue
+
+        chunk_size = comp_size if comp_size > 0 else decomp_size
+        if chunk_size <= 0:
+            return None
+        if decomp_size > entry.orig_size or rebuilt_size + decomp_size > entry.orig_size:
+            return None
+        if file_offset + chunk_size > len(data):
+            return None
+
+        slots.append((comp_size, decomp_size, file_offset))
+        file_offset += chunk_size
+        rebuilt_size += decomp_size
+        if comp_size > 0:
+            saw_compressed_section = True
+
+    if not saw_compressed_section:
+        return None
+    if file_offset != len(data) or rebuilt_size != entry.orig_size:
+        return None
+
+    rebuilt = bytearray(data[:0x50])
+    for comp_size, decomp_size, chunk_offset in slots:
+        raise_if_cancelled(stop_event)
+        chunk_size = comp_size if comp_size > 0 else decomp_size
+        chunk = data[chunk_offset : chunk_offset + chunk_size]
+        if comp_size > 0:
+            try:
+                chunk = lz4_block.decompress(chunk, uncompressed_size=decomp_size)
+            except Exception:
+                return None
+            if len(chunk) != decomp_size:
+                return None
+        rebuilt.extend(chunk)
+
+    if len(rebuilt) != entry.orig_size:
+        return None
+
+    # Preserve section sizes but clear the stored compressed lengths so the
+    # rebuilt payload behaves like a normal decompressed PAR for downstream parsers.
+    for slot in range(8):
+        struct.pack_into("<I", rebuilt, 0x10 + slot * 8, 0)
+
+    return bytes(rebuilt), "PartialPAR"
+
+
+def read_archive_entry_data(
+    entry: ArchiveEntry,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[bytes, bool, str]:
+    data = read_archive_entry_raw_data(entry, stop_event=stop_event)
 
     decompressed = False
     note = ""
     if entry.encrypted:
+        raise_if_cancelled(stop_event)
         data, decrypt_note = try_decrypt_archive_entry_data(entry, data)
         if decrypt_note:
             note = decrypt_note
+        raise_if_cancelled(stop_event)
     if entry.compressed:
-        if entry.compression_type == 1 and entry.extension == ".dds":
-            data = reconstruct_partial_dds(entry, data)
-            decompressed = True
-            note = ",".join(part for part in [note, "PartialDDS"] if part)
+        if entry.compression_type == 1:
+            partial_par = _maybe_decompress_partial_par_container(
+                entry,
+                data,
+                stop_event=stop_event,
+            )
+            if partial_par is not None:
+                data, partial_note = partial_par
+                decompressed = True
+                note = ",".join(part for part in [note, partial_note] if part)
+            elif entry.extension == ".dds":
+                raise_if_cancelled(stop_event)
+                data = reconstruct_partial_dds(entry, data)
+                decompressed = True
+                note = ",".join(part for part in [note, "PartialDDS"] if part)
+            else:
+                note = ",".join(
+                    part
+                    for part in [note, "PartialRaw"]
+                    if part
+                )
         elif entry.compression_type == 2:
             if lz4_block is None:
                 raise ValueError("This entry uses LZ4 compression, but the lz4 Python package is not installed.")
+            raise_if_cancelled(stop_event)
             data = lz4_block.decompress(data, uncompressed_size=entry.orig_size)
             decompressed = True
             note = ",".join(part for part in [note, "LZ4"] if part)
@@ -1843,6 +2132,7 @@ def read_archive_entry_data(entry: ArchiveEntry) -> Tuple[bytes, bool, str]:
                 note = ",".join(part for part in [note, sparse_note] if part)
             else:
                 raise ValueError(f"Unsupported archive compression type {entry.compression_type} for {entry.path}")
+        raise_if_cancelled(stop_event)
 
     return data, decompressed, note
 
@@ -2299,7 +2589,11 @@ def build_dds_header_detail_text(dds_path: Path, dds_info: Optional[DdsInfo] = N
     return "\n".join(lines)
 
 
-def ensure_archive_preview_source(entry: ArchiveEntry) -> Tuple[Path, str]:
+def ensure_archive_preview_source(
+    entry: ArchiveEntry,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[Path, str]:
     try:
         pamt_stat = entry.pamt_path.stat()
         pamt_stamp = f"{pamt_stat.st_size}:{pamt_stat.st_mtime_ns}"
@@ -2335,11 +2629,518 @@ def ensure_archive_preview_source(entry: ArchiveEntry) -> Tuple[Path, str]:
         return target_path, note
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    data, _decompressed, note = read_archive_entry_data(entry)
+    data, _decompressed, note = read_archive_entry_data(entry, stop_event=stop_event)
     target_path.write_bytes(data)
     if note:
         (cache_dir / ".note").write_text(note, encoding="utf-8")
     return target_path, note
+
+
+def _normalize_model_texture_reference(value: str) -> str:
+    return PurePosixPath(str(value or "").replace("\\", "/")).as_posix().strip().lower()
+
+
+def extract_binary_dds_references(
+    data: bytes,
+    *,
+    sample_limit: int = 262_144,
+    max_strings: int = 96,
+) -> List[str]:
+    references: List[str] = []
+    seen: set[str] = set()
+    string_candidates = extract_binary_strings(
+        data,
+        sample_limit=sample_limit,
+        max_strings=max(max_strings * 2, 48),
+    )
+    for text in string_candidates:
+        for match in _TEXT_DDS_REFERENCE_RE.finditer(text):
+            raw_text = str(match.group(0) or "").strip().strip("\x00")
+            if not raw_text or not any(char.isalpha() for char in raw_text):
+                continue
+            normalized = _normalize_model_texture_reference(raw_text)
+            if not normalized or not normalized.endswith(".dds") or normalized in seen:
+                continue
+            seen.add(normalized)
+            references.append(raw_text.replace("\\", "/"))
+            if len(references) >= max_strings:
+                return references
+    return references
+
+
+def _iter_model_texture_family_reference_candidates(group_key: str) -> Tuple[str, ...]:
+    normalized_group_key = _normalize_model_texture_reference(group_key)
+    if not normalized_group_key:
+        return ()
+
+    ordered_candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(raw_value: str) -> None:
+        normalized = _normalize_model_texture_reference(raw_value)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        ordered_candidates.append(normalized)
+
+    if "/" in normalized_group_key:
+        folder, _, family_name = normalized_group_key.rpartition("/")
+    else:
+        folder, family_name = "", normalized_group_key
+    family_name = family_name.strip()
+    if not family_name:
+        return ()
+
+    for suffix in _MODEL_TEXTURE_VISIBLE_FAMILY_SUFFIXES:
+        basename = f"{family_name}{suffix}.dds"
+        add_candidate(basename)
+        if folder:
+            add_candidate(f"{folder}/{basename}")
+
+    return tuple(ordered_candidates)
+
+
+def _iter_model_texture_reference_candidates(
+    texture_name: str,
+    material_name: str = "",
+) -> Tuple[str, ...]:
+    ordered_candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(raw_value: str) -> None:
+        normalized = _normalize_model_texture_reference(raw_value)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        ordered_candidates.append(normalized)
+
+    for raw_value in (texture_name, material_name):
+        normalized = _normalize_model_texture_reference(raw_value)
+        if not normalized:
+            continue
+        add_candidate(normalized)
+        basename = PurePosixPath(normalized).name
+        stem = PurePosixPath(normalized).stem
+        suffix = PurePosixPath(normalized).suffix.lower()
+        if basename:
+            add_candidate(basename)
+        if stem:
+            add_candidate(stem)
+        if suffix != ".dds":
+            add_candidate(f"{normalized}.dds")
+            if basename:
+                add_candidate(f"{basename}.dds")
+            if stem:
+                add_candidate(f"{stem}.dds")
+
+    return tuple(ordered_candidates)
+
+
+def _looks_like_technical_model_texture(texture_path: str) -> bool:
+    normalized = _normalize_model_texture_reference(texture_path)
+    if not normalized:
+        return False
+    basename = PurePosixPath(normalized).name
+    for pattern in _COMMON_TECHNICAL_DDS_EXCLUDE_PATTERNS:
+        if (basename and fnmatch.fnmatch(basename, pattern)) or fnmatch.fnmatch(normalized, pattern):
+            return True
+    return False
+
+
+def _resolve_model_texture_semantics(
+    texture_path: str,
+    *,
+    family_members: Sequence[str] = (),
+) -> Tuple[str, str, int]:
+    semantic = infer_texture_semantics(texture_path, family_members=family_members)
+    texture_type = str(getattr(semantic, "texture_type", "") or "").strip().lower() or "unknown"
+    semantic_subtype = str(getattr(semantic, "semantic_subtype", "") or "").strip().lower() or texture_type
+    confidence = int(getattr(semantic, "confidence", 0) or 0)
+    if texture_type == "unknown":
+        normalized = _normalize_model_texture_reference(texture_path)
+        if normalized.endswith(".dds") and not _looks_like_technical_model_texture(normalized):
+            return "color", "albedo", max(confidence, 64)
+    return texture_type, semantic_subtype, confidence
+
+
+def _score_model_texture_archive_candidate(
+    source_entry: ArchiveEntry,
+    candidate: ArchiveEntry,
+    reference_candidates: Sequence[str],
+) -> Tuple[int, int]:
+    score_value = 0
+    normalized_candidate_path = _normalize_model_texture_reference(candidate.path)
+    candidate_basename = PurePosixPath(normalized_candidate_path).name
+    for reference_index, normalized_reference in enumerate(reference_candidates):
+        reference_basename = PurePosixPath(normalized_reference).name
+        if normalized_candidate_path == normalized_reference:
+            score_value += max(8, 24 - reference_index)
+            break
+        if candidate_basename and candidate_basename == reference_basename:
+            score_value += max(4, 16 - reference_index)
+            break
+    if candidate.pamt_path == source_entry.pamt_path:
+        score_value += 8
+    if candidate.pamt_path.parent == source_entry.pamt_path.parent:
+        score_value += 4
+    if candidate.paz_file == source_entry.paz_file:
+        score_value += 2
+    if "/texture/" in normalized_candidate_path:
+        score_value += 1
+    return score_value, -len(candidate.path)
+
+
+def _collect_model_texture_archive_entry_candidates(
+    source_entry: ArchiveEntry,
+    texture_name: str,
+    material_name: str,
+    texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]],
+    texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]],
+) -> List[Tuple[ArchiveEntry, Tuple[int, int]]]:
+    reference_candidates = _iter_model_texture_reference_candidates(texture_name, material_name)
+    if not reference_candidates:
+        return []
+
+    expanded_reference_candidates: List[str] = list(reference_candidates)
+    seen_expanded = set(expanded_reference_candidates)
+    for normalized_reference in reference_candidates:
+        group_key = derive_texture_group_key(normalized_reference)
+        for family_reference in _iter_model_texture_family_reference_candidates(group_key):
+            if family_reference in seen_expanded:
+                continue
+            seen_expanded.add(family_reference)
+            expanded_reference_candidates.append(family_reference)
+
+    candidates: List[ArchiveEntry] = []
+    for normalized_reference in expanded_reference_candidates:
+        if texture_entries_by_normalized_path is not None:
+            for candidate in texture_entries_by_normalized_path.get(normalized_reference, []):
+                if candidate.extension == ".dds" and candidate not in candidates:
+                    candidates.append(candidate)
+
+        basename = PurePosixPath(normalized_reference).name
+        if texture_entries_by_basename is not None and basename:
+            for candidate in texture_entries_by_basename.get(basename, []):
+                if candidate.extension == ".dds" and candidate not in candidates:
+                    candidates.append(candidate)
+
+    if not candidates:
+        return []
+
+    scored_candidates = [
+        (candidate, _score_model_texture_archive_candidate(source_entry, candidate, reference_candidates))
+        for candidate in candidates
+    ]
+    scored_candidates.sort(key=lambda item: item[1], reverse=True)
+    return scored_candidates
+
+
+def _model_texture_semantic_priority(texture_type: str, semantic_subtype: str) -> Tuple[int, int]:
+    normalized_type = str(texture_type or "").strip().lower()
+    normalized_subtype = str(semantic_subtype or "").strip().lower()
+    if normalized_type == "color":
+        subtype_priority = {
+            "albedo": 4,
+            "albedo_variant": 3,
+            "diffuse": 2,
+        }.get(normalized_subtype, 1)
+        return 6, subtype_priority
+    if normalized_type == "ui":
+        return 5, 0
+    if normalized_type == "emissive":
+        return 4, 0
+    if normalized_type == "impostor":
+        return 3, 0
+    if normalized_type == "unknown":
+        return 2, 0
+    if normalized_type == "mask" and normalized_subtype in {"detail_support", "grayscale_data"}:
+        return 1, 0
+    return 0, 0
+
+
+def _resolve_model_texture_archive_entry(
+    source_entry: ArchiveEntry,
+    texture_name: str,
+    material_name: str,
+    texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]],
+    texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]],
+) -> Tuple[Optional[ArchiveEntry], str]:
+    scored_candidates = _collect_model_texture_archive_entry_candidates(
+        source_entry,
+        texture_name,
+        material_name,
+        texture_entries_by_normalized_path,
+        texture_entries_by_basename,
+    )
+    if not scored_candidates:
+        return None, "missing"
+
+    family_members_by_group: Dict[str, Tuple[str, ...]] = defaultdict(tuple)
+    grouped_family_members: Dict[str, List[str]] = defaultdict(list)
+    for candidate, _direct_score in scored_candidates:
+        grouped_family_members[derive_texture_group_key(candidate.path)].append(candidate.path)
+    for group_key, members in grouped_family_members.items():
+        family_members_by_group[group_key] = tuple(members)
+
+    best_candidate: Optional[ArchiveEntry] = None
+    best_candidate_key: Optional[Tuple[int, int, int, Tuple[int, int]]] = None
+    best_candidate_priority = (0, 0)
+    for candidate, direct_score in scored_candidates:
+        group_key = derive_texture_group_key(candidate.path)
+        texture_type, semantic_subtype, confidence = _resolve_model_texture_semantics(
+            candidate.path,
+            family_members=family_members_by_group.get(group_key, (candidate.path,)),
+        )
+        semantic_priority = _model_texture_semantic_priority(
+            texture_type,
+            semantic_subtype,
+        )
+        sort_key = (
+            semantic_priority[0],
+            semantic_priority[1],
+            confidence,
+            direct_score,
+        )
+        if best_candidate_key is None or sort_key > best_candidate_key:
+            best_candidate = candidate
+            best_candidate_key = sort_key
+            best_candidate_priority = semantic_priority
+
+    if best_candidate is None:
+        return None, "missing"
+    if best_candidate_priority[0] <= 0:
+        return None, "technical_only"
+    return best_candidate, "resolved"
+
+
+def _attach_model_texture_preview_paths(
+    texconv_path: Optional[Path],
+    source_entry: ArchiveEntry,
+    model_preview: Optional[ModelPreviewData],
+    *,
+    texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> List[str]:
+    if texconv_path is None or model_preview is None or not model_preview.meshes:
+        return []
+
+    resolved_texconv_path = texconv_path.expanduser().resolve()
+    preview_cache: Dict[str, str] = {}
+    resolved_count = 0
+    unresolved_lookup_count = 0
+    technical_skip_count = 0
+    preview_failure_count = 0
+    unresolved_lookup_names: List[str] = []
+    technical_skip_names: List[str] = []
+    preview_failure_names: List[str] = []
+
+    for mesh in model_preview.meshes:
+        raise_if_cancelled(stop_event)
+        texture_name = str(getattr(mesh, "texture_name", "") or "").strip()
+        material_name = str(getattr(mesh, "material_name", "") or "").strip()
+        texture_label = texture_name or material_name
+        if not texture_label:
+            continue
+
+        texture_entry, resolution_status = _resolve_model_texture_archive_entry(
+            source_entry,
+            texture_name,
+            material_name,
+            texture_entries_by_normalized_path,
+            texture_entries_by_basename,
+        )
+        if texture_entry is None:
+            if resolution_status == "technical_only":
+                technical_skip_count += 1
+                if texture_label not in technical_skip_names and len(technical_skip_names) < 5:
+                    technical_skip_names.append(texture_label)
+            else:
+                unresolved_lookup_count += 1
+                if texture_label not in unresolved_lookup_names and len(unresolved_lookup_names) < 5:
+                    unresolved_lookup_names.append(texture_label)
+            continue
+
+        cache_key = _normalize_model_texture_reference(texture_entry.path)
+        preview_path_text = preview_cache.get(cache_key, "")
+        if not preview_path_text:
+            try:
+                texture_source_path, _texture_note = ensure_archive_preview_source(
+                    texture_entry,
+                    stop_event=stop_event,
+                )
+                dds_info: Optional[DdsInfo] = None
+                try:
+                    dds_info = parse_dds(texture_source_path)
+                except Exception:
+                    dds_info = None
+                preview_path = ensure_dds_display_preview_png(
+                    resolved_texconv_path,
+                    texture_source_path.resolve(),
+                    dds_info=dds_info,
+                    max_dimension=_MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION,
+                    stop_event=stop_event,
+                )
+                preview_path_text = str(preview_path)
+                preview_cache[cache_key] = preview_path_text
+            except RunCancelled:
+                raise
+            except Exception:
+                preview_failure_count += 1
+                if texture_label not in preview_failure_names and len(preview_failure_names) < 5:
+                    preview_failure_names.append(texture_label)
+                continue
+
+        mesh.preview_texture_path = preview_path_text
+        resolved_count += 1
+
+    info_lines: List[str] = []
+    if resolved_count > 0:
+        info_lines.append(
+            f"Resolved {resolved_count:,} mesh texture preview(s) for textured shading and export using semantic base-color selection only."
+        )
+    if unresolved_lookup_count > 0:
+        lookup_suffix = f" Examples: {', '.join(unresolved_lookup_names)}." if unresolved_lookup_names else ""
+        info_lines.append(
+            f"{unresolved_lookup_count:,} referenced texture(s) could not be found in the archive index.{lookup_suffix}"
+        )
+    if technical_skip_count > 0:
+        technical_suffix = f" Examples: {', '.join(technical_skip_names)}." if technical_skip_names else ""
+        info_lines.append(
+            f"{technical_skip_count:,} mesh texture reference(s) were skipped because only technical DDS matches were found.{technical_suffix}"
+        )
+    if preview_failure_count > 0:
+        failure_suffix = f" Examples: {', '.join(preview_failure_names)}." if preview_failure_names else ""
+        info_lines.append(
+            f"{preview_failure_count:,} resolved texture(s) failed during DDS-to-PNG preview generation.{failure_suffix}"
+        )
+    return info_lines
+
+
+def _describe_model_texture_semantic_label(texture_path: str) -> str:
+    texture_type_raw, subtype_raw, _confidence = _resolve_model_texture_semantics(texture_path)
+    texture_type = str(texture_type_raw or "").strip().replace("_", " ")
+    subtype = str(subtype_raw or "").strip().replace("_", " ")
+    if not texture_type or texture_type.lower() == "unknown":
+        return ""
+    if subtype and subtype.lower() not in {"unknown", texture_type.lower()}:
+        return f"{texture_type.title()} / {subtype.title()}"
+    return texture_type.title()
+
+
+def build_archive_model_texture_references(
+    source_entry: ArchiveEntry,
+    model_preview: Optional[ModelPreviewData],
+    *,
+    parsed_mesh: Optional[object] = None,
+    binary_texture_references: Sequence[str] = (),
+    texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+) -> List[ArchiveModelTextureReference]:
+    preview_meshes = list(getattr(model_preview, "meshes", ()) or [])
+    parsed_submeshes: List[object] = []
+    if parsed_mesh is not None:
+        if str(getattr(parsed_mesh, "format", "") or "").strip().lower() == "pamlod":
+            parsed_submeshes = list((getattr(parsed_mesh, "lod_levels", None) or [[]])[0] or [])
+        else:
+            parsed_submeshes = list(getattr(parsed_mesh, "submeshes", ()) or [])
+
+    if not preview_meshes and not parsed_submeshes:
+        return []
+
+    references: Dict[Tuple[str, str, str, str], ArchiveModelTextureReference] = {}
+    ordered_keys: List[Tuple[str, str, str, str]] = []
+
+    candidates: List[Tuple[str, str, str]] = []
+    seen_candidate_keys: set[Tuple[str, str]] = set()
+    for mesh in preview_meshes:
+        texture_name = str(getattr(mesh, "texture_name", "") or "").strip()
+        material_name = str(getattr(mesh, "material_name", "") or "").strip()
+        key = (
+            _normalize_model_texture_reference(texture_name),
+            _normalize_model_texture_reference(material_name),
+        )
+        seen_candidate_keys.add(key)
+        candidates.append(
+            (
+                texture_name,
+                material_name,
+                str(getattr(mesh, "preview_texture_path", "") or "").strip(),
+            )
+        )
+    for submesh in parsed_submeshes:
+        texture_name = str(getattr(submesh, "texture", "") or "").strip()
+        material_name = str(getattr(submesh, "material", "") or "").strip()
+        key = (
+            _normalize_model_texture_reference(texture_name),
+            _normalize_model_texture_reference(material_name),
+        )
+        if key in seen_candidate_keys:
+            continue
+        seen_candidate_keys.add(key)
+        candidates.append((texture_name, material_name, ""))
+    for raw_reference in binary_texture_references:
+        texture_name = str(raw_reference or "").strip()
+        if not texture_name:
+            continue
+        key = (_normalize_model_texture_reference(texture_name), "")
+        if key in seen_candidate_keys:
+            continue
+        seen_candidate_keys.add(key)
+        candidates.append((texture_name, "", ""))
+
+    for texture_name, material_name, preview_texture_path in candidates:
+        reference_name = texture_name or material_name
+        if not reference_name:
+            continue
+
+        texture_entry, resolution_status = _resolve_model_texture_archive_entry(
+            source_entry,
+            texture_name,
+            material_name,
+            texture_entries_by_normalized_path,
+            texture_entries_by_basename,
+        )
+        resolved_archive_path = texture_entry.path if texture_entry is not None else ""
+        key = (
+            _normalize_model_texture_reference(reference_name),
+            _normalize_model_texture_reference(resolved_archive_path),
+            str(resolution_status or "").strip().lower(),
+        )
+        existing = references.get(key)
+        if existing is None:
+            semantic_label = ""
+            resolved_package_label = ""
+            if texture_entry is not None:
+                semantic_label = _describe_model_texture_semantic_label(texture_entry.path)
+                resolved_package_label = texture_entry.package_label
+            references[key] = ArchiveModelTextureReference(
+                reference_name=reference_name,
+                material_name=material_name,
+                semantic_label=semantic_label,
+                resolution_status=resolution_status,
+                resolved_archive_path=resolved_archive_path,
+                resolved_package_label=resolved_package_label,
+                resolved_entry=texture_entry,
+                preview_texture_path=preview_texture_path,
+                usage_count=1,
+            )
+            ordered_keys.append(key)
+            continue
+
+        existing.usage_count += 1
+        if material_name and not existing.material_name:
+            existing.material_name = material_name
+        if preview_texture_path and not existing.preview_texture_path:
+            existing.preview_texture_path = preview_texture_path
+        if texture_entry is not None and existing.resolved_entry is None:
+            existing.resolved_entry = texture_entry
+            existing.resolved_archive_path = texture_entry.path
+            existing.resolved_package_label = texture_entry.package_label
+            if not existing.semantic_label:
+                existing.semantic_label = _describe_model_texture_semantic_label(texture_entry.path)
+
+    return [references[key] for key in ordered_keys]
 
 
 def iter_archive_loose_file_candidates(
@@ -2416,6 +3217,370 @@ def build_loose_archive_preview_assets(
     return "", f"Loose file | {resolved_path.name}", detail + "\nThis loose file type cannot be previewed as an image."
 
 
+def _format_media_duration_millis(duration_ms: int) -> str:
+    total_seconds = max(0, int(duration_ms // 1000))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:d}:{seconds:02d}"
+
+
+def _runtime_search_roots() -> List[Path]:
+    roots: List[Path] = []
+    seen: set[str] = set()
+
+    def add_root(candidate: Optional[Path]) -> None:
+        if candidate is None:
+            return
+        try:
+            resolved = candidate.expanduser().resolve()
+        except OSError:
+            resolved = candidate.expanduser()
+        lowered = str(resolved).lower()
+        if not lowered or lowered in seen:
+            return
+        seen.add(lowered)
+        roots.append(resolved)
+
+    if getattr(sys, "frozen", False):
+        add_root(Path(sys.executable).resolve().parent)
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            add_root(Path(str(meipass)))
+    add_root(Path(__file__).resolve().parents[2])
+    return roots
+
+
+def _resolve_vgmstream_cli_path() -> Optional[Path]:
+    candidate_names = ("vgmstream-cli.exe", "test.exe")
+    for root in _runtime_search_roots():
+        for relative_dir in ("vgmstream", ".tools/vgmstream"):
+            base_dir = root / relative_dir
+            for candidate_name in candidate_names:
+                candidate_path = base_dir / candidate_name
+                if candidate_path.is_file():
+                    return candidate_path
+    return None
+
+
+def _decode_wem_with_vgmstream(
+    source_path: Path,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[Optional[Path], str]:
+    cli_path = _resolve_vgmstream_cli_path()
+    if cli_path is None:
+        return None, "Bundled vgmstream decoder is not available in this build."
+
+    output_path = source_path.with_name(f"{sanitize_cache_filename(source_path.stem)}.vgmstream.wav")
+    if output_path.exists():
+        try:
+            if output_path.stat().st_size > 44 and output_path.stat().st_mtime_ns >= source_path.stat().st_mtime_ns:
+                return output_path, "Decoded for playback with bundled vgmstream-cli."
+        except OSError:
+            pass
+
+    command = [str(cli_path), "-o", str(output_path), str(source_path)]
+    popen_kwargs: Dict[str, object] = {
+        "cwd": str(cli_path.parent),
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if os.name == "nt":
+        creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if creation_flags:
+            popen_kwargs["creationflags"] = creation_flags
+        startup_info = subprocess.STARTUPINFO()
+        startup_info.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        popen_kwargs["startupinfo"] = startup_info
+    process = subprocess.Popen(
+        command,
+        **popen_kwargs,
+    )
+    try:
+        while True:
+            try:
+                return_code = process.wait(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                raise_if_cancelled(stop_event)
+        stderr_text = ""
+        if process.stderr is not None:
+            try:
+                stderr_text = process.stderr.read().strip()
+            except Exception:
+                stderr_text = ""
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+        raise
+    finally:
+        if process.stderr is not None:
+            try:
+                process.stderr.close()
+            except Exception:
+                pass
+
+    if return_code != 0 or not output_path.exists():
+        return None, stderr_text or "vgmstream-cli could not decode this Wwise stream."
+    return output_path, "Decoded for playback with bundled vgmstream-cli."
+
+
+def _ensure_media_preview_source_path(
+    source_path: Path,
+    declared_extension: str,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[Path, str]:
+    resolved_source = source_path.expanduser().resolve()
+    normalized_extension = str(declared_extension or resolved_source.suffix).strip().lower()
+    if normalized_extension != ".wem":
+        return resolved_source, ""
+
+    decoded_wav_path, decode_note = _decode_wem_with_vgmstream(
+        resolved_source,
+        stop_event=stop_event,
+    )
+    if decoded_wav_path is not None:
+        return decoded_wav_path, decode_note
+
+    raise_if_cancelled(stop_event)
+    try:
+        with resolved_source.open("rb") as handle:
+            header = handle.read(12)
+    except OSError:
+        return resolved_source, decode_note
+    if len(header) < 12 or not header.startswith(b"RIFF") or header[8:12] != b"WAVE":
+        return resolved_source, decode_note
+
+    alias_path = resolved_source.with_suffix(".wav")
+    if alias_path == resolved_source:
+        return resolved_source, decode_note
+    if alias_path.exists() and alias_path.stat().st_size == resolved_source.stat().st_size:
+        return alias_path, decode_note
+
+    shutil.copy2(resolved_source, alias_path)
+    return alias_path, decode_note
+
+
+def _iter_riff_chunks(
+    data: bytes,
+    *,
+    max_chunks: int = 32,
+) -> List[Tuple[str, int, int]]:
+    chunks: List[Tuple[str, int, int]] = []
+    if len(data) < 12 or not data.startswith(b"RIFF"):
+        return chunks
+    offset = 12
+    while offset + 8 <= len(data) and len(chunks) < max_chunks:
+        chunk_id = data[offset : offset + 4]
+        chunk_size = struct.unpack_from("<I", data, offset + 4)[0]
+        chunk_name = chunk_id.decode("ascii", errors="replace")
+        data_offset = offset + 8
+        if data_offset > len(data):
+            break
+        chunks.append((chunk_name, chunk_size, data_offset))
+        next_offset = data_offset + chunk_size
+        if next_offset <= offset:
+            break
+        offset = next_offset + (chunk_size % 2)
+    return chunks
+
+
+def _build_wem_media_preview_detail_text(
+    source_path: Path,
+    data: bytes,
+    *,
+    loose: bool,
+    playback_source_path: Optional[Path] = None,
+    playback_note: str = "",
+) -> Tuple[str, str]:
+    resolved_source = source_path.expanduser().resolve()
+    metadata_summary = f"{'Loose' if loose else 'Archive'} Wwise audio | {resolved_source.name}"
+    detail_lines = [f"{'Loose file' if loose else 'Archive preview source'}: {resolved_source}"]
+    if playback_source_path is not None:
+        resolved_playback = playback_source_path.expanduser().resolve()
+        if resolved_playback != resolved_source:
+            detail_lines.append(f"Playback source: {resolved_playback}")
+    if playback_note:
+        detail_lines.append(playback_note)
+    if len(data) < 12 or not data.startswith(b"RIFF") or data[8:12] != b"WAVE":
+        detail_lines.append("Container sniffing did not confirm a RIFF/WAVE-style Wwise stream. Playback support may depend on the local multimedia backend.")
+        return metadata_summary, "\n".join(detail_lines)
+
+    detail_lines.append("Detected RIFF/WAVE-style Wwise audio container.")
+    fmt_channels = None
+    fmt_sample_rate = None
+    fmt_bits_per_sample = None
+    chunk_names: List[str] = []
+    for chunk_name, chunk_size, chunk_offset in _iter_riff_chunks(data):
+        chunk_names.append(f"{chunk_name} ({chunk_size:,} B)")
+        if chunk_name == "fmt " and chunk_size >= 16 and chunk_offset + 16 <= len(data):
+            try:
+                _audio_format, fmt_channels, fmt_sample_rate, _byte_rate, _block_align, fmt_bits_per_sample = struct.unpack_from(
+                    "<HHIIHH",
+                    data,
+                    chunk_offset,
+                )
+            except struct.error:
+                fmt_channels = None
+                fmt_sample_rate = None
+                fmt_bits_per_sample = None
+    if fmt_channels is not None and fmt_sample_rate is not None:
+        metadata_summary = (
+            f"{metadata_summary} | {fmt_channels} ch | {fmt_sample_rate:,} Hz"
+            + (f" | {fmt_bits_per_sample}-bit" if fmt_bits_per_sample is not None else "")
+        )
+    if chunk_names:
+        detail_lines.append("RIFF chunks: " + ", ".join(chunk_names[:12]))
+    detail_lines.append(
+        "Playback is best-effort through Qt Multimedia. Some Wwise `.wem` variants may still fail if the local backend cannot decode them."
+    )
+    return metadata_summary, "\n".join(detail_lines)
+
+
+def _build_mp4_media_preview_detail_text(
+    source_path: Path,
+    *,
+    loose: bool,
+) -> Tuple[str, str]:
+    resolved_source = source_path.expanduser().resolve()
+    metadata_summary = f"{'Loose' if loose else 'Archive'} video | {resolved_source.name}"
+    detail_lines = [
+        f"{'Loose file' if loose else 'Archive preview source'}: {resolved_source}",
+        "Embedded playback uses Qt Multimedia.",
+    ]
+    return metadata_summary, "\n".join(detail_lines)
+
+
+def build_loose_archive_media_preview_assets(
+    loose_path: Path,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[str, str, str, str]:
+    resolved_path = loose_path.expanduser().resolve()
+    suffix = resolved_path.suffix.lower()
+    raise_if_cancelled(stop_event)
+
+    if suffix in ARCHIVE_VIDEO_EXTENSIONS:
+        metadata_summary, detail_text = _build_mp4_media_preview_detail_text(resolved_path, loose=True)
+        return str(resolved_path), "video", metadata_summary, detail_text
+
+    if suffix in ARCHIVE_AUDIO_EXTENSIONS:
+        media_source, playback_note = _ensure_media_preview_source_path(
+            resolved_path,
+            suffix,
+            stop_event=stop_event,
+        )
+        try:
+            with resolved_path.open("rb") as handle:
+                sample = handle.read(131072)
+        except OSError:
+            sample = b""
+        metadata_summary, detail_text = _build_wem_media_preview_detail_text(
+            resolved_path,
+            sample,
+            loose=True,
+            playback_source_path=media_source,
+            playback_note=playback_note,
+        )
+        return str(media_source), "audio", metadata_summary, detail_text
+
+    return "", "", f"Loose file | {resolved_path.name}", f"Loose file preview from: {resolved_path}"
+
+
+def _iter_bnk_chunks(
+    data: bytes,
+    *,
+    max_chunks: int = 32,
+) -> List[Tuple[str, int, int]]:
+    chunks: List[Tuple[str, int, int]] = []
+    offset = 0
+    while offset + 8 <= len(data) and len(chunks) < max_chunks:
+        chunk_name = data[offset : offset + 4].decode("ascii", errors="replace")
+        chunk_size = struct.unpack_from("<I", data, offset + 4)[0]
+        data_offset = offset + 8
+        if data_offset + chunk_size > len(data):
+            break
+        chunks.append((chunk_name, chunk_size, data_offset))
+        next_offset = data_offset + chunk_size
+        aligned_offset = (next_offset + 3) & ~3
+        if aligned_offset <= offset:
+            break
+        offset = aligned_offset
+    return chunks
+
+
+def build_bnk_soundbank_preview(data: bytes) -> Tuple[str, str]:
+    if len(data) < 8 or data[:4] != b"BKHD":
+        return "", ""
+
+    chunk_rows = _iter_bnk_chunks(data)
+    if not chunk_rows:
+        return "Detected Wwise soundbank container.", "Wwise soundbank preview is limited because the bank does not expose readable chunk boundaries."
+
+    detail_lines = ["Detected Wwise soundbank container."]
+    preview_lines = ["Wwise soundbank summary:"]
+    chunk_descriptions: List[str] = []
+    embedded_media_count = 0
+    embedded_media_examples: List[str] = []
+    hirc_object_count = None
+    bank_version = None
+    bank_id = None
+
+    for chunk_name, chunk_size, chunk_offset in chunk_rows:
+        chunk_descriptions.append(f"{chunk_name} ({chunk_size:,} B)")
+        if chunk_name == "BKHD" and chunk_size >= 8:
+            try:
+                bank_version, bank_id = struct.unpack_from("<II", data, chunk_offset)
+            except struct.error:
+                bank_version = None
+                bank_id = None
+        elif chunk_name == "DIDX" and chunk_size >= 12:
+            embedded_media_count = chunk_size // 12
+            preview_lines.append(f"- Embedded media entries: {embedded_media_count:,}")
+            for media_index in range(min(8, embedded_media_count)):
+                media_id, media_offset, media_size = struct.unpack_from("<III", data, chunk_offset + media_index * 12)
+                embedded_media_examples.append(
+                    f"{media_id} @ {media_offset:,} ({format_byte_size(media_size)})"
+                )
+        elif chunk_name == "HIRC" and chunk_size >= 4:
+            try:
+                hirc_object_count = struct.unpack_from("<I", data, chunk_offset)[0]
+            except struct.error:
+                hirc_object_count = None
+
+    if bank_version is not None:
+        preview_lines.append(f"- Bank version: {bank_version}")
+    if bank_id is not None:
+        preview_lines.append(f"- Bank id: {bank_id}")
+    preview_lines.append(f"- Top-level chunks: {', '.join(chunk_name for chunk_name, _chunk_size, _chunk_offset in chunk_rows)}")
+    if hirc_object_count is not None:
+        preview_lines.append(f"- HIRC objects: {hirc_object_count:,}")
+    if embedded_media_examples:
+        preview_lines.append("- First embedded media ids:")
+        preview_lines.extend(f"  {example}" for example in embedded_media_examples)
+
+    readable_strings = extract_binary_strings(data, sample_limit=262144, max_strings=24)
+    if readable_strings:
+        preview_lines.append("- Readable strings:")
+        preview_lines.extend(f"  {text}" for text in readable_strings[:16])
+
+    detail_lines.append("Top-level chunks: " + ", ".join(chunk_descriptions[:16]))
+    if embedded_media_count:
+        detail_lines.append(
+            f"Embedded media index contains {embedded_media_count:,} item(s). These can be inspected, but direct bank playback is not exposed yet."
+        )
+    else:
+        detail_lines.append("No embedded media index entries were detected in the top-level DIDX chunk.")
+
+    return "\n".join(preview_lines), "\n".join(detail_lines)
+
+
 def format_binary_header_preview(data: bytes) -> str:
     if not data:
         return "No bytes available."
@@ -2426,6 +3591,146 @@ def format_binary_header_preview(data: bytes) -> str:
         ascii_part = "".join(chr(value) if 32 <= value <= 126 else "." for value in chunk)
         lines.append(f"{offset:04X}  {hex_part:<47}  {ascii_part}")
     return "\n".join(lines)
+
+
+def try_decode_text_like_archive_data(data: bytes) -> Optional[str]:
+    if not data:
+        return None
+
+    preview_bytes = data[:ARCHIVE_TEXT_PREVIEW_LIMIT]
+    for bom, encoding in (
+        (b"\xef\xbb\xbf", "utf-8-sig"),
+        (b"\xff\xfe", "utf-16-le"),
+        (b"\xfe\xff", "utf-16-be"),
+    ):
+        if preview_bytes.startswith(bom):
+            text = preview_bytes.decode(encoding, errors="replace")
+            return text if text.strip("\ufeff\r\n\t ") else None
+
+    sample = preview_bytes[:4096]
+    if not sample:
+        return None
+    if sample.count(0) > max(2, len(sample) // 100):
+        return None
+
+    printable_count = sum(1 for value in sample if value in (9, 10, 13) or 32 <= value <= 126)
+    likely_text = printable_count / max(len(sample), 1) >= 0.92
+    stripped_sample = sample.lstrip(b"\xef\xbb\xbf\r\n\t ")
+    if not likely_text and not stripped_sample.startswith((b"<?xml", b"<", b"{", b"[")):
+        return None
+
+    text = preview_bytes.decode("utf-8", errors="replace")
+    non_whitespace = [char for char in text[:1024] if not char.isspace()]
+    if not non_whitespace:
+        return None
+    control_count = sum(1 for char in non_whitespace if ord(char) < 32 and char not in "\r\n\t")
+    if control_count > max(2, len(non_whitespace) // 20):
+        return None
+    return text
+
+
+def extract_binary_strings(data: bytes, *, sample_limit: int = 131_072, max_strings: int = 48) -> List[str]:
+    sample = data[:sample_limit]
+    strings: List[str] = []
+    seen: set[str] = set()
+    for match in _PRINTABLE_BINARY_STRING_RE.finditer(sample):
+        text = match.group().decode("ascii", errors="ignore").strip()
+        letter_count = sum(1 for char in text if char.isalpha())
+        if len(text) < 4 or text in seen or letter_count == 0:
+            continue
+        allowed_char_count = sum(1 for char in text if char.isalnum() or char in " _./:-[](){}")
+        if allowed_char_count / max(len(text), 1) < 0.85:
+            continue
+        if len(text) < 12 and letter_count < 4:
+            continue
+        if "_" not in text and "/" not in text and "::" not in text and " " not in text and len(text) < 12:
+            continue
+        if len(text) > 160:
+            text = text[:157] + "..."
+        seen.add(text)
+        strings.append(text)
+        if len(strings) >= max_strings:
+            break
+    return strings
+
+
+def build_binary_strings_preview(data: bytes, *, sample_limit: int = 131_072, max_strings: int = 48) -> str:
+    strings = extract_binary_strings(data, sample_limit=sample_limit, max_strings=max_strings)
+    if not strings:
+        return ""
+    scanned_size = min(len(data), sample_limit)
+    lines = [f"Readable strings from the first {format_byte_size(scanned_size)} of binary data:"]
+    lines.extend(strings)
+    if len(data) > sample_limit:
+        lines.extend(["", "String scan truncated to keep the preview responsive."])
+    return "\n".join(lines)
+
+
+def describe_archive_binary_content(extension: str, data: bytes) -> str:
+    head4 = data[:4]
+    if head4 == b"BKHD":
+        return "Detected Wwise soundbank data."
+    if head4 == b"PAR ":
+        if extension == ".pac":
+            return "Detected PAR skinned mesh data."
+        if extension == ".pab":
+            return "Detected PAR skeleton data."
+        if extension == ".pat":
+            return "Detected PAR model data. Visual model preview is not available yet."
+        if extension == ".pam":
+            return "Detected PAR mesh data."
+        if extension == ".pamlod":
+            return "Detected PAR mesh LOD data."
+        if extension == ".paa":
+            return "Detected PAR animation data. Visual animation preview is not available yet."
+        return "Detected PAR-family binary data."
+    if head4 == b"PARC":
+        return "Detected PARC structured container data."
+    if len(data) >= 16 and data[4:8] == b"TAG0" and data[12:16] == b"SDKV":
+        return "Detected Havok tagfile data. Visual animation or skeleton preview is not available yet."
+    if data.startswith(b"RIFF") and data[8:12] == b"WAVE":
+        return "Detected RIFF/WAVE audio data, likely Wwise `.wem`."
+    if b"EmitterData" in data[:4096]:
+        return "Structured emitter or effect data detected."
+    if b"SceneObject" in data[:4096]:
+        return "Structured scene or prefab metadata detected."
+    if b"AnimationMetaData" in data[:4096]:
+        return "Animation metadata detected."
+    if b"ParameterizedMotionSpace" in data[:4096]:
+        return "Animation motion-blending metadata detected."
+    if b"Sequencer" in data[:4096]:
+        return "Structured sequencer data detected."
+    if extension == ".pabgb":
+        return "Structured gameplay or table-like binary data detected."
+    if extension == ".meshinfo":
+        return "Structured mesh metadata detected."
+    if extension == ".levelinfo":
+        return "Structured level metadata detected."
+    if extension == ".prefab":
+        return "Structured prefab metadata detected."
+    return ""
+
+
+def build_archive_binary_preview_payload(
+    entry: ArchiveEntry,
+    data: bytes,
+    *,
+    info_extra: str = "",
+) -> Tuple[str, str, str]:
+    text_preview = try_decode_text_like_archive_data(data)
+    if text_preview:
+        extra_parts = [part for part in [info_extra, "Binary content was sniffed as plain text."] if part]
+        if len(data) > ARCHIVE_TEXT_PREVIEW_LIMIT:
+            extra_parts.append(f"Preview truncated to {format_byte_size(ARCHIVE_TEXT_PREVIEW_LIMIT)}.")
+        return "text", text_preview, "\n\n".join(extra_parts)
+
+    strings_preview = build_binary_strings_preview(data)
+    hint_text = describe_archive_binary_content(entry.extension, data)
+    extra_parts = [part for part in [info_extra, hint_text] if part]
+    if strings_preview:
+        extra_parts.append(strings_preview)
+        return "text", strings_preview, "\n\n".join(extra_parts)
+    return "info", "", "\n\n".join(extra_parts)
 
 
 def parse_archive_note_flags(note: str) -> set[str]:
@@ -2450,11 +3755,237 @@ def summarize_obj_text(content: str) -> str:
     return f"OBJ summary: {vertices:,} vertices, {texcoords:,} UVs, {normals:,} normals, {faces:,} faces."
 
 
+def _build_model_preview_summary_text(path: str, model_preview: ModelPreviewData) -> str:
+    if getattr(model_preview, "format", "").lower() == "pamlod":
+        lod_index = getattr(model_preview, "lod_index", -1)
+        lod_count = getattr(model_preview, "lod_count", 0)
+        lod_label = f"LOD {lod_index + 1}" if lod_index >= 0 else "LOD"
+        if lod_count > 0 and lod_index >= 0:
+            lod_label = f"{lod_label} of {lod_count}"
+        return (
+            f"{path}\n"
+            f"{lod_label}\n"
+            f"{model_preview.vertex_count:,} vertices\n"
+            f"{model_preview.face_count:,} faces"
+        )
+    return (
+        f"{path}\n"
+        f"{model_preview.mesh_count:,} submesh(es)\n"
+        f"{model_preview.vertex_count:,} vertices\n"
+        f"{model_preview.face_count:,} faces"
+    )
+
+
+def _retarget_model_preview(model_preview: ModelPreviewData, path: str) -> None:
+    model_preview.path = path
+    model_preview.summary = _build_model_preview_summary_text(path, model_preview)
+
+
+def _inspect_pam_declared_geometry(data: bytes) -> Tuple[int, int]:
+    if len(data) < 64 or data[:4] != b"PAR ":
+        return 0, 0
+    mesh_count = struct.unpack_from("<I", data, 16)[0]
+    declared_index_count = 0
+    for index in range(mesh_count):
+        entry_offset = 1040 + index * 536
+        if entry_offset + 8 > len(data):
+            break
+        declared_index_count += struct.unpack_from("<I", data, entry_offset + 4)[0]
+    return mesh_count, declared_index_count
+
+
+def _pam_preview_looks_incomplete(data: bytes, model_preview: ModelPreviewData) -> bool:
+    declared_mesh_count, declared_index_count = _inspect_pam_declared_geometry(data)
+    if declared_mesh_count > 0 and model_preview.mesh_count < declared_mesh_count:
+        return True
+    if declared_index_count > 0 and (model_preview.face_count * 3) < int(declared_index_count * 0.85):
+        return True
+    return False
+
+
+def _build_pam_model_preview_with_fallback(
+    entry: ArchiveEntry,
+    data: bytes,
+    note_flags: set[str],
+    *,
+    companion_entry: Optional[ArchiveEntry] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[ModelPreviewData, List[str]]:
+    info_extra_parts: List[str] = []
+    recovery_errors: List[str] = []
+    raw_model_preview: Optional[ModelPreviewData] = None
+    skip_padded_recovery = False
+
+    try:
+        candidate_raw_model_preview = build_pam_model_preview(entry, data, stop_event=stop_event)
+        ensure_model_preview_is_reasonable(candidate_raw_model_preview, stop_event=stop_event)
+        raw_model_preview = candidate_raw_model_preview
+        if (
+            "PartialRaw" in note_flags
+            and companion_entry is not None
+            and _pam_preview_looks_incomplete(data, raw_model_preview)
+        ):
+            info_extra_parts.append(
+                "Stored PAM geometry recovery looks incomplete for this Partial entry; a companion PAMLOD preview will be preferred when available."
+            )
+        else:
+            return raw_model_preview, info_extra_parts
+    except RunCancelled:
+        raise
+    except Exception as exc:
+        raw_error_text = str(exc)
+        recovery_errors.append(f"Stored PAM geometry recovery failed: {raw_error_text}")
+        if "suppressed" in raw_error_text.lower() or "scrambled" in raw_error_text.lower():
+            skip_padded_recovery = True
+
+    if companion_entry is not None:
+        try:
+            companion_data, _companion_decompressed, companion_note = read_archive_entry_data(
+                companion_entry,
+                stop_event=stop_event,
+            )
+            model_preview = build_pamlod_model_preview(companion_entry, companion_data, stop_event=stop_event)
+            ensure_model_preview_is_reasonable(model_preview, stop_event=stop_event)
+            _retarget_model_preview(model_preview, entry.path)
+            info_extra_parts.append(
+                f"Visual model preview uses companion {companion_entry.basename} geometry because the selected PAM payload did not yield a complete renderable mesh preview."
+            )
+            companion_note_flags = parse_archive_note_flags(companion_note)
+            if "ChaCha20" in companion_note_flags:
+                info_extra_parts.append("Companion PAMLOD geometry was decrypted via deterministic ChaCha20 filename derivation.")
+            return model_preview, info_extra_parts
+        except RunCancelled:
+            raise
+        except Exception as exc:
+            recovery_errors.append(f"Companion PAMLOD recovery failed: {exc}")
+
+    if "PartialRaw" in note_flags and len(data) < entry.orig_size and not skip_padded_recovery:
+        try:
+            padded_data = data + (b"\x00" * (entry.orig_size - len(data)))
+            model_preview = build_pam_model_preview(entry, padded_data, stop_event=stop_event)
+            ensure_model_preview_is_reasonable(model_preview, stop_event=stop_event)
+            info_extra_parts.append(
+                "Visual model preview uses zero-padded Partial reconstruction because the stored PAM payload is incomplete."
+            )
+            return model_preview, info_extra_parts
+        except RunCancelled:
+            raise
+        except Exception as exc:
+            recovery_errors.append(f"Zero-padded Partial reconstruction failed: {exc}")
+
+    if raw_model_preview is not None:
+        info_extra_parts.append(
+            "Stored PAM geometry preview is being shown even though the recovered mesh set appears incomplete."
+        )
+        return raw_model_preview, info_extra_parts
+
+    if "PartialRaw" in note_flags and len(data) < entry.orig_size:
+        recovery_errors.append("Stored Partial payload appears truncated beyond the geometry data needed for preview.")
+    raise ValueError("; ".join(recovery_errors) if recovery_errors else "PAM geometry could not be recovered.")
+
+
+def _build_pamlod_model_preview_with_fallback(
+    entry: ArchiveEntry,
+    data: bytes,
+    note_flags: set[str],
+    *,
+    companion_entry: Optional[ArchiveEntry] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[ModelPreviewData, List[str]]:
+    info_extra_parts: List[str] = []
+    recovery_errors: List[str] = []
+
+    try:
+        model_preview = build_pamlod_model_preview(entry, data, stop_event=stop_event)
+        ensure_model_preview_is_reasonable(model_preview, stop_event=stop_event)
+        return model_preview, info_extra_parts
+    except RunCancelled:
+        raise
+    except Exception as exc:
+        recovery_errors.append(f"Stored PAMLOD geometry recovery failed: {exc}")
+
+    if companion_entry is not None:
+        try:
+            companion_data, _companion_decompressed, companion_note = read_archive_entry_data(
+                companion_entry,
+                stop_event=stop_event,
+            )
+            model_preview = build_pam_model_preview(companion_entry, companion_data, stop_event=stop_event)
+            ensure_model_preview_is_reasonable(model_preview, stop_event=stop_event)
+            _retarget_model_preview(model_preview, entry.path)
+            info_extra_parts.append(
+                f"Visual model preview uses companion {companion_entry.basename} geometry because the selected PAMLOD payload did not yield a complete renderable LOD preview."
+            )
+            companion_note_flags = parse_archive_note_flags(companion_note)
+            if "ChaCha20" in companion_note_flags:
+                info_extra_parts.append("Companion PAM geometry was decrypted via deterministic ChaCha20 filename derivation.")
+            return model_preview, info_extra_parts
+        except RunCancelled:
+            raise
+        except Exception as exc:
+            recovery_errors.append(f"Companion PAM recovery failed: {exc}")
+
+    if "PartialRaw" in note_flags and len(data) < entry.orig_size:
+        try:
+            padded_data = data + (b"\x00" * (entry.orig_size - len(data)))
+            model_preview = build_pamlod_model_preview(entry, padded_data, stop_event=stop_event)
+            ensure_model_preview_is_reasonable(model_preview, stop_event=stop_event)
+            info_extra_parts.append(
+                "Visual model preview uses zero-padded Partial reconstruction because the stored PAMLOD payload is incomplete."
+            )
+            return model_preview, info_extra_parts
+        except RunCancelled:
+            raise
+        except Exception as exc:
+            recovery_errors.append(f"Zero-padded PAMLOD reconstruction failed: {exc}")
+        recovery_errors.append("Stored Partial payload appears truncated beyond the geometry data needed for preview.")
+
+    raise ValueError("; ".join(recovery_errors) if recovery_errors else "PAMLOD geometry could not be recovered.")
+
+
+def _build_pac_model_preview_with_fallback(
+    entry: ArchiveEntry,
+    data: bytes,
+    note_flags: set[str],
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[ModelPreviewData, ParsedMesh, List[str]]:
+    info_extra_parts: List[str] = []
+    recovery_errors: List[str] = []
+
+    try:
+        model_preview, parsed_mesh = build_mesh_preview_from_bytes(data, entry.path)
+        return model_preview, parsed_mesh, info_extra_parts
+    except RunCancelled:
+        raise
+    except Exception as exc:
+        recovery_errors.append(f"Stored PAC geometry recovery failed: {exc}")
+
+    if "PartialRaw" in note_flags and len(data) < entry.orig_size:
+        try:
+            padded_data = data + (b"\x00" * (entry.orig_size - len(data)))
+            model_preview, parsed_mesh = build_mesh_preview_from_bytes(padded_data, entry.path)
+            info_extra_parts.append(
+                "Visual model preview uses zero-padded Partial reconstruction because the stored PAC payload is incomplete."
+            )
+            return model_preview, parsed_mesh, info_extra_parts
+        except RunCancelled:
+            raise
+        except Exception as exc:
+            recovery_errors.append(f"Zero-padded PAC reconstruction failed: {exc}")
+        recovery_errors.append("Stored Partial payload appears truncated beyond the geometry data needed for preview.")
+
+    raise ValueError("; ".join(recovery_errors) if recovery_errors else "PAC geometry could not be recovered.")
+
+
 def build_archive_preview_result(
     texconv_path: Optional[Path],
     entry: Optional[ArchiveEntry],
     loose_search_roots: Optional[Sequence[Path]] = None,
     *,
+    companion_entry: Optional[ArchiveEntry] = None,
+    texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
     include_loose_preview_assets: bool = True,
     stop_event: Optional[threading.Event] = None,
 ) -> ArchivePreviewResult:
@@ -2471,6 +4002,8 @@ def build_archive_preview_result(
     extension = entry.extension
     loose_file_path = ""
     loose_preview_image_path = ""
+    loose_preview_media_path = ""
+    loose_preview_media_kind = ""
     loose_preview_title = ""
     loose_preview_metadata_summary = ""
     loose_preview_detail_text = ""
@@ -2483,15 +4016,28 @@ def build_archive_preview_result(
             loose_preview_title = f"{entry.basename} (Loose file)"
             if include_loose_preview_assets:
                 try:
-                    (
-                        loose_preview_image_path,
-                        loose_preview_metadata_summary,
-                        loose_preview_detail_text,
-                    ) = build_loose_archive_preview_assets(
-                        texconv_path,
-                        loose_candidate,
-                        stop_event=stop_event,
-                    )
+                    if loose_candidate.suffix.lower() in ARCHIVE_AUDIO_EXTENSIONS.union(ARCHIVE_VIDEO_EXTENSIONS):
+                        (
+                            loose_preview_media_path,
+                            loose_preview_media_kind,
+                            loose_preview_metadata_summary,
+                            loose_preview_detail_text,
+                        ) = build_loose_archive_media_preview_assets(
+                            loose_candidate,
+                            stop_event=stop_event,
+                        )
+                    else:
+                        (
+                            loose_preview_image_path,
+                            loose_preview_metadata_summary,
+                            loose_preview_detail_text,
+                        ) = build_loose_archive_preview_assets(
+                            texconv_path,
+                            loose_candidate,
+                            stop_event=stop_event,
+                        )
+                except RunCancelled:
+                    raise
                 except Exception as exc:
                     loose_preview_metadata_summary = f"Loose file | {loose_candidate.name}"
                     loose_preview_detail_text = (
@@ -2503,8 +4049,72 @@ def build_archive_preview_result(
                     )
 
     try:
+        if extension in ARCHIVE_VIDEO_EXTENSIONS:
+            source_path, note = ensure_archive_preview_source(entry, stop_event=stop_event)
+            metadata_summary, media_detail = _build_mp4_media_preview_detail_text(source_path, loose=False)
+            extra_detail_parts: List[str] = []
+            if "ChaCha20" in parse_archive_note_flags(note):
+                extra_detail_parts.append("Archive payload decrypted via deterministic ChaCha20 filename derivation.")
+            extra_detail_parts.append(media_detail)
+            return ArchivePreviewResult(
+                status="ok",
+                title=entry.basename,
+                metadata_summary=metadata_summary,
+                detail_text=build_archive_entry_detail_text(entry, "\n\n".join(part for part in extra_detail_parts if part)),
+                preview_media_path=str(source_path.resolve()),
+                preview_media_kind="video",
+                preferred_view="media",
+                loose_file_path=loose_file_path,
+                loose_preview_image_path=loose_preview_image_path,
+                loose_preview_media_path=loose_preview_media_path,
+                loose_preview_media_kind=loose_preview_media_kind,
+                loose_preview_title=loose_preview_title,
+                loose_preview_metadata_summary=loose_preview_metadata_summary,
+                loose_preview_detail_text=loose_preview_detail_text,
+            )
+
+        if extension in ARCHIVE_AUDIO_EXTENSIONS:
+            source_path, note = ensure_archive_preview_source(entry, stop_event=stop_event)
+            media_source, playback_note = _ensure_media_preview_source_path(
+                source_path,
+                extension,
+                stop_event=stop_event,
+            )
+            try:
+                with source_path.open("rb") as handle:
+                    audio_sample = handle.read(131072)
+            except OSError:
+                audio_sample = b""
+            metadata_summary, media_detail = _build_wem_media_preview_detail_text(
+                source_path,
+                audio_sample,
+                loose=False,
+                playback_source_path=media_source,
+                playback_note=playback_note,
+            )
+            extra_detail_parts: List[str] = []
+            if "ChaCha20" in parse_archive_note_flags(note):
+                extra_detail_parts.append("Archive payload decrypted via deterministic ChaCha20 filename derivation.")
+            extra_detail_parts.append(media_detail)
+            return ArchivePreviewResult(
+                status="ok",
+                title=entry.basename,
+                metadata_summary=metadata_summary,
+                detail_text=build_archive_entry_detail_text(entry, "\n\n".join(part for part in extra_detail_parts if part)),
+                preview_media_path=str(media_source),
+                preview_media_kind="audio",
+                preferred_view="media",
+                loose_file_path=loose_file_path,
+                loose_preview_image_path=loose_preview_image_path,
+                loose_preview_media_path=loose_preview_media_path,
+                loose_preview_media_kind=loose_preview_media_kind,
+                loose_preview_title=loose_preview_title,
+                loose_preview_metadata_summary=loose_preview_metadata_summary,
+                loose_preview_detail_text=loose_preview_detail_text,
+            )
+
         if extension == ".dds":
-            source_path, note = ensure_archive_preview_source(entry)
+            source_path, note = ensure_archive_preview_source(entry, stop_event=stop_event)
             note_flags = parse_archive_note_flags(note)
             warning_badge = ""
             warning_text = ""
@@ -2555,6 +4165,8 @@ def build_archive_preview_result(
                     warning_text=warning_text,
                     loose_file_path=loose_file_path,
                     loose_preview_image_path=loose_preview_image_path,
+                    loose_preview_media_path=loose_preview_media_path,
+                    loose_preview_media_kind=loose_preview_media_kind,
                     loose_preview_title=loose_preview_title,
                     loose_preview_metadata_summary=loose_preview_metadata_summary,
                     loose_preview_detail_text=loose_preview_detail_text,
@@ -2576,13 +4188,15 @@ def build_archive_preview_result(
                 warning_text=warning_text,
                 loose_file_path=loose_file_path,
                 loose_preview_image_path=loose_preview_image_path,
+                loose_preview_media_path=loose_preview_media_path,
+                loose_preview_media_kind=loose_preview_media_kind,
                 loose_preview_title=loose_preview_title,
                 loose_preview_metadata_summary=loose_preview_metadata_summary,
                 loose_preview_detail_text=loose_preview_detail_text,
             )
 
         if extension in ARCHIVE_IMAGE_EXTENSIONS:
-            source_path, note = ensure_archive_preview_source(entry)
+            source_path, note = ensure_archive_preview_source(entry, stop_event=stop_event)
             return ArchivePreviewResult(
                 status="ok",
                 title=entry.basename,
@@ -2597,20 +4211,116 @@ def build_archive_preview_result(
                 preferred_view="image",
                 loose_file_path=loose_file_path,
                 loose_preview_image_path=loose_preview_image_path,
+                loose_preview_media_path=loose_preview_media_path,
+                loose_preview_media_kind=loose_preview_media_kind,
                 loose_preview_title=loose_preview_title,
                 loose_preview_metadata_summary=loose_preview_metadata_summary,
                 loose_preview_detail_text=loose_preview_detail_text,
             )
 
-        data, _decompressed, note = read_archive_entry_data(entry)
+        data, _decompressed, note = read_archive_entry_data(entry, stop_event=stop_event)
         note_flags = parse_archive_note_flags(note)
+
+        if extension == ".bnk":
+            bnk_preview_text, bnk_detail_text = build_bnk_soundbank_preview(data)
+            detail_extra = "\n\n".join(
+                part
+                for part in [
+                    (
+                        "Archive entry uses non-DDS Partial storage; preview is based on raw stored bytes."
+                        if "PartialRaw" in note_flags
+                        else ""
+                    ),
+                    ("Decrypted via deterministic ChaCha20 filename derivation." if "ChaCha20" in note_flags else ""),
+                    bnk_detail_text,
+                ]
+                if part
+            )
+            return ArchivePreviewResult(
+                status="ok",
+                title=entry.basename,
+                metadata_summary=f"{metadata_summary} | Wwise SoundBank",
+                detail_text=build_archive_entry_detail_text(entry, detail_extra),
+                preview_text=bnk_preview_text or build_binary_strings_preview(data),
+                preferred_view="text",
+                loose_file_path=loose_file_path,
+                loose_preview_image_path=loose_preview_image_path,
+                loose_preview_media_path=loose_preview_media_path,
+                loose_preview_media_kind=loose_preview_media_kind,
+                loose_preview_title=loose_preview_title,
+                loose_preview_metadata_summary=loose_preview_metadata_summary,
+                loose_preview_detail_text=loose_preview_detail_text,
+            )
+
+        if extension == ".pab":
+            skeleton_preview = build_pab_preview(data, entry.path)
+            detail_extra = "\n\n".join(
+                part
+                for part in [
+                    ("Archive entry uses non-DDS Partial storage; preview is based on raw stored bytes." if "PartialRaw" in note_flags else ""),
+                    ("Decrypted via deterministic ChaCha20 filename derivation." if "ChaCha20" in note_flags else ""),
+                    "\n".join(skeleton_preview.detail_lines),
+                ]
+                if part
+            )
+            return ArchivePreviewResult(
+                status="ok",
+                title=entry.basename,
+                metadata_summary=f"{metadata_summary} | Skeleton",
+                detail_text=build_archive_entry_detail_text(entry, detail_extra),
+                preview_text=skeleton_preview.preview_text,
+                preferred_view="text",
+                loose_file_path=loose_file_path,
+                loose_preview_image_path=loose_preview_image_path,
+                loose_preview_media_path=loose_preview_media_path,
+                loose_preview_media_kind=loose_preview_media_kind,
+                loose_preview_title=loose_preview_title,
+                loose_preview_metadata_summary=loose_preview_metadata_summary,
+                loose_preview_detail_text=loose_preview_detail_text,
+            )
+
+        if extension == ".hkx":
+            hkx_preview = build_hkx_preview(data, entry.path)
+            detail_extra = "\n\n".join(
+                part
+                for part in [
+                    ("Archive entry uses non-DDS Partial storage; preview is based on raw stored bytes." if "PartialRaw" in note_flags else ""),
+                    ("Decrypted via deterministic ChaCha20 filename derivation." if "ChaCha20" in note_flags else ""),
+                    "\n".join(hkx_preview.detail_lines),
+                ]
+                if part
+            )
+            return ArchivePreviewResult(
+                status="ok",
+                title=entry.basename,
+                metadata_summary=f"{metadata_summary} | Havok",
+                detail_text=build_archive_entry_detail_text(entry, detail_extra),
+                preview_text=hkx_preview.preview_text,
+                preferred_view="text",
+                loose_file_path=loose_file_path,
+                loose_preview_image_path=loose_preview_image_path,
+                loose_preview_media_path=loose_preview_media_path,
+                loose_preview_media_kind=loose_preview_media_kind,
+                loose_preview_title=loose_preview_title,
+                loose_preview_metadata_summary=loose_preview_metadata_summary,
+                loose_preview_detail_text=loose_preview_detail_text,
+            )
 
         if extension in ARCHIVE_TEXT_EXTENSIONS:
             preview_bytes = data[:ARCHIVE_TEXT_PREVIEW_LIMIT]
-            text = preview_bytes.decode("utf-8", errors="replace")
+            text = try_decode_text_like_archive_data(data) or preview_bytes.decode("utf-8", errors="replace")
             extra_note = ""
             if len(data) > ARCHIVE_TEXT_PREVIEW_LIMIT:
                 extra_note = f"\n\nPreview truncated to {format_byte_size(ARCHIVE_TEXT_PREVIEW_LIMIT)}."
+            if "PartialRaw" in note_flags:
+                extra_note = "\n\n".join(
+                    part
+                    for part in [
+                        "Archive entry uses non-DDS Partial storage; preview is based on raw stored bytes.",
+                        extra_note.strip(),
+                    ]
+                    if part
+                )
             if "ChaCha20" in note_flags:
                 extra_note = "\n\n".join(
                     part for part in ["Decrypted via deterministic ChaCha20 filename derivation.", extra_note.strip()] if part
@@ -2637,44 +4347,249 @@ def build_archive_preview_result(
                 preferred_view="text",
                 loose_file_path=loose_file_path,
                 loose_preview_image_path=loose_preview_image_path,
+                loose_preview_media_path=loose_preview_media_path,
+                loose_preview_media_kind=loose_preview_media_kind,
                 loose_preview_title=loose_preview_title,
                 loose_preview_metadata_summary=loose_preview_metadata_summary,
                 loose_preview_detail_text=loose_preview_detail_text,
             )
 
-        info_extra = ""
+        info_extra_parts: List[str] = []
         if "SparseDDS" in note_flags:
-            info_extra = "Preview fallback: sparse DDS padding was applied."
+            info_extra_parts.append("Preview fallback: sparse DDS padding was applied.")
+        if "PartialPAR" in note_flags:
+            info_extra_parts.append(
+                "Archive entry uses Partial PAR storage; preview uses reconstructed decompressed sections."
+            )
+        if "PartialRaw" in note_flags:
+            info_extra_parts.append(
+                "Archive entry uses non-DDS Partial storage; preview is based on raw stored bytes."
+            )
         if "ChaCha20" in note_flags:
-            info_extra = "\n".join(part for part in [info_extra, "Decrypted via deterministic ChaCha20 filename derivation."] if part)
+            info_extra_parts.append("Decrypted via deterministic ChaCha20 filename derivation.")
+        model_preview = None
+        model_texture_references: Tuple[ArchiveModelTextureReference, ...] = ()
+        model_preview_error = ""
+        parsed_mesh_for_references = None
+        binary_texture_references: Tuple[str, ...] = ()
         if extension in ARCHIVE_MODEL_EXTENSIONS:
-            info_extra = "\n".join(part for part in [info_extra, "Visual preview is not available for this model format yet."] if part)
+            binary_texture_references = tuple(extract_binary_dds_references(data))
+        if extension == ".pam":
+            try:
+                model_preview, model_info = _build_pam_model_preview_with_fallback(
+                    entry,
+                    data,
+                    note_flags,
+                    companion_entry=companion_entry,
+                    stop_event=stop_event,
+                )
+                if getattr(model_preview, "format", "").lower() == "pamlod":
+                    lod_label = (
+                        f"LOD {model_preview.lod_index + 1} of {model_preview.lod_count}"
+                        if getattr(model_preview, "lod_count", 0) > 0 and getattr(model_preview, "lod_index", -1) >= 0
+                        else "highest-detail LOD"
+                    )
+                    metadata_summary = f"{metadata_summary} | {lod_label} | {model_preview.face_count:,} faces"
+                else:
+                    metadata_summary = (
+                        f"{metadata_summary} | {model_preview.mesh_count:,} submesh(es)"
+                        f" | {model_preview.face_count:,} faces"
+                    )
+                info_extra_parts.extend(model_info)
+                if getattr(model_preview, "format", "").lower() == "pamlod":
+                    info_extra_parts.append(
+                        "Geometry preview uses the highest-detail recovered companion PAMLOD LOD only; lower-detail LODs are not stacked in the preview. "
+                        "Texture and material references remain listed below."
+                    )
+                else:
+                    info_extra_parts.append(
+                        "Geometry preview uses recovered PAM submeshes with temporary material colors. "
+                        "Texture and material references remain listed below."
+                    )
+            except RunCancelled:
+                raise
+            except Exception as exc:
+                model_preview_error = str(exc)
+                info_extra_parts.append(f"Visual model preview failed to recover geometry: {exc}")
+        elif extension == ".pamlod":
+            try:
+                model_preview, model_info = _build_pamlod_model_preview_with_fallback(
+                    entry,
+                    data,
+                    note_flags,
+                    companion_entry=companion_entry,
+                    stop_event=stop_event,
+                )
+                if getattr(model_preview, "format", "").lower() == "pam":
+                    metadata_summary = (
+                        f"{metadata_summary} | {model_preview.mesh_count:,} submesh(es)"
+                        f" | {model_preview.face_count:,} faces"
+                    )
+                else:
+                    lod_label = (
+                        f"LOD {model_preview.lod_index + 1} of {model_preview.lod_count}"
+                        if getattr(model_preview, "lod_count", 0) > 0 and getattr(model_preview, "lod_index", -1) >= 0
+                        else "highest-detail LOD"
+                    )
+                    metadata_summary = f"{metadata_summary} | {lod_label} | {model_preview.face_count:,} faces"
+                info_extra_parts.extend(model_info)
+                if getattr(model_preview, "format", "").lower() == "pam":
+                    info_extra_parts.append(
+                        "Geometry preview uses recovered companion PAM submeshes with temporary material colors. "
+                        "Texture and material references remain listed below."
+                    )
+                else:
+                    info_extra_parts.append(
+                        "Geometry preview uses the highest-detail recovered PAMLOD LOD only; lower-detail LODs are not stacked in the preview. "
+                        "Texture and material references remain listed below."
+                    )
+            except RunCancelled:
+                raise
+            except Exception as exc:
+                model_preview_error = str(exc)
+                info_extra_parts.append(f"Visual model preview failed to recover geometry: {exc}")
+        elif extension == ".pac":
+            try:
+                model_preview, parsed_mesh, model_info = _build_pac_model_preview_with_fallback(
+                    entry,
+                    data,
+                    note_flags,
+                    stop_event=stop_event,
+                )
+                parsed_mesh_for_references = parsed_mesh
+                metadata_summary = (
+                    f"{metadata_summary} | {model_preview.mesh_count:,} submesh(es)"
+                    f" | {model_preview.face_count:,} faces"
+                )
+                info_extra_parts.extend(model_info)
+                info_extra_parts.append(
+                    "Geometry preview uses recovered PAC skinned mesh data. Texture and material references remain listed below."
+                )
+                if getattr(parsed_mesh, "has_bones", False):
+                    unique_bones = {
+                        int(bone_index)
+                        for submesh in getattr(parsed_mesh, "submeshes", [])
+                        for palette in getattr(submesh, "bone_indices", [])
+                        for bone_index in palette
+                        if int(bone_index) >= 0
+                    }
+                    if unique_bones:
+                        info_extra_parts.append(
+                            f"Recovered skinning data referencing {len(unique_bones):,} bone slot(s)."
+                        )
+            except Exception as exc:
+                model_preview_error = str(exc)
+                info_extra_parts.append(f"Visual model preview failed to recover geometry: {exc}")
+        elif extension in ARCHIVE_MODEL_EXTENSIONS:
+            info_extra_parts.append("Visual preview is not available for this model format yet.")
+        if model_preview is not None:
+            if texconv_path is None:
+                if any(
+                    str(getattr(mesh, "texture_name", "") or "").strip().lower().endswith(".dds")
+                    for mesh in model_preview.meshes
+                ):
+                    info_extra_parts.append(
+                        "Set texconv.exe in the Workflow tab to enable textured model shading and PNG-backed model export."
+                    )
+            else:
+                info_extra_parts.extend(
+                    _attach_model_texture_preview_paths(
+                        texconv_path,
+                        entry,
+                        model_preview,
+                        texture_entries_by_normalized_path=texture_entries_by_normalized_path,
+                        texture_entries_by_basename=texture_entries_by_basename,
+                        stop_event=stop_event,
+                    )
+                )
+        if extension in ARCHIVE_MODEL_EXTENSIONS and parsed_mesh_for_references is None:
+            try:
+                from crimson_forge_toolkit.modding.mesh_parser import parse_mesh
+
+                parsed_mesh_for_references = parse_mesh(data, entry.path)
+            except RunCancelled:
+                raise
+            except Exception:
+                parsed_mesh_for_references = None
+        if model_preview is not None or parsed_mesh_for_references is not None:
+            model_texture_references = tuple(
+                build_archive_model_texture_references(
+                    entry,
+                    model_preview,
+                    parsed_mesh=parsed_mesh_for_references,
+                    binary_texture_references=binary_texture_references,
+                    texture_entries_by_normalized_path=texture_entries_by_normalized_path,
+                    texture_entries_by_basename=texture_entries_by_basename,
+                )
+            )
+        preferred_view, preview_text, info_extra = build_archive_binary_preview_payload(
+            entry,
+            data,
+            info_extra="\n".join(info_extra_parts),
+        )
         header_preview = format_binary_header_preview(data[:ARCHIVE_BINARY_HEX_PREVIEW_LIMIT])
         detail_text = build_archive_entry_detail_text(
             entry,
-            f"{info_extra}\n\nBinary header preview:\n{header_preview}".strip(),
+            "\n\n".join(part for part in [info_extra, f"Binary header preview:\n{header_preview}"] if part).strip(),
         )
         return ArchivePreviewResult(
             status="ok",
             title=entry.basename,
             metadata_summary=metadata_summary,
             detail_text=detail_text,
-            preferred_view="info",
+            preview_text=preview_text,
+            preview_model=model_preview,
+            model_texture_references=model_texture_references,
+            preferred_view="model" if model_preview is not None else preferred_view,
+            warning_badge="Model preview fallback" if model_preview is None and model_preview_error else "",
+            warning_text=model_preview_error if model_preview is None and model_preview_error else "",
             loose_file_path=loose_file_path,
             loose_preview_image_path=loose_preview_image_path,
+            loose_preview_media_path=loose_preview_media_path,
+            loose_preview_media_kind=loose_preview_media_kind,
             loose_preview_title=loose_preview_title,
             loose_preview_metadata_summary=loose_preview_metadata_summary,
             loose_preview_detail_text=loose_preview_detail_text,
         )
+    except RunCancelled:
+        raise
     except Exception as exc:
+        try:
+            raw_data = read_archive_entry_raw_data(entry)
+        except Exception:
+            raw_data = b""
+        preferred_view = "info"
+        preview_text = ""
+        raw_extra_parts = [
+            f"Decoded preview failed: {exc}",
+            "Showing raw stored bytes instead.",
+        ]
+        if raw_data:
+            raw_preferred_view, raw_preview_text, raw_extra = build_archive_binary_preview_payload(
+                entry,
+                raw_data,
+            )
+            preferred_view = raw_preferred_view
+            preview_text = raw_preview_text
+            if raw_extra:
+                raw_extra_parts.append(raw_extra)
+        raw_header_preview = format_binary_header_preview(raw_data[:ARCHIVE_BINARY_HEX_PREVIEW_LIMIT])
         return ArchivePreviewResult(
-            status="error",
+            status="ok",
             title=entry.basename,
             metadata_summary=metadata_summary,
-            detail_text=build_archive_entry_detail_text(entry, f"Preview failed: {exc}"),
-            preferred_view="info",
+            detail_text=build_archive_entry_detail_text(
+                entry,
+                "\n\n".join(part for part in [*raw_extra_parts, f"Binary header preview:\n{raw_header_preview}"] if part),
+            ),
+            preview_text=preview_text,
+            preferred_view=preferred_view,
+            warning_badge="Raw bytes",
+            warning_text="Showing raw stored bytes because the decoded preview path failed.",
             loose_file_path=loose_file_path,
             loose_preview_image_path=loose_preview_image_path,
+            loose_preview_media_path=loose_preview_media_path,
+            loose_preview_media_kind=loose_preview_media_kind,
             loose_preview_title=loose_preview_title,
             loose_preview_metadata_summary=loose_preview_metadata_summary,
             loose_preview_detail_text=loose_preview_detail_text,

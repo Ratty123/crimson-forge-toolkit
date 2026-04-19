@@ -1725,6 +1725,7 @@ class TextureEditorTab(QWidget):
         self._settings_ready = False
         self._last_open_dir = str(base_dir)
         self._last_save_dir = str(base_dir)
+        self._grid_color = QColor("#74C1FF")
         self._hover_pixel_info: Optional[Dict[str, object]] = None
         self._show_rulers = True
         self._show_guides = False
@@ -4930,10 +4931,11 @@ class TextureEditorTab(QWidget):
         self._save_settings()
 
     def _handle_grid_state_changed(self, *_args) -> None:
+        grid_color = QColor(getattr(self, "_grid_color", QColor("#74C1FF")))
         self.canvas.set_grid_state(
             enabled=self.grid_checkbox.isChecked(),
             grid_size=self.grid_size_spin.value(),
-            grid_color=self._grid_color,
+            grid_color=grid_color,
             grid_opacity=self.grid_opacity_spin.value(),
         )
         self._refresh_navigation_overlays()
