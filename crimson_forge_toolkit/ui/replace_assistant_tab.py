@@ -366,7 +366,8 @@ class ReplaceAssistantReviewCompareWorker(QObject):
         size = reader.size()
         if size.isValid():
             metadata["size"] = f"{size.width()}x{size.height()}"
-        image_format = bytes(reader.imageFormat()).decode("ascii", errors="ignore").upper().strip()
+        format_bytes = reader.format()
+        image_format = bytes(format_bytes).decode("ascii", errors="ignore").upper().strip()
         if image_format:
             metadata["format"] = image_format
         return metadata
