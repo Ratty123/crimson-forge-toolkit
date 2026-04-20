@@ -17,7 +17,7 @@ The format is intentionally simple:
 - Added mesh export/import tooling for supported archive meshes, including `Export OBJ`, `Export FBX`, `Import OBJ Preview`, `Import OBJ`, paired `PAM -> PAMLOD` transfer handling, and PAC FBX export paths that can attach matching `PAB` skeleton data.
 - Added referenced-texture inspection for archive mesh previews, including a dedicated texture list plus `Open`, `Export DDS`, `Replace DDS`, and `Replace From PNG` actions for resolved mesh texture entries.
 - Added broader archive media/binary preview coverage, including `.wem` playback via bundled `vgmstream-cli`, `.mp4` / `.bk2` playback through Qt Multimedia, `.bnk` Wwise soundbank summaries, `.pab` skeleton summaries, `.hkx` metadata summaries, and `.pami` text decoding in the archive browser.
-- Added flat-vs-tree archive browsing, incremental tree population, full extension-list population from the loaded archive index, a browsed-extension capability matrix CSV, and a Windows GitHub Actions build workflow for onefile/onedir packaging with optional SignPath signing.
+- Added flat-vs-tree archive browsing, incremental tree population, full extension-list population from the loaded archive index etc.
 
 ### Changed
 - Repositioned `Archive Browser` from a purely read-only explorer into a mixed browse/inspect/export/patch surface for supported mesh and audio paths, while still keeping loose DDS workflows and confirm-before-write behavior intact.
