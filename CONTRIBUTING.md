@@ -51,8 +51,11 @@ Please try to:
 
 Crimson Forge Toolkit is intentionally centered on:
 
-- read-only archive browsing
+- archive browsing, preview, extraction, and supported patch workflows
+- explicit confirm-before-write archive mutation for supported paths only
 - loose-file DDS and PNG workflows
 - rebuild, review, classification, and mod-package export
 
-It does not currently aim to write back into game archives directly.
+It does support writing back to game archives for specific supported workflows, but those writes should stay explicit, recoverable, and tightly scoped.
+
+The project does not aim for broad arbitrary archive editing or silent in-place mutation across unsupported formats.
