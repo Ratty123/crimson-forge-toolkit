@@ -4,7 +4,7 @@ Windows desktop tool for **Crimson Desert texture workflows**, **archive browsin
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-Latest release: `0.7.0`
+Latest release: `0.7.0-beta.1`
 
 - added patch-capable archive workflows for supported mesh and audio entries, including backups, restore, and mod-ready export paths
 - added real `.pam` / `.pamlod` / `.pac` model preview, OBJ/FBX export, OBJ import preview, texture reference tools, and in-app textured shading
