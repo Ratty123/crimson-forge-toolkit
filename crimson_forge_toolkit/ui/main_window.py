@@ -2829,7 +2829,7 @@ def run_gui() -> int:
 
         def _build_about_intro_html(self) -> str:
             return f"""
-            <p><b>{APP_TITLE} v{APP_VERSION}</b> is a Windows desktop tool for Crimson Desert archive browsing, texture workflow planning, DDS rebuild, visible-texture editing, replacement packaging, research, and text search.</p>
+            <p><b>{APP_TITLE} v{APP_VERSION}</b> is a Windows desktop tool for Crimson Desert archive browsing and preview, supported archive patching, DDS rebuild workflows, visible-texture editing, replacement packaging, research, and text search.</p>
             <p>Use the search box and topic list on the left, or jump straight to:
             <a href="topic:workflow_overview">Texture Workflow</a>,
             <a href="topic:workflow_profiles">Workflow Profiles</a>,
@@ -2863,7 +2863,7 @@ def run_gui() -> int:
                     <p>The app is split into major work areas rather than one single pipeline.</p>
                     <ul>
                       <li><b>Texture Workflow</b>: batch loose DDS processing, optional upscaling, DDS rebuild, compare, and mod-ready loose export.</li>
-                      <li><b>Archive Browser</b>: read-only scanning, filtering, preview, extraction, workflow handoff, and Research/Editor handoff.</li>
+                      <li><b>Archive Browser</b>: archive scanning, filtering, preview, extraction, supported patch/loose-export workflows, and Research/Editor handoff.</li>
                       <li><b>Texture Editor</b>: layered visible-texture editing and direct workflow handoff.</li>
                       <li><b>Replace Assistant</b>: guided one-off replacement packaging for edited PNG/DDS files.</li>
                       <li><b>Research</b>: grouped texture families, unknown-resolution work, DDS analysis, references, reports, and notes.</li>
@@ -3068,17 +3068,20 @@ def run_gui() -> int:
                 {
                     "id": "archive_browser",
                     "title": "Archive Browser",
-                    "summary": "Read-only archive scan, preview, filter, and extraction surface.",
-                    "keywords": "archive browser pamt paz scan preview filter extract workflow research texture editor read only",
+                    "summary": "Archive scan, preview, extraction, and supported patch surface.",
+                    "keywords": "archive browser pamt paz scan preview filter extract patch mod ready mesh audio video text dds workflow research texture editor",
                     "html": """
-                    <p><b>Archive Browser</b> is read-only. It never writes back to <code>.pamt</code> or <code>.paz</code>.</p>
+                    <p><b>Archive Browser</b> is the in-app inspection surface for Crimson Desert package data. It can browse archives in flat or tree view, preview many supported formats directly, extract files, and for supported workflows either patch the game archives or write mod-ready loose output with confirmation and backup support.</p>
                     <ul>
                       <li>Scan package roots and cache the discovered archive index locally.</li>
-                      <li>Filter by path, package, folder, likely role, size, and previewability.</li>
-                      <li>Preview supported DDS/images, text-like files, and other supported assets.</li>
+                      <li>Filter by path, package, folder, likely role, size, and previewability, then switch between flat and tree browsing as needed.</li>
+                      <li>Preview supported DDS/images, text-like files, audio/video, and model assets such as <code>.pam</code>, <code>.pamlod</code>, and <code>.pac</code>.</li>
                       <li>Extract selected or filtered content to loose folders.</li>
+                      <li>Inspect referenced model textures, export supported meshes as OBJ/FBX, import OBJ for rebuilt preview, and choose between archive patching or mod-ready loose export for supported mesh flows.</li>
+                      <li>Replace supported archive DDS entries from DDS or PNG, patch supported audio entries, and restore backups created by supported patch operations.</li>
                       <li>Send DDS content into Texture Workflow, open supported images in Texture Editor, or resolve items in Research.</li>
                     </ul>
+                    <p>Not every archive format is editable. Browsing and preview support is broader than patch support, so use the visible actions beside the preview to see what is currently available for the selected entry.</p>
                     """,
                 },
                 {
