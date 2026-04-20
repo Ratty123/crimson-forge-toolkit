@@ -47,6 +47,12 @@ This file is a practical notice list for repository and release packaging. For a
 - CLI documentation: https://github.com/chaiNNer-org/chaiNNer/wiki/05--CLI
 - Notes: Crimson Forge Toolkit can open the official chaiNNer download page, launch chaiNNer, inspect `.chn` chains, and pass override JSON, but chaiNNer remains a separate upstream application with its own dependencies and licenses
 
+### vgmstream
+
+- Purpose: `.wem` decoding for archive/loose audio playback and `WAV` export
+- Upstream: https://github.com/vgmstream/vgmstream
+- Notes: the build/runtime can bundle `vgmstream-cli.exe` and its runtime DLLs for Wwise decode support in the archive browser and audio export flows
+
 ## Archive Format References And Compatibility Validation
 
 ### lazorr410/crimson-desert-unpacker
@@ -60,8 +66,15 @@ This file is a practical notice list for repository and release packaging. For a
 - Purpose: behavior/reference comparison while validating some archive DDS reconstruction cases
 - Notes: used as a compatibility reference during local validation; not bundled with this repository
 
+### hzeemr/crimsonforge
+
+- Purpose: selectively adapted mesh parsing/export/import and archive-modding reference code
+- Upstream: https://github.com/hzeemr/crimsonforge
+- License: MIT
+- Notes: selected components are vendored under `crimson_forge_toolkit/modding/` with the upstream MIT license text included in `CrimsonForge_MIT_LICENSE.txt`
+
 ## Redistribution Notes
  
-- Crimson Forge Toolkit does not write back to `.pamt` or `.paz` archives.
+- Crimson Forge Toolkit now includes explicit, confirm-before-write archive patch workflows for selected mesh and audio replacement paths.
 - External tools such as `texconv.exe` and `chaiNNer.exe` remain separate projects and should be distributed in accordance with their upstream terms.
 - If you publish releases of this app, review the upstream licenses of any bundled or redistributed third-party components before shipping them.

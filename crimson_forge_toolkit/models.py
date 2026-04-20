@@ -707,16 +707,62 @@ class ArchivePreviewResult:
     detail_text: str = ""
     preview_image_path: str = ""
     preview_image: object = None
+    preview_media_path: str = ""
+    preview_media_kind: str = ""
     preview_text: str = ""
+    preview_model: object = None
+    model_texture_references: Tuple["ArchiveModelTextureReference", ...] = ()
     preferred_view: str = "info"
     warning_badge: str = ""
     warning_text: str = ""
     loose_file_path: str = ""
     loose_preview_image_path: str = ""
     loose_preview_image: object = None
+    loose_preview_media_path: str = ""
+    loose_preview_media_kind: str = ""
     loose_preview_title: str = ""
     loose_preview_metadata_summary: str = ""
     loose_preview_detail_text: str = ""
+
+
+@dataclass(slots=True)
+class ModelPreviewMesh:
+    material_name: str = ""
+    texture_name: str = ""
+    positions: List[Tuple[float, float, float]] = field(default_factory=list)
+    texture_coordinates: List[Tuple[float, float]] = field(default_factory=list)
+    normals: List[Tuple[float, float, float]] = field(default_factory=list)
+    indices: List[int] = field(default_factory=list)
+    preview_texture_path: str = ""
+    preview_texture_image: object = None
+
+
+@dataclass(slots=True)
+class ArchiveModelTextureReference:
+    reference_name: str = ""
+    material_name: str = ""
+    semantic_label: str = ""
+    resolution_status: str = "missing"
+    resolved_archive_path: str = ""
+    resolved_package_label: str = ""
+    resolved_entry: Optional["ArchiveEntry"] = None
+    preview_texture_path: str = ""
+    usage_count: int = 0
+
+
+@dataclass(slots=True)
+class ModelPreviewData:
+    path: str = ""
+    format: str = ""
+    summary: str = ""
+    mesh_count: int = 0
+    vertex_count: int = 0
+    face_count: int = 0
+    lod_index: int = -1
+    lod_count: int = 0
+    normalization_center: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    normalization_scale: float = 1.0
+    meshes: List[ModelPreviewMesh] = field(default_factory=list)
 
 
 @dataclass

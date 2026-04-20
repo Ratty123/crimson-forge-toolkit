@@ -1,17 +1,21 @@
-from __future__ import annotations
+"""
+Keep Pillow on PyInstaller's standard collection path.
 
-from PyInstaller.utils.hooks import collect_all
+The previous hook used collect_all("PIL"), which can produce corrupt onefile
+payloads for compiled Pillow modules like ``_imagingft``. This hook now only
+applies lightweight import exclusions and lets PyInstaller's built-in handling
+bundle Pillow normally.
+"""
 
-
-def _keep_entry(entry: object) -> bool:
-    try:
-        path_text = str(entry[0]).lower()
-    except Exception:
-        path_text = str(entry).lower()
-    return "avif" not in path_text
-
-
-datas, binaries, hiddenimports = collect_all("PIL")
-datas = [entry for entry in datas if _keep_entry(entry)]
-binaries = [entry for entry in binaries if _keep_entry(entry)]
-hiddenimports = [name for name in hiddenimports if "avif" not in name.lower()]
+# Mirror the intent of PyInstaller's built-in Pillow hook while also excluding
+# AVIF support that we do not ship.
+excludedimports = [
+    "tkinter",
+    "PyQt5",
+    "PySide2",
+    "PyQt6",
+    "PySide6",
+    "IPython",
+    "PIL.AvifImagePlugin",
+    "PIL._avif",
+]

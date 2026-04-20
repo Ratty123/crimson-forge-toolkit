@@ -9,6 +9,41 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.7.0] - 2026-04-20
+
+### Added
+- Added explicit archive-mutation workflows for supported archive entries, including patch requests, per-entry backup capture, backup restore, and mod-ready loose export helpers instead of keeping archive work extract-only.
+- Added real 3D archive preview support for recovered `.pam`, `.pamlod`, and `.pac` geometry, with orbit/zoom/reset controls, textured shading, richer details, and fallback messaging when geometry recovery is incomplete.
+- Added mesh export/import tooling for supported archive meshes, including `Export OBJ`, `Export FBX`, `Import OBJ Preview`, `Import OBJ`, paired `PAM -> PAMLOD` transfer handling, and PAC FBX export paths that can attach matching `PAB` skeleton data.
+- Added referenced-texture inspection for archive mesh previews, including a dedicated texture list plus `Open`, `Export DDS`, `Replace DDS`, and `Replace From PNG` actions for resolved mesh texture entries.
+- Added broader archive media/binary preview coverage, including `.wem` playback via bundled `vgmstream-cli`, `.mp4` / `.bk2` playback through Qt Multimedia, `.bnk` Wwise soundbank summaries, `.pab` skeleton summaries, `.hkx` metadata summaries, and `.pami` text decoding in the archive browser.
+- Added flat-vs-tree archive browsing, incremental tree population, full extension-list population from the loaded archive index, a browsed-extension capability matrix CSV, and a Windows GitHub Actions build workflow for onefile/onedir packaging with optional SignPath signing.
+
+### Changed
+- Repositioned `Archive Browser` from a purely read-only explorer into a mixed browse/inspect/export/patch surface for supported mesh and audio paths, while still keeping loose DDS workflows and confirm-before-write behavior intact.
+- Reworked the archive preview pane so export/import/restore actions are visible beside the preview instead of being hidden behind right-click-only discovery, and moved referenced textures beside the model preview for a larger, more practical preview area.
+- Archive filtering and archive preview work now run with more progress-aware background behavior, better cancellation, and lighter UI-thread work when changing large extensions, rebuilding previews, or switching between flat/tree views.
+- Text-like archive preview now uses the same styled text presentation more consistently across supported text formats, including decrypted or decoded archive payloads such as `.pami`.
+- Model texture resolution is now broader and more semantic: preview/export paths resolve more DDS candidates from parsed mesh data and raw binary references, prefer visible/base-color matches over technical-only maps, and apply those references across `.pam`, `.pamlod`, and `.pac` preview/export flows.
+- Onefile packaging is now more defensive, with improved custom PyInstaller hooks, bundled Wwise decode runtime handling, and full embedded-archive validation after build so release EXEs fail fast during packaging instead of at first launch.
+
+### Fixed
+- Fixed the archive extension filter/drop-down regressions so supported extensions are populated again from the archive contents instead of forcing manual entry for some workflows.
+- Fixed archive DDS preview regressions where selecting `.dds` entries could get stuck on details, fail to switch to the preview tab correctly, or become noticeably slower after later archive-browser changes.
+- Fixed `.pami` preview stability and presentation so decoded text no longer opens with mismatched styling and is less likely to leave the browser in a stuck `Preparing archive preview...` state.
+- Fixed a long list of `.pam`, `.pamlod`, and `.pac` geometry-recovery problems, including better companion PAMLOD fallback usage, better submesh preservation during companion fallback, additional partial/zero-padded recovery paths, more helpful failure text, and fewer cases where previews stall or degrade into obviously scrambled geometry.
+- Fixed more textured-model issues, including missing referenced DDS rows, overly narrow texture-reference columns, companion-preview texture loss, PAC texture availability in preview/export, and incorrect vertical texture orientation on assets such as the shield atlas that were previously mapped into opaque black atlas space.
+- Fixed archive-browser responsiveness issues around large extension switches, archive-cache reuse, background preview cancellation, and long-running per-file preview work so the UI spends less time in `Not Responding` during heavy archive browsing.
+- Fixed `Texture Editor` grid-state handling so the archive/browser-driven editor path no longer throws `AttributeError: 'TextureEditorTab' object has no attribute '_grid_color'`.
+- Fixed onefile extraction/runtime failures involving Pillow/OpenCV/crypto packaging, including corrupt `_imagingft` payload handling, OpenCV FFmpeg plugin extraction failures, and related embedded-DLL extraction errors that could break startup on Windows.
+- Fixed `.wem` decode playback launching a visible console window and improved Wwise playback fallback messaging when the local multimedia backend still cannot decode a variant directly.
+- Fixed archive patch safety gaps by surfacing backup restore in the UI and tightening patch/build flows so interrupted mesh/audio patch attempts are easier to recover from.
+
+### Docs
+- Updated the README for `0.7.0` so the front page now reflects archive patching, mesh preview/modding, media preview, and the broader archive-browser scope instead of describing the app as read-only.
+- Added and refreshed `docs/archive_extension_preview_matrix.csv` to capture current extension coverage, what the app can actually preview today, and where future investment is still worthwhile.
+- Expanded third-party notices and release metadata to cover vendored MIT-licensed CrimsonForge-derived mesh tooling, bundled `vgmstream` usage, and the newer packaging/build workflow.
+
 ## [0.6.5] - 2026-04-18
 
 ### Added
