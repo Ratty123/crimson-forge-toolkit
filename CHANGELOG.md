@@ -9,7 +9,7 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
-## [0.7.0] - 2026-04-20
+## [0.7.0-beta.1] - 2026-04-20
 
 ### Added
 - Added explicit archive-mutation workflows for supported archive entries, including patch requests, per-entry backup capture, backup restore, and mod-ready loose export helpers instead of keeping archive work extract-only.
@@ -40,7 +40,7 @@ The format is intentionally simple:
 - Fixed archive patch safety gaps by surfacing backup restore in the UI and tightening patch/build flows so interrupted mesh/audio patch attempts are easier to recover from.
 
 ### Docs
-- Updated the README for `0.7.0` so the front page now reflects archive patching, mesh preview/modding, media preview, and the broader archive-browser scope instead of describing the app as read-only.
+- Updated the README for `0.7.0-beta.1` so the front page now reflects archive patching, mesh preview/modding, media preview, and the broader archive-browser scope instead of describing the app as read-only.
 - Added and refreshed `docs/archive_extension_preview_matrix.csv` to capture current extension coverage, what the app can actually preview today, and where future investment is still worthwhile.
 - Expanded third-party notices and release metadata to cover vendored MIT-licensed CrimsonForge-derived mesh tooling, bundled `vgmstream` usage, and the newer packaging/build workflow.
 
