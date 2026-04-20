@@ -9,6 +9,24 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.7.0-beta.2] - 2026-04-20
+
+### Added
+- Added an explicit mesh loose-export metadata prompt to the `Import OBJ... -> Write Mod-Ready Loose File` flow, so title/version/author/description and `.no_encrypt` are confirmed at export time instead of being taken silently from saved app settings.
+
+### Changed
+- Changed mesh loose package generation so `README.txt`, `manifest.json`, and `info.json` are produced from the same confirmed export metadata with a cleaner mesh-package layout.
+- Changed the README front page for `0.7.0-beta.2` so the current beta highlights focus on the newer loose-export prompt and sidecar-aware texture-reference improvements rather than repeating the broader `0.7.0-beta.1` feature list.
+
+### Fixed
+- Fixed the actual `Import OBJ...` loose-export path still bypassing the metadata prompt and reusing stored values from `CrimsonTextureForge.cfg` / app config even after the prompt UI had been added elsewhere.
+- Fixed archive mesh referenced-texture resolution for PAC XML / PAMI sidecar bindings so exact technical maps such as `_normalTexture`, `_materialTexture`, `_heightTexture`, and `_maskTexture` are no longer flattened toward the albedo entry in the `Referenced Textures` list.
+- Fixed sidecar-driven texture labels so archive mesh previews now show clearer semantic names like `Base Color Texture`, `Normal Texture`, `Material Texture`, `Height Texture`, and `Mask Texture` when those roles are present in companion sidecar data.
+- Fixed textured model preview assignment so sidecar-aware preview shading continues to prefer visible/base-color bindings for display while still preserving the full exact semantic DDS set in the reference list.
+
+### Docs
+- Updated release version references from `0.7.0-beta.1` to `0.7.0-beta.2` in the README, changelog, and app version metadata.
+
 ## [0.7.0-beta.1] - 2026-04-20
 
 ### Added

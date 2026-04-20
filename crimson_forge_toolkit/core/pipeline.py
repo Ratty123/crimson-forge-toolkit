@@ -38,6 +38,8 @@ from crimson_forge_toolkit.core.upscale_profiles import (
     derive_texture_group_key,
     is_png_intermediate_high_risk,
     is_technical_texture_type,
+    normalize_texture_reference_for_sidecar_lookup,
+    parse_texture_sidecar_bindings,
     should_upscale_texture,
     suggest_texture_upscale_decision,
     TexturePreviewSample,
@@ -63,6 +65,7 @@ _DDS_ALPHA_CAPABLE_FORMATS = {
 }
 _LOOSE_SEMANTIC_SIDECAR_EXTENSIONS = {
     ".xml",
+    ".pami",
     ".material",
     ".shader",
     ".json",
@@ -107,9 +110,11 @@ _DEFAULT_SEMANTIC_SUBTYPES: Dict[str, str] = {
     "emissive": "emissive",
     "impostor": "impostor",
     "normal": "normal",
+    "world_normal": "normal",
     "height": "height",
     "vector": "vector",
     "roughness": "roughness",
+    "gloss_or_smoothness": "roughness",
     "mask": "mask",
     "unknown": "unknown",
 }
@@ -2724,11 +2729,22 @@ def _read_loose_sidecar_text(path: Path) -> str:
     return ""
 
 
-def _build_loose_sidecar_index(root: Path) -> Tuple[Dict[str, List[Path]], Dict[str, List[Path]]]:
+def _build_loose_sidecar_index(
+    root: Path,
+) -> Tuple[
+    Dict[str, List[Path]],
+    Dict[str, List[Path]],
+    Dict[str, List[Path]],
+    Dict[str, List[Path]],
+    Dict[Path, str],
+]:
     by_group: Dict[str, List[Path]] = defaultdict(list)
     by_folder: Dict[str, List[Path]] = defaultdict(list)
+    by_texture_path: Dict[str, List[Path]] = defaultdict(list)
+    by_texture_basename: Dict[str, List[Path]] = defaultdict(list)
+    text_cache: Dict[Path, str] = {}
     if not root.exists() or not root.is_dir():
-        return {}, {}
+        return {}, {}, {}, {}, {}
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in _LOOSE_SEMANTIC_SIDECAR_EXTENSIONS:
             continue
@@ -2738,7 +2754,18 @@ def _build_loose_sidecar_index(root: Path) -> Tuple[Dict[str, List[Path]], Dict[
             continue
         by_group[derive_texture_group_key(rel_text)].append(path)
         by_folder[str(path.relative_to(root).parent).replace("\\", "/")].append(path)
-    return dict(by_group), dict(by_folder)
+        text = _read_loose_sidecar_text(path)
+        text_cache[path] = text
+        if text and path.suffix.lower() in {".xml", ".pami"}:
+            for binding in parse_texture_sidecar_bindings(text, sidecar_path=rel_text):
+                normalized_texture = normalize_texture_reference_for_sidecar_lookup(binding.texture_path)
+                if not normalized_texture:
+                    continue
+                by_texture_path[normalized_texture].append(path)
+                texture_basename = PurePosixPath(normalized_texture).name
+                if texture_basename:
+                    by_texture_basename[texture_basename].append(path)
+    return dict(by_group), dict(by_folder), dict(by_texture_path), dict(by_texture_basename), text_cache
 
 
 def _collect_loose_sidecar_texts(
@@ -2747,32 +2774,48 @@ def _collect_loose_sidecar_texts(
     *,
     sidecars_by_group: Dict[str, List[Path]],
     sidecars_by_folder: Dict[str, List[Path]],
+    sidecars_by_texture_path: Dict[str, List[Path]],
+    sidecars_by_texture_basename: Dict[str, List[Path]],
     text_cache: Dict[Path, str],
     limit: int = 6,
 ) -> List[str]:
     rel_text = relative_path.as_posix()
     group_key = derive_texture_group_key(rel_text)
     folder_key = str(relative_path.parent).replace("\\", "/")
-    candidates: List[Path] = []
+    normalized_target = normalize_texture_reference_for_sidecar_lookup(rel_text)
+    target_basename = PurePosixPath(normalized_target).name
+    candidates: List[Tuple[Path, bool]] = []
     seen: set[Path] = set()
+
+    def add_candidate(path: Path, *, exact_match: bool) -> None:
+        if path not in seen:
+            seen.add(path)
+            candidates.append((path, exact_match))
+
+    for path in sidecars_by_texture_path.get(normalized_target, []):
+        add_candidate(path, exact_match=True)
+    for path in sidecars_by_texture_basename.get(target_basename, []):
+        add_candidate(path, exact_match=True)
     for path in sidecars_by_group.get(group_key, []):
-        if path not in seen:
-            candidates.append(path)
-            seen.add(path)
+        add_candidate(path, exact_match=False)
     for path in sidecars_by_folder.get(folder_key, []):
-        if path not in seen:
-            candidates.append(path)
-            seen.add(path)
+        add_candidate(path, exact_match=False)
+
     snippets: List[str] = []
     target_name = relative_path.name.lower()
     target_stem = relative_path.stem.lower()
-    for path in candidates[:limit]:
+    for path, exact_match in candidates[:limit]:
         text = text_cache.get(path)
         if text is None:
             text = _read_loose_sidecar_text(path)
             text_cache[path] = text
         lowered = text.lower()
-        if lowered and (target_name in lowered or target_stem in lowered or derive_texture_group_key(path.relative_to(root).as_posix()).lower() == group_key.lower()):
+        if lowered and (
+            exact_match
+            or target_name in lowered
+            or target_stem in lowered
+            or derive_texture_group_key(path.relative_to(root).as_posix()).lower() == group_key.lower()
+        ):
             snippets.append(text)
     return snippets
 
@@ -2850,8 +2893,13 @@ def build_texture_processing_plan(
     backend_matrix: Optional[BackendCapabilityMatrix] = None,
 ) -> List[TextureProcessingPlan]:
     resolved_backend_matrix = backend_matrix or _build_backend_capability_matrix(normalized)
-    sidecars_by_group, sidecars_by_folder = _build_loose_sidecar_index(normalized.original_dds_root)
-    sidecar_text_cache: Dict[Path, str] = {}
+    (
+        sidecars_by_group,
+        sidecars_by_folder,
+        sidecars_by_texture_path,
+        sidecars_by_texture_basename,
+        sidecar_text_cache,
+    ) = _build_loose_sidecar_index(normalized.original_dds_root)
     family_members_by_group: Dict[str, List[str]] = defaultdict(list)
     for dds_path in dds_files:
         rel_text = dds_path.relative_to(normalized.original_dds_root).as_posix()
@@ -2868,6 +2916,8 @@ def build_texture_processing_plan(
             rel_path,
             sidecars_by_group=sidecars_by_group,
             sidecars_by_folder=sidecars_by_folder,
+            sidecars_by_texture_path=sidecars_by_texture_path,
+            sidecars_by_texture_basename=sidecars_by_texture_basename,
             text_cache=sidecar_text_cache,
         )
         preview_sample = _preview_sample_for_unknown_dds(normalized.texconv_path, dds_path, coarse_texture_type)

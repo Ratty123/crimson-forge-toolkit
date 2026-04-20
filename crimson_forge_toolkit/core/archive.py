@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -50,6 +51,7 @@ from crimson_forge_toolkit.core.upscale_profiles import (
     classify_texture_type,
     derive_texture_group_key,
     infer_texture_semantics,
+    parse_texture_sidecar_bindings,
 )
 
 _PATHC_COLLECTION_CACHE: Dict[str, Tuple[str, "PathcCollection"]] = {}
@@ -67,6 +69,14 @@ _MODEL_TEXTURE_VISIBLE_FAMILY_SUFFIXES: Tuple[str, ...] = (
     "_base_color",
     "_diffuse",
 )
+
+
+@dataclass(slots=True)
+class _ArchiveModelSidecarTextureBinding:
+    texture_path: str
+    parameter_name: str = ""
+    submesh_name: str = ""
+    sidecar_path: str = ""
 
 _COMMON_TECHNICAL_DDS_EXCLUDE_PATTERNS: Tuple[str, ...] = (
     "*_n.dds",
@@ -2668,6 +2678,170 @@ def extract_binary_dds_references(
     return references
 
 
+def _humanize_model_texture_hint(semantic_hint: str) -> str:
+    raw_text = str(semantic_hint or "").strip().lstrip("_")
+    if not raw_text:
+        return ""
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw_text)
+    spaced = re.sub(r"[_\s]+", " ", spaced).strip()
+    if not spaced:
+        return ""
+    return " ".join(part[:1].upper() + part[1:] for part in spaced.split())
+
+
+def _model_texture_hint_priority(semantic_hint: str) -> Optional[Tuple[int, int]]:
+    normalized = str(semantic_hint or "").strip().lower().replace("_", "")
+    if not normalized:
+        return None
+
+    technical_tokens = (
+        "normal",
+        "height",
+        "displacement",
+        "materialtexture",
+        "materialmask",
+        "detailmask",
+        "masktexture",
+        "roughness",
+        "metallic",
+        "occlusion",
+        "opacity",
+        "screenspacedisplacement",
+        "specular",
+    )
+    if any(token in normalized for token in technical_tokens):
+        return (0, 0)
+
+    if any(
+        token in normalized
+        for token in (
+            "overlaycolor",
+            "colortexture",
+            "diffuse",
+            "albedo",
+            "basecolor",
+            "emissive",
+            "tintcolor",
+        )
+    ):
+        return (6, 3)
+    if "color" in normalized or "overlay" in normalized or "tint" in normalized:
+        return (6, 2)
+    return None
+
+
+def _score_model_sidecar_entry_candidate(source_entry: ArchiveEntry, candidate: ArchiveEntry) -> Tuple[int, int, int]:
+    normalized_candidate = _normalize_model_texture_reference(candidate.path)
+    source_path = _normalize_model_texture_reference(source_entry.path)
+    source_root = PurePosixPath(source_path).parts[:1]
+    candidate_root = PurePosixPath(normalized_candidate).parts[:1]
+    score_value = 0
+    if candidate.pamt_path == source_entry.pamt_path:
+        score_value += 10
+    if candidate.pamt_path.parent == source_entry.pamt_path.parent:
+        score_value += 6
+    if "/texture/" in normalized_candidate:
+        score_value += 8
+    if candidate_root and source_root and candidate_root == source_root:
+        score_value += 4
+    source_extension = str(source_entry.extension or "").strip().lower()
+    if source_extension in {".pam", ".pamlod"} and normalized_candidate.endswith(".pami"):
+        extension_priority = 2
+    elif normalized_candidate.endswith(".xml"):
+        extension_priority = 1
+    else:
+        extension_priority = 0
+    return score_value, -len(candidate.path), extension_priority
+
+
+def _find_archive_model_sidecar_entries(
+    source_entry: ArchiveEntry,
+    archive_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]],
+) -> Tuple[ArchiveEntry, ...]:
+    if archive_entries_by_basename is None:
+        return ()
+
+    basename = PurePosixPath(source_entry.path.replace("\\", "/")).name.strip()
+    source_stem = PurePosixPath(source_entry.path.replace("\\", "/")).stem.strip()
+    if not basename:
+        return ()
+    target_basenames = {f"{basename}.xml".lower()}
+    if source_stem and source_entry.extension in {".pam", ".pamlod"}:
+        target_basenames.add(f"{source_stem}.pami".lower())
+    candidates: List[ArchiveEntry] = []
+    for target_basename in target_basenames:
+        for candidate in archive_entries_by_basename.get(target_basename, ()):
+            if candidate.extension not in {".xml", ".pami"}:
+                continue
+            if candidate not in candidates:
+                candidates.append(candidate)
+    if not candidates:
+        return ()
+    candidates.sort(key=lambda candidate: _score_model_sidecar_entry_candidate(source_entry, candidate), reverse=True)
+    return tuple(candidates[:4])
+
+
+def _parse_archive_model_sidecar_texture_bindings(
+    sidecar_text: str,
+    *,
+    sidecar_path: str,
+) -> Tuple[_ArchiveModelSidecarTextureBinding, ...]:
+    parsed_bindings = parse_texture_sidecar_bindings(sidecar_text, sidecar_path=sidecar_path)
+    return tuple(
+        _ArchiveModelSidecarTextureBinding(
+            texture_path=binding.texture_path,
+            parameter_name=binding.parameter_name,
+            submesh_name=binding.submesh_name,
+            sidecar_path=binding.sidecar_path,
+        )
+        for binding in parsed_bindings
+    )
+
+
+def _extract_archive_model_sidecar_texture_references(
+    source_entry: ArchiveEntry,
+    *,
+    archive_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]],
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[Tuple[_ArchiveModelSidecarTextureBinding, ...], Tuple[str, ...]]:
+    bindings: List[_ArchiveModelSidecarTextureBinding] = []
+    sidecar_paths: List[str] = []
+    seen_binding_keys: set[Tuple[str, str, str]] = set()
+    for sidecar_entry in _find_archive_model_sidecar_entries(source_entry, archive_entries_by_basename):
+        raise_if_cancelled(stop_event)
+        try:
+            sidecar_data, _decompressed, _note = read_archive_entry_data(sidecar_entry, stop_event=stop_event)
+        except Exception:
+            continue
+        text = try_decode_text_like_archive_data(sidecar_data)
+        if text is None:
+            continue
+        parsed_bindings = _parse_archive_model_sidecar_texture_bindings(text, sidecar_path=sidecar_entry.path)
+        if not parsed_bindings:
+            continue
+        sidecar_paths.append(sidecar_entry.path)
+        for binding in parsed_bindings:
+            key = (
+                _normalize_model_texture_reference(binding.texture_path),
+                str(binding.submesh_name or "").strip().lower(),
+                str(binding.parameter_name or "").strip().lower(),
+            )
+            if key in seen_binding_keys:
+                continue
+            seen_binding_keys.add(key)
+            bindings.append(binding)
+    return tuple(bindings), tuple(sidecar_paths)
+
+
+def _iter_parsed_model_submeshes(parsed_mesh: Optional[object]) -> List[object]:
+    if parsed_mesh is None:
+        return []
+    if str(getattr(parsed_mesh, "format", "") or "").strip().lower() == "pamlod":
+        lod_levels = getattr(parsed_mesh, "lod_levels", None) or [[]]
+        return list(lod_levels[0] or [])
+    return list(getattr(parsed_mesh, "submeshes", ()) or [])
+
+
 def _iter_model_texture_family_reference_candidates(group_key: str) -> Tuple[str, ...]:
     normalized_group_key = _normalize_model_texture_reference(group_key)
     if not normalized_group_key:
@@ -2747,6 +2921,18 @@ def _looks_like_technical_model_texture(texture_path: str) -> bool:
     return False
 
 
+def _has_explicit_model_texture_reference(*values: str) -> bool:
+    for raw_value in values:
+        normalized = _normalize_model_texture_reference(raw_value)
+        if normalized.endswith(".dds"):
+            return True
+    return False
+
+
+def _is_visible_model_texture_type(texture_type: str) -> bool:
+    return str(texture_type or "").strip().lower() in {"color", "ui", "emissive", "impostor"}
+
+
 def _resolve_model_texture_semantics(
     texture_path: str,
     *,
@@ -2796,20 +2982,23 @@ def _collect_model_texture_archive_entry_candidates(
     material_name: str,
     texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]],
     texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]],
+    *,
+    expand_family_candidates: bool = True,
 ) -> List[Tuple[ArchiveEntry, Tuple[int, int]]]:
     reference_candidates = _iter_model_texture_reference_candidates(texture_name, material_name)
     if not reference_candidates:
         return []
 
     expanded_reference_candidates: List[str] = list(reference_candidates)
-    seen_expanded = set(expanded_reference_candidates)
-    for normalized_reference in reference_candidates:
-        group_key = derive_texture_group_key(normalized_reference)
-        for family_reference in _iter_model_texture_family_reference_candidates(group_key):
-            if family_reference in seen_expanded:
-                continue
-            seen_expanded.add(family_reference)
-            expanded_reference_candidates.append(family_reference)
+    if expand_family_candidates:
+        seen_expanded = set(expanded_reference_candidates)
+        for normalized_reference in reference_candidates:
+            group_key = derive_texture_group_key(normalized_reference)
+            for family_reference in _iter_model_texture_family_reference_candidates(group_key):
+                if family_reference in seen_expanded:
+                    continue
+                seen_expanded.add(family_reference)
+                expanded_reference_candidates.append(family_reference)
 
     candidates: List[ArchiveEntry] = []
     for normalized_reference in expanded_reference_candidates:
@@ -2864,13 +3053,20 @@ def _resolve_model_texture_archive_entry(
     material_name: str,
     texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]],
     texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]],
+    *,
+    semantic_hint: str = "",
+    expand_family_candidates: Optional[bool] = None,
+    allow_technical_match: bool = False,
 ) -> Tuple[Optional[ArchiveEntry], str]:
+    if expand_family_candidates is None:
+        expand_family_candidates = not _has_explicit_model_texture_reference(texture_name, material_name)
     scored_candidates = _collect_model_texture_archive_entry_candidates(
         source_entry,
         texture_name,
         material_name,
         texture_entries_by_normalized_path,
         texture_entries_by_basename,
+        expand_family_candidates=expand_family_candidates,
     )
     if not scored_candidates:
         return None, "missing"
@@ -2885,6 +3081,7 @@ def _resolve_model_texture_archive_entry(
     best_candidate: Optional[ArchiveEntry] = None
     best_candidate_key: Optional[Tuple[int, int, int, Tuple[int, int]]] = None
     best_candidate_priority = (0, 0)
+    hint_priority = _model_texture_hint_priority(semantic_hint)
     for candidate, direct_score in scored_candidates:
         group_key = derive_texture_group_key(candidate.path)
         texture_type, semantic_subtype, confidence = _resolve_model_texture_semantics(
@@ -2895,6 +3092,8 @@ def _resolve_model_texture_archive_entry(
             texture_type,
             semantic_subtype,
         )
+        if hint_priority is not None and hint_priority > semantic_priority:
+            semantic_priority = hint_priority
         sort_key = (
             semantic_priority[0],
             semantic_priority[1],
@@ -2908,9 +3107,126 @@ def _resolve_model_texture_archive_entry(
 
     if best_candidate is None:
         return None, "missing"
+    if allow_technical_match and best_candidate_priority[0] <= 0:
+        return best_candidate, "resolved"
     if best_candidate_priority[0] <= 0:
         return None, "technical_only"
     return best_candidate, "resolved"
+
+
+def _ensure_archive_model_texture_preview_path(
+    resolved_texconv_path: Path,
+    texture_entry: ArchiveEntry,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> str:
+    texture_source_path, _texture_note = ensure_archive_preview_source(
+        texture_entry,
+        stop_event=stop_event,
+    )
+    dds_info: Optional[DdsInfo] = None
+    try:
+        dds_info = parse_dds(texture_source_path)
+    except Exception:
+        dds_info = None
+    preview_path = ensure_dds_display_preview_png(
+        resolved_texconv_path,
+        texture_source_path.resolve(),
+        dds_info=dds_info,
+        max_dimension=_MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION,
+        stop_event=stop_event,
+    )
+    return str(preview_path)
+
+
+def _attach_model_sidecar_texture_preview_paths(
+    texconv_path: Optional[Path],
+    source_entry: ArchiveEntry,
+    model_preview: Optional[ModelPreviewData],
+    *,
+    parsed_mesh: Optional[object],
+    sidecar_texture_bindings: Sequence[_ArchiveModelSidecarTextureBinding],
+    texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> List[str]:
+    if texconv_path is None or model_preview is None or not model_preview.meshes or not sidecar_texture_bindings:
+        return []
+
+    parsed_submeshes = _iter_parsed_model_submeshes(parsed_mesh)
+    if not parsed_submeshes:
+        return []
+
+    resolved_texconv_path = texconv_path.expanduser().resolve()
+    resolved_by_submesh: Dict[str, Tuple[Tuple[int, int, int, int], ArchiveEntry, str]] = {}
+    sidecar_paths: List[str] = []
+
+    for binding in sidecar_texture_bindings:
+        raise_if_cancelled(stop_event)
+        submesh_key = str(binding.submesh_name or "").strip().lower()
+        if not submesh_key:
+            continue
+        texture_entry, resolution_status = _resolve_model_texture_archive_entry(
+            source_entry,
+            binding.texture_path,
+            binding.submesh_name,
+            texture_entries_by_normalized_path,
+            texture_entries_by_basename,
+            semantic_hint=binding.parameter_name,
+            expand_family_candidates=False,
+            allow_technical_match=True,
+        )
+        if texture_entry is None or resolution_status != "resolved":
+            continue
+        texture_type, semantic_subtype, confidence = _resolve_model_texture_semantics(texture_entry.path)
+        if not _is_visible_model_texture_type(texture_type):
+            continue
+        priority = _model_texture_hint_priority(binding.parameter_name) or _model_texture_semantic_priority(
+            texture_type,
+            semantic_subtype,
+        )
+        candidate_key = (
+            priority[0],
+            priority[1],
+            confidence,
+            -len(texture_entry.path),
+        )
+        existing = resolved_by_submesh.get(submesh_key)
+        if existing is None or candidate_key > existing[0]:
+            resolved_by_submesh[submesh_key] = (candidate_key, texture_entry, binding.parameter_name)
+        if binding.sidecar_path and binding.sidecar_path not in sidecar_paths:
+            sidecar_paths.append(binding.sidecar_path)
+
+    assigned_count = 0
+    for mesh_index, mesh in enumerate(model_preview.meshes):
+        raise_if_cancelled(stop_event)
+        if str(getattr(mesh, "preview_texture_path", "") or "").strip():
+            continue
+        if mesh_index >= len(parsed_submeshes):
+            continue
+        submesh_name = str(getattr(parsed_submeshes[mesh_index], "name", "") or "").strip().lower()
+        resolved = resolved_by_submesh.get(submesh_name)
+        if resolved is None:
+            continue
+        _candidate_key, texture_entry, _parameter_name = resolved
+        try:
+            mesh.preview_texture_path = _ensure_archive_model_texture_preview_path(
+                resolved_texconv_path,
+                texture_entry,
+                stop_event=stop_event,
+            )
+            assigned_count += 1
+        except RunCancelled:
+            raise
+        except Exception:
+            continue
+
+    if assigned_count <= 0:
+        return []
+    sidecar_suffix = f" from {', '.join(sidecar_paths[:2])}" if sidecar_paths else ""
+    if len(sidecar_paths) > 2:
+        sidecar_suffix += " ..."
+    return [f"Applied {assigned_count:,} textured preview binding(s) from companion material sidecar data{sidecar_suffix}."]
 
 
 def _attach_model_texture_preview_paths(
@@ -2937,6 +3253,9 @@ def _attach_model_texture_preview_paths(
 
     for mesh in model_preview.meshes:
         raise_if_cancelled(stop_event)
+        if str(getattr(mesh, "preview_texture_path", "") or "").strip():
+            resolved_count += 1
+            continue
         texture_name = str(getattr(mesh, "texture_name", "") or "").strip()
         material_name = str(getattr(mesh, "material_name", "") or "").strip()
         texture_label = texture_name or material_name
@@ -2965,23 +3284,11 @@ def _attach_model_texture_preview_paths(
         preview_path_text = preview_cache.get(cache_key, "")
         if not preview_path_text:
             try:
-                texture_source_path, _texture_note = ensure_archive_preview_source(
+                preview_path_text = _ensure_archive_model_texture_preview_path(
+                    resolved_texconv_path,
                     texture_entry,
                     stop_event=stop_event,
                 )
-                dds_info: Optional[DdsInfo] = None
-                try:
-                    dds_info = parse_dds(texture_source_path)
-                except Exception:
-                    dds_info = None
-                preview_path = ensure_dds_display_preview_png(
-                    resolved_texconv_path,
-                    texture_source_path.resolve(),
-                    dds_info=dds_info,
-                    max_dimension=_MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION,
-                    stop_event=stop_event,
-                )
-                preview_path_text = str(preview_path)
                 preview_cache[cache_key] = preview_path_text
             except RunCancelled:
                 raise
@@ -3017,12 +3324,18 @@ def _attach_model_texture_preview_paths(
     return info_lines
 
 
-def _describe_model_texture_semantic_label(texture_path: str) -> str:
+def _describe_model_texture_semantic_label(texture_path: str, *, semantic_hint: str = "") -> str:
+    hint_label = _humanize_model_texture_hint(semantic_hint)
+    if hint_label:
+        return hint_label
     texture_type_raw, subtype_raw, _confidence = _resolve_model_texture_semantics(texture_path)
     texture_type = str(texture_type_raw or "").strip().replace("_", " ")
     subtype = str(subtype_raw or "").strip().replace("_", " ")
     if not texture_type or texture_type.lower() == "unknown":
-        return ""
+        return hint_label
+    hint_priority = _model_texture_hint_priority(semantic_hint)
+    if hint_label and hint_priority is not None and hint_priority[0] >= 5 and texture_type.lower() not in {"color", "ui", "emissive"}:
+        return hint_label
     if subtype and subtype.lower() not in {"unknown", texture_type.lower()}:
         return f"{texture_type.title()} / {subtype.title()}"
     return texture_type.title()
@@ -3034,31 +3347,28 @@ def build_archive_model_texture_references(
     *,
     parsed_mesh: Optional[object] = None,
     binary_texture_references: Sequence[str] = (),
+    sidecar_texture_references: Sequence[_ArchiveModelSidecarTextureBinding] = (),
     texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
     texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
 ) -> List[ArchiveModelTextureReference]:
     preview_meshes = list(getattr(model_preview, "meshes", ()) or [])
-    parsed_submeshes: List[object] = []
-    if parsed_mesh is not None:
-        if str(getattr(parsed_mesh, "format", "") or "").strip().lower() == "pamlod":
-            parsed_submeshes = list((getattr(parsed_mesh, "lod_levels", None) or [[]])[0] or [])
-        else:
-            parsed_submeshes = list(getattr(parsed_mesh, "submeshes", ()) or [])
+    parsed_submeshes = _iter_parsed_model_submeshes(parsed_mesh)
 
-    if not preview_meshes and not parsed_submeshes:
+    if not preview_meshes and not parsed_submeshes and not binary_texture_references and not sidecar_texture_references:
         return []
 
     references: Dict[Tuple[str, str, str, str], ArchiveModelTextureReference] = {}
     ordered_keys: List[Tuple[str, str, str, str]] = []
 
-    candidates: List[Tuple[str, str, str]] = []
-    seen_candidate_keys: set[Tuple[str, str]] = set()
+    candidates: List[Tuple[str, str, str, str]] = []
+    seen_candidate_keys: set[Tuple[str, str, str]] = set()
     for mesh in preview_meshes:
         texture_name = str(getattr(mesh, "texture_name", "") or "").strip()
         material_name = str(getattr(mesh, "material_name", "") or "").strip()
         key = (
             _normalize_model_texture_reference(texture_name),
             _normalize_model_texture_reference(material_name),
+            "",
         )
         seen_candidate_keys.add(key)
         candidates.append(
@@ -3066,6 +3376,7 @@ def build_archive_model_texture_references(
                 texture_name,
                 material_name,
                 str(getattr(mesh, "preview_texture_path", "") or "").strip(),
+                "",
             )
         )
     for submesh in parsed_submeshes:
@@ -3074,22 +3385,36 @@ def build_archive_model_texture_references(
         key = (
             _normalize_model_texture_reference(texture_name),
             _normalize_model_texture_reference(material_name),
+            "",
         )
         if key in seen_candidate_keys:
             continue
         seen_candidate_keys.add(key)
-        candidates.append((texture_name, material_name, ""))
+        candidates.append((texture_name, material_name, "", ""))
+    for binding in sidecar_texture_references:
+        texture_name = str(binding.texture_path or "").strip()
+        material_name = str(binding.submesh_name or binding.parameter_name or "").strip()
+        semantic_hint = str(binding.parameter_name or "").strip()
+        key = (
+            _normalize_model_texture_reference(texture_name),
+            _normalize_model_texture_reference(material_name),
+            str(semantic_hint or "").strip().lower(),
+        )
+        if not texture_name or key in seen_candidate_keys:
+            continue
+        seen_candidate_keys.add(key)
+        candidates.append((texture_name, material_name, "", semantic_hint))
     for raw_reference in binary_texture_references:
         texture_name = str(raw_reference or "").strip()
         if not texture_name:
             continue
-        key = (_normalize_model_texture_reference(texture_name), "")
+        key = (_normalize_model_texture_reference(texture_name), "", "")
         if key in seen_candidate_keys:
             continue
         seen_candidate_keys.add(key)
-        candidates.append((texture_name, "", ""))
+        candidates.append((texture_name, "", "", ""))
 
-    for texture_name, material_name, preview_texture_path in candidates:
+    for texture_name, material_name, preview_texture_path, semantic_hint in candidates:
         reference_name = texture_name or material_name
         if not reference_name:
             continue
@@ -3100,19 +3425,23 @@ def build_archive_model_texture_references(
             material_name,
             texture_entries_by_normalized_path,
             texture_entries_by_basename,
+            semantic_hint=semantic_hint,
+            expand_family_candidates=not _has_explicit_model_texture_reference(texture_name, material_name),
+            allow_technical_match=True,
         )
         resolved_archive_path = texture_entry.path if texture_entry is not None else ""
         key = (
             _normalize_model_texture_reference(reference_name),
             _normalize_model_texture_reference(resolved_archive_path),
             str(resolution_status or "").strip().lower(),
+            str(semantic_hint or "").strip().lower(),
         )
         existing = references.get(key)
         if existing is None:
-            semantic_label = ""
+            semantic_label = _humanize_model_texture_hint(semantic_hint)
             resolved_package_label = ""
             if texture_entry is not None:
-                semantic_label = _describe_model_texture_semantic_label(texture_entry.path)
+                semantic_label = _describe_model_texture_semantic_label(texture_entry.path, semantic_hint=semantic_hint)
                 resolved_package_label = texture_entry.package_label
             references[key] = ArchiveModelTextureReference(
                 reference_name=reference_name,
@@ -3138,7 +3467,9 @@ def build_archive_model_texture_references(
             existing.resolved_archive_path = texture_entry.path
             existing.resolved_package_label = texture_entry.package_label
             if not existing.semantic_label:
-                existing.semantic_label = _describe_model_texture_semantic_label(texture_entry.path)
+                existing.semantic_label = _describe_model_texture_semantic_label(texture_entry.path, semantic_hint=semantic_hint)
+        elif semantic_hint and not existing.semantic_label:
+            existing.semantic_label = _humanize_model_texture_hint(semantic_hint)
 
     return [references[key] for key in ordered_keys]
 
@@ -4372,8 +4703,23 @@ def build_archive_preview_result(
         model_preview_error = ""
         parsed_mesh_for_references = None
         binary_texture_references: Tuple[str, ...] = ()
+        sidecar_texture_references: Tuple[_ArchiveModelSidecarTextureBinding, ...] = ()
+        sidecar_reference_paths: Tuple[str, ...] = ()
         if extension in ARCHIVE_MODEL_EXTENSIONS:
             binary_texture_references = tuple(extract_binary_dds_references(data))
+            sidecar_texture_references, sidecar_reference_paths = _extract_archive_model_sidecar_texture_references(
+                entry,
+                archive_entries_by_basename=texture_entries_by_basename,
+                stop_event=stop_event,
+            )
+            if sidecar_texture_references:
+                sidecar_count = len(sidecar_texture_references)
+                sidecar_suffix = f" from {', '.join(sidecar_reference_paths[:2])}" if sidecar_reference_paths else ""
+                if len(sidecar_reference_paths) > 2:
+                    sidecar_suffix += " ..."
+                info_extra_parts.append(
+                    f"Companion material sidecar data contributed {sidecar_count:,} texture binding(s){sidecar_suffix}."
+                )
         if extension == ".pam":
             try:
                 model_preview, model_info = _build_pam_model_preview_with_fallback(
@@ -4482,6 +4828,20 @@ def build_archive_preview_result(
                 info_extra_parts.append(f"Visual model preview failed to recover geometry: {exc}")
         elif extension in ARCHIVE_MODEL_EXTENSIONS:
             info_extra_parts.append("Visual preview is not available for this model format yet.")
+        if (
+            model_preview is not None
+            and sidecar_texture_references
+            and parsed_mesh_for_references is None
+            and extension in ARCHIVE_MODEL_EXTENSIONS
+        ):
+            try:
+                from crimson_forge_toolkit.modding.mesh_parser import parse_mesh
+
+                parsed_mesh_for_references = parse_mesh(data, entry.path)
+            except RunCancelled:
+                raise
+            except Exception:
+                parsed_mesh_for_references = None
         if model_preview is not None:
             if texconv_path is None:
                 if any(
@@ -4492,6 +4852,19 @@ def build_archive_preview_result(
                         "Set texconv.exe in the Workflow tab to enable textured model shading and PNG-backed model export."
                     )
             else:
+                if sidecar_texture_references:
+                    info_extra_parts.extend(
+                        _attach_model_sidecar_texture_preview_paths(
+                            texconv_path,
+                            entry,
+                            model_preview,
+                            parsed_mesh=parsed_mesh_for_references,
+                            sidecar_texture_bindings=sidecar_texture_references,
+                            texture_entries_by_normalized_path=texture_entries_by_normalized_path,
+                            texture_entries_by_basename=texture_entries_by_basename,
+                            stop_event=stop_event,
+                        )
+                    )
                 info_extra_parts.extend(
                     _attach_model_texture_preview_paths(
                         texconv_path,
@@ -4511,13 +4884,14 @@ def build_archive_preview_result(
                 raise
             except Exception:
                 parsed_mesh_for_references = None
-        if model_preview is not None or parsed_mesh_for_references is not None:
+        if model_preview is not None or parsed_mesh_for_references is not None or binary_texture_references or sidecar_texture_references:
             model_texture_references = tuple(
                 build_archive_model_texture_references(
                     entry,
                     model_preview,
                     parsed_mesh=parsed_mesh_for_references,
                     binary_texture_references=binary_texture_references,
+                    sidecar_texture_references=sidecar_texture_references,
                     texture_entries_by_normalized_path=texture_entries_by_normalized_path,
                     texture_entries_by_basename=texture_entries_by_basename,
                 )

@@ -18,10 +18,13 @@ from crimson_forge_toolkit.core.archive import (
     archive_entry_role,
     ensure_archive_preview_source,
     read_archive_entry_data,
+    try_decode_text_like_archive_data,
 )
 from crimson_forge_toolkit.core.classification_registry import get_registered_texture_classification
 from crimson_forge_toolkit.core.common import raise_if_cancelled
 from crimson_forge_toolkit.core.pipeline import (
+    _build_loose_sidecar_index,
+    _collect_loose_sidecar_texts,
     _SCALAR_HIGH_PRECISION_MASK_SUBTYPES,
     build_texture_processing_plan,
     collect_compare_relative_paths,
@@ -37,6 +40,8 @@ from crimson_forge_toolkit.core.upscale_profiles import (
     derive_texture_group_key as derive_semantic_texture_group_key,
     infer_texture_semantics,
     is_png_intermediate_high_risk,
+    normalize_texture_reference_for_sidecar_lookup,
+    parse_texture_sidecar_bindings,
 )
 from crimson_forge_toolkit.models import AppConfig, TextureProcessingPlan
 
@@ -65,6 +70,7 @@ TEXTURE_SIDECAR_EXTENSIONS = {
     ".shader",
     ".xml",
     ".json",
+    ".pami",
 }
 REFERENCE_SOURCE_EXTENSIONS = {
     ".cfg",
@@ -72,6 +78,7 @@ REFERENCE_SOURCE_EXTENSIONS = {
     ".json",
     ".lua",
     ".material",
+    ".pami",
     ".shader",
     ".txt",
     ".xml",
@@ -96,7 +103,7 @@ NORMAL_SUSPICIOUS_FORMATS = {
     "BC3_UNORM_SRGB",
     "BC7_UNORM_SRGB",
 }
-REGEX_PRESET_DEFAULT_EXTENSIONS = ".xml;.json;.cfg;.ini;.lua;.material;.shader"
+REGEX_PRESET_DEFAULT_EXTENSIONS = ".xml;.json;.cfg;.ini;.lua;.material;.shader;.pami"
 
 _SYSTEM_AREA_RULES: Tuple[Tuple[str, str], ...] = (
     ("ui", "ui"),
@@ -519,12 +526,13 @@ def classify_texture_path(
     *,
     role_hint: str = "",
     family_members: Sequence[str] = (),
+    sidecar_texts: Sequence[str] = (),
 ) -> Tuple[str, int, str]:
     if role_hint == "ui":
         return "ui", 92, "archive role marked as UI"
     if role_hint == "impostor":
         return "impostor", 96, "archive role marked as impostor"
-    semantic = infer_texture_semantics(path_value, family_members=family_members)
+    semantic = infer_texture_semantics(path_value, family_members=family_members, sidecar_texts=sidecar_texts)
     if semantic.texture_type != "unknown":
         reason = semantic.evidence[0] if semantic.evidence else "semantic inference"
         return semantic.texture_type, semantic.confidence, reason
@@ -536,6 +544,89 @@ def classify_texture_path(
     if "/texture/" in lowered or Path(lowered).suffix.lower() in TEXTURE_IMAGE_EXTENSIONS:
         return "unknown", 45, "image/texture path without a stronger semantic hint"
     return "unknown", 25, "no strong texture-type hint"
+
+
+def _read_archive_sidecar_text(
+    entry: ArchiveEntry,
+    *,
+    stop_event: Optional[object] = None,
+) -> str:
+    try:
+        raw, _decompressed, _note = read_archive_entry_data(entry, stop_event=stop_event)
+    except Exception:
+        return ""
+    return str(try_decode_text_like_archive_data(raw) or "").strip()
+
+
+def _build_archive_sidecar_reference_index(
+    entries: Sequence[ArchiveEntry],
+    *,
+    stop_event: Optional[object] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    progress_label: str = "Building archive research snapshot: indexing sidecar texture bindings...",
+) -> Tuple[Dict[str, Tuple[str, ...]], Dict[str, Tuple[str, ...]]]:
+    sidecar_entries = [entry for entry in entries if entry.extension in TEXTURE_SIDECAR_EXTENSIONS]
+    if not sidecar_entries:
+        return {}, {}
+
+    texts_by_texture_path: Dict[str, List[str]] = defaultdict(list)
+    texts_by_texture_basename: Dict[str, List[str]] = defaultdict(list)
+    total_sidecars = len(sidecar_entries)
+    progress_interval = max(total_sidecars // 100, 1) if total_sidecars > 0 else 1
+    for index, entry in enumerate(sidecar_entries, start=1):
+        raise_if_cancelled(stop_event, "Research refresh cancelled.")
+        text = _read_archive_sidecar_text(entry, stop_event=stop_event)
+        if text and entry.extension in {".xml", ".pami"}:
+            for binding in parse_texture_sidecar_bindings(text, sidecar_path=entry.path):
+                normalized_texture = normalize_texture_reference_for_sidecar_lookup(binding.texture_path)
+                if not normalized_texture:
+                    continue
+                texts_by_texture_path[normalized_texture].append(text)
+                texture_basename = PurePosixPath(normalized_texture).name
+                if texture_basename:
+                    texts_by_texture_basename[texture_basename].append(text)
+        if on_progress is not None and (index == total_sidecars or index % progress_interval == 0):
+            on_progress(index, total_sidecars, f"{progress_label} {index:,} / {total_sidecars:,}")
+
+    normalized_path_map = {
+        key: tuple(dict.fromkeys(value))
+        for key, value in texts_by_texture_path.items()
+    }
+    normalized_basename_map = {
+        key: tuple(dict.fromkeys(value))
+        for key, value in texts_by_texture_basename.items()
+    }
+    return normalized_path_map, normalized_basename_map
+
+
+def _collect_archive_texture_sidecar_texts(
+    path_value: str,
+    *,
+    sidecar_texts_by_texture_path: Dict[str, Tuple[str, ...]],
+    sidecar_texts_by_texture_basename: Dict[str, Tuple[str, ...]],
+    limit: int = 6,
+) -> Tuple[str, ...]:
+    normalized_target = normalize_texture_reference_for_sidecar_lookup(path_value)
+    if not normalized_target:
+        return ()
+    target_basename = PurePosixPath(normalized_target).name
+    collected: List[str] = []
+    seen: set[str] = set()
+    for text in sidecar_texts_by_texture_path.get(normalized_target, ()):
+        if text in seen:
+            continue
+        seen.add(text)
+        collected.append(text)
+        if len(collected) >= limit:
+            return tuple(collected)
+    for text in sidecar_texts_by_texture_basename.get(target_basename, ()):
+        if text in seen:
+            continue
+        seen.add(text)
+        collected.append(text)
+        if len(collected) >= limit:
+            break
+    return tuple(collected)
 
 
 def derive_texture_group_key(path_value: str) -> str:
@@ -572,6 +663,12 @@ def build_archive_research_snapshot(
         if on_progress is not None and (index == total_entries or index % progress_interval == 0):
             on_progress(index, total_entries, f"Building archive research snapshot: indexing archive entries... {index:,} / {total_entries:,}")
 
+    archive_sidecar_texts_by_texture_path, archive_sidecar_texts_by_texture_basename = _build_archive_sidecar_reference_index(
+        entries,
+        stop_event=stop_event,
+        on_progress=on_progress,
+    )
+
     classification_rows: List[TextureClassificationRow] = []
     classified_kinds_by_path: Dict[str, str] = {}
     heatmap_scopes: Dict[Tuple[str, str], Dict[str, object]] = {}
@@ -585,10 +682,16 @@ def build_archive_research_snapshot(
 
         family_members = tuple(family_members_by_group.get(group_key, ()))
         role_hint = archive_entry_role(entry)
+        sidecar_texts = _collect_archive_texture_sidecar_texts(
+            normalized_path,
+            sidecar_texts_by_texture_path=archive_sidecar_texts_by_texture_path,
+            sidecar_texts_by_texture_basename=archive_sidecar_texts_by_texture_basename,
+        )
         texture_type, confidence, reason = classify_texture_path(
             normalized_path,
             role_hint=role_hint,
             family_members=family_members,
+            sidecar_texts=sidecar_texts,
         )
         classified_kinds_by_path[lowered] = texture_type
 
@@ -1959,6 +2062,13 @@ def build_texture_budget_analysis(
         rebuilt_root,
         stop_event=stop_event,
     )
+    (
+        sidecars_by_group,
+        sidecars_by_folder,
+        sidecars_by_texture_path,
+        sidecars_by_texture_basename,
+        sidecar_text_cache,
+    ) = _build_loose_sidecar_index(original_root)
     if ui_constraint_related_paths:
         ui_constraint_keys: set[str] = set()
         for path_value in ui_constraint_related_paths:
@@ -1969,6 +2079,19 @@ def build_texture_budget_analysis(
         ui_constraint_keys = _build_ui_constraint_path_keys(archive_entries) if archive_entries else set()
     rows: List[TextureBudgetRow] = []
     compare_relative_paths = sorted(family_members_by_path.keys())
+    sidecar_texts_by_relative_path: Dict[str, Tuple[str, ...]] = {}
+    for relative_path_text in compare_relative_paths:
+        sidecar_texts_by_relative_path[relative_path_text] = tuple(
+            _collect_loose_sidecar_texts(
+                original_root,
+                Path(relative_path_text),
+                sidecars_by_group=sidecars_by_group,
+                sidecars_by_folder=sidecars_by_folder,
+                sidecars_by_texture_path=sidecars_by_texture_path,
+                sidecars_by_texture_basename=sidecars_by_texture_basename,
+                text_cache=sidecar_text_cache,
+            )
+        )
     for relative_path_text in compare_relative_paths:
         raise_if_cancelled(stop_event)
         relative_path = Path(relative_path_text)
@@ -1982,7 +2105,11 @@ def build_texture_budget_analysis(
         except Exception:
             continue
         family_members = family_members_by_path.get(relative_path_text, ())
-        texture_type = classify_texture_path(relative_path_text, family_members=family_members)[0]
+        texture_type = classify_texture_path(
+            relative_path_text,
+            family_members=family_members,
+            sidecar_texts=sidecar_texts_by_relative_path.get(relative_path_text, ()),
+        )[0]
         group_key = derive_texture_group_key(relative_path_text)
         system_area = system_area_from_path(relative_path_text)
         parts = _normalized_parts(relative_path_text)
@@ -2667,12 +2794,17 @@ def _texture_specific_preview_warnings(
     rebuilt: Optional[TexturePreviewStats],
     *,
     family_members: Sequence[str] = (),
+    sidecar_texts: Sequence[str] = (),
 ) -> List[str]:
     if original is None or rebuilt is None:
         return []
 
     lowered = relative_path.lower()
-    texture_type, _confidence, _reason = classify_texture_path(relative_path, family_members=family_members)
+    texture_type, _confidence, _reason = classify_texture_path(
+        relative_path,
+        family_members=family_members,
+        sidecar_texts=sidecar_texts,
+    )
     warnings: List[str] = []
 
     if texture_type == "normal":
@@ -2789,11 +2921,33 @@ def build_mip_analysis_detail(
     relative = Path(row.relative_path)
     original_path = original_root / relative
     rebuilt_path = rebuilt_root / relative
+    (
+        sidecars_by_group,
+        sidecars_by_folder,
+        sidecars_by_texture_path,
+        sidecars_by_texture_basename,
+        sidecar_text_cache,
+    ) = _build_loose_sidecar_index(original_root)
     resolved_family_members = family_members_by_path
     if resolved_family_members is None:
         resolved_family_members = build_mip_analysis_family_members_by_path(original_root, rebuilt_root)
     family_members = resolved_family_members.get(row.relative_path, ())
-    texture_type, confidence, reason = classify_texture_path(row.relative_path, family_members=family_members)
+    sidecar_texts = tuple(
+        _collect_loose_sidecar_texts(
+            original_root,
+            relative,
+            sidecars_by_group=sidecars_by_group,
+            sidecars_by_folder=sidecars_by_folder,
+            sidecars_by_texture_path=sidecars_by_texture_path,
+            sidecars_by_texture_basename=sidecars_by_texture_basename,
+            text_cache=sidecar_text_cache,
+        )
+    )
+    texture_type, confidence, reason = classify_texture_path(
+        row.relative_path,
+        family_members=family_members,
+        sidecar_texts=sidecar_texts,
+    )
     detail_lines: List[str] = [
         f"Relative path: {row.relative_path}",
         "",
@@ -2979,13 +3133,34 @@ def analyze_mip_behavior(
             rebuilt_root,
             stop_event=stop_event,
         )
+    (
+        sidecars_by_group,
+        sidecars_by_folder,
+        sidecars_by_texture_path,
+        sidecars_by_texture_basename,
+        sidecar_text_cache,
+    ) = _build_loose_sidecar_index(original_root)
     compare_relative_paths = sorted(resolved_family_members.keys())
+    sidecar_texts_by_relative_path: Dict[str, Tuple[str, ...]] = {}
+    for relative_path_text in compare_relative_paths:
+        sidecar_texts_by_relative_path[relative_path_text] = tuple(
+            _collect_loose_sidecar_texts(
+                original_root,
+                Path(relative_path_text),
+                sidecars_by_group=sidecars_by_group,
+                sidecars_by_folder=sidecars_by_folder,
+                sidecars_by_texture_path=sidecars_by_texture_path,
+                sidecars_by_texture_basename=sidecars_by_texture_basename,
+                text_cache=sidecar_text_cache,
+            )
+        )
     for relative_path_text in compare_relative_paths:
         raise_if_cancelled(stop_event)
         relative_path = Path(relative_path_text)
         original_path = original_root / relative_path
         rebuilt_path = rebuilt_root / relative_path
         family_members = resolved_family_members.get(relative_path_text, ())
+        sidecar_texts = sidecar_texts_by_relative_path.get(relative_path_text, ())
         plan_entry = (processing_plan_lookup or {}).get(relative_path_text)
         try:
             original_dds = parse_dds(original_path)
@@ -3037,7 +3212,11 @@ def analyze_mip_behavior(
             warnings.append("DDS format changed between original and rebuilt output.")
         if original_dds.has_alpha != rebuilt_dds.has_alpha:
             warnings.append("Alpha capability changed between original and rebuilt DDS.")
-        texture_type = classify_texture_path(relative_path_text, family_members=family_members)[0]
+        texture_type = classify_texture_path(
+            relative_path_text,
+            family_members=family_members,
+            sidecar_texts=sidecar_texts,
+        )[0]
         warnings.extend(
             _planner_path_specific_mip_warnings(
                 plan_entry,
@@ -3074,6 +3253,7 @@ def analyze_mip_behavior(
                     original_preview,
                     rebuilt_preview,
                     family_members=family_members,
+                    sidecar_texts=sidecar_texts,
                 )
             )
         warnings = _dedupe_preserve_order(warnings)
@@ -3149,15 +3329,37 @@ def validate_normal_maps(
 ) -> List[NormalValidationRow]:
     display_root_label = (root_label or root.name or str(root)).strip() or str(root)
     dds_files = collect_dds_files(root, (), stop_event=stop_event)
+    (
+        sidecars_by_group,
+        sidecars_by_folder,
+        sidecars_by_texture_path,
+        sidecars_by_texture_basename,
+        sidecar_text_cache,
+    ) = _build_loose_sidecar_index(root)
     grouped_by_key: Dict[str, List[Path]] = defaultdict(list)
     for dds_path in dds_files:
         grouped_by_key[derive_texture_group_key(dds_path.relative_to(root).as_posix())].append(dds_path)
+    sidecar_texts_by_relative_path: Dict[str, Tuple[str, ...]] = {}
+    for dds_path in dds_files:
+        relative_path = dds_path.relative_to(root)
+        sidecar_texts_by_relative_path[relative_path.as_posix()] = tuple(
+            _collect_loose_sidecar_texts(
+                root,
+                relative_path,
+                sidecars_by_group=sidecars_by_group,
+                sidecars_by_folder=sidecars_by_folder,
+                sidecars_by_texture_path=sidecars_by_texture_path,
+                sidecars_by_texture_basename=sidecars_by_texture_basename,
+                text_cache=sidecar_text_cache,
+            )
+        )
     normal_candidate_count = sum(
         1
         for dds_path in dds_files
         if classify_texture_path(
             dds_path.relative_to(root).as_posix(),
             family_members=tuple(member.relative_to(root).as_posix() for member in grouped_by_key[derive_texture_group_key(dds_path.relative_to(root).as_posix())]),
+            sidecar_texts=sidecar_texts_by_relative_path.get(dds_path.relative_to(root).as_posix(), ()),
         )[0]
         == "normal"
     )
@@ -3170,7 +3372,12 @@ def validate_normal_maps(
         relative_path = dds_path.relative_to(root).as_posix()
         group_members = grouped_by_key.get(derive_texture_group_key(relative_path), [])
         family_member_paths = tuple(member.relative_to(root).as_posix() for member in group_members)
-        texture_type, _confidence, _reason = classify_texture_path(relative_path, family_members=family_member_paths)
+        sidecar_texts = sidecar_texts_by_relative_path.get(relative_path, ())
+        texture_type, _confidence, _reason = classify_texture_path(
+            relative_path,
+            family_members=family_member_paths,
+            sidecar_texts=sidecar_texts,
+        )
         if texture_type != "normal":
             continue
         plan_entry = (processing_plan_lookup or {}).get(relative_path)
@@ -3216,6 +3423,7 @@ def validate_normal_maps(
                 and classify_texture_path(
                     candidate.relative_to(root).as_posix(),
                     family_members=family_member_paths,
+                    sidecar_texts=sidecar_texts_by_relative_path.get(candidate.relative_to(root).as_posix(), ()),
                 )[0]
                 == "color"
             ),

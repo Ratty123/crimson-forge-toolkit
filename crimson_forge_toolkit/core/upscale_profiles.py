@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 import shutil
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -75,7 +77,7 @@ _GROUP_SUFFIX_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"(?<=\d)[a-z]$", re.IGNORECASE),
 )
 
-_SIDECARE_EXTENSIONS = {".xml", ".material", ".shader", ".json"}
+_SIDECARE_EXTENSIONS = {".xml", ".material", ".shader", ".json", ".pami"}
 
 _PRESET_UPSCALE_TYPES: Dict[str, Tuple[str, ...]] = {
     UPSCALE_TEXTURE_PRESET_BALANCED: ("color", "ui", "emissive", "impostor"),
@@ -106,6 +108,14 @@ _ALL_TEXTURE_TYPES: Tuple[str, ...] = (
 
 _TECHNICAL_TEXTURE_TYPES = frozenset({"normal", "roughness", "mask", "height", "vector"})
 _LOSSY_PNG_RISK_TYPES = frozenset({"height", "vector", "roughness", "mask"})
+
+
+@dataclass(slots=True, frozen=True)
+class TextureSidecarBinding:
+    texture_path: str
+    parameter_name: str = ""
+    submesh_name: str = ""
+    sidecar_path: str = ""
 
 
 @dataclass(slots=True)
@@ -191,6 +201,243 @@ class TexturePreviewSample:
     mean_chroma: float
     opaque_fraction: float
     transparent_fraction: float
+
+
+def _strip_texture_sidecar_xml_namespace(tag: str) -> str:
+    text = str(tag or "").strip()
+    if "}" in text:
+        return text.rsplit("}", 1)[-1]
+    return text
+
+
+def normalize_texture_reference_for_sidecar_lookup(value: str) -> str:
+    normalized = str(value or "").strip().replace("\\", "/")
+    if not normalized:
+        return ""
+    normalized = re.sub(r"/{2,}", "/", normalized)
+    return normalized.lower()
+
+
+def _humanize_texture_parameter_name(parameter_name: str) -> str:
+    raw_text = str(parameter_name or "").strip().lstrip("_")
+    if not raw_text:
+        return ""
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw_text)
+    spaced = re.sub(r"[_\s]+", " ", spaced).strip()
+    if not spaced:
+        return ""
+    return " ".join(part[:1].upper() + part[1:] for part in spaced.split())
+
+
+@lru_cache(maxsize=512)
+def _parse_texture_sidecar_bindings_cached(
+    normalized_sidecar_text: str,
+    sidecar_path: str,
+) -> Tuple[TextureSidecarBinding, ...]:
+    sidecar_text = str(normalized_sidecar_text or "").replace("\ufeff", "").replace("\x00", "").strip()
+    if not sidecar_text:
+        return ()
+    sidecar_text = re.sub(r"^\s*<\?xml[^>]*\?>", "", sidecar_text, count=1, flags=re.IGNORECASE)
+    wrapped_text = f"<Root>{sidecar_text}</Root>"
+    try:
+        root = ET.fromstring(wrapped_text)
+    except ET.ParseError:
+        return ()
+
+    bindings: List[TextureSidecarBinding] = []
+    seen: set[Tuple[str, str, str]] = set()
+
+    def _parameter_name_for(parameter: ET.Element) -> str:
+        return str(
+            parameter.attrib.get("_name")
+            or parameter.attrib.get("StringItemID")
+            or parameter.attrib.get("Name")
+            or parameter.attrib.get("name")
+            or ""
+        ).strip()
+
+    def _iter_texture_paths(parameter: ET.Element) -> Iterable[str]:
+        direct_value = str(
+            parameter.attrib.get("Value")
+            or parameter.attrib.get("_value")
+            or parameter.attrib.get("value")
+            or ""
+        ).strip()
+        if direct_value:
+            yield direct_value.replace("\\", "/")
+        for resource in parameter.iter():
+            if resource is parameter:
+                continue
+            if _strip_texture_sidecar_xml_namespace(resource.tag) != "ResourceReferencePath_ITexture":
+                continue
+            for attr_name in ("_path", "path", "_value", "Value", "value"):
+                texture_path = str(resource.attrib.get(attr_name) or "").strip()
+                if texture_path:
+                    yield texture_path.replace("\\", "/")
+                    break
+
+    def _append_parameter_bindings(parameter: ET.Element, *, submesh_name: str = "") -> None:
+        if _strip_texture_sidecar_xml_namespace(parameter.tag) != "MaterialParameterTexture":
+            return
+        parameter_name = _parameter_name_for(parameter)
+        for texture_path in _iter_texture_paths(parameter):
+            normalized_texture = normalize_texture_reference_for_sidecar_lookup(texture_path)
+            if not normalized_texture:
+                continue
+            key = (
+                normalized_texture,
+                str(submesh_name or "").strip().lower(),
+                str(parameter_name or "").strip().lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            bindings.append(
+                TextureSidecarBinding(
+                    texture_path=texture_path,
+                    parameter_name=parameter_name,
+                    submesh_name=submesh_name,
+                    sidecar_path=sidecar_path,
+                )
+            )
+
+    wrapper_count = 0
+    for wrapper in root.iter():
+        if _strip_texture_sidecar_xml_namespace(wrapper.tag) != "SkinnedMeshMaterialWrapper":
+            continue
+        wrapper_count += 1
+        submesh_name = str(
+            wrapper.attrib.get("_subMeshName")
+            or wrapper.attrib.get("subMeshName")
+            or wrapper.attrib.get("Name")
+            or wrapper.attrib.get("name")
+            or ""
+        ).strip()
+        for parameter in wrapper.iter():
+            _append_parameter_bindings(parameter, submesh_name=submesh_name)
+
+    if bindings or wrapper_count > 0:
+        return tuple(bindings)
+
+    for parameter in root.iter():
+        _append_parameter_bindings(parameter)
+    return tuple(bindings)
+
+
+def parse_texture_sidecar_bindings(
+    sidecar_text: str,
+    *,
+    sidecar_path: str = "",
+) -> Tuple[TextureSidecarBinding, ...]:
+    return _parse_texture_sidecar_bindings_cached(str(sidecar_text or ""), str(sidecar_path or ""))
+
+
+def _semantic_priority_for_exact_sidecar_hint(texture_type: str) -> int:
+    normalized = str(texture_type or "").strip().lower()
+    return {
+        "color": 6,
+        "emissive": 6,
+        "normal": 5,
+        "height": 5,
+        "vector": 5,
+        "roughness": 4,
+        "mask": 3,
+    }.get(normalized, 0)
+
+
+def _semantic_hint_from_sidecar_parameter(
+    parameter_name: str,
+) -> Optional[Tuple[str, str, int, Tuple[str, ...], Tuple[str, ...]]]:
+    normalized = re.sub(r"[^a-z0-9]+", "", str(parameter_name or "").strip().lower())
+    if not normalized:
+        return None
+    label = _humanize_texture_parameter_name(parameter_name) or str(parameter_name or "").strip()
+    evidence = (f"sidecar exact binding: {label}",)
+
+    if "emissive" in normalized or "glow" in normalized:
+        return "emissive", "emissive", 99, evidence, ()
+    if any(token in normalized for token in ("basecolor", "overlaycolor", "diffuse", "albedo", "colortexture")):
+        semantic_subtype = "albedo" if any(token in normalized for token in ("basecolor", "albedo", "overlaycolor", "colortexture")) else "diffuse"
+        return "color", semantic_subtype, 99, evidence, ()
+    if "normal" in normalized:
+        semantic_subtype = "world_normal" if "world" in normalized else "normal"
+        return "normal", semantic_subtype, 99, evidence, ()
+    if any(token in normalized for token in ("height", "displacement", "parallax", "pom", "ssdm", "bump")):
+        if any(token in normalized for token in ("displacement", "ssdm")):
+            semantic_subtype = "displacement"
+        elif "bump" in normalized:
+            semantic_subtype = "bump"
+        elif any(token in normalized for token in ("parallax", "pom")):
+            semantic_subtype = "parallax_height"
+        else:
+            semantic_subtype = "height"
+        return "height", semantic_subtype, 98, evidence, ()
+    if any(token in normalized for token in ("flow", "vector", "velocity", "position", "pivot")):
+        if any(token in normalized for token in ("flow", "velocity")):
+            semantic_subtype = "flow_vector"
+        elif "pivot" in normalized:
+            semantic_subtype = "pivot_position"
+        elif "position" in normalized:
+            semantic_subtype = "position_vector"
+        else:
+            semantic_subtype = "vector"
+        return "vector", semantic_subtype, 96, evidence, ()
+    if any(token in normalized for token in ("roughness", "gloss", "smoothness")):
+        semantic_subtype = "gloss_or_smoothness" if any(token in normalized for token in ("gloss", "smoothness")) else "roughness"
+        return "roughness", semantic_subtype, 97, evidence, ()
+    if "specular" in normalized:
+        return "mask", "specular", 97, evidence, ("specular",)
+    if "metallic" in normalized or "metalness" in normalized:
+        return "mask", "metallic", 97, evidence, ("metallic",)
+    if "occlusion" in normalized or "ambientocclusion" in normalized or normalized.endswith("ao"):
+        return "mask", "ao", 97, evidence, ("ao",)
+    if "material" in normalized:
+        return "mask", "packed_mask", 98, evidence, ()
+    if "opacity" in normalized or "alpha" in normalized:
+        return "mask", "opacity_mask", 98, evidence, ("alpha",)
+    if "mask" in normalized:
+        return "mask", "mask", 96, evidence, ()
+    return None
+
+
+def _select_exact_sidecar_semantic_hint(
+    path_value: str,
+    sidecar_texts: Sequence[str],
+) -> Optional[Tuple[str, str, int, Tuple[str, ...], Tuple[str, ...]]]:
+    normalized_target = normalize_texture_reference_for_sidecar_lookup(path_value)
+    if not normalized_target:
+        return None
+    target_basename = PurePosixPath(normalized_target).name
+    if not target_basename:
+        return None
+
+    best_hint: Optional[Tuple[str, str, int, Tuple[str, ...], Tuple[str, ...]]] = None
+    best_score: Tuple[int, int, int, int] = (-1, -1, -1, -1)
+    for sidecar_text in sidecar_texts:
+        for binding in parse_texture_sidecar_bindings(sidecar_text):
+            normalized_binding = normalize_texture_reference_for_sidecar_lookup(binding.texture_path)
+            if not normalized_binding:
+                continue
+            if normalized_binding == normalized_target:
+                path_score = 2
+            elif PurePosixPath(normalized_binding).name == target_basename:
+                path_score = 1
+            else:
+                continue
+            semantic_hint = _semantic_hint_from_sidecar_parameter(binding.parameter_name)
+            if semantic_hint is None:
+                continue
+            texture_type, semantic_subtype, confidence, evidence, packed_channels = semantic_hint
+            candidate_score = (
+                path_score,
+                _semantic_priority_for_exact_sidecar_hint(texture_type),
+                confidence,
+                len(normalized_binding),
+            )
+            if candidate_score > best_score:
+                best_score = candidate_score
+                best_hint = (texture_type, semantic_subtype, confidence, evidence, packed_channels)
+    return best_hint
 
 
 def get_texture_preset_definition(preset: str) -> TexturePresetDefinition:
@@ -402,8 +649,13 @@ def infer_texture_semantics(
     evidence: List[str] = []
     combined_sidecar_text = "\n".join(text.lower() for text in sidecar_texts if text).lower()
     original_upper = original_texconv_format.strip().upper()
+    exact_sidecar_hint = _select_exact_sidecar_semantic_hint(path_value, sidecar_texts)
 
-    if texture_type == "height":
+    if exact_sidecar_hint is not None:
+        texture_type, semantic_subtype, confidence, exact_evidence, exact_packed_channels = exact_sidecar_hint
+        evidence.extend(exact_evidence)
+        packed_channels.extend(exact_packed_channels)
+    elif texture_type == "height":
         semantic_subtype = "height"
         if _stem_has_token(stem_lower, "disp", "displacement", "dmap") or _contains_any(
             combined_sidecar_text,

@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover - optional dependency
 from crimson_forge_toolkit.constants import APP_NAME
 from crimson_forge_toolkit.core.common import raise_if_cancelled
 from crimson_forge_toolkit.core.model_preview import _build_lod_summary, _build_model_preview
-from crimson_forge_toolkit.models import ArchiveEntry, ModelPreviewData, ModelPreviewMesh
+from crimson_forge_toolkit.models import ArchiveEntry, ModelPreviewData, ModelPreviewMesh, ModPackageInfo
 from crimson_forge_toolkit.modding.mesh_exporter import export_fbx, export_fbx_with_skeleton, export_obj
 from crimson_forge_toolkit.modding.mesh_importer import build_mesh, import_obj, transfer_pam_edit_to_pamlod_mesh
 from crimson_forge_toolkit.modding.mesh_parser import ParsedMesh, SubMesh, parse_mesh
@@ -623,6 +623,86 @@ def export_archive_payloads_to_mod_ready_loose(
     return ArchiveLooseExportResult(package_root=package_root, written_files=written_files)
 
 
+def export_archive_mesh_payloads_to_mod_ready_loose(
+    requests: Sequence[ArchivePatchRequest],
+    *,
+    primary_entry: ArchiveEntry,
+    preview_result: MeshImportPreviewResult,
+    source_obj_path: Path,
+    parent_root: Path,
+    package_info: ModPackageInfo,
+    create_no_encrypt_file: bool = True,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> ArchiveLooseExportResult:
+    from crimson_forge_toolkit.core.mod_package import (
+        MeshLooseModAsset,
+        MeshLooseModFile,
+        resolve_mod_package_root,
+        write_mesh_loose_mod_package_metadata,
+    )
+
+    if not requests:
+        raise ValueError("No archive payloads were provided for mesh mod-ready loose export.")
+
+    resolved_parent_root = parent_root.expanduser().resolve()
+    package_root = resolve_mod_package_root(resolved_parent_root, package_info)
+    files_root = package_root / "files"
+    files_root.mkdir(parents=True, exist_ok=True)
+
+    written_files: List[Path] = []
+    file_rows: List[MeshLooseModFile] = []
+    source_obj_display = source_obj_path.expanduser().resolve().as_posix()
+    paired_lod_path = (preview_result.paired_lod_path or "").strip().replace("\\", "/")
+    primary_path = primary_entry.path.replace("\\", "/")
+    for request in requests:
+        relative_parts = PurePosixPath(request.entry.path.replace("\\", "/")).parts
+        if not relative_parts:
+            raise ValueError(f"Archive path is invalid: {request.entry.path}")
+        target_path = files_root.joinpath(*relative_parts)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        _safe_log(on_log, f"Writing loose mesh payload: files/{target_path.relative_to(files_root).as_posix()}")
+        target_path.write_bytes(request.payload_data)
+        written_files.append(target_path)
+        note = ""
+        normalized_request_path = request.entry.path.replace("\\", "/")
+        if paired_lod_path and normalized_request_path == paired_lod_path and normalized_request_path != primary_path:
+            note = f"Auto-generated paired LOD for {primary_entry.path}"
+        file_rows.append(
+            MeshLooseModFile(
+                path=normalized_request_path,
+                package_group=request.entry.pamt_path.parent.name,
+                format=request.entry.extension.lstrip(".").lower(),
+                generated_from=source_obj_display,
+                note=note,
+            )
+        )
+
+    asset_rows = [
+        MeshLooseModAsset(
+            entry_path=primary_path,
+            package_group=primary_entry.pamt_path.parent.name,
+            format=primary_entry.extension.lstrip(".").lower(),
+            obj_path=source_obj_display,
+            vertices=int(preview_result.parsed_mesh.total_vertices or 0),
+            faces=int(preview_result.parsed_mesh.total_faces or 0),
+            submeshes=len(preview_result.parsed_mesh.submeshes),
+        )
+    ]
+    metadata_files = write_mesh_loose_mod_package_metadata(
+        package_root,
+        package_info,
+        assets=asset_rows,
+        files=file_rows,
+        include_paired_lod=bool(paired_lod_path),
+        create_no_encrypt_file=create_no_encrypt_file,
+    )
+
+    return ArchiveLooseExportResult(
+        package_root=package_root,
+        written_files=[*written_files, *metadata_files],
+    )
+
+
 def _refresh_changed_entries(pamt_paths: Iterable[Path], changed_paths: Iterable[str]) -> Dict[str, ArchiveEntry]:
     from crimson_forge_toolkit.core.archive import parse_archive_pamt
 
@@ -878,7 +958,9 @@ def build_mesh_import_preview(
     texture_entries_by_basename: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
 ) -> MeshImportPreviewResult:
     from crimson_forge_toolkit.core.archive import (
+        _attach_model_sidecar_texture_preview_paths,
         _attach_model_texture_preview_paths,
+        _extract_archive_model_sidecar_texture_references,
         build_archive_model_texture_references,
         read_archive_entry_data,
     )
@@ -897,8 +979,43 @@ def build_mesh_import_preview(
         f"Submeshes: {len(parsed_mesh.submeshes):,}",
         f"Rebuilt size: {len(rebuilt_data):,} bytes",
     ]
+    sidecar_texture_references: Tuple[object, ...] = ()
+    sidecar_reference_paths: Tuple[str, ...] = ()
+    if texture_entries_by_basename is not None:
+        sidecar_texture_references, sidecar_reference_paths = _extract_archive_model_sidecar_texture_references(
+            entry,
+            archive_entries_by_basename=(
+                dict(texture_entries_by_basename) if texture_entries_by_basename is not None else None
+            ),
+        )
+        if sidecar_texture_references:
+            sidecar_suffix = f" from {', '.join(sidecar_reference_paths[:2])}" if sidecar_reference_paths else ""
+            if len(sidecar_reference_paths) > 2:
+                sidecar_suffix += " ..."
+            summary_lines.append(
+                f"Companion material sidecar data contributed {len(sidecar_texture_references):,} texture binding(s){sidecar_suffix}."
+            )
+            summary_lines.append(
+                "Loose mesh mods may still need the matching companion .xml sidecar when custom material or texture remaps are involved."
+            )
     texture_references: Tuple[ArchiveModelTextureReference, ...] = ()
     if texconv_path is not None:
+        if sidecar_texture_references:
+            summary_lines.extend(
+                _attach_model_sidecar_texture_preview_paths(
+                    texconv_path,
+                    entry,
+                    preview_model,
+                    parsed_mesh=parsed_mesh,
+                    sidecar_texture_bindings=sidecar_texture_references,
+                    texture_entries_by_normalized_path=(
+                        dict(texture_entries_by_normalized_path) if texture_entries_by_normalized_path is not None else None
+                    ),
+                    texture_entries_by_basename=(
+                        dict(texture_entries_by_basename) if texture_entries_by_basename is not None else None
+                    ),
+                )
+            )
         summary_lines.extend(
             _attach_model_texture_preview_paths(
                 texconv_path,
@@ -917,6 +1034,7 @@ def build_mesh_import_preview(
             entry,
             preview_model,
             parsed_mesh=parsed_mesh,
+            sidecar_texture_references=sidecar_texture_references,
             texture_entries_by_normalized_path=(
                 dict(texture_entries_by_normalized_path) if texture_entries_by_normalized_path is not None else None
             ),

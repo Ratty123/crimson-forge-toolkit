@@ -4,11 +4,11 @@ Windows desktop tool for **Crimson Desert texture workflows**, **archive browsin
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-Latest release: `0.7.0-beta.1`
+Latest release: `0.7.0-beta.2`
 
-- added patch-capable archive workflows for supported mesh and audio entries, including backups, restore, and mod-ready export paths
-- added real `.pam` / `.pamlod` / `.pac` model preview, OBJ/FBX export, OBJ import preview, texture reference tools, and in-app textured shading
-- expanded archive media/text coverage with `.wem` playback, `.mp4` playback, `.bnk` inspection, richer binary/text preview, and stronger archive-browser responsiveness
+- keeps the `0.7.x` archive patching, mesh preview/modding, media preview, and referenced-texture workflows introduced in the previous beta
+- improves loose mesh export packaging so `Import OBJ...` now prompts for the package metadata instead of silently reusing saved defaults
+- improves PAC / PAM companion sidecar texture handling so referenced texture rows preserve `_baseColorTexture`, `_normalTexture`, `_materialTexture`, `_heightTexture`, `_maskTexture`, and similar semantic roles more accurately
 
 Project guidelines:
 

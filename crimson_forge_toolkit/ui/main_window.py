@@ -37,6 +37,7 @@ from crimson_forge_toolkit.core.archive_modding import (
     build_archive_texture_payload_from_dds,
     build_archive_texture_payload_from_png,
     build_mesh_import_preview,
+    export_archive_mesh_payloads_to_mod_ready_loose,
     export_archive_payloads_to_mod_ready_loose,
     export_archive_audio_as_wav,
     export_archive_mesh,
@@ -7340,11 +7341,31 @@ def run_gui() -> int:
                         self.archive_tree.scrollToItem(target_item, QAbstractItemView.PositionAtCenter)
                         self.set_status_message(f"Focused Archive Browser on {normalized_path}.")
                         return
-                if any(entry.path == normalized_path for entry in self.archive_entries):
-                    self.set_status_message(
-                        "Archive Browser is open, but the current archive filters hide this file. Clear or adjust the filters to reveal it.",
-                        error=True,
-                    )
+                matching_entry = next((entry for entry in self.archive_entries if entry.path == normalized_path), None)
+                if matching_entry is not None:
+                    if self.worker_thread is not None:
+                        self.set_status_message(
+                            "Archive Browser is busy. Wait for the current task to finish, then try again.",
+                            error=True,
+                        )
+                        return
+                    self.archive_filter_edit.clear()
+                    self.archive_exclude_filter_edit.clear()
+                    self.archive_package_filter_edit.clear()
+                    self.archive_structure_filter_pending_value = ARCHIVE_STRUCTURE_FILTER
+                    self._rebuild_archive_structure_filter_controls(ARCHIVE_STRUCTURE_FILTER)
+                    self._set_combo_by_value(self.archive_role_filter_combo, ARCHIVE_ROLE_FILTER)
+                    self.archive_exclude_common_technical_checkbox.setChecked(False)
+                    self.archive_min_size_spin.setValue(ARCHIVE_MIN_SIZE_KB)
+                    self.archive_previewable_only_checkbox.setChecked(False)
+                    self._rebuild_archive_extension_filter_choices(matching_entry.extension)
+                    self._set_combo_by_value(self.archive_extension_filter_combo, matching_entry.extension)
+                    self._save_settings()
+                    self.archive_filters_dirty = False
+                    self._update_archive_filter_button_state()
+                    self._start_archive_filter_worker(normalized_path)
+                    self.set_status_message(f"Revealing {normalized_path} in Archive Browser...")
+                    return
                 else:
                     self.set_status_message(
                         f"Archive Browser is open. Could not find {normalized_path} in the loaded archive index.",
@@ -8666,10 +8687,139 @@ def run_gui() -> int:
                 return ""
             return ""
 
+        def _prompt_archive_mod_ready_export_target(
+            self,
+            *,
+            browse_title: str,
+            initial_export_root: Path,
+            initial_package_info: ModPackageInfo,
+            initial_create_no_encrypt: bool,
+            dialog_title: str = "Write Mod-Ready Loose File",
+        ) -> Optional[Tuple[Path, ModPackageInfo, bool]]:
+            dialog = QDialog(self)
+            dialog.setWindowTitle(dialog_title)
+            dialog.setModal(True)
+            dialog.resize(680, 260)
+
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(10)
+
+            intro_label = QLabel(
+                "Choose the loose package parent folder and the basic metadata that should be written into info.json. "
+                "The same title, version, author, and description are then reused for the basic manifest.json metadata."
+            )
+            intro_label.setWordWrap(True)
+            intro_label.setObjectName("HintLabel")
+            layout.addWidget(intro_label)
+
+            form_layout = QGridLayout()
+            form_layout.setHorizontalSpacing(8)
+            form_layout.setVerticalSpacing(8)
+
+            export_root_edit = QLineEdit(str(initial_export_root))
+            browse_button = QPushButton("Browse...")
+            title_edit = QLineEdit(str(getattr(initial_package_info, "title", "") or "").strip())
+            version_edit = QLineEdit(str(getattr(initial_package_info, "version", "") or "").strip())
+            author_edit = QLineEdit(str(getattr(initial_package_info, "author", "") or "").strip())
+            description_edit = QLineEdit(str(getattr(initial_package_info, "description", "") or "").strip())
+            no_encrypt_checkbox = QCheckBox("Create .no_encrypt file")
+            no_encrypt_checkbox.setChecked(bool(initial_create_no_encrypt))
+
+            title_edit.setPlaceholderText(MOD_READY_PACKAGE_TITLE)
+            version_edit.setPlaceholderText(MOD_READY_PACKAGE_VERSION)
+            author_edit.setPlaceholderText(MOD_READY_PACKAGE_AUTHOR)
+            description_edit.setPlaceholderText(MOD_READY_PACKAGE_DESCRIPTION)
+
+            form_layout.addWidget(QLabel("Parent export root"), 0, 0)
+            form_layout.addWidget(export_root_edit, 0, 1)
+            form_layout.addWidget(browse_button, 0, 2)
+            form_layout.addWidget(QLabel("Package title"), 1, 0)
+            form_layout.addWidget(title_edit, 1, 1, 1, 2)
+            form_layout.addWidget(QLabel("Version"), 2, 0)
+            form_layout.addWidget(version_edit, 2, 1, 1, 2)
+            form_layout.addWidget(QLabel("Author"), 3, 0)
+            form_layout.addWidget(author_edit, 3, 1, 1, 2)
+            form_layout.addWidget(QLabel("Description"), 4, 0)
+            form_layout.addWidget(description_edit, 4, 1, 1, 2)
+            form_layout.addWidget(no_encrypt_checkbox, 5, 0, 1, 3)
+            form_layout.setColumnStretch(1, 1)
+            layout.addLayout(form_layout)
+
+            hint_label = QLabel(
+                "Warning: rebuilding a mesh payload does not automatically rewrite every referenced DDS or the companion material sidecars. "
+                "For many PAC meshes, the matching .pac.xml still controls important material and texture assignments. "
+                "For PAM / PAMLOD meshes, the matching .pami often carries the same kind of texture-role data. "
+                "If the imported mesh changes submesh/material usage, you may also need to review the linked DDS files and those companion sidecars."
+            )
+            hint_label.setWordWrap(True)
+            hint_label.setObjectName("HintLabel")
+            layout.addWidget(hint_label)
+
+            button_row = QHBoxLayout()
+            button_row.setSpacing(8)
+            button_row.addStretch(1)
+            cancel_button = QPushButton("Cancel")
+            continue_button = QPushButton("Continue")
+            continue_button.setDefault(True)
+            button_row.addWidget(cancel_button)
+            button_row.addWidget(continue_button)
+            layout.addLayout(button_row)
+
+            result: List[object] = []
+
+            def _browse_export_root() -> None:
+                selected_dir = QFileDialog.getExistingDirectory(
+                    dialog,
+                    browse_title,
+                    export_root_edit.text().strip() or str(initial_export_root),
+                )
+                if selected_dir:
+                    export_root_edit.setText(selected_dir)
+
+            def _accept() -> None:
+                export_root_text = export_root_edit.text().strip()
+                if not export_root_text:
+                    QMessageBox.warning(dialog, dialog_title, "Parent export root is required.")
+                    return
+                export_root = Path(export_root_text).expanduser()
+                package_info = ModPackageInfo(
+                    title=title_edit.text().strip() or MOD_READY_PACKAGE_TITLE,
+                    version=version_edit.text().strip() or MOD_READY_PACKAGE_VERSION,
+                    author=author_edit.text().strip(),
+                    description=description_edit.text().strip(),
+                    nexus_url="",
+                )
+                result[:] = [export_root, package_info, bool(no_encrypt_checkbox.isChecked())]
+                dialog.accept()
+
+            browse_button.clicked.connect(_browse_export_root)
+            cancel_button.clicked.connect(dialog.reject)
+            continue_button.clicked.connect(_accept)
+
+            if dialog.exec() != QDialog.Accepted or len(result) != 3:
+                return None
+
+            export_root = Path(result[0]).expanduser()
+            package_info = result[1] if isinstance(result[1], ModPackageInfo) else initial_package_info
+            create_no_encrypt_file = bool(result[2])
+
+            self.mod_ready_export_root_edit.setText(str(export_root))
+            self.mod_ready_package_title_edit.setText(package_info.title)
+            self.mod_ready_package_version_edit.setText(package_info.version)
+            self.mod_ready_package_author_edit.setText(package_info.author)
+            self.mod_ready_package_description_edit.setText(package_info.description)
+            self.mod_ready_create_no_encrypt_checkbox.setChecked(create_no_encrypt_file)
+            self.schedule_settings_save()
+
+            return export_root, package_info, create_no_encrypt_file
+
         def _collect_archive_mod_ready_export_target(
             self,
             *,
             browse_title: str,
+            prompt_for_metadata: bool = False,
+            dialog_title: str = "Write Mod-Ready Loose File",
         ) -> Optional[Tuple[Path, ModPackageInfo, bool]]:
             config = self.collect_config()
             export_root_text = str(getattr(config, "mod_ready_export_root", "") or "").strip()
@@ -8693,10 +8843,19 @@ def run_gui() -> int:
                 description=str(getattr(config, "mod_ready_package_description", MOD_READY_PACKAGE_DESCRIPTION) or "").strip(),
                 nexus_url=str(getattr(config, "mod_ready_package_nexus_url", MOD_READY_PACKAGE_NEXUS_URL) or "").strip(),
             )
+            create_no_encrypt_file = bool(getattr(config, "mod_ready_create_no_encrypt_file", True))
+            if prompt_for_metadata:
+                return self._prompt_archive_mod_ready_export_target(
+                    browse_title=browse_title,
+                    initial_export_root=export_root,
+                    initial_package_info=package_info,
+                    initial_create_no_encrypt=create_no_encrypt_file,
+                    dialog_title=dialog_title,
+                )
             return (
                 export_root,
                 package_info,
-                bool(getattr(config, "mod_ready_create_no_encrypt_file", True)),
+                create_no_encrypt_file,
             )
 
         def _replace_selected_archive_texture_reference_from_dds(self) -> None:
@@ -8730,7 +8889,9 @@ def run_gui() -> int:
             loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool]] = None
             if destination == "loose":
                 loose_export_settings = self._collect_archive_mod_ready_export_target(
-                    browse_title="Select Mod-Ready Export Parent Root"
+                    browse_title="Select Mod-Ready Export Parent Root",
+                    prompt_for_metadata=True,
+                    dialog_title="Mesh Loose Export Metadata",
                 )
                 if loose_export_settings is None:
                     return
@@ -8823,7 +8984,9 @@ def run_gui() -> int:
             loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool]] = None
             if destination == "loose":
                 loose_export_settings = self._collect_archive_mod_ready_export_target(
-                    browse_title="Select Mod-Ready Export Parent Root"
+                    browse_title="Select Mod-Ready Export Parent Root",
+                    prompt_for_metadata=True,
+                    dialog_title="Mesh Loose Export Metadata",
                 )
                 if loose_export_settings is None:
                     return
@@ -9120,7 +9283,9 @@ def run_gui() -> int:
             loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool]] = None
             if destination == "loose":
                 loose_export_settings = self._collect_archive_mod_ready_export_target(
-                    browse_title="Select Mod-Ready Export Parent Root"
+                    browse_title="Select Mod-Ready Export Parent Root",
+                    prompt_for_metadata=True,
+                    dialog_title="Mesh Loose Export Metadata",
                 )
                 if loose_export_settings is None:
                     return
@@ -9154,8 +9319,11 @@ def run_gui() -> int:
                     raise RuntimeError("Mod-ready export target is not available.")
                 parent_root, package_info, create_no_encrypt = loose_export_settings
                 log(f"Writing {len(requests)} rebuilt entrie(s) into a mod-ready loose package...")
-                loose_result = export_archive_payloads_to_mod_ready_loose(
+                loose_result = export_archive_mesh_payloads_to_mod_ready_loose(
                     requests,
+                    primary_entry=entry,
+                    preview_result=preview_result,
+                    source_obj_path=Path(obj_path),
                     parent_root=parent_root,
                     package_info=package_info,
                     create_no_encrypt_file=create_no_encrypt,
