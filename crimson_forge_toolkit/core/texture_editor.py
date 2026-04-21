@@ -145,6 +145,7 @@ def derive_texture_editor_binding(
     semantic_path = source_binding.relative_path or source_binding.archive_relative_path or resolved.name
     semantic = infer_texture_semantics(
         semantic_path,
+        sidecar_texts=tuple(str(text or "") for text in getattr(source_binding, "semantic_sidecar_texts", ()) if text),
         original_texconv_format=source_binding.original_texconv_format,
     )
     source_binding.texture_type = semantic.texture_type

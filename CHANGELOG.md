@@ -9,6 +9,26 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.7.0-beta.4] - 2026-04-21
+
+### Added
+- Added a broader `Referenced Files` browser beside mesh previews in `Archive Browser`, so supported `.pam`, `.pamlod`, and `.pac` entries can now surface related `.dds`, `.xml`, `.pami`, `.meshinfo`, `.pab`, `.paa`, `.pae`, and similar companion files with direct open/export actions.
+- Added multi-file related-export actions from the mesh preview pane, including `Export Selected...` and `Export All...` for resolved referenced files.
+- Added structured binary inspectors for `.meshinfo`, `.paa`, `.pae` / `.paem`, and richer `.pab`-adjacent companion discovery so those files no longer fall back to raw string dumps as often.
+
+### Changed
+- Changed mesh import/export workflows so `Export OBJ...`, `Export FBX...`, `Import OBJ Preview...`, and `Import OBJ...` can all work with optional supplemental local files such as sidecar `.xml` / `.pami` data and matching `.dds` textures when you want the preview or loose export to reflect a fuller material setup.
+- Changed loose mesh package output so the generated `README.txt`, `manifest.json`, and `info.json` stay cleaner and more focused on the minimum metadata needed for a practical mod-ready package.
+- Changed sidecar-aware archive reference handling so preview/detail flows can carry richer related-file context instead of limiting the mesh side panel to textures only.
+
+### Fixed
+- Fixed PAC textured preview orientation for archive and local supplemental-file workflows, so sidecar-backed `.pac` previews no longer rely on the previous vertical-flip guess in cases where the texture should be used as-is.
+- Fixed related-file actions so archive mesh companions can be opened or exported directly from the preview pane instead of only being listed.
+- Fixed more semantic propagation from `.pac.xml` / `.pami` sidecars so referenced-file rows and preview texture assignment retain better `_baseColorTexture`, `_normalTexture`, `_materialTexture`, `_heightTexture`, `_maskTexture`, and similar role information.
+
+### Docs
+- Updated release version references from `0.7.0-beta.2` to `0.7.0-beta.4` in the README, changelog, and app version metadata.
+
 ## [0.7.0-beta.2] - 2026-04-20
 
 ### Added

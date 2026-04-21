@@ -45,6 +45,7 @@ class MeshImportPreviewResult:
     preview_model: ModelPreviewData
     summary_lines: List[str]
     texture_references: Tuple[ArchiveModelTextureReference, ...] = ()
+    supplemental_file_specs: Tuple["MeshImportSupplementalFileSpec", ...] = ()
     paired_lod_data: Optional[bytes] = None
     paired_lod_path: str = ""
 
@@ -67,6 +68,15 @@ class ArchivePatchResult:
 class ArchiveLooseExportResult:
     package_root: Path
     written_files: List[Path]
+
+
+@dataclass(slots=True)
+class MeshImportSupplementalFileSpec:
+    source_path: Path
+    target_path: str = ""
+    kind: str = ""
+    target_entry: Optional[ArchiveEntry] = None
+    used_for_preview: bool = False
 
 
 @dataclass(slots=True)
@@ -150,9 +160,397 @@ def _normalize_virtual_path(value: str) -> str:
     return str(value or "").replace("\\", "/").strip().lower()
 
 
+def _mesh_import_candidate_virtual_paths(source_path: Path) -> Tuple[str, ...]:
+    normalized_parts = [part for part in source_path.expanduser().parts if part]
+    if not normalized_parts:
+        return ()
+    lowered_parts = [str(part).strip() for part in normalized_parts]
+    ordered: List[str] = []
+    seen: set[str] = set()
+
+    def _append(parts: Sequence[str]) -> None:
+        candidate = PurePosixPath(*parts).as_posix().strip()
+        normalized_candidate = _normalize_virtual_path(candidate)
+        if not normalized_candidate or normalized_candidate in seen:
+            return
+        seen.add(normalized_candidate)
+        ordered.append(candidate)
+
+    for index, part in enumerate(lowered_parts):
+        if str(part).strip().lower() == "files" and index + 1 < len(lowered_parts):
+            _append(lowered_parts[index + 1 :])
+            break
+
+    asset_root_markers = {
+        "animation",
+        "character",
+        "effect",
+        "gamedata",
+        "leveldata",
+        "movie",
+        "object",
+        "sound",
+        "ui",
+    }
+    for index, part in enumerate(lowered_parts):
+        if str(part).strip().lower() in asset_root_markers:
+            _append(lowered_parts[index:])
+            break
+
+    _append([source_path.name])
+    return tuple(ordered)
+
+
+def _resolve_supplemental_target_entry(
+    source_path: Path,
+    *,
+    archive_entries_by_normalized_path: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    archive_entries_by_basename: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    preferred_paths: Sequence[str] = (),
+) -> Tuple[Optional[ArchiveEntry], str]:
+    candidate_virtual_paths: List[str] = []
+    seen_virtual_paths: set[str] = set()
+    for raw_path in list(preferred_paths) + list(_mesh_import_candidate_virtual_paths(source_path)):
+        normalized = _normalize_virtual_path(raw_path)
+        if not normalized or normalized in seen_virtual_paths:
+            continue
+        seen_virtual_paths.add(normalized)
+        candidate_virtual_paths.append(raw_path)
+
+    if archive_entries_by_normalized_path is not None:
+        for candidate_virtual_path in candidate_virtual_paths:
+            normalized = _normalize_virtual_path(candidate_virtual_path)
+            entries = archive_entries_by_normalized_path.get(normalized, ())
+            if entries:
+                return entries[0], candidate_virtual_path.replace("\\", "/")
+
+    basename = source_path.name.lower()
+    if archive_entries_by_basename is not None and basename:
+        entries = archive_entries_by_basename.get(basename, ())
+        if len(entries) == 1:
+            return entries[0], entries[0].path
+
+    if candidate_virtual_paths:
+        return None, candidate_virtual_paths[0].replace("\\", "/")
+    return None, ""
+
+
+def _build_mesh_import_local_dds_lookup(
+    supplemental_files: Sequence[Path],
+) -> Tuple[Dict[str, Path], Dict[str, Path]]:
+    by_normalized_path: Dict[str, Path] = {}
+    by_basename: Dict[str, Path] = {}
+    for supplemental_path in supplemental_files:
+        if supplemental_path.suffix.lower() != ".dds":
+            continue
+        resolved_path = supplemental_path.expanduser().resolve()
+        for candidate_virtual_path in _mesh_import_candidate_virtual_paths(resolved_path):
+            normalized = _normalize_virtual_path(candidate_virtual_path)
+            if normalized and normalized not in by_normalized_path:
+                by_normalized_path[normalized] = resolved_path
+        basename = resolved_path.name.lower()
+        if basename and basename not in by_basename:
+            by_basename[basename] = resolved_path
+    return by_normalized_path, by_basename
+
+
+def _apply_mesh_import_local_sidecar_texture_overrides(
+    preview_model: ModelPreviewData,
+    parsed_mesh: Optional[ParsedMesh],
+    sidecar_texture_bindings: Sequence[object],
+    supplemental_dds_by_normalized_path: Mapping[str, Path],
+    supplemental_dds_by_basename: Mapping[str, Path],
+    *,
+    texconv_path: Optional[Path],
+) -> List[str]:
+    if texconv_path is None or not getattr(preview_model, "meshes", None) or not sidecar_texture_bindings:
+        return []
+
+    from crimson_forge_toolkit.core.archive import (
+        _is_visible_model_texture_type,
+        _iter_model_submesh_reference_candidates,
+        _iter_parsed_model_submeshes,
+        _model_texture_hint_priority,
+        _model_texture_semantic_priority,
+        _normalize_model_submesh_reference,
+        _resolve_model_texture_semantics,
+    )
+    from crimson_forge_toolkit.core.pipeline import ensure_dds_display_preview_png, parse_dds
+    from crimson_forge_toolkit.core.upscale_profiles import normalize_texture_reference_for_sidecar_lookup
+
+    resolved_texconv_path = texconv_path.expanduser().resolve()
+    parsed_submeshes = _iter_parsed_model_submeshes(parsed_mesh)
+    preview_cache: Dict[str, str] = {}
+    resolved_by_submesh: Dict[str, Tuple[Tuple[int, int, int, int], Path, str, str, str]] = {}
+    global_visible_bindings: List[Tuple[Path, str, str, str]] = []
+    fallback_visible_bindings: List[Tuple[Tuple[int, int, int, int], Path, str, str, str]] = []
+    seen_fallback_binding_keys: set[Tuple[str, str, str]] = set()
+    seen_global_binding_keys: set[Tuple[str, str]] = set()
+    promoted_anonymous_fallback = False
+
+    for binding in sidecar_texture_bindings:
+        texture_path = str(getattr(binding, "texture_path", "") or "").strip()
+        if not texture_path:
+            continue
+        normalized_texture_path = normalize_texture_reference_for_sidecar_lookup(texture_path)
+        basename = PurePosixPath(normalized_texture_path or texture_path.replace("\\", "/")).name.lower()
+        override_path = supplemental_dds_by_normalized_path.get(normalized_texture_path)
+        if override_path is None and basename:
+            override_path = supplemental_dds_by_basename.get(basename)
+        if override_path is None:
+            continue
+
+        parameter_name = str(getattr(binding, "parameter_name", "") or "").strip()
+        texture_type, semantic_subtype, confidence = _resolve_model_texture_semantics(texture_path)
+        priority = _model_texture_hint_priority(parameter_name)
+        if priority is None:
+            priority = _model_texture_semantic_priority(texture_type, semantic_subtype)
+        if priority[0] <= 0 and not _is_visible_model_texture_type(texture_type):
+            continue
+
+        candidate_key = (priority[0], priority[1], confidence, -len(texture_path or override_path.name))
+        submesh_name = str(getattr(binding, "submesh_name", "") or "").strip()
+        submesh_keys = _iter_model_submesh_reference_candidates(submesh_name)
+        fallback_binding_key = (
+            _normalize_model_submesh_reference(submesh_name),
+            basename,
+            parameter_name.lower(),
+        )
+        if fallback_binding_key not in seen_fallback_binding_keys:
+            seen_fallback_binding_keys.add(fallback_binding_key)
+            fallback_visible_bindings.append((candidate_key, override_path, parameter_name, submesh_name, texture_path))
+        if submesh_keys:
+            for submesh_key in submesh_keys:
+                existing = resolved_by_submesh.get(submesh_key)
+                if existing is None or candidate_key > existing[0]:
+                    resolved_by_submesh[submesh_key] = (
+                        candidate_key,
+                        override_path,
+                        parameter_name,
+                        submesh_name,
+                        texture_path,
+                    )
+        else:
+            global_key = (basename, parameter_name.lower())
+            if global_key not in seen_global_binding_keys:
+                seen_global_binding_keys.add(global_key)
+                global_visible_bindings.append((override_path, parameter_name, submesh_name, texture_path))
+
+    def _preview_path_for_dds(dds_path: Path) -> str:
+        cache_key = str(dds_path).lower()
+        preview_path = preview_cache.get(cache_key, "")
+        if preview_path:
+            return preview_path
+        dds_info = None
+        try:
+            dds_info = parse_dds(dds_path)
+        except Exception:
+            dds_info = None
+        preview_path = ensure_dds_display_preview_png(
+            resolved_texconv_path,
+            dds_path,
+            dds_info=dds_info,
+        )
+        preview_cache[cache_key] = preview_path
+        return preview_path
+
+    assigned_count = 0
+    unresolved_meshes: List[ModelPreviewMesh] = []
+    for mesh_index, mesh in enumerate(preview_model.meshes):
+        if str(getattr(mesh, "preview_texture_path", "") or "").strip():
+            continue
+        parsed_submesh = parsed_submeshes[mesh_index] if mesh_index < len(parsed_submeshes) else None
+        candidate_keys = _iter_model_submesh_reference_candidates(
+            str(getattr(parsed_submesh, "name", "") or ""),
+            str(getattr(parsed_submesh, "material", "") or ""),
+            str(getattr(parsed_submesh, "texture", "") or ""),
+            str(getattr(mesh, "material_name", "") or ""),
+            str(getattr(mesh, "texture_name", "") or ""),
+        )
+        best_match: Optional[Tuple[Tuple[int, int, int, int], Path, str, str, str]] = None
+        for candidate_key_text in candidate_keys:
+            resolved = resolved_by_submesh.get(candidate_key_text)
+            if resolved is None:
+                continue
+            if best_match is None or resolved[0] > best_match[0]:
+                best_match = resolved
+        if best_match is None:
+            unresolved_meshes.append(mesh)
+            continue
+        _candidate_key, override_path, _parameter_name, submesh_name, texture_path = best_match
+        try:
+            mesh.preview_texture_path = _preview_path_for_dds(override_path)
+            mesh.texture_name = texture_path or override_path.name
+            mesh.preview_texture_flip_vertical = False
+            current_material_name = str(getattr(mesh, "material_name", "") or "").strip()
+            if submesh_name and not current_material_name:
+                mesh.material_name = submesh_name
+            assigned_count += 1
+        except Exception:
+            continue
+
+    if not global_visible_bindings and unresolved_meshes and fallback_visible_bindings:
+        unique_named_sidecar_submeshes = {
+            _normalize_model_submesh_reference(submesh_name)
+            for _candidate_key, _override_path, _parameter_name, submesh_name, _texture_path in fallback_visible_bindings
+            if _normalize_model_submesh_reference(submesh_name)
+        }
+        should_promote_fallback = (
+            len(unresolved_meshes) == 1
+            or len(preview_model.meshes) == 1
+            or len(parsed_submeshes) <= 1
+            or len(unique_named_sidecar_submeshes) == 1
+        )
+        if should_promote_fallback:
+            fallback_visible_bindings.sort(key=lambda item: item[0], reverse=True)
+            _candidate_key, override_path, parameter_name, submesh_name, texture_path = fallback_visible_bindings[0]
+            global_visible_bindings.append((override_path, parameter_name, submesh_name, texture_path))
+            promoted_anonymous_fallback = True
+
+    if global_visible_bindings and unresolved_meshes:
+        if len(global_visible_bindings) == 1:
+            override_path, _parameter_name, submesh_name, texture_path = global_visible_bindings[0]
+            for mesh in unresolved_meshes:
+                if str(getattr(mesh, "preview_texture_path", "") or "").strip():
+                    continue
+                try:
+                    mesh.preview_texture_path = _preview_path_for_dds(override_path)
+                    mesh.texture_name = texture_path or override_path.name
+                    mesh.preview_texture_flip_vertical = False
+                    current_material_name = str(getattr(mesh, "material_name", "") or "").strip()
+                    if submesh_name and not current_material_name:
+                        mesh.material_name = submesh_name
+                    assigned_count += 1
+                except Exception:
+                    continue
+        else:
+            binding_index = 0
+            for mesh in unresolved_meshes:
+                if str(getattr(mesh, "preview_texture_path", "") or "").strip():
+                    continue
+                if binding_index >= len(global_visible_bindings):
+                    break
+                override_path, _parameter_name, submesh_name, texture_path = global_visible_bindings[binding_index]
+                binding_index += 1
+                try:
+                    mesh.preview_texture_path = _preview_path_for_dds(override_path)
+                    mesh.texture_name = texture_path or override_path.name
+                    mesh.preview_texture_flip_vertical = False
+                    current_material_name = str(getattr(mesh, "material_name", "") or "").strip()
+                    if submesh_name and not current_material_name:
+                        mesh.material_name = submesh_name
+                    assigned_count += 1
+                except Exception:
+                    continue
+
+    if assigned_count <= 0:
+        return []
+    info_lines = [
+        f"Applied {assigned_count:,} local sidecar-driven texture preview binding(s) from the selected supplemental files."
+    ]
+    if promoted_anonymous_fallback:
+        info_lines.append(
+            "Used a local sidecar texture fallback because the rebuilt preview did not preserve a reliable submesh/material name match."
+        )
+    return info_lines
+
+
+def _apply_mesh_import_local_texture_overrides(
+    preview_model: ModelPreviewData,
+    supplemental_dds_by_normalized_path: Mapping[str, Path],
+    supplemental_dds_by_basename: Mapping[str, Path],
+    *,
+    texconv_path: Optional[Path],
+) -> List[str]:
+    if texconv_path is None or not getattr(preview_model, "meshes", None):
+        return []
+
+    from crimson_forge_toolkit.core.pipeline import ensure_dds_display_preview_png, parse_dds
+
+    resolved_texconv_path = texconv_path.expanduser().resolve()
+    preview_cache: Dict[str, str] = {}
+    override_count = 0
+    unresolved_names: List[str] = []
+    for mesh in preview_model.meshes:
+        texture_name = str(getattr(mesh, "texture_name", "") or "").strip()
+        if not texture_name:
+            continue
+        normalized_texture_name = _normalize_virtual_path(texture_name)
+        basename = PurePosixPath(texture_name.replace("\\", "/")).name.lower()
+        override_path = supplemental_dds_by_normalized_path.get(normalized_texture_name)
+        if override_path is None and basename:
+            override_path = supplemental_dds_by_basename.get(basename)
+        if override_path is None:
+            if texture_name not in unresolved_names and len(unresolved_names) < 5:
+                unresolved_names.append(texture_name)
+            continue
+        cache_key = str(override_path).lower()
+        preview_path = preview_cache.get(cache_key, "")
+        if not preview_path:
+            dds_info = None
+            try:
+                dds_info = parse_dds(override_path)
+            except Exception:
+                dds_info = None
+            preview_path = ensure_dds_display_preview_png(
+                resolved_texconv_path,
+                override_path,
+                dds_info=dds_info,
+            )
+            preview_cache[cache_key] = preview_path
+        mesh.preview_texture_path = preview_path
+        mesh.preview_texture_flip_vertical = False
+        override_count += 1
+
+    info_lines: List[str] = []
+    if override_count > 0:
+        info_lines.append(f"Applied {override_count:,} local DDS override texture(s) from the selected supplemental files.")
+    return info_lines
+
+
+def _merge_sidecar_text_maps(
+    base_map: Mapping[str, Tuple[str, ...]],
+    extra_map: Mapping[str, Tuple[str, ...]],
+) -> Dict[str, Tuple[str, ...]]:
+    merged: Dict[str, List[str]] = {key: list(values) for key, values in base_map.items()}
+    for key, values in extra_map.items():
+        bucket = merged.setdefault(key, [])
+        for value in values:
+            if value not in bucket:
+                bucket.append(value)
+    return {key: tuple(values) for key, values in merged.items()}
+
+
 def _safe_log(log: Optional[Callable[[str], None]], message: str) -> None:
     if log is not None:
         log(message)
+
+
+def _export_related_archive_entries(
+    entries: Sequence[ArchiveEntry],
+    output_root: Path,
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> List[Path]:
+    from crimson_forge_toolkit.core.archive import ensure_archive_preview_source
+
+    written_paths: List[Path] = []
+    seen_paths: set[str] = set()
+    for entry in entries:
+        normalized_path = _normalize_virtual_path(entry.path)
+        if not normalized_path or normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+        relative_parts = PurePosixPath(entry.path.replace("\\", "/")).parts
+        if not relative_parts:
+            continue
+        source_path, _note = ensure_archive_preview_source(entry)
+        target_path = output_root.joinpath(*relative_parts)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        _safe_log(on_log, f"Copying related file: {target_path.relative_to(output_root).as_posix()}")
+        shutil.copy2(source_path, target_path)
+        written_paths.append(target_path)
+    return written_paths
 
 
 def _parse_mutable_pamt(pamt_path: Path) -> _MutablePamt:
@@ -632,6 +1030,9 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
     parent_root: Path,
     package_info: ModPackageInfo,
     create_no_encrypt_file: bool = True,
+    include_related_files: bool = False,
+    related_entries_to_include: Optional[Sequence[ArchiveEntry]] = None,
+    supplemental_files_to_include: Sequence[MeshImportSupplementalFileSpec] = (),
     on_log: Optional[Callable[[str], None]] = None,
 ) -> ArchiveLooseExportResult:
     from crimson_forge_toolkit.core.mod_package import (
@@ -640,6 +1041,7 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
         resolve_mod_package_root,
         write_mesh_loose_mod_package_metadata,
     )
+    from crimson_forge_toolkit.core.archive import ensure_archive_preview_source
 
     if not requests:
         raise ValueError("No archive payloads were provided for mesh mod-ready loose export.")
@@ -654,6 +1056,7 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
     source_obj_display = source_obj_path.expanduser().resolve().as_posix()
     paired_lod_path = (preview_result.paired_lod_path or "").strip().replace("\\", "/")
     primary_path = primary_entry.path.replace("\\", "/")
+    written_virtual_paths: set[str] = set()
     for request in requests:
         relative_parts = PurePosixPath(request.entry.path.replace("\\", "/")).parts
         if not relative_parts:
@@ -665,6 +1068,7 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
         written_files.append(target_path)
         note = ""
         normalized_request_path = request.entry.path.replace("\\", "/")
+        written_virtual_paths.add(normalized_request_path.lower())
         if paired_lod_path and normalized_request_path == paired_lod_path and normalized_request_path != primary_path:
             note = f"Auto-generated paired LOD for {primary_entry.path}"
         file_rows.append(
@@ -676,6 +1080,93 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
                 note=note,
             )
         )
+
+    supplemental_specs = [
+        spec
+        for spec in supplemental_files_to_include
+        if isinstance(spec, MeshImportSupplementalFileSpec) and spec.source_path.expanduser().resolve().is_file()
+    ]
+    for spec in supplemental_specs:
+        normalized_target_path = str(spec.target_path or "").strip().replace("\\", "/")
+        if not normalized_target_path:
+            _safe_log(
+                on_log,
+                f"Skipping selected supplemental file without a mapped loose target: {spec.source_path.name}",
+            )
+            continue
+        relative_parts = PurePosixPath(normalized_target_path).parts
+        if not relative_parts:
+            _safe_log(
+                on_log,
+                f"Skipping selected supplemental file with an invalid target path: {spec.source_path.name}",
+            )
+            continue
+        target_path = files_root.joinpath(*relative_parts)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        _safe_log(
+            on_log,
+            f"Copying selected supplemental file: files/{target_path.relative_to(files_root).as_posix()}",
+        )
+        shutil.copy2(spec.source_path, target_path)
+        if target_path not in written_files:
+            written_files.append(target_path)
+        written_virtual_paths.add(normalized_target_path.lower())
+        if spec.kind == "sidecar":
+            note = f"Selected local sidecar included for {primary_entry.path}"
+        elif spec.kind == "texture":
+            note = f"Selected local texture override included for {primary_entry.path}"
+        else:
+            note = f"Selected local file included for {primary_entry.path}"
+        package_group = ""
+        if isinstance(spec.target_entry, ArchiveEntry):
+            package_group = spec.target_entry.pamt_path.parent.name
+        file_rows.append(
+            MeshLooseModFile(
+                path=normalized_target_path,
+                package_group=package_group,
+                format=spec.source_path.suffix.lstrip(".").lower(),
+                generated_from=spec.source_path.as_posix(),
+                note=note,
+            )
+        )
+
+    related_entries: List[ArchiveEntry] = []
+    if related_entries_to_include is not None:
+        related_entries.extend(entry for entry in related_entries_to_include if isinstance(entry, ArchiveEntry))
+    elif include_related_files:
+        for reference in preview_result.texture_references:
+            related_entry = getattr(reference, "resolved_entry", None)
+            if isinstance(related_entry, ArchiveEntry):
+                related_entries.append(related_entry)
+
+    if related_entries:
+        for related_entry in related_entries:
+            normalized_related_path = related_entry.path.replace("\\", "/")
+            if normalized_related_path.lower() in written_virtual_paths:
+                continue
+            relative_parts = PurePosixPath(normalized_related_path).parts
+            if not relative_parts:
+                continue
+            source_path, _note = ensure_archive_preview_source(related_entry)
+            target_path = files_root.joinpath(*relative_parts)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            _safe_log(on_log, f"Copying related file: files/{target_path.relative_to(files_root).as_posix()}")
+            shutil.copy2(source_path, target_path)
+            written_files.append(target_path)
+            written_virtual_paths.add(normalized_related_path.lower())
+            if related_entry.extension in {".xml", ".pami", ".json"}:
+                note = f"Related companion file copied from archive for {primary_entry.path}"
+            else:
+                note = f"Referenced texture copied from archive for {primary_entry.path}"
+            file_rows.append(
+                MeshLooseModFile(
+                    path=normalized_related_path,
+                    package_group=related_entry.pamt_path.parent.name,
+                    format=related_entry.extension.lstrip(".").lower(),
+                    generated_from=source_obj_display,
+                    note=note,
+                )
+            )
 
     asset_rows = [
         MeshLooseModAsset(
@@ -853,6 +1344,7 @@ def export_archive_mesh(
     export_format: str,
     *,
     archive_entries_by_normalized_path: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    related_entries: Sequence[ArchiveEntry] = (),
     on_log: Optional[Callable[[str], None]] = None,
 ) -> MeshExportResult:
     export_kind = export_format.strip().lower()
@@ -871,6 +1363,7 @@ def export_archive_mesh(
 
     output_paths: List[Path] = []
     skeleton: Optional[Skeleton] = None
+    copied_related_count = 0
     if export_kind == "obj":
         output_paths.extend(Path(path) for path in export_obj(parsed_mesh, str(output_dir), basename))
     else:
@@ -889,6 +1382,16 @@ def export_archive_mesh(
         else:
             output_paths.append(Path(export_fbx(parsed_mesh, str(output_dir), basename)))
 
+    if related_entries:
+        related_output_root = output_dir / "referenced_files"
+        copied_paths = _export_related_archive_entries(
+            related_entries,
+            related_output_root,
+            on_log=on_log,
+        )
+        output_paths.extend(copied_paths)
+        copied_related_count = len(copied_paths)
+
     summary_lines = [
         f"Path: {entry.path}",
         f"Format: {parsed_mesh.format.upper()}",
@@ -896,6 +1399,8 @@ def export_archive_mesh(
         f"Vertices: {parsed_mesh.total_vertices:,}",
         f"Faces: {parsed_mesh.total_faces:,}",
     ]
+    if copied_related_count:
+        summary_lines.append(f"Referenced files copied: {copied_related_count:,}")
     if skeleton is not None and skeleton.bones:
         summary_lines.append(f"Skeleton bones: {len(skeleton.bones):,}")
     return MeshExportResult(output_paths=output_paths, summary_lines=summary_lines)
@@ -948,6 +1453,135 @@ def build_mesh_preview_from_bytes(data: bytes, virtual_path: str) -> Tuple[Model
     return preview_model, parsed_mesh
 
 
+def _build_selected_sidecar_texture_bindings(
+    supplemental_files: Sequence[Path],
+) -> Tuple[
+    Tuple[object, ...],
+    Tuple[str, ...],
+    Dict[str, Tuple[str, ...]],
+    Dict[str, Tuple[str, ...]],
+]:
+    from collections import defaultdict
+
+    from crimson_forge_toolkit.core.archive import _ArchiveModelSidecarTextureBinding
+    from crimson_forge_toolkit.core.upscale_profiles import normalize_texture_reference_for_sidecar_lookup, parse_texture_sidecar_bindings
+
+    bindings: List[object] = []
+    sidecar_paths: List[str] = []
+    seen_binding_keys: set[Tuple[str, str, str]] = set()
+    sidecar_texts_by_normalized_path: Dict[str, List[str]] = defaultdict(list)
+    sidecar_texts_by_basename: Dict[str, List[str]] = defaultdict(list)
+    for supplemental_path in supplemental_files:
+        if supplemental_path.suffix.lower() not in {".xml", ".pami"}:
+            continue
+        resolved_path = supplemental_path.expanduser().resolve()
+        if not resolved_path.is_file():
+            continue
+        try:
+            text = resolved_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        parsed_bindings = parse_texture_sidecar_bindings(text, sidecar_path=resolved_path.name)
+        if not parsed_bindings:
+            continue
+        sidecar_paths.append(resolved_path.name)
+        for binding in parsed_bindings:
+            normalized_texture_path = normalize_texture_reference_for_sidecar_lookup(binding.texture_path)
+            key = (
+                normalized_texture_path,
+                str(binding.submesh_name or "").strip().lower(),
+                str(binding.parameter_name or "").strip().lower(),
+            )
+            if normalized_texture_path:
+                sidecar_texts_by_normalized_path[normalized_texture_path].append(text)
+                basename = PurePosixPath(normalized_texture_path).name
+                if basename:
+                    sidecar_texts_by_basename[basename].append(text)
+            if key in seen_binding_keys:
+                continue
+            seen_binding_keys.add(key)
+            bindings.append(
+                _ArchiveModelSidecarTextureBinding(
+                    texture_path=binding.texture_path,
+                    parameter_name=binding.parameter_name,
+                    submesh_name=binding.submesh_name,
+                    sidecar_path=resolved_path.name,
+                )
+            )
+    return (
+        tuple(bindings),
+        tuple(sidecar_paths),
+        {key: tuple(values) for key, values in sidecar_texts_by_normalized_path.items()},
+        {key: tuple(values) for key, values in sidecar_texts_by_basename.items()},
+    )
+
+
+def _build_mesh_import_supplemental_file_specs(
+    entry: ArchiveEntry,
+    supplemental_files: Sequence[Path],
+    texture_references: Sequence[ArchiveModelTextureReference],
+    *,
+    archive_entries_by_normalized_path: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    archive_entries_by_basename: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+) -> Tuple[MeshImportSupplementalFileSpec, ...]:
+    if not supplemental_files:
+        return ()
+
+    reference_candidates_by_basename: Dict[str, List[str]] = {}
+    for reference in texture_references:
+        resolved_archive_path = str(getattr(reference, "resolved_archive_path", "") or "").strip()
+        reference_name = str(getattr(reference, "reference_name", "") or "").strip()
+        target_path = resolved_archive_path or reference_name
+        if not target_path:
+            continue
+        basename = PurePosixPath(target_path.replace("\\", "/")).name.lower()
+        if not basename:
+            continue
+        bucket = reference_candidates_by_basename.setdefault(basename, [])
+        if target_path not in bucket:
+            bucket.append(target_path)
+
+    related_entries: Sequence[ArchiveEntry] = ()
+    if archive_entries_by_basename is not None:
+        from crimson_forge_toolkit.core.archive import _find_archive_model_related_entries
+
+        related_entries = _find_archive_model_related_entries(entry, dict(archive_entries_by_basename))
+    related_entries_by_extension: Dict[str, List[ArchiveEntry]] = {}
+    for related_entry in related_entries:
+        related_entries_by_extension.setdefault(related_entry.extension.lower(), []).append(related_entry)
+
+    specs: List[MeshImportSupplementalFileSpec] = []
+    for supplemental_path in supplemental_files:
+        resolved_source = supplemental_path.expanduser().resolve()
+        if not resolved_source.is_file():
+            continue
+        extension = resolved_source.suffix.lower()
+        preferred_paths: List[str] = []
+        if extension == ".dds":
+            preferred_paths.extend(reference_candidates_by_basename.get(resolved_source.name.lower(), ()))
+        elif extension in {".xml", ".pami"}:
+            related_by_extension = related_entries_by_extension.get(extension, [])
+            if len(related_by_extension) == 1:
+                preferred_paths.append(related_by_extension[0].path)
+        target_entry, target_path = _resolve_supplemental_target_entry(
+            resolved_source,
+            archive_entries_by_normalized_path=archive_entries_by_normalized_path,
+            archive_entries_by_basename=archive_entries_by_basename,
+            preferred_paths=preferred_paths,
+        )
+        kind = "texture" if extension == ".dds" else "sidecar" if extension in {".xml", ".pami"} else "file"
+        specs.append(
+            MeshImportSupplementalFileSpec(
+                source_path=resolved_source,
+                target_path=target_path or (target_entry.path if isinstance(target_entry, ArchiveEntry) else ""),
+                kind=kind,
+                target_entry=target_entry if isinstance(target_entry, ArchiveEntry) else None,
+                used_for_preview=kind in {"texture", "sidecar"},
+            )
+        )
+    return tuple(specs)
+
+
 def build_mesh_import_preview(
     entry: ArchiveEntry,
     obj_path: Path,
@@ -956,6 +1590,7 @@ def build_mesh_import_preview(
     texconv_path: Optional[Path] = None,
     texture_entries_by_normalized_path: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
     texture_entries_by_basename: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    supplemental_files: Sequence[Path] = (),
 ) -> MeshImportPreviewResult:
     from crimson_forge_toolkit.core.archive import (
         _attach_model_sidecar_texture_preview_paths,
@@ -979,10 +1614,40 @@ def build_mesh_import_preview(
         f"Submeshes: {len(parsed_mesh.submeshes):,}",
         f"Rebuilt size: {len(rebuilt_data):,} bytes",
     ]
+    resolved_supplemental_files = tuple(
+        path.expanduser().resolve()
+        for path in supplemental_files
+        if isinstance(path, Path) and path.expanduser().resolve().is_file()
+    )
+    if resolved_supplemental_files:
+        summary_lines.append(f"Selected supplemental files: {len(resolved_supplemental_files):,}")
     sidecar_texture_references: Tuple[object, ...] = ()
     sidecar_reference_paths: Tuple[str, ...] = ()
-    if texture_entries_by_basename is not None:
-        sidecar_texture_references, sidecar_reference_paths = _extract_archive_model_sidecar_texture_references(
+    sidecar_texts_by_normalized_path: Dict[str, Tuple[str, ...]] = {}
+    sidecar_texts_by_basename: Dict[str, Tuple[str, ...]] = {}
+    selected_sidecar_texture_references: Tuple[object, ...] = ()
+    selected_sidecar_reference_paths: Tuple[str, ...] = ()
+    selected_sidecar_texts_by_normalized_path: Dict[str, Tuple[str, ...]] = {}
+    selected_sidecar_texts_by_basename: Dict[str, Tuple[str, ...]] = {}
+    if resolved_supplemental_files:
+        (
+            selected_sidecar_texture_references,
+            selected_sidecar_reference_paths,
+            selected_sidecar_texts_by_normalized_path,
+            selected_sidecar_texts_by_basename,
+        ) = _build_selected_sidecar_texture_bindings(resolved_supplemental_files)
+        if selected_sidecar_texture_references:
+            summary_lines.append(
+                f"Using {len(selected_sidecar_texture_references):,} texture binding(s) from selected local sidecar file(s): {', '.join(selected_sidecar_reference_paths[:3])}"
+                + (" ..." if len(selected_sidecar_reference_paths) > 3 else "")
+            )
+    if texture_entries_by_basename is not None and not selected_sidecar_texture_references:
+        (
+            sidecar_texture_references,
+            sidecar_reference_paths,
+            sidecar_texts_by_normalized_path,
+            sidecar_texts_by_basename,
+        ) = _extract_archive_model_sidecar_texture_references(
             entry,
             archive_entries_by_basename=(
                 dict(texture_entries_by_basename) if texture_entries_by_basename is not None else None
@@ -998,6 +1663,11 @@ def build_mesh_import_preview(
             summary_lines.append(
                 "Loose mesh mods may still need the matching companion .xml sidecar when custom material or texture remaps are involved."
             )
+    if selected_sidecar_texture_references:
+        sidecar_texture_references = selected_sidecar_texture_references
+        sidecar_reference_paths = selected_sidecar_reference_paths
+        sidecar_texts_by_normalized_path = selected_sidecar_texts_by_normalized_path
+        sidecar_texts_by_basename = selected_sidecar_texts_by_basename
     texture_references: Tuple[ArchiveModelTextureReference, ...] = ()
     if texconv_path is not None:
         if sidecar_texture_references:
@@ -1014,6 +1684,8 @@ def build_mesh_import_preview(
                     texture_entries_by_basename=(
                         dict(texture_entries_by_basename) if texture_entries_by_basename is not None else None
                     ),
+                    sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                    sidecar_texts_by_basename=sidecar_texts_by_basename,
                 )
             )
         summary_lines.extend(
@@ -1027,8 +1699,33 @@ def build_mesh_import_preview(
                 texture_entries_by_basename=(
                     dict(texture_entries_by_basename) if texture_entries_by_basename is not None else None
                 ),
+                sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                sidecar_texts_by_basename=sidecar_texts_by_basename,
             )
         )
+        if resolved_supplemental_files:
+            supplemental_dds_by_normalized_path, supplemental_dds_by_basename = _build_mesh_import_local_dds_lookup(
+                resolved_supplemental_files
+            )
+            if selected_sidecar_texture_references:
+                summary_lines.extend(
+                    _apply_mesh_import_local_sidecar_texture_overrides(
+                        preview_model,
+                        parsed_mesh,
+                        selected_sidecar_texture_references,
+                        supplemental_dds_by_normalized_path,
+                        supplemental_dds_by_basename,
+                        texconv_path=texconv_path,
+                    )
+                )
+            summary_lines.extend(
+                _apply_mesh_import_local_texture_overrides(
+                    preview_model,
+                    supplemental_dds_by_normalized_path,
+                    supplemental_dds_by_basename,
+                    texconv_path=texconv_path,
+                )
+            )
     texture_references = tuple(
         build_archive_model_texture_references(
             entry,
@@ -1041,8 +1738,25 @@ def build_mesh_import_preview(
             texture_entries_by_basename=(
                 dict(texture_entries_by_basename) if texture_entries_by_basename is not None else None
             ),
+            sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+            sidecar_texts_by_basename=sidecar_texts_by_basename,
         )
     )
+    supplemental_file_specs = _build_mesh_import_supplemental_file_specs(
+        entry,
+        resolved_supplemental_files,
+        texture_references,
+        archive_entries_by_normalized_path=archive_entries_by_normalized_path,
+        archive_entries_by_basename=texture_entries_by_basename,
+    )
+    if supplemental_file_specs:
+        mapped_count = sum(1 for spec in supplemental_file_specs if spec.target_path)
+        unmapped_count = len(supplemental_file_specs) - mapped_count
+        summary_lines.append(f"Supplemental files mapped to package/archive targets: {mapped_count:,}")
+        if unmapped_count > 0:
+            summary_lines.append(
+                f"{unmapped_count:,} supplemental file(s) could not be mapped to a known game-relative target automatically."
+            )
 
     paired_lod_data: Optional[bytes] = None
     paired_lod_path = ""
@@ -1063,6 +1777,7 @@ def build_mesh_import_preview(
         preview_model=preview_model,
         summary_lines=summary_lines,
         texture_references=texture_references,
+        supplemental_file_specs=supplemental_file_specs,
         paired_lod_data=paired_lod_data,
         paired_lod_path=paired_lod_path,
     )
@@ -1241,12 +1956,60 @@ def build_pab_preview(data: bytes, virtual_path: str) -> SkeletonPreviewResult:
         return SkeletonPreviewResult(preview_text="\n".join(lines), detail_lines=detail_lines)
 
     root_bones = [bone for bone in skeleton.bones if bone.parent_index < 0]
+    named_bones = [bone for bone in skeleton.bones if str(bone.name or "").strip()]
+    child_map: Dict[int, List[int]] = {}
+    for bone in skeleton.bones:
+        child_map.setdefault(int(bone.parent_index), []).append(int(bone.index))
+
+    def _depth(index: int) -> int:
+        children = child_map.get(index, [])
+        if not children:
+            return 1
+        return 1 + max(_depth(child_index) for child_index in children)
+
+    max_depth = max((_depth(root.index) for root in root_bones), default=0)
+    positions = [
+        tuple(float(component) for component in bone.position)
+        for bone in skeleton.bones
+        if len(tuple(bone.position)) >= 3
+    ]
     detail_lines.append(f"Root bones: {len(root_bones):,}")
+    detail_lines.append(f"Named bones: {len(named_bones):,}")
+    detail_lines.append(f"Max hierarchy depth: {max_depth}")
+    if positions:
+        min_x = min(position[0] for position in positions)
+        min_y = min(position[1] for position in positions)
+        min_z = min(position[2] for position in positions)
+        max_x = max(position[0] for position in positions)
+        max_y = max(position[1] for position in positions)
+        max_z = max(position[2] for position in positions)
+        detail_lines.append(
+            "Bone position bounds: "
+            f"min=({min_x:.3f}, {min_y:.3f}, {min_z:.3f}) "
+            f"max=({max_x:.3f}, {max_y:.3f}, {max_z:.3f})"
+        )
+    lines.extend(
+        [
+            "",
+            "Summary:",
+            f"- Bones: {len(skeleton.bones):,}",
+            f"- Root bones: {len(root_bones):,}",
+            f"- Named bones: {len(named_bones):,}",
+            f"- Max hierarchy depth: {max_depth}",
+        ]
+    )
+    if root_bones:
+        lines.append("- Root names: " + ", ".join((bone.name or "<unnamed>") for bone in root_bones[:8]))
+        if len(root_bones) > 8:
+            lines[-1] += " ..."
     lines.append("")
     lines.append("Bone hierarchy:")
     for bone in skeleton.bones[:128]:
         parent_text = "root" if bone.parent_index < 0 else f"parent {bone.parent_index}"
-        lines.append(f"[{bone.index:03d}] {bone.name or '<unnamed>'} ({parent_text})")
+        position_text = ""
+        if len(tuple(bone.position)) >= 3:
+            position_text = f" pos=({bone.position[0]:.3f}, {bone.position[1]:.3f}, {bone.position[2]:.3f})"
+        lines.append(f"[{bone.index:03d}] {bone.name or '<unnamed>'} ({parent_text}){position_text}")
     if len(skeleton.bones) > 128:
         lines.append("")
         lines.append("Preview truncated to the first 128 bones.")

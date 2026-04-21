@@ -539,6 +539,7 @@ class TextureEditorSourceBinding:
     texture_type: str = "unknown"
     semantic_subtype: str = "unknown"
     technical_warning: str = ""
+    semantic_sidecar_texts: Tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -735,6 +736,7 @@ class ModelPreviewMesh:
     indices: List[int] = field(default_factory=list)
     preview_texture_path: str = ""
     preview_texture_image: object = None
+    preview_texture_flip_vertical: Optional[bool] = None
 
 
 @dataclass(slots=True)
@@ -742,12 +744,15 @@ class ArchiveModelTextureReference:
     reference_name: str = ""
     material_name: str = ""
     semantic_label: str = ""
+    semantic_hint: str = ""
+    sidecar_texts: Tuple[str, ...] = ()
     resolution_status: str = "missing"
     resolved_archive_path: str = ""
     resolved_package_label: str = ""
     resolved_entry: Optional["ArchiveEntry"] = None
     preview_texture_path: str = ""
     usage_count: int = 0
+    reference_kind: str = "texture"
 
 
 @dataclass(slots=True)

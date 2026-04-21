@@ -21,6 +21,8 @@ from crimson_forge_toolkit.core.mod_package import (
     write_mod_package_info,
 )
 from crimson_forge_toolkit.core.pipeline import (
+    _build_loose_sidecar_index,
+    _collect_loose_sidecar_texts,
     build_preview_png_command,
     build_texconv_command,
     max_mips_for_size,
@@ -602,6 +604,23 @@ def build_replace_assistant_package(
     on_current_file: Optional[Callable[[str], None]] = None,
 ) -> ReplaceAssistantBuildSummary:
     archive_index = build_replace_assistant_archive_index(archive_entries, original_dds_root=original_dds_root)
+    resolved_original_dds_root: Optional[Path] = None
+    sidecars_by_group: Dict[str, List[Path]] = {}
+    sidecars_by_folder: Dict[str, List[Path]] = {}
+    sidecars_by_texture_path: Dict[str, List[Path]] = {}
+    sidecars_by_texture_basename: Dict[str, List[Path]] = {}
+    sidecar_text_cache: Dict[Path, str] = {}
+    if original_dds_root is not None:
+        candidate_root = original_dds_root.expanduser()
+        if candidate_root.exists() and candidate_root.is_dir():
+            resolved_original_dds_root = candidate_root.resolve()
+            (
+                sidecars_by_group,
+                sidecars_by_folder,
+                sidecars_by_texture_path,
+                sidecars_by_texture_basename,
+                sidecar_text_cache,
+            ) = _build_loose_sidecar_index(resolved_original_dds_root)
     stage_root = Path(tempfile.mkdtemp(prefix="crimson_forge_toolkit_replace_stage_"))
     scratch_root = Path(tempfile.mkdtemp(prefix="crimson_forge_toolkit_replace_work_"))
     total_items = len(items)
@@ -684,12 +703,29 @@ def build_replace_assistant_package(
                         on_log=on_log,
                     )
                     if options.upscale_post_correction_mode and options.upscale_post_correction_mode.lower() != "none":
+                        sidecar_texts: Sequence[str] = ()
+                        if resolved_original_dds_root is not None:
+                            try:
+                                sidecar_texts = tuple(
+                                    _collect_loose_sidecar_texts(
+                                        resolved_original_dds_root,
+                                        Path(package_label) / Path(original_rel),
+                                        sidecars_by_group=sidecars_by_group,
+                                        sidecars_by_folder=sidecars_by_folder,
+                                        sidecars_by_texture_path=sidecars_by_texture_path,
+                                        sidecars_by_texture_basename=sidecars_by_texture_basename,
+                                        text_cache=sidecar_text_cache,
+                                    )
+                                )
+                            except Exception:
+                                sidecar_texts = ()
                         decision, correction_plan = build_source_match_plan_for_path(
                             relative_path=original_rel.as_posix(),
                             source_png_path=processing_source_png,
                             mode=options.upscale_post_correction_mode,
                             preset=options.upscale_texture_preset,
                             enable_automatic_rules=options.enable_automatic_texture_rules,
+                            sidecar_texts=sidecar_texts,
                             original_dds_path=target_original,
                             direct_backend_supported=True,
                         )

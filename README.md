@@ -4,11 +4,11 @@ Windows desktop tool for **Crimson Desert texture workflows**, **archive browsin
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-Latest release: `0.7.0-beta.2`
+Latest release: `0.7.0-beta.4`
 
-- keeps the `0.7.x` archive patching, mesh preview/modding, media preview, and referenced-texture workflows introduced in the previous beta
-- improves loose mesh export packaging so `Import OBJ...` now prompts for the package metadata instead of silently reusing saved defaults
-- improves PAC / PAM companion sidecar texture handling so referenced texture rows preserve `_baseColorTexture`, `_normalTexture`, `_materialTexture`, `_heightTexture`, `_maskTexture`, and similar semantic roles more accurately
+- keeps the `0.7.x` archive patching, mesh preview/modding, media preview, and sidecar-aware texture workflows introduced in the previous betas
+- adds a broader `Referenced Files` surface in `Archive Browser`, so mesh previews can now expose related `.dds`, `.xml`, `.pami`, `.meshinfo`, `.pab`, `.paa`, and similar companion files with direct open/export actions
+- improves OBJ/FBX mesh workflows so export/import can carry selected supplemental files, loose mesh packages are described more clearly, and PAC-side texture preview orientation is more reliable for sidecar-backed previews
 
 Project guidelines:
 

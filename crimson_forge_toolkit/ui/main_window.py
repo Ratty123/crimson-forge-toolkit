@@ -2481,7 +2481,7 @@ def run_gui() -> int:
             self.archive_preview_warning_label.setWordWrap(True)
             self.archive_preview_warning_label.setVisible(False)
             archive_preview_container_layout.addWidget(self.archive_preview_warning_label)
-            self.archive_texture_refs_group = QGroupBox("Referenced Textures")
+            self.archive_texture_refs_group = QGroupBox("Referenced Files")
             self.archive_texture_refs_group.setVisible(False)
             self.archive_texture_refs_group.setMinimumWidth(280)
             self.archive_texture_refs_group.setMaximumWidth(420)
@@ -2495,7 +2495,7 @@ def run_gui() -> int:
             )
             self.archive_texture_refs_tree.setRootIsDecorated(False)
             self.archive_texture_refs_tree.setAlternatingRowColors(True)
-            self.archive_texture_refs_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+            self.archive_texture_refs_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
             self.archive_texture_refs_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
             self.archive_texture_refs_tree.setUniformRowHeights(True)
             self.archive_texture_refs_tree.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
@@ -2510,22 +2510,32 @@ def run_gui() -> int:
             texture_refs_header.setSectionResizeMode(4, QHeaderView.Interactive)
             texture_refs_header.setSectionResizeMode(5, QHeaderView.Fixed)
             archive_texture_refs_layout.addWidget(self.archive_texture_refs_tree)
+            archive_texture_actions_layout = QVBoxLayout()
+            archive_texture_actions_layout.setSpacing(6)
             archive_texture_actions_row = QHBoxLayout()
             archive_texture_actions_row.setSpacing(8)
             self.archive_texture_open_button = QPushButton("Open")
-            self.archive_texture_export_button = QPushButton("Export DDS...")
+            self.archive_texture_export_button = QPushButton("Export Selected...")
+            self.archive_texture_export_all_button = QPushButton("Export All...")
             self.archive_texture_replace_dds_button = QPushButton("Replace DDS...")
             self.archive_texture_replace_png_button = QPushButton("Replace From PNG...")
             self.archive_texture_open_button.setEnabled(False)
             self.archive_texture_export_button.setEnabled(False)
+            self.archive_texture_export_all_button.setEnabled(False)
             self.archive_texture_replace_dds_button.setEnabled(False)
             self.archive_texture_replace_png_button.setEnabled(False)
             archive_texture_actions_row.addWidget(self.archive_texture_open_button)
             archive_texture_actions_row.addWidget(self.archive_texture_export_button)
-            archive_texture_actions_row.addWidget(self.archive_texture_replace_dds_button)
-            archive_texture_actions_row.addWidget(self.archive_texture_replace_png_button)
+            archive_texture_actions_row.addWidget(self.archive_texture_export_all_button)
             archive_texture_actions_row.addStretch(1)
-            archive_texture_refs_layout.addLayout(archive_texture_actions_row)
+            archive_texture_actions_layout.addLayout(archive_texture_actions_row)
+            archive_texture_replace_row = QHBoxLayout()
+            archive_texture_replace_row.setSpacing(8)
+            archive_texture_replace_row.addWidget(self.archive_texture_replace_dds_button)
+            archive_texture_replace_row.addWidget(self.archive_texture_replace_png_button)
+            archive_texture_replace_row.addStretch(1)
+            archive_texture_actions_layout.addLayout(archive_texture_replace_row)
+            archive_texture_refs_layout.addLayout(archive_texture_actions_layout)
 
             self.archive_preview_stack = QStackedWidget()
             self.archive_preview_label = PreviewLabel("Select an archive file to preview it here.")
@@ -2740,6 +2750,7 @@ def run_gui() -> int:
             self.archive_preview_content_splitter.splitterMoved.connect(self._layout_archive_texture_reference_columns)
             self.archive_texture_open_button.clicked.connect(self._open_selected_archive_texture_reference)
             self.archive_texture_export_button.clicked.connect(self._export_selected_archive_texture_reference)
+            self.archive_texture_export_all_button.clicked.connect(self._export_all_archive_texture_references)
             self.archive_texture_replace_dds_button.clicked.connect(self._replace_selected_archive_texture_reference_from_dds)
             self.archive_texture_replace_png_button.clicked.connect(self._replace_selected_archive_texture_reference_from_png)
             self.archive_preview_loose_toggle_button.clicked.connect(self._toggle_archive_loose_preview)
@@ -3578,8 +3589,11 @@ def run_gui() -> int:
             self._schedule_column_autofit()
             self.schedule_settings_save()
 
-        def _archive_preview_text_language_extension(self, preview_text: str) -> str:
-            entry = self._current_archive_entry()
+        def _archive_preview_text_language_extension_for_entry(
+            self,
+            entry: Optional[ArchiveEntry],
+            preview_text: str,
+        ) -> str:
             extension = entry.extension.lower() if entry is not None else ""
             stripped = preview_text.lstrip("\ufeff\r\n\t ")
             if extension == ".pami":
@@ -3598,6 +3612,9 @@ def run_gui() -> int:
             if any(line.startswith("--") for line in sample_lines) or "function " in preview_text[:4096]:
                 return ".lua"
             return extension
+
+        def _archive_preview_text_language_extension(self, preview_text: str) -> str:
+            return self._archive_preview_text_language_extension_for_entry(self._current_archive_entry(), preview_text)
 
         def _preference_bool(self, key: str, default: bool) -> bool:
             return self._read_bool(f"preferences/{key}", default)
@@ -7374,11 +7391,7 @@ def run_gui() -> int:
             else:
                 self.set_status_message("Archive Browser is open. Select a DDS file and use 'Open in Texture Editor'.")
 
-        def _open_archive_current_in_texture_editor(self) -> None:
-            entry = self._current_archive_entry()
-            if entry is None:
-                self.set_status_message("Select an archive file first.", error=True)
-                return
+        def _open_archive_entry_in_texture_editor(self, entry: ArchiveEntry) -> None:
             try:
                 source_path, _note = ensure_archive_preview_source(entry)
             except Exception as exc:
@@ -7396,6 +7409,13 @@ def run_gui() -> int:
                 original_dds_path=str(source_path) if source_path.suffix.lower() == ".dds" else "",
             )
             self._open_source_in_texture_editor(str(source_path), binding)
+
+        def _open_archive_current_in_texture_editor(self) -> None:
+            entry = self._current_archive_entry()
+            if entry is None:
+                self.set_status_message("Select an archive file first.", error=True)
+                return
+            self._open_archive_entry_in_texture_editor(entry)
 
         def _resolve_archive_current_in_research(self) -> None:
             entry = self._current_archive_entry()
@@ -8546,6 +8566,9 @@ def run_gui() -> int:
                 material_name = str(getattr(reference, "material_name", "") or "").strip()
                 if material_name:
                     item.setToolTip(0, f"Material: {material_name}")
+                semantic_hint = str(getattr(reference, "semantic_hint", "") or "").strip()
+                if semantic_hint:
+                    item.setToolTip(2, semantic_hint)
                 if resolved_archive_path:
                     item.setToolTip(3, resolved_archive_path)
                 item.setData(0, Qt.UserRole, index)
@@ -8569,13 +8592,13 @@ def run_gui() -> int:
 
             viewport_width = max(0, tree.viewport().width())
             available_width = max(viewport_width, 320)
-            reference_width = 190
-            status_width = 132
-            semantic_width = 108
-            package_width = 112
-            uses_width = 56
+            reference_width = 210
+            status_width = 128
+            semantic_width = 150
+            package_width = 104
+            uses_width = 52
             archive_width = max(
-                240,
+                200,
                 available_width - (reference_width + status_width + semantic_width + package_width + uses_width + 12),
             )
 
@@ -8599,45 +8622,81 @@ def run_gui() -> int:
                 return self.current_archive_model_texture_references[index]
             return None
 
-        def _update_archive_texture_reference_action_controls(self) -> None:
-            reference = self._current_archive_texture_reference()
-            resolved_entry = getattr(reference, "resolved_entry", None) if reference is not None else None
-            can_open = isinstance(resolved_entry, ArchiveEntry)
-            can_export_or_replace = can_open and resolved_entry.extension == ".dds"
-            self.archive_texture_open_button.setEnabled(can_open)
-            self.archive_texture_export_button.setEnabled(can_export_or_replace)
-            self.archive_texture_replace_dds_button.setEnabled(can_export_or_replace)
-            self.archive_texture_replace_png_button.setEnabled(can_export_or_replace)
+        def _selected_archive_texture_references(self) -> List[ArchiveModelTextureReference]:
+            selected_references: List[ArchiveModelTextureReference] = []
+            seen_indices: set[int] = set()
+            for item in self.archive_texture_refs_tree.selectedItems():
+                raw_index = item.data(0, Qt.UserRole)
+                try:
+                    index = int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+                if index in seen_indices:
+                    continue
+                seen_indices.add(index)
+                if 0 <= index < len(self.current_archive_model_texture_references):
+                    selected_references.append(self.current_archive_model_texture_references[index])
+            return selected_references
 
-        def _open_selected_archive_texture_reference(self) -> None:
-            reference = self._current_archive_texture_reference()
-            resolved_entry = getattr(reference, "resolved_entry", None) if reference is not None else None
-            if not isinstance(resolved_entry, ArchiveEntry):
-                self.set_status_message("Select a resolved texture reference first.", error=True)
-                return
-            self._show_archive_browser_from_texture_editor(resolved_entry.path)
+        def _resolved_archive_reference_entries(
+            self,
+            references: Sequence[ArchiveModelTextureReference],
+        ) -> List[ArchiveEntry]:
+            resolved_entries: List[ArchiveEntry] = []
+            seen_paths: set[str] = set()
+            for reference in references:
+                resolved_entry = getattr(reference, "resolved_entry", None)
+                if not isinstance(resolved_entry, ArchiveEntry):
+                    continue
+                normalized_path = resolved_entry.path.replace("\\", "/").strip().lower()
+                if not normalized_path or normalized_path in seen_paths:
+                    continue
+                seen_paths.add(normalized_path)
+                resolved_entries.append(resolved_entry)
+            return resolved_entries
 
-        def _export_selected_archive_texture_reference(self) -> None:
-            reference = self._current_archive_texture_reference()
-            resolved_entry = getattr(reference, "resolved_entry", None) if reference is not None else None
-            if not isinstance(resolved_entry, ArchiveEntry) or resolved_entry.extension != ".dds":
-                self.set_status_message("Select a resolved DDS texture reference first.", error=True)
-                return
+        def _current_archive_related_references_for_entry(
+            self,
+            entry: ArchiveEntry,
+        ) -> Tuple[ArchiveModelTextureReference, ...]:
+            current_entry = self._current_archive_entry()
+            if current_entry is None:
+                return ()
+            current_path = current_entry.path.replace("\\", "/").strip().lower()
+            target_path = entry.path.replace("\\", "/").strip().lower()
+            if current_path != target_path:
+                return ()
+            return tuple(self.current_archive_model_texture_references)
 
-            default_dir = self.settings_file_path.parent / "archive_texture_export"
-            default_target = default_dir / resolved_entry.basename
+        def _archive_reference_export_filter(self, entry: ArchiveEntry) -> str:
+            extension = str(entry.extension or "").strip().lower()
+            if extension == ".dds":
+                return "DDS (*.dds)"
+            if extension == ".xml":
+                return "XML (*.xml);;All Files (*)"
+            if extension == ".pami":
+                return "PAMI (*.pami);;All Files (*)"
+            if extension == ".json":
+                return "JSON (*.json);;All Files (*)"
+            if extension:
+                return f"{extension.upper()} (*{extension});;All Files (*)"
+            return "All Files (*)"
+
+        def _export_archive_reference_entry(self, entry: ArchiveEntry, *, title: str = "Export Referenced File") -> None:
+            default_dir = self.settings_file_path.parent / "archive_related_export"
+            default_target = default_dir / entry.basename
             output_path, _selected = QFileDialog.getSaveFileName(
                 self,
-                "Export Resolved DDS",
+                title,
                 str(default_target),
-                "DDS (*.dds)",
+                self._archive_reference_export_filter(entry),
             )
             if not output_path:
                 return
 
             def _task(log: Callable[[str], None]) -> Path:
-                log(f"Exporting resolved DDS for {resolved_entry.path}...")
-                source_path, _note = ensure_archive_preview_source(resolved_entry)
+                log(f"Exporting referenced file for {entry.path}...")
+                source_path, _note = ensure_archive_preview_source(entry)
                 target_path = Path(output_path).expanduser()
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, target_path)
@@ -8645,16 +8704,397 @@ def run_gui() -> int:
 
             def _handle_complete(result: object) -> None:
                 if not isinstance(result, Path):
-                    self.set_status_message("Texture export finished with an unexpected result payload.", error=True)
+                    self.set_status_message("Referenced file export finished with an unexpected result payload.", error=True)
                     return
-                QMessageBox.information(self, "Texture Export Complete", f"Exported DDS:\n{result}")
-                self.set_status_message(f"Exported {resolved_entry.basename}.")
+                QMessageBox.information(self, "Export Complete", f"Exported file:\n{result}")
+                self.set_status_message(f"Exported {entry.basename}.")
 
             self._run_utility_task(
-                status_message=f"Exporting {resolved_entry.basename}...",
+                status_message=f"Exporting {entry.basename}...",
                 task=_task,
                 on_complete=_handle_complete,
                 show_archive_progress=True,
+            )
+
+        def _export_archive_reference_entries_to_folder(
+            self,
+            entries: Sequence[ArchiveEntry],
+            *,
+            title: str,
+        ) -> None:
+            unique_entries: List[ArchiveEntry] = []
+            seen_paths: set[str] = set()
+            for entry in entries:
+                normalized_path = entry.path.replace("\\", "/").strip().lower()
+                if not normalized_path or normalized_path in seen_paths:
+                    continue
+                seen_paths.add(normalized_path)
+                unique_entries.append(entry)
+            if not unique_entries:
+                self.set_status_message("No resolved referenced files are available to export.", error=True)
+                return
+
+            default_dir = self.settings_file_path.parent / "archive_related_export"
+            output_dir = QFileDialog.getExistingDirectory(
+                self,
+                title,
+                str(default_dir),
+            )
+            if not output_dir:
+                return
+
+            def _task(log: Callable[[str], None]) -> List[Path]:
+                exported_root = Path(output_dir).expanduser()
+                exported_paths: List[Path] = []
+                for related_entry in unique_entries:
+                    source_path, _note = ensure_archive_preview_source(related_entry)
+                    target_path = exported_root.joinpath(*PurePosixPath(related_entry.path.replace("\\", "/")).parts)
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    log(f"Exporting referenced file: {related_entry.path}")
+                    shutil.copy2(source_path, target_path)
+                    exported_paths.append(target_path.resolve())
+                return exported_paths
+
+            def _handle_complete(result: object) -> None:
+                if not isinstance(result, list) or not all(isinstance(path, Path) for path in result):
+                    self.set_status_message("Referenced-file export finished with an unexpected result payload.", error=True)
+                    return
+                QMessageBox.information(
+                    self,
+                    "Export Complete",
+                    f"Exported {len(result)} referenced file(s) into:\n{Path(output_dir).expanduser()}",
+                )
+                self.set_status_message(f"Exported {len(result)} referenced file(s).")
+
+            self._run_utility_task(
+                status_message=f"Exporting {len(unique_entries)} referenced file(s)...",
+                task=_task,
+                on_complete=_handle_complete,
+                show_archive_progress=True,
+            )
+
+        def _prompt_archive_reference_selection(
+            self,
+            *,
+            title: str,
+            intro_text: str,
+            references: Sequence[ArchiveModelTextureReference],
+            confirm_button_text: str = "Continue",
+        ) -> Optional[Tuple[ArchiveEntry, ...]]:
+            resolved_references: List[ArchiveModelTextureReference] = []
+            seen_paths: set[str] = set()
+            for reference in references:
+                resolved_entry = getattr(reference, "resolved_entry", None)
+                if not isinstance(resolved_entry, ArchiveEntry):
+                    continue
+                normalized_path = resolved_entry.path.replace("\\", "/").strip().lower()
+                if not normalized_path or normalized_path in seen_paths:
+                    continue
+                seen_paths.add(normalized_path)
+                resolved_references.append(reference)
+            if not resolved_references:
+                return ()
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle(title)
+            dialog.setModal(True)
+            dialog.resize(900, 520)
+
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(8)
+
+            intro_label = QLabel(intro_text)
+            intro_label.setWordWrap(True)
+            intro_label.setObjectName("HintLabel")
+            layout.addWidget(intro_label)
+
+            tree = QTreeWidget()
+            tree.setColumnCount(5)
+            tree.setHeaderLabels(["Include", "Type", "Semantic", "Archive Path", "Package"])
+            tree.setRootIsDecorated(False)
+            tree.setAlternatingRowColors(True)
+            tree.setSelectionMode(QAbstractItemView.NoSelection)
+            tree.setUniformRowHeights(True)
+            tree.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+            header = tree.header()
+            header.setStretchLastSection(False)
+            header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.Stretch)
+            header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+
+            for index, reference in enumerate(resolved_references):
+                resolved_entry = reference.resolved_entry
+                if not isinstance(resolved_entry, ArchiveEntry):
+                    continue
+                label = str(getattr(reference, "reference_name", "") or "").strip() or resolved_entry.basename
+                reference_kind = str(getattr(reference, "reference_kind", "") or "").strip().lower()
+                type_label = "Sidecar" if reference_kind == "sidecar" else "Texture"
+                item = QTreeWidgetItem(
+                    [
+                        label,
+                        type_label,
+                        str(getattr(reference, "semantic_label", "") or "").strip() or "-",
+                        resolved_entry.path,
+                        resolved_entry.package_label,
+                    ]
+                )
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                item.setCheckState(0, Qt.Checked)
+                item.setData(0, Qt.UserRole, index)
+                item.setToolTip(3, resolved_entry.path)
+                tree.addTopLevelItem(item)
+
+            layout.addWidget(tree, stretch=1)
+
+            controls_row = QHBoxLayout()
+            controls_row.setSpacing(8)
+            select_all_button = QPushButton("Select All")
+            select_none_button = QPushButton("Select None")
+            controls_row.addWidget(select_all_button)
+            controls_row.addWidget(select_none_button)
+            controls_row.addStretch(1)
+            cancel_button = QPushButton("Cancel")
+            confirm_button = QPushButton(confirm_button_text)
+            confirm_button.setDefault(True)
+            controls_row.addWidget(cancel_button)
+            controls_row.addWidget(confirm_button)
+            layout.addLayout(controls_row)
+
+            result: List[ArchiveEntry] = []
+
+            def _set_all(check_state: Qt.CheckState) -> None:
+                for row_index in range(tree.topLevelItemCount()):
+                    item = tree.topLevelItem(row_index)
+                    if item is not None:
+                        item.setCheckState(0, check_state)
+
+            def _accept() -> None:
+                selected_entries: List[ArchiveEntry] = []
+                for row_index in range(tree.topLevelItemCount()):
+                    item = tree.topLevelItem(row_index)
+                    if item is None or item.checkState(0) != Qt.Checked:
+                        continue
+                    raw_index = item.data(0, Qt.UserRole)
+                    try:
+                        index = int(raw_index)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= index < len(resolved_references):
+                        resolved_entry = getattr(resolved_references[index], "resolved_entry", None)
+                        if isinstance(resolved_entry, ArchiveEntry):
+                            selected_entries.append(resolved_entry)
+                result[:] = selected_entries
+                dialog.accept()
+
+            select_all_button.clicked.connect(lambda: _set_all(Qt.Checked))
+            select_none_button.clicked.connect(lambda: _set_all(Qt.Unchecked))
+            cancel_button.clicked.connect(dialog.reject)
+            confirm_button.clicked.connect(_accept)
+
+            if dialog.exec() != QDialog.Accepted:
+                return None
+            return tuple(result)
+
+        def _show_archive_reference_preview_dialog(
+            self,
+            entry: ArchiveEntry,
+            result: ArchivePreviewResult,
+        ) -> None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Referenced File Preview - {entry.basename}")
+            dialog.setModal(True)
+            dialog.resize(1040, 760)
+
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(8)
+
+            title_label = QLabel(result.title or entry.basename)
+            title_label.setObjectName("SectionTitle")
+            layout.addWidget(title_label)
+
+            meta_label = QLabel(result.metadata_summary or build_archive_entry_metadata_summary(entry))
+            meta_label.setWordWrap(True)
+            meta_label.setObjectName("HintLabel")
+            layout.addWidget(meta_label)
+
+            action_row = QHBoxLayout()
+            action_row.setSpacing(8)
+            export_button = QPushButton("Export DDS..." if entry.extension == ".dds" else "Export...")
+            action_row.addWidget(export_button)
+            open_in_editor_button: Optional[QPushButton] = None
+            if entry.extension == ".dds":
+                open_in_editor_button = QPushButton("Open In Texture Editor...")
+                action_row.addWidget(open_in_editor_button)
+            action_row.addStretch(1)
+            close_button = QPushButton("Close")
+            close_button.setDefault(True)
+            action_row.addWidget(close_button)
+            layout.addLayout(action_row)
+
+            preview_tabs = QTabWidget()
+            preview_stack = QStackedWidget()
+            preview_label = PreviewLabel("No image preview available.")
+            preview_scroll = PreviewScrollArea()
+            preview_scroll.setWidgetResizable(False)
+            preview_scroll.setAlignment(Qt.AlignCenter)
+            preview_scroll.setWidget(preview_label)
+            preview_label.attach_scroll_area(preview_scroll)
+            preview_text_edit = CodePreviewEditor(theme_key=self.current_theme_key)
+            preview_text_edit.document().setMaximumBlockCount(5000)
+            preview_info_edit = QPlainTextEdit()
+            preview_info_edit.setReadOnly(True)
+            preview_info_edit.document().setMaximumBlockCount(2000)
+            preview_model = ModelPreviewWidget("No model preview available.", theme_key=self.current_theme_key)
+            preview_media = MediaPreviewWidget("No media preview available.", theme_key=self.current_theme_key)
+            preview_stack.addWidget(preview_scroll)
+            preview_stack.addWidget(preview_model)
+            preview_stack.addWidget(preview_media)
+            preview_stack.addWidget(preview_text_edit)
+            preview_stack.addWidget(preview_info_edit)
+
+            preview_tab = QWidget()
+            preview_tab_layout = QVBoxLayout(preview_tab)
+            preview_tab_layout.setContentsMargins(0, 0, 0, 0)
+            preview_tab_layout.setSpacing(0)
+            preview_tab_layout.addWidget(preview_stack)
+
+            details_edit = QPlainTextEdit()
+            details_edit.setReadOnly(True)
+            details_edit.document().setMaximumBlockCount(2000)
+            details_edit.setPlainText(result.detail_text or result.metadata_summary or "No details available.")
+
+            details_tab = QWidget()
+            details_tab_layout = QVBoxLayout(details_tab)
+            details_tab_layout.setContentsMargins(0, 0, 0, 0)
+            details_tab_layout.setSpacing(0)
+            details_tab_layout.addWidget(details_edit)
+
+            preview_tabs.addTab(preview_tab, "Preview")
+            preview_tabs.addTab(details_tab, "Details")
+            layout.addWidget(preview_tabs, stretch=1)
+
+            preferred_view = result.preferred_view
+            if preferred_view == "image" and (result.preview_image is not None or result.preview_image_path):
+                if result.preview_image is not None:
+                    preview_label.set_preview_image(result.preview_image, result.title or entry.basename)
+                else:
+                    preview_label.set_preview_image_path(result.preview_image_path, result.title or entry.basename)
+                preview_media.clear_media("No media preview available.")
+                preview_model.clear_model("No model preview available.")
+                preview_stack.setCurrentWidget(preview_scroll)
+            elif preferred_view == "model" and result.preview_model is not None:
+                preview_model.set_model(result.preview_model)
+                preview_label.clear_preview("No image preview available.")
+                preview_media.clear_media("No media preview available.")
+                preview_stack.setCurrentWidget(preview_model)
+            elif preferred_view == "media" and result.preview_media_path:
+                preview_label.clear_preview("No image preview available.")
+                preview_model.clear_model("No model preview available.")
+                preview_media.set_media(
+                    result.preview_media_path,
+                    media_kind=result.preview_media_kind,
+                    detail_text=result.detail_text or result.metadata_summary,
+                )
+                preview_stack.setCurrentWidget(preview_media)
+            elif preferred_view == "text":
+                preview_text = result.preview_text or "No text preview available."
+                preview_text_edit.set_language_for_extension(
+                    self._archive_preview_text_language_extension_for_entry(entry, preview_text)
+                )
+                preview_text_edit.setPlainText(preview_text)
+                preview_label.clear_preview("No image preview available.")
+                preview_model.clear_model("No model preview available.")
+                preview_media.clear_media("No media preview available.")
+                preview_stack.setCurrentWidget(preview_text_edit)
+            else:
+                preview_info_edit.setPlainText(result.detail_text or result.metadata_summary or "No preview available.")
+                preview_label.clear_preview("No image preview available.")
+                preview_model.clear_model("No model preview available.")
+                preview_media.clear_media("No media preview available.")
+                preview_stack.setCurrentWidget(preview_info_edit)
+
+            export_button.clicked.connect(
+                lambda _checked=False, current_entry=entry: self._export_archive_reference_entry(current_entry)
+            )
+            if open_in_editor_button is not None:
+                open_in_editor_button.clicked.connect(
+                    lambda _checked=False, current_entry=entry: self._open_archive_entry_in_texture_editor(current_entry)
+                )
+            close_button.clicked.connect(dialog.accept)
+            dialog.exec()
+
+        def _update_archive_texture_reference_action_controls(self) -> None:
+            selected_references = self._selected_archive_texture_references()
+            selected_entries = self._resolved_archive_reference_entries(selected_references)
+            all_entries = self._resolved_archive_reference_entries(self.current_archive_model_texture_references)
+            single_selected_entry = selected_entries[0] if len(selected_entries) == 1 else None
+            can_open = isinstance(single_selected_entry, ArchiveEntry)
+            can_replace = isinstance(single_selected_entry, ArchiveEntry) and single_selected_entry.extension == ".dds"
+            self.archive_texture_open_button.setEnabled(can_open)
+            self.archive_texture_export_button.setEnabled(bool(selected_entries))
+            self.archive_texture_export_all_button.setEnabled(bool(all_entries))
+            self.archive_texture_replace_dds_button.setEnabled(can_replace)
+            self.archive_texture_replace_png_button.setEnabled(can_replace)
+
+        def _open_selected_archive_texture_reference(self) -> None:
+            selected_references = self._selected_archive_texture_references()
+            reference = selected_references[0] if len(selected_references) == 1 else self._current_archive_texture_reference()
+            resolved_entry = getattr(reference, "resolved_entry", None) if reference is not None else None
+            if not isinstance(resolved_entry, ArchiveEntry):
+                self.set_status_message("Select a resolved referenced file first.", error=True)
+                return
+            semantic_sidecar_texts = tuple(
+                str(text or "") for text in getattr(reference, "sidecar_texts", ()) if str(text or "").strip()
+            ) if reference is not None else ()
+
+            def _task(log: Callable[[str], None]) -> ArchivePreviewResult:
+                log(f"Preparing referenced-file preview for {resolved_entry.path}...")
+                texconv_text = self.texconv_path_edit.text().strip()
+                texconv_path = Path(texconv_text).expanduser() if texconv_text else None
+                return build_archive_preview_result(
+                    texconv_path,
+                    resolved_entry,
+                    texture_entries_by_normalized_path=self.archive_entries_by_normalized_path,
+                    texture_entries_by_basename=self.archive_entries_by_basename,
+                    semantic_sidecar_texts=semantic_sidecar_texts,
+                )
+
+            def _handle_complete(result: object) -> None:
+                if not isinstance(result, ArchivePreviewResult):
+                    self.set_status_message("Referenced-file preview finished with an unexpected result payload.", error=True)
+                    return
+                self._show_archive_reference_preview_dialog(resolved_entry, result)
+                self.set_status_message(f"Opened preview for {resolved_entry.basename}.")
+
+            self._run_utility_task(
+                status_message=f"Preparing preview for {resolved_entry.basename}...",
+                task=_task,
+                on_complete=_handle_complete,
+                show_archive_progress=True,
+            )
+
+        def _export_selected_archive_texture_reference(self) -> None:
+            selected_entries = self._resolved_archive_reference_entries(self._selected_archive_texture_references())
+            if not selected_entries:
+                self.set_status_message("Select one or more resolved referenced files first.", error=True)
+                return
+            self._export_archive_reference_entries_to_folder(
+                selected_entries,
+                title="Export Selected Referenced Files",
+            )
+
+        def _export_all_archive_texture_references(self) -> None:
+            resolved_entries = self._resolved_archive_reference_entries(self.current_archive_model_texture_references)
+            if not resolved_entries:
+                self.set_status_message("No resolved referenced files are available to export.", error=True)
+                return
+            self._export_archive_reference_entries_to_folder(
+                resolved_entries,
+                title="Export All Referenced Files",
             )
 
         def _choose_archive_write_target(
@@ -8694,12 +9134,14 @@ def run_gui() -> int:
             initial_export_root: Path,
             initial_package_info: ModPackageInfo,
             initial_create_no_encrypt: bool,
+            initial_include_related_files: bool = False,
+            show_include_related_files_option: bool = False,
             dialog_title: str = "Write Mod-Ready Loose File",
-        ) -> Optional[Tuple[Path, ModPackageInfo, bool]]:
+        ) -> Optional[Tuple[Path, ModPackageInfo, bool, bool]]:
             dialog = QDialog(self)
             dialog.setWindowTitle(dialog_title)
             dialog.setModal(True)
-            dialog.resize(680, 260)
+            dialog.resize(680, 300 if show_include_related_files_option else 260)
 
             layout = QVBoxLayout(dialog)
             layout.setContentsMargins(12, 12, 12, 12)
@@ -8708,6 +9150,11 @@ def run_gui() -> int:
             intro_label = QLabel(
                 "Choose the loose package parent folder and the basic metadata that should be written into info.json. "
                 "The same title, version, author, and description are then reused for the basic manifest.json metadata."
+                + (
+                    " You can also include the resolved related DDS and sidecar files that were detected for the selected mesh."
+                    if show_include_related_files_option
+                    else ""
+                )
             )
             intro_label.setWordWrap(True)
             intro_label.setObjectName("HintLabel")
@@ -8725,6 +9172,9 @@ def run_gui() -> int:
             description_edit = QLineEdit(str(getattr(initial_package_info, "description", "") or "").strip())
             no_encrypt_checkbox = QCheckBox("Create .no_encrypt file")
             no_encrypt_checkbox.setChecked(bool(initial_create_no_encrypt))
+            include_related_files_checkbox = QCheckBox("Include resolved related files (textures, .xml, .pami)")
+            include_related_files_checkbox.setChecked(bool(initial_include_related_files))
+            include_related_files_checkbox.setVisible(bool(show_include_related_files_option))
 
             title_edit.setPlaceholderText(MOD_READY_PACKAGE_TITLE)
             version_edit.setPlaceholderText(MOD_READY_PACKAGE_VERSION)
@@ -8743,6 +9193,7 @@ def run_gui() -> int:
             form_layout.addWidget(QLabel("Description"), 4, 0)
             form_layout.addWidget(description_edit, 4, 1, 1, 2)
             form_layout.addWidget(no_encrypt_checkbox, 5, 0, 1, 3)
+            form_layout.addWidget(include_related_files_checkbox, 6, 0, 1, 3)
             form_layout.setColumnStretch(1, 1)
             layout.addLayout(form_layout)
 
@@ -8790,19 +9241,25 @@ def run_gui() -> int:
                     description=description_edit.text().strip(),
                     nexus_url="",
                 )
-                result[:] = [export_root, package_info, bool(no_encrypt_checkbox.isChecked())]
+                result[:] = [
+                    export_root,
+                    package_info,
+                    bool(no_encrypt_checkbox.isChecked()),
+                    bool(include_related_files_checkbox.isChecked()),
+                ]
                 dialog.accept()
 
             browse_button.clicked.connect(_browse_export_root)
             cancel_button.clicked.connect(dialog.reject)
             continue_button.clicked.connect(_accept)
 
-            if dialog.exec() != QDialog.Accepted or len(result) != 3:
+            if dialog.exec() != QDialog.Accepted or len(result) != 4:
                 return None
 
             export_root = Path(result[0]).expanduser()
             package_info = result[1] if isinstance(result[1], ModPackageInfo) else initial_package_info
             create_no_encrypt_file = bool(result[2])
+            include_related_files = bool(result[3])
 
             self.mod_ready_export_root_edit.setText(str(export_root))
             self.mod_ready_package_title_edit.setText(package_info.title)
@@ -8812,15 +9269,17 @@ def run_gui() -> int:
             self.mod_ready_create_no_encrypt_checkbox.setChecked(create_no_encrypt_file)
             self.schedule_settings_save()
 
-            return export_root, package_info, create_no_encrypt_file
+            return export_root, package_info, create_no_encrypt_file, include_related_files
 
         def _collect_archive_mod_ready_export_target(
             self,
             *,
             browse_title: str,
             prompt_for_metadata: bool = False,
+            initial_include_related_files: bool = False,
+            show_include_related_files_option: bool = False,
             dialog_title: str = "Write Mod-Ready Loose File",
-        ) -> Optional[Tuple[Path, ModPackageInfo, bool]]:
+        ) -> Optional[Tuple[Path, ModPackageInfo, bool, bool]]:
             config = self.collect_config()
             export_root_text = str(getattr(config, "mod_ready_export_root", "") or "").strip()
             if export_root_text:
@@ -8850,16 +9309,20 @@ def run_gui() -> int:
                     initial_export_root=export_root,
                     initial_package_info=package_info,
                     initial_create_no_encrypt=create_no_encrypt_file,
+                    initial_include_related_files=initial_include_related_files,
+                    show_include_related_files_option=show_include_related_files_option,
                     dialog_title=dialog_title,
                 )
             return (
                 export_root,
                 package_info,
                 create_no_encrypt_file,
+                False,
             )
 
         def _replace_selected_archive_texture_reference_from_dds(self) -> None:
-            reference = self._current_archive_texture_reference()
+            selected_references = self._selected_archive_texture_references()
+            reference = selected_references[0] if len(selected_references) == 1 else self._current_archive_texture_reference()
             resolved_entry = getattr(reference, "resolved_entry", None) if reference is not None else None
             if not isinstance(resolved_entry, ArchiveEntry) or resolved_entry.extension != ".dds":
                 self.set_status_message("Select a resolved DDS texture reference first.", error=True)
@@ -8886,12 +9349,12 @@ def run_gui() -> int:
                 QMessageBox.warning(self, "Replace Texture", patch_blocker)
                 return
 
-            loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool]] = None
+            loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool, bool]] = None
             if destination == "loose":
                 loose_export_settings = self._collect_archive_mod_ready_export_target(
                     browse_title="Select Mod-Ready Export Parent Root",
                     prompt_for_metadata=True,
-                    dialog_title="Mesh Loose Export Metadata",
+                    dialog_title="Texture Loose Export Metadata",
                 )
                 if loose_export_settings is None:
                     return
@@ -8905,7 +9368,7 @@ def run_gui() -> int:
                     return patch_archive_entries(requests, on_log=log)
                 if loose_export_settings is None:
                     raise RuntimeError("Mod-ready export target is not available.")
-                parent_root, package_info, create_no_encrypt = loose_export_settings
+                parent_root, package_info, create_no_encrypt, _include_related_files = loose_export_settings
                 log(f"Writing loose mod payload for {resolved_entry.path}...")
                 return export_archive_payloads_to_mod_ready_loose(
                     requests,
@@ -8949,7 +9412,8 @@ def run_gui() -> int:
             )
 
         def _replace_selected_archive_texture_reference_from_png(self) -> None:
-            reference = self._current_archive_texture_reference()
+            selected_references = self._selected_archive_texture_references()
+            reference = selected_references[0] if len(selected_references) == 1 else self._current_archive_texture_reference()
             resolved_entry = getattr(reference, "resolved_entry", None) if reference is not None else None
             if not isinstance(resolved_entry, ArchiveEntry) or resolved_entry.extension != ".dds":
                 self.set_status_message("Select a resolved DDS texture reference first.", error=True)
@@ -8981,12 +9445,12 @@ def run_gui() -> int:
                 QMessageBox.warning(self, "Replace Texture From PNG", patch_blocker)
                 return
 
-            loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool]] = None
+            loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool, bool]] = None
             if destination == "loose":
                 loose_export_settings = self._collect_archive_mod_ready_export_target(
                     browse_title="Select Mod-Ready Export Parent Root",
                     prompt_for_metadata=True,
-                    dialog_title="Mesh Loose Export Metadata",
+                    dialog_title="Texture Loose Export Metadata",
                 )
                 if loose_export_settings is None:
                     return
@@ -9005,7 +9469,7 @@ def run_gui() -> int:
                     return patch_archive_entries(requests, on_log=log)
                 if loose_export_settings is None:
                     raise RuntimeError("Mod-ready export target is not available.")
-                parent_root, package_info, create_no_encrypt = loose_export_settings
+                parent_root, package_info, create_no_encrypt, _include_related_files = loose_export_settings
                 log(f"Writing rebuilt DDS for {resolved_entry.path} into a loose mod package...")
                 return export_archive_payloads_to_mod_ready_loose(
                     requests,
@@ -9173,6 +9637,57 @@ def run_gui() -> int:
                     continue
                 mesh.preview_texture_image = image
 
+        def _prompt_archive_mesh_related_file_selection(
+            self,
+            entry: ArchiveEntry,
+            *,
+            title: str,
+            intro_text: str,
+            confirm_button_text: str,
+        ) -> Optional[Tuple[ArchiveEntry, ...]]:
+            references = self._current_archive_related_references_for_entry(entry)
+            return self._prompt_archive_reference_selection(
+                title=title,
+                intro_text=intro_text,
+                references=references,
+                confirm_button_text=confirm_button_text,
+            )
+
+        def _prompt_archive_mesh_import_supplemental_files(
+            self,
+            entry: ArchiveEntry,
+            *,
+            title: str,
+        ) -> Optional[Tuple[Path, ...]]:
+            decision = QMessageBox.question(
+                self,
+                title,
+                (
+                    f"Do you want to add local supplemental files for {entry.basename}?\n\n"
+                    "Supported files:\n"
+                    "  - .dds texture overrides\n"
+                    "  - .xml PAC material sidecars\n"
+                    "  - .pami PAM material sidecars\n\n"
+                    "Selected files will be used for rebuilt preview, and mapped files can also be included in loose export or archive patch."
+                ),
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.No,
+            )
+            if decision == QMessageBox.Cancel:
+                return None
+            if decision != QMessageBox.Yes:
+                return ()
+
+            selected_files, _selected_filter = QFileDialog.getOpenFileNames(
+                self,
+                title,
+                str(self.settings_file_path.parent),
+                "Supplemental Files (*.dds *.xml *.pami);;DDS Files (*.dds);;Material Sidecars (*.xml *.pami)",
+            )
+            if not selected_files:
+                return ()
+            return tuple(Path(path) for path in selected_files if path)
+
         def _start_archive_mesh_export(self, entry: ArchiveEntry, export_format: str) -> None:
             default_dir = self.settings_file_path.parent / "mesh_export"
             output_dir = QFileDialog.getExistingDirectory(
@@ -9183,12 +9698,29 @@ def run_gui() -> int:
             if not output_dir:
                 return
 
+            selected_related_entries: Tuple[ArchiveEntry, ...] = ()
+            normalized_export_format = export_format.strip().lower()
+            if normalized_export_format in {"obj", "fbx"}:
+                selected_related_entries_result = self._prompt_archive_mesh_related_file_selection(
+                    entry,
+                    title=f"Export Referenced Files With {normalized_export_format.upper()}",
+                    intro_text=(
+                        "Select which resolved referenced files should be copied alongside the mesh export. "
+                        "The selected files will be written into a referenced_files/ folder inside the chosen export directory."
+                    ),
+                    confirm_button_text=f"Export {normalized_export_format.upper()}",
+                )
+                if selected_related_entries_result is None:
+                    return
+                selected_related_entries = selected_related_entries_result
+
             def _task(log: Callable[[str], None]) -> MeshExportResult:
                 return export_archive_mesh(
                     entry,
                     Path(output_dir),
                     export_format,
                     archive_entries_by_normalized_path=self.archive_entries_by_normalized_path,
+                    related_entries=selected_related_entries,
                     on_log=log,
                 )
 
@@ -9196,7 +9728,10 @@ def run_gui() -> int:
                 if not isinstance(result, MeshExportResult):
                     self.set_status_message("Mesh export finished with an unexpected result payload.", error=True)
                     return
-                exported_files = "\n".join(str(path) for path in result.output_paths)
+                displayed_paths = [str(path) for path in result.output_paths[:15]]
+                if len(result.output_paths) > 15:
+                    displayed_paths.append(f"... {len(result.output_paths) - 15} more file(s)")
+                exported_files = "\n".join(displayed_paths)
                 summary_text = "\n".join(result.summary_lines)
                 QMessageBox.information(
                     self,
@@ -9221,6 +9756,12 @@ def run_gui() -> int:
             )
             if not obj_path:
                 return
+            supplemental_files = self._prompt_archive_mesh_import_supplemental_files(
+                entry,
+                title="Select Supplemental Files For OBJ Preview",
+            )
+            if supplemental_files is None:
+                return
             texconv_text = self.texconv_path_edit.text().strip()
 
             def _task(log: Callable[[str], None]) -> MeshImportPreviewResult:
@@ -9232,6 +9773,7 @@ def run_gui() -> int:
                     texconv_path=(Path(texconv_text).expanduser() if texconv_text else None),
                     texture_entries_by_normalized_path=self.archive_entries_by_normalized_path,
                     texture_entries_by_basename=self.archive_entries_by_basename,
+                    supplemental_files=supplemental_files,
                 )
 
             def _handle_complete(result: object) -> None:
@@ -9266,6 +9808,13 @@ def run_gui() -> int:
             if not destination:
                 return
 
+            supplemental_files = self._prompt_archive_mesh_import_supplemental_files(
+                entry,
+                title="Select Supplemental Files For OBJ Import",
+            )
+            if supplemental_files is None:
+                return
+
             if destination == "patch":
                 confirmation = QMessageBox.question(
                     self,
@@ -9280,15 +9829,30 @@ def run_gui() -> int:
                 if confirmation != QMessageBox.Yes:
                     return
 
-            loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool]] = None
+            loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool, bool]] = None
+            selected_related_entries: Tuple[ArchiveEntry, ...] = ()
             if destination == "loose":
                 loose_export_settings = self._collect_archive_mod_ready_export_target(
                     browse_title="Select Mod-Ready Export Parent Root",
                     prompt_for_metadata=True,
+                    initial_include_related_files=False,
+                    show_include_related_files_option=False,
                     dialog_title="Mesh Loose Export Metadata",
                 )
                 if loose_export_settings is None:
                     return
+                selected_related_entries_result = self._prompt_archive_mesh_related_file_selection(
+                    entry,
+                    title="Include Referenced Files In Loose Package",
+                    intro_text=(
+                        "Select which resolved referenced files should be copied into the mod-ready loose package together with the rebuilt mesh. "
+                        "Leave everything unchecked if you only want the rebuilt mesh payload."
+                    ),
+                    confirm_button_text="Continue",
+                )
+                if selected_related_entries_result is None:
+                    return
+                selected_related_entries = selected_related_entries_result
 
             paired_entry = None
             if entry.extension == ".pam":
@@ -9304,10 +9868,33 @@ def run_gui() -> int:
                     texconv_path=(Path(texconv_text).expanduser() if texconv_text else None),
                     texture_entries_by_normalized_path=self.archive_entries_by_normalized_path,
                     texture_entries_by_basename=self.archive_entries_by_basename,
+                    supplemental_files=supplemental_files,
                 )
-                requests = [ArchivePatchRequest(entry=entry, payload_data=preview_result.rebuilt_data)]
+                request_by_normalized_path: dict[str, ArchivePatchRequest] = {
+                    entry.path.replace("\\", "/").strip().lower(): ArchivePatchRequest(
+                        entry=entry,
+                        payload_data=preview_result.rebuilt_data,
+                    )
+                }
                 if paired_entry is not None and preview_result.paired_lod_data is not None:
-                    requests.append(ArchivePatchRequest(entry=paired_entry, payload_data=preview_result.paired_lod_data))
+                    request_by_normalized_path[paired_entry.path.replace("\\", "/").strip().lower()] = ArchivePatchRequest(
+                        entry=paired_entry,
+                        payload_data=preview_result.paired_lod_data,
+                    )
+                skipped_supplemental_specs = 0
+                for spec in preview_result.supplemental_file_specs:
+                    if not isinstance(spec.target_entry, ArchiveEntry):
+                        skipped_supplemental_specs += 1
+                        continue
+                    request_by_normalized_path[spec.target_entry.path.replace("\\", "/").strip().lower()] = ArchivePatchRequest(
+                        entry=spec.target_entry,
+                        payload_data=spec.source_path.read_bytes(),
+                    )
+                requests = list(request_by_normalized_path.values())
+                if skipped_supplemental_specs > 0:
+                    log(
+                        f"Skipping {skipped_supplemental_specs} selected supplemental file(s) that could not be mapped to an archive patch target."
+                    )
                 if destination == "patch":
                     log(f"Patching {len(requests)} archive entrie(s) back into the game files...")
                     patch_result = patch_archive_entries(requests, on_log=log)
@@ -9317,7 +9904,7 @@ def run_gui() -> int:
                     }
                 if loose_export_settings is None:
                     raise RuntimeError("Mod-ready export target is not available.")
-                parent_root, package_info, create_no_encrypt = loose_export_settings
+                parent_root, package_info, create_no_encrypt, include_related_files = loose_export_settings
                 log(f"Writing {len(requests)} rebuilt entrie(s) into a mod-ready loose package...")
                 loose_result = export_archive_mesh_payloads_to_mod_ready_loose(
                     requests,
@@ -9327,6 +9914,9 @@ def run_gui() -> int:
                     parent_root=parent_root,
                     package_info=package_info,
                     create_no_encrypt_file=create_no_encrypt,
+                    include_related_files=include_related_files,
+                    related_entries_to_include=selected_related_entries,
+                    supplemental_files_to_include=preview_result.supplemental_file_specs,
                     on_log=log,
                 )
                 return {

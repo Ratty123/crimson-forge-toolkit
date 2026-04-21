@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 from crimson_forge_toolkit.constants import (
     UPSCALE_POST_CORRECTION_MATCH_HISTOGRAM,
@@ -329,6 +329,7 @@ def build_source_match_plan_for_path(
     mode: str,
     preset: str,
     enable_automatic_rules: bool,
+    sidecar_texts: Sequence[str] = (),
     original_dds_path: Optional[Path] = None,
     direct_backend_supported: bool = True,
 ) -> Tuple[TextureUpscaleDecision, SourceMatchPlan]:
@@ -350,6 +351,7 @@ def build_source_match_plan_for_path(
         preset=preset,
         original_texconv_format=original_texconv_format,
         has_alpha=has_alpha,
+        sidecar_texts=sidecar_texts,
         enable_automatic_rules=enable_automatic_rules,
     )
     return decision, build_source_match_plan_for_decision(

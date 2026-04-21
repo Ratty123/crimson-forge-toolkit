@@ -1112,6 +1112,9 @@ class ModelPreviewWidget(QOpenGLWidget):
         return opaque_black, transparent, colored, total
 
     def _should_flip_texture_vertically(self, mesh) -> bool:
+        flip_override = getattr(mesh, "preview_texture_flip_vertical", None)
+        if flip_override is not None:
+            return bool(flip_override)
         texture_image = getattr(mesh, "preview_texture_image", None)
         if not isinstance(texture_image, QImage) or texture_image.isNull():
             return True
