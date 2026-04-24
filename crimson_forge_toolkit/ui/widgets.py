@@ -2135,7 +2135,7 @@ class ModelPreviewWidget(QOpenGLWidget):
         mvp: QMatrix4x4,
         point: tuple[float, float, float],
     ) -> Optional[QPointF]:
-        clip = mvp * QVector4D(float(point[0]), float(point[1]), float(point[2]), 1.0)
+        clip = mvp.map(QVector4D(float(point[0]), float(point[1]), float(point[2]), 1.0))
         w = float(clip.w())
         if abs(w) < 1e-8:
             return None
