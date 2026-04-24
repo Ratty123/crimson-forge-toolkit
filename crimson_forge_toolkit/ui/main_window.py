@@ -22,6 +22,7 @@ from crimson_forge_toolkit.constants import *
 from crimson_forge_toolkit.models import *
 from crimson_forge_toolkit.core.archive import *
 from crimson_forge_toolkit.core.archive import (
+    _attach_model_sidecar_texture_preview_paths,
     _extract_archive_model_sidecar_texture_references,
     _infer_model_preview_normal_strength,
     _resolve_model_texture_semantic_details,
@@ -12067,6 +12068,7 @@ def run_gui() -> int:
             preview_panel.setMinimumWidth(560)
             preview_panel_layout = QVBoxLayout(preview_panel)
             preview_panel_layout.addWidget(QLabel("Live Alignment Preview"))
+            preview_render_settings = self._current_model_preview_render_settings()
             preview_splitter = QSplitter(Qt.Horizontal, preview_panel)
             original_preview_container = QWidget(preview_splitter)
             original_preview_layout = QVBoxLayout(original_preview_container)
@@ -12074,6 +12076,9 @@ def run_gui() -> int:
             original_preview_layout.addWidget(QLabel("Original Reference"))
             original_dialog_preview = ModelPreviewWidget("Original asset reference preview.", theme_key=self.current_theme_key)
             original_dialog_preview.setMinimumSize(360, 360)
+            original_dialog_preview.set_render_settings(preview_render_settings)
+            original_dialog_preview.set_use_textures(True)
+            original_dialog_preview.set_high_quality_textures(True)
             original_preview_layout.addWidget(original_dialog_preview, 1)
             replacement_preview_container = QWidget(preview_splitter)
             replacement_preview_layout = QVBoxLayout(replacement_preview_container)
@@ -12081,6 +12086,9 @@ def run_gui() -> int:
             replacement_preview_layout.addWidget(QLabel("Replacement With Current Mapping"))
             static_dialog_preview = ModelPreviewWidget("Select texture slots to preview.", theme_key=self.current_theme_key)
             static_dialog_preview.setMinimumSize(420, 360)
+            static_dialog_preview.set_render_settings(preview_render_settings)
+            static_dialog_preview.set_use_textures(True)
+            static_dialog_preview.set_high_quality_textures(True)
             replacement_preview_layout.addWidget(static_dialog_preview, 1)
             preview_splitter.addWidget(original_preview_container)
             preview_splitter.addWidget(replacement_preview_container)
@@ -12179,15 +12187,24 @@ def run_gui() -> int:
 
             def _refresh_static_dialog_preview() -> None:
                 if replacement_preview_model is not None:
+                    previous_view_state = static_dialog_preview.view_state_snapshot()
                     static_dialog_preview.set_model(replacement_preview_model)
+                    static_dialog_preview.restore_view_state(previous_view_state)
+                    static_dialog_preview.set_use_textures(True)
+                    static_dialog_preview.set_high_quality_textures(True)
 
             try:
                 original_data, _decompressed, _note = read_archive_entry_data(entry)
                 original_mesh_for_mapping = parse_mesh(original_data, entry.path)
                 replacement_mesh_for_mapping = import_scene_mesh(obj_path)
-                original_dialog_preview.set_model(parsed_mesh_to_preview_model(original_mesh_for_mapping))
+                original_reference_preview_model = parsed_mesh_to_preview_model(original_mesh_for_mapping)
                 replacement_preview_model = parsed_mesh_to_preview_model(replacement_mesh_for_mapping)
+                original_dialog_preview.set_model(original_reference_preview_model)
+                original_dialog_preview.set_use_textures(True)
+                original_dialog_preview.set_high_quality_textures(True)
                 static_dialog_preview.set_model(replacement_preview_model)
+                static_dialog_preview.set_use_textures(True)
+                static_dialog_preview.set_high_quality_textures(True)
                 suggested_mappings = suggest_static_submesh_mappings(original_mesh_for_mapping, replacement_mesh_for_mapping)
 
                 mapping_group = QGroupBox("Submesh / Material Mapping")
@@ -12548,7 +12565,11 @@ def run_gui() -> int:
                                 mesh.preview_material_texture_type = semantic_type
                                 mesh.preview_material_texture_subtype = semantic_subtype
                                 mesh.preview_material_texture_packed_channels = tuple(packed_channels)
+                    previous_view_state = static_dialog_preview.view_state_snapshot()
                     static_dialog_preview.set_model(preview_model)
+                    static_dialog_preview.restore_view_state(previous_view_state)
+                    static_dialog_preview.set_use_textures(True)
+                    static_dialog_preview.set_high_quality_textures(True)
 
                 if texture_files_for_mapping:
                     texture_group = QGroupBox("Texture Slot Mapping")
@@ -12566,6 +12587,21 @@ def run_gui() -> int:
                             entry,
                             archive_entries_by_basename=dict(self.archive_entries_by_basename),
                         )
+                        texconv_text = self.texconv_path_edit.text().strip()
+                        if texconv_text and original_reference_preview_model is not None:
+                            _attach_model_sidecar_texture_preview_paths(
+                                Path(texconv_text).expanduser(),
+                                entry,
+                                original_reference_preview_model,
+                                parsed_mesh=original_mesh_for_mapping,
+                                sidecar_texture_bindings=sidecar_bindings,
+                                visible_texture_mode=str(self._current_model_preview_render_settings().visible_texture_mode),
+                                texture_entries_by_normalized_path=dict(self.archive_entries_by_normalized_path),
+                                texture_entries_by_basename=dict(self.archive_entries_by_basename),
+                            )
+                            original_dialog_preview.set_model(original_reference_preview_model)
+                            original_dialog_preview.set_use_textures(True)
+                            original_dialog_preview.set_high_quality_textures(True)
                     except Exception:
                         sidecar_bindings = ()
                     texture_sets = group_replacement_texture_sets(texture_files_for_mapping, obj_mesh=replacement_mesh_for_mapping)

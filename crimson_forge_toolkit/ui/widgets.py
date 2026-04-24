@@ -797,6 +797,35 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._show_origin_overlay = bool(visible)
         self.update()
 
+    def view_state_snapshot(self) -> Tuple[float, float, bool, float, float, Tuple[float, float, float]]:
+        return (
+            float(self._yaw),
+            float(self._pitch),
+            bool(self._fit_to_view),
+            float(self._zoom_factor),
+            float(self._distance),
+            (float(self._pan_offset.x()), float(self._pan_offset.y()), float(self._pan_offset.z())),
+        )
+
+    def restore_view_state(
+        self,
+        state: Optional[Tuple[float, float, bool, float, float, Tuple[float, float, float]]],
+    ) -> None:
+        if not state:
+            return
+        try:
+            yaw, pitch, fit_to_view, zoom_factor, distance, pan_offset = state
+            self._yaw = float(yaw)
+            self._pitch = float(pitch)
+            self._fit_to_view = bool(fit_to_view)
+            self._zoom_factor = min(max(float(zoom_factor), 0.1), 16.0)
+            self._distance = max(0.1, float(distance))
+            self._pan_offset = QVector3D(float(pan_offset[0]), float(pan_offset[1]), float(pan_offset[2]))
+        except Exception:
+            return
+        self.view_state_changed.emit(self._zoom_factor, self._fit_to_view)
+        self.update()
+
     def _reset_model_state(self, message: str) -> bool:
         had_renderable_state = bool(
             self._current_model is not None
@@ -2169,9 +2198,9 @@ class ModelPreviewWidget(QOpenGLWidget):
         if self._vertex_count <= 0 or not (self._show_grid_overlay or self._show_origin_overlay):
             return
         mvp = self._preview_mvp_matrix()
-        grid_color = QColor(148, 163, 184, 54)
-        major_grid_color = QColor(148, 163, 184, 86)
-        extent = 2.0
+        grid_color = QColor(148, 163, 184, 125)
+        major_grid_color = QColor(203, 213, 225, 175)
+        extent = 3.0
         step = 0.25
         if self._show_grid_overlay:
             line_count = int(round((extent * 2.0) / step))
@@ -2182,10 +2211,10 @@ class ModelPreviewWidget(QOpenGLWidget):
                 self._draw_preview_line(painter, mvp, (value, 0.0, -extent), (value, 0.0, extent), color)
                 self._draw_preview_line(painter, mvp, (-extent, 0.0, value), (extent, 0.0, value), color)
 
-        axis_extent = 2.25
-        self._draw_preview_line(painter, mvp, (-axis_extent, 0.0, 0.0), (axis_extent, 0.0, 0.0), QColor(239, 68, 68, 170), width=1.6)
-        self._draw_preview_line(painter, mvp, (0.0, -axis_extent, 0.0), (0.0, axis_extent, 0.0), QColor(59, 130, 246, 170), width=1.6)
-        self._draw_preview_line(painter, mvp, (0.0, 0.0, -axis_extent), (0.0, 0.0, axis_extent), QColor(34, 197, 94, 170), width=1.6)
+        axis_extent = 3.25
+        self._draw_preview_line(painter, mvp, (-axis_extent, 0.0, 0.0), (axis_extent, 0.0, 0.0), QColor(239, 68, 68, 235), width=2.4)
+        self._draw_preview_line(painter, mvp, (0.0, -axis_extent, 0.0), (0.0, axis_extent, 0.0), QColor(59, 130, 246, 235), width=2.4)
+        self._draw_preview_line(painter, mvp, (0.0, 0.0, -axis_extent), (0.0, 0.0, axis_extent), QColor(34, 197, 94, 235), width=2.4)
         for label, point, color in (
             ("X", (axis_extent, 0.0, 0.0), QColor(239, 68, 68, 210)),
             ("Y", (0.0, axis_extent, 0.0), QColor(59, 130, 246, 210)),
@@ -2199,13 +2228,19 @@ class ModelPreviewWidget(QOpenGLWidget):
         if self._show_origin_overlay:
             origin = self._project_preview_point(mvp, (0.0, 0.0, 0.0))
             if origin is not None:
-                painter.setPen(QPen(QColor(226, 232, 240, 210), 1.2))
-                radius = 7.0
+                painter.setPen(QPen(QColor(255, 255, 255, 245), 1.8))
+                radius = 8.0
                 painter.drawEllipse(origin, radius, radius)
                 painter.drawLine(QPointF(origin.x() - 10.0, origin.y()), QPointF(origin.x() + 10.0, origin.y()))
                 painter.drawLine(QPointF(origin.x(), origin.y() - 10.0), QPointF(origin.x(), origin.y() + 10.0))
                 painter.setPen(QColor(226, 232, 240, 170))
                 painter.drawText(QRect(int(origin.x()) + 10, int(origin.y()) + 8, 80, 18), Qt.AlignLeft, "origin")
+            center = QPointF(float(self.width()) * 0.5, float(self.height()) * 0.5)
+            painter.setPen(QPen(QColor(255, 255, 255, 95), 1.0))
+            painter.drawLine(QPointF(center.x() - 18.0, center.y()), QPointF(center.x() + 18.0, center.y()))
+            painter.drawLine(QPointF(center.x(), center.y() - 18.0), QPointF(center.x(), center.y() + 18.0))
+            painter.setPen(QPen(QColor(255, 255, 255, 170), 1.3))
+            painter.drawEllipse(center, 3.0, 3.0)
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         super().paintEvent(event)
