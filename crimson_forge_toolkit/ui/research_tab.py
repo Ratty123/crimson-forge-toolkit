@@ -110,6 +110,7 @@ class ResearchRefreshWorker(QObject):
         *,
         archive_entries: Sequence[object],
         filtered_archive_entries: Sequence[object],
+        sidecar_source_entries: Sequence[object],
         original_root: Optional[Path],
         output_root: Optional[Path],
         texconv_path: Optional[Path],
@@ -120,6 +121,7 @@ class ResearchRefreshWorker(QObject):
         super().__init__()
         self.archive_entries = archive_entries
         self.filtered_archive_entries = filtered_archive_entries
+        self.sidecar_source_entries = sidecar_source_entries
         self.original_root = original_root
         self.output_root = output_root
         self.texconv_path = texconv_path
@@ -152,6 +154,7 @@ class ResearchRefreshWorker(QObject):
                 payload.update(
                     build_archive_research_snapshot(
                         working_entries,
+                        sidecar_source_entries=self.sidecar_source_entries,
                         stop_event=self.stop_event,
                         on_progress=emit_snapshot_progress,
                     )
@@ -407,7 +410,8 @@ class ResearchTab(QWidget):
     review_reference_in_text_search_requested = Signal(str, str)
     REFRESH_POPULATION_BATCH_SIZE = 80
     REFRESH_GROUP_BATCH_SIZE = 20
-    UNKNOWN_GROUP_BATCH_SIZE = 100
+    UNKNOWN_GROUP_BATCH_SIZE = 50
+    POPULATION_TIMER_INTERVAL_MS = 1
 
     def __init__(
         self,
@@ -468,6 +472,7 @@ class ResearchTab(QWidget):
         self.archive_picker_child_folders: Dict[tuple[str, ...], List[tuple[str, tuple[str, ...]]]] = {}
         self.archive_picker_direct_files: Dict[tuple[str, ...], List[int]] = {}
         self.archive_picker_folder_entry_indexes: Dict[tuple[str, ...], List[int]] = {}
+        self.archive_picker_folder_preview_stats: Dict[tuple[str, ...], tuple[int, int, int]] = {}
         self.archive_picker_items_by_folder_key: Dict[tuple[str, ...], QTreeWidgetItem] = {}
         self.archive_picker_refresh_pending = False
         self.defer_archive_picker_refresh = True
@@ -481,7 +486,7 @@ class ResearchTab(QWidget):
         self._populating_unknown_resolver_controls = False
         self._refresh_population_timer = QTimer(self)
         self._refresh_population_timer.setSingleShot(True)
-        self._refresh_population_timer.setInterval(0)
+        self._refresh_population_timer.setInterval(self.POPULATION_TIMER_INTERVAL_MS)
         self._refresh_population_timer.timeout.connect(self._flush_refresh_population_batch)
         self._refresh_population_phases: List[Dict[str, object]] = []
         self._refresh_population_phase_index = 0
@@ -489,7 +494,7 @@ class ResearchTab(QWidget):
         self._refresh_population_processed = 0
         self._unknown_population_timer = QTimer(self)
         self._unknown_population_timer.setSingleShot(True)
-        self._unknown_population_timer.setInterval(0)
+        self._unknown_population_timer.setInterval(self.POPULATION_TIMER_INTERVAL_MS)
         self._unknown_population_timer.timeout.connect(self._flush_unknown_group_population_batch)
         self._pending_unknown_source_groups: List[UnknownResolverGroup] = []
         self._pending_unknown_groups: List[UnknownResolverGroup] = []
@@ -497,6 +502,9 @@ class ResearchTab(QWidget):
         self._pending_unknown_showing_classified = False
         self._pending_unknown_population_total = 0
         self._pending_unknown_scanned_total = 0
+        self._pending_research_view_entry_count = 0
+        self._pending_research_full_archive_entry_count = 0
+        self._pending_research_uses_full_archive_view = False
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -505,7 +513,9 @@ class ResearchTab(QWidget):
         top_row = QHBoxLayout()
         top_row.setSpacing(6)
         self.refresh_button = QPushButton("Refresh Research")
-        self.refresh_status_label = QLabel("Ready. Use the current archive scan and compare roots.")
+        self.refresh_status_label = QLabel(
+            "Ready. Research lists follow the current Archive Browser view, while DDS semantics can still use loaded .pac.xml / .pami sidecars when available."
+        )
         self.refresh_status_label.setWordWrap(True)
         self.refresh_status_label.setObjectName("HintLabel")
         self.refresh_progress = QProgressBar()
@@ -647,6 +657,7 @@ class ResearchTab(QWidget):
                 self.archive_picker_tree.setCurrentItem(first)
         self.archive_picker_status_label.setText(
             f"{len(self.archive_picker_entries):,} archive file(s) available from the current Archive Browser view."
+            " DDS semantics can still use loaded archive sidecars when they are available."
             if self.archive_picker_entries
             else "No archive files are available yet. Scan archives or broaden the current Archive Browser filter."
         )
@@ -664,6 +675,7 @@ class ResearchTab(QWidget):
             self.archive_picker_child_folders,
             self.archive_picker_direct_files,
             self.archive_picker_folder_entry_indexes,
+            self.archive_picker_folder_preview_stats,
         ) = build_archive_tree_index(self.archive_picker_entries)
         self.archive_picker_items_by_folder_key = {}
 
@@ -1055,6 +1067,13 @@ class ResearchTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
+        archive_scope_hint = QLabel(
+            "Research rows in this tab are built from the current Archive Browser view/filter. When available, DDS classification can still consult loaded archive sidecars such as .pac.xml and .pami so color/albedo and other roles do not depend only on filename guessing."
+        )
+        archive_scope_hint.setWordWrap(True)
+        archive_scope_hint.setObjectName("HintLabel")
+        layout.addWidget(archive_scope_hint)
+
         sub_tabs = QTabWidget()
         self.archive_insights_tabs = sub_tabs
         layout.addWidget(sub_tabs, stretch=1)
@@ -1109,7 +1128,7 @@ class ResearchTab(QWidget):
         classifier_layout.setContentsMargins(10, 12, 10, 10)
         classifier_layout.setSpacing(8)
         classifier_hint = QLabel(
-            "Classifies archive textures as color, normal, mask, roughness, emissive, UI, impostor, or unknown using naming and path heuristics."
+            "Classifies archive textures as color, normal, mask, roughness, emissive, UI, impostor, or unknown using naming/path heuristics plus exact sidecar bindings from files such as .pac.xml and .pami when available."
         )
         classifier_hint.setWordWrap(True)
         classifier_hint.setObjectName("HintLabel")
@@ -1134,7 +1153,7 @@ class ResearchTab(QWidget):
         unknown_layout.setSpacing(6)
 
         unknown_hint = QLabel(
-            "Review DDS files here, preview them directly, and approve a label once so the app remembers it for future scans and policy planning."
+            "Review DDS files here, preview them directly, and approve a label once so the app remembers it for future scans and policy planning. The list follows the current Research snapshot from Archive Browser, while inferred roles may still use loaded sidecar bindings."
         )
         unknown_hint.setWordWrap(True)
         unknown_hint.setObjectName("HintLabel")
@@ -1994,7 +2013,8 @@ class ResearchTab(QWidget):
         original_root = Path(self.get_original_root()).expanduser() if self.get_original_root().strip() else None
         output_root = Path(self.get_output_root()).expanduser() if self.get_output_root().strip() else None
         texconv_path = Path(self.get_texconv_path()).expanduser() if self.get_texconv_path().strip() else None
-        archive_snapshot_cache_key = self._build_archive_snapshot_cache_key(working_entries)
+        working_archive_key = self._build_archive_snapshot_cache_key(working_entries)
+        archive_snapshot_cache_key = f"{working_archive_key}|sidecars:{full_archive_key}"
         cached_archive_snapshot = self.archive_snapshot_cache.get(archive_snapshot_cache_key)
         ui_constraint_related_paths = ()
         if self._ui_constraint_scan_archive_key and self._ui_constraint_scan_archive_key == full_archive_key:
@@ -2003,6 +2023,7 @@ class ResearchTab(QWidget):
         worker = ResearchRefreshWorker(
             archive_entries=archive_entries,
             filtered_archive_entries=filtered_entries,
+            sidecar_source_entries=archive_entries,
             original_root=original_root,
             output_root=output_root,
             texconv_path=texconv_path,
@@ -2024,14 +2045,29 @@ class ResearchTab(QWidget):
         self.refresh_thread = thread
         self.pending_archive_snapshot_cache_key = archive_snapshot_cache_key
         self._pending_refresh_full_archive_key = full_archive_key
+        self._pending_research_view_entry_count = len(working_entries)
+        self._pending_research_full_archive_entry_count = len(archive_entries)
+        self._pending_research_uses_full_archive_view = use_full_archive_for_focus
         self.refresh_button.setEnabled(False)
         self.refresh_progress.setRange(0, 0)
         self.refresh_progress.setFormat("Working...")
         if cached_archive_snapshot:
-            self.refresh_status_label.setText("Preparing research snapshot with cached archive insights...")
+            self.refresh_status_label.setText(
+                (
+                    f"Preparing research snapshot from the full loaded archive ({len(archive_entries):,} file(s)) with cached archive insights..."
+                    if use_full_archive_for_focus
+                    else f"Preparing research snapshot from the current Archive Browser view ({len(working_entries):,} file(s)) with cached archive insights..."
+                )
+            )
             self.status_message_requested.emit("Refreshing research snapshot with cached archive insights...", False)
         else:
-            self.refresh_status_label.setText("Preparing research snapshot...")
+            self.refresh_status_label.setText(
+                (
+                    f"Preparing research snapshot from the full loaded archive ({len(archive_entries):,} file(s))..."
+                    if use_full_archive_for_focus
+                    else f"Preparing research snapshot from the current Archive Browser view ({len(working_entries):,} file(s))..."
+                )
+            )
             self.status_message_requested.emit("Refreshing research snapshot...", False)
         thread.start()
 
@@ -2619,7 +2655,13 @@ class ResearchTab(QWidget):
         if self._refresh_population_total <= 0:
             self._finish_refresh_population()
             return
-        self.refresh_status_label.setText(f"Populating research snapshot... 0 / {self._refresh_population_total:,}")
+        self.refresh_status_label.setText(
+            (
+                f"Populating research snapshot for the full loaded archive... 0 / {self._refresh_population_total:,}"
+                if self._pending_research_uses_full_archive_view
+                else f"Populating research snapshot for the current Archive Browser view... 0 / {self._refresh_population_total:,}"
+            )
+        )
         self.refresh_progress.setRange(0, self._refresh_population_total)
         self.refresh_progress.setValue(0)
         self.refresh_progress.setFormat(f"0 / {self._refresh_population_total}")
@@ -2710,11 +2752,17 @@ class ResearchTab(QWidget):
     def _finish_refresh_population(self) -> None:
         self._stop_refresh_population()
         self._refresh_texture_analysis_summary()
-        self.refresh_status_label.setText("Research snapshot ready.")
+        self.refresh_status_label.setText(
+            (
+                f"Research snapshot ready for the full loaded archive ({self._pending_research_full_archive_entry_count:,} file(s))."
+                if self._pending_research_uses_full_archive_view
+                else f"Research snapshot ready for the current Archive Browser view ({self._pending_research_view_entry_count:,} file(s))."
+            )
+        )
         self.refresh_progress.setRange(0, 1)
         self.refresh_progress.setValue(1)
         self.refresh_progress.setFormat("Ready")
-        self.status_message_requested.emit("Research snapshot ready.", False)
+        self.status_message_requested.emit(self.refresh_status_label.text(), False)
         self._focus_pending_mip_row()
 
     def _populate_texture_groups(self, groups: object) -> None:
@@ -2939,7 +2987,8 @@ class ResearchTab(QWidget):
         return True
 
     def _handle_unknown_show_classified_toggled(self, _checked: bool) -> None:
-        self._refresh_unknown_resolver_view()
+        self.unknown_resolver_status_label.setText("Refreshing classification review for the current Research snapshot...")
+        QTimer.singleShot(0, self._refresh_unknown_resolver_view)
 
     def _handle_unknown_name_filter_changed(self, _text: str) -> None:
         self._clear_pending_classification_review_focus()
@@ -2956,9 +3005,13 @@ class ResearchTab(QWidget):
         previous_group = self._current_unknown_group()
         previous_group_key = previous_group.group_key if previous_group is not None else ""
         self._unknown_population_timer.stop()
+        self.unknown_group_tree.blockSignals(True)
         self.unknown_group_tree.setUpdatesEnabled(False)
-        self.unknown_group_tree.clear()
-        self.unknown_group_tree.setUpdatesEnabled(True)
+        try:
+            self.unknown_group_tree.clear()
+        finally:
+            self.unknown_group_tree.setUpdatesEnabled(True)
+            self.unknown_group_tree.blockSignals(False)
         self._pending_unknown_source_groups = [
             group
             for group in groups
@@ -3141,6 +3194,7 @@ class ResearchTab(QWidget):
             return
         self._populating_unknown_resolver_controls = True
         try:
+            self.unknown_member_tree.blockSignals(True)
             self.unknown_member_tree.clear()
             self._update_unknown_member_group_visibility(group)
             focused_member_item: Optional[QTreeWidgetItem] = None
@@ -3172,6 +3226,7 @@ class ResearchTab(QWidget):
             )
             self._select_unknown_label_choice(suggested_choice)
         finally:
+            self.unknown_member_tree.blockSignals(False)
             self._populating_unknown_resolver_controls = False
         if self.unknown_member_tree.topLevelItemCount() > 0:
             first_member = focused_member_item or self.unknown_member_tree.topLevelItem(0)

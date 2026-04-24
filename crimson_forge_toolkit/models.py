@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
+
+if TYPE_CHECKING:
+    from crimson_forge_toolkit.core.upscale_profiles import TextureUpscaleDecision
 
 from crimson_forge_toolkit.constants import (
     ALLOW_UNIQUE_BASENAME_FALLBACK,
@@ -700,19 +704,71 @@ class ComparePreviewPaneResult:
     metadata_summary: str = ""
 
 
+class RelationKind(str, Enum):
+    MESH = "mesh"
+    LOD = "lod"
+    MATERIAL_SIDECAR = "material_sidecar"
+    TEXTURE = "texture"
+    SKELETON = "skeleton"
+    ANIMATION = "animation"
+    METADATA = "metadata"
+
+
+class RelationConfidence(str, Enum):
+    AUTHORITATIVE = "authoritative"
+    DERIVED_SAME_STEM = "derived_same_stem"
+    DERIVED_FAMILY_HEURISTIC = "derived_family_heuristic"
+
+
+class ImportIssueStatus(str, Enum):
+    AUTO_FIXED = "auto-fixed"
+    WARNING = "warning"
+    REQUIRES_MANUAL_REVIEW = "requires-manual-review"
+
+
+@dataclass(slots=True)
+class AssetRelation:
+    source_path: str = ""
+    target_path: str = ""
+    relation_kind: str = RelationKind.METADATA.value
+    confidence: str = RelationConfidence.DERIVED_SAME_STEM.value
+    role_label: str = ""
+    reason: str = ""
+    source_entry: Optional["ArchiveEntry"] = None
+    target_entry: Optional["ArchiveEntry"] = None
+    semantic_label: str = ""
+    semantic_hint: str = ""
+    sidecar_parameter_name: str = ""
+    material_name: str = ""
+    package_label: str = ""
+
+
+@dataclass(slots=True)
+class AssetFamilyGraph:
+    root_path: str = ""
+    family_key: str = ""
+    members: Tuple[str, ...] = ()
+    relations: Tuple[AssetRelation, ...] = ()
+    grouped_paths: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+
+
 @dataclass(slots=True)
 class ArchivePreviewResult:
     status: str
     title: str = ""
     metadata_summary: str = ""
     detail_text: str = ""
+    timings: Dict[str, float] = field(default_factory=dict)
+    timing_summary: str = ""
     preview_image_path: str = ""
     preview_image: object = None
     preview_media_path: str = ""
     preview_media_kind: str = ""
     preview_text: str = ""
     preview_model: object = None
+    prepared_preview_model: Optional["PreparedModelPreviewData"] = None
     model_texture_references: Tuple["ArchiveModelTextureReference", ...] = ()
+    asset_family_graph: Optional[AssetFamilyGraph] = None
     preferred_view: str = "info"
     warning_badge: str = ""
     warning_text: str = ""
@@ -736,7 +792,34 @@ class ModelPreviewMesh:
     indices: List[int] = field(default_factory=list)
     preview_texture_path: str = ""
     preview_texture_image: object = None
+    preview_normal_texture_path: str = ""
+    preview_normal_texture_image: object = None
+    preview_normal_texture_name: str = ""
+    preview_normal_texture_strength: float = 0.0
+    preview_material_texture_path: str = ""
+    preview_material_texture_image: object = None
+    preview_material_texture_name: str = ""
+    preview_material_texture_type: str = ""
+    preview_material_texture_subtype: str = ""
+    preview_material_texture_packed_channels: Tuple[str, ...] = ()
+    preview_height_texture_path: str = ""
+    preview_height_texture_image: object = None
+    preview_height_texture_name: str = ""
+    preview_base_texture_default_path: str = ""
+    preview_base_texture_default_name: str = ""
+    preview_normal_texture_default_path: str = ""
+    preview_normal_texture_default_name: str = ""
+    preview_normal_texture_default_strength: float = 0.0
+    preview_material_texture_default_path: str = ""
+    preview_material_texture_default_name: str = ""
+    preview_material_texture_default_type: str = ""
+    preview_material_texture_default_subtype: str = ""
+    preview_material_texture_default_packed_channels: Tuple[str, ...] = ()
+    preview_height_texture_default_path: str = ""
+    preview_height_texture_default_name: str = ""
     preview_texture_flip_vertical: Optional[bool] = None
+    preview_debug_flip_base_v: bool = False
+    preview_debug_disable_support_maps: bool = False
 
 
 @dataclass(slots=True)
@@ -745,6 +828,7 @@ class ArchiveModelTextureReference:
     material_name: str = ""
     semantic_label: str = ""
     semantic_hint: str = ""
+    sidecar_parameter_name: str = ""
     sidecar_texts: Tuple[str, ...] = ()
     resolution_status: str = "missing"
     resolved_archive_path: str = ""
@@ -753,6 +837,9 @@ class ArchiveModelTextureReference:
     preview_texture_path: str = ""
     usage_count: int = 0
     reference_kind: str = "texture"
+    relation_group: str = "Textures"
+    relation_reason: str = ""
+    relation_confidence: str = RelationConfidence.DERIVED_SAME_STEM.value
 
 
 @dataclass(slots=True)
@@ -770,12 +857,180 @@ class ModelPreviewData:
     meshes: List[ModelPreviewMesh] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class PreparedModelPreviewBatch:
+    material_name: str = ""
+    texture_name: str = ""
+    vertex_blob: bytes = b""
+    index_count: int = 0
+    preview_texture_path: str = ""
+    preview_normal_texture_path: str = ""
+    preview_material_texture_path: str = ""
+    preview_height_texture_path: str = ""
+    preview_texture_flip_vertical: Optional[bool] = None
+    preview_normal_texture_strength: float = 0.0
+    preview_material_texture_type: str = ""
+    preview_material_texture_subtype: str = ""
+    preview_material_texture_packed_channels: Tuple[str, ...] = ()
+    has_texture_coordinates: bool = False
+    texture_wrap_repeat: bool = False
+    preview_debug_flip_base_v: bool = False
+    preview_debug_disable_support_maps: bool = False
+
+
+@dataclass(slots=True)
+class PreparedModelPreviewData:
+    source_path: str = ""
+    format: str = ""
+    summary: str = ""
+    mesh_count: int = 0
+    vertex_count: int = 0
+    face_count: int = 0
+    lod_index: int = -1
+    lod_count: int = 0
+    normalization_center: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    normalization_scale: float = 1.0
+    batches: Tuple[PreparedModelPreviewBatch, ...] = ()
+
+
+@dataclass(slots=True)
+class MeshImportDiff:
+    field_name: str = ""
+    original_value: str = ""
+    imported_value: str = ""
+    severity: str = ""
+    safe_to_auto_fix: bool = False
+    detail: str = ""
+
+
+@dataclass(slots=True)
+class ImportIssue:
+    code: str = ""
+    title: str = ""
+    status: str = ImportIssueStatus.WARNING.value
+    detail: str = ""
+    diffs: Tuple[MeshImportDiff, ...] = ()
+
+
+@dataclass(slots=True)
+class ImportAutoFixResult:
+    applied_fields: Tuple[str, ...] = ()
+    warning_fields: Tuple[str, ...] = ()
+    manual_review_fields: Tuple[str, ...] = ()
+    issues: Tuple[ImportIssue, ...] = ()
+
+
+MODEL_PREVIEW_RENDER_LIMITS: Dict[str, Tuple[float, float]] = {
+    "preview_texture_max_dimension": (1024.0, 16384.0),
+    "low_quality_texture_max_dimension": (128.0, 4096.0),
+    "max_anisotropy": (1.0, 16.0),
+    "ambient_strength": (0.35, 1.0),
+    "diffuse_wrap_bias": (0.20, 1.0),
+    "diffuse_light_scale": (0.20, 1.0),
+    "orbit_sensitivity": (0.05, 1.0),
+    "pan_sensitivity": (0.05, 3.0),
+    "normal_strength_cap": (0.0, 1.0),
+    "normal_strength_floor": (0.0, 1.0),
+    "height_effect_max": (0.0, 1.0),
+    "cavity_clamp_min": (0.70, 1.0),
+    "cavity_clamp_max": (1.0, 2.0),
+    "specular_base": (0.0, 0.5),
+    "specular_min": (0.0, 0.5),
+    "specular_max": (0.0, 1.0),
+    "shininess_base": (1.0, 128.0),
+    "shininess_min": (1.0, 128.0),
+    "shininess_max": (1.0, 256.0),
+    "height_shininess_boost": (0.0, 64.0),
+}
+
+MODEL_PREVIEW_VISIBLE_TEXTURE_MODES: Tuple[str, ...] = (
+    "mesh_base_first",
+    "layer_aware_visible",
+    "sidecar_visible_first",
+)
+
+MODEL_PREVIEW_VISIBLE_TEXTURE_MODE_LABELS: Dict[str, str] = {
+    "mesh_base_first": "Mesh Base First",
+    "layer_aware_visible": "Layer-Aware Visible",
+    "sidecar_visible_first": "Sidecar Visible First",
+}
+
+
+@dataclass(slots=True)
+class ModelPreviewRenderSettings:
+    use_textures_by_default: bool = True
+    high_quality_by_default: bool = True
+    visible_texture_mode: str = "mesh_base_first"
+    preview_texture_max_dimension: int = 16384
+    low_quality_texture_max_dimension: int = 2048
+    max_anisotropy: int = 16
+    ambient_strength: float = 0.55
+    diffuse_wrap_bias: float = 0.60
+    diffuse_light_scale: float = 0.65
+    orbit_sensitivity: float = 0.22
+    pan_sensitivity: float = 0.60
+    invert_orbit_x: bool = False
+    invert_orbit_y: bool = False
+    invert_pan_x: bool = False
+    invert_pan_y: bool = False
+    normal_strength_cap: float = 1.00
+    normal_strength_floor: float = 0.50
+    height_effect_max: float = 0.35
+    cavity_clamp_min: float = 0.75
+    cavity_clamp_max: float = 1.25
+    specular_base: float = 0.050
+    specular_min: float = 0.050
+    specular_max: float = 0.18
+    shininess_base: float = 36.0
+    shininess_min: float = 28.0
+    shininess_max: float = 72.0
+    height_shininess_boost: float = 16.0
+
+def clamp_model_preview_render_settings(
+    settings: Optional[ModelPreviewRenderSettings] = None,
+) -> ModelPreviewRenderSettings:
+    if settings is None:
+        value = ModelPreviewRenderSettings()
+    else:
+        value = ModelPreviewRenderSettings(
+            **{field_info.name: getattr(settings, field_info.name) for field_info in fields(ModelPreviewRenderSettings)}
+        )
+
+    int_fields = {
+        "preview_texture_max_dimension",
+        "low_quality_texture_max_dimension",
+        "max_anisotropy",
+    }
+    for field_name, (minimum, maximum) in MODEL_PREVIEW_RENDER_LIMITS.items():
+        raw_value = getattr(value, field_name)
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            numeric_value = float(getattr(ModelPreviewRenderSettings(), field_name))
+        clamped_value = max(minimum, min(maximum, numeric_value))
+        if field_name in int_fields:
+            setattr(value, field_name, int(round(clamped_value)))
+        else:
+            setattr(value, field_name, float(clamped_value))
+
+    value.normal_strength_floor = min(value.normal_strength_floor, value.normal_strength_cap)
+    value.cavity_clamp_min = min(value.cavity_clamp_min, value.cavity_clamp_max)
+    value.specular_min = min(value.specular_min, value.specular_max)
+    value.shininess_min = min(value.shininess_min, value.shininess_max)
+    normalized_visible_texture_mode = str(getattr(value, "visible_texture_mode", "") or "").strip().lower()
+    if normalized_visible_texture_mode not in MODEL_PREVIEW_VISIBLE_TEXTURE_MODES:
+        normalized_visible_texture_mode = ModelPreviewRenderSettings().visible_texture_mode
+    value.visible_texture_mode = normalized_visible_texture_mode
+    return value
+
+
 @dataclass
 class PathcEntry:
     texture_header_index: int
     collision_start_index: int
     collision_end_index: int
     compressed_block_infos: bytes
+    checksum: int = 0
 
 
 @dataclass
@@ -784,6 +1039,19 @@ class PathcCollisionEntry:
     texture_header_index: int
     unknown0: int
     compressed_block_infos: bytes
+    path: str = ""
+
+
+@dataclass
+class PathcLookupResult:
+    normalized_path: str
+    checksum: int
+    mapping_mode: str
+    texture_header_index: int = -1
+    header_size: int = 0
+    compressed_block_infos: bytes = b""
+    collision_path: str = ""
+    message: str = ""
 
 
 def default_config() -> AppConfig:

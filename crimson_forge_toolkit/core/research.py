@@ -43,7 +43,7 @@ from crimson_forge_toolkit.core.upscale_profiles import (
     normalize_texture_reference_for_sidecar_lookup,
     parse_texture_sidecar_bindings,
 )
-from crimson_forge_toolkit.models import AppConfig, TextureProcessingPlan
+from crimson_forge_toolkit.models import AppConfig, DdsInfo, TextureProcessingPlan
 
 try:
     from PySide6.QtGui import QColor, QImage
@@ -639,6 +639,7 @@ def build_archive_research_snapshot(
     classification_limit: int = 3000,
     group_limit: int = 2000,
     heatmap_limit_per_scope: int = 24,
+    sidecar_source_entries: Optional[Sequence[ArchiveEntry]] = None,
     stop_event: Optional[object] = None,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> Dict[str, object]:
@@ -663,10 +664,17 @@ def build_archive_research_snapshot(
         if on_progress is not None and (index == total_entries or index % progress_interval == 0):
             on_progress(index, total_entries, f"Building archive research snapshot: indexing archive entries... {index:,} / {total_entries:,}")
 
+    semantic_source_entries = list(sidecar_source_entries or entries)
+    uses_external_sidecar_source = sidecar_source_entries is not None
     archive_sidecar_texts_by_texture_path, archive_sidecar_texts_by_texture_basename = _build_archive_sidecar_reference_index(
-        entries,
+        semantic_source_entries,
         stop_event=stop_event,
         on_progress=on_progress,
+        progress_label=(
+            "Building archive research snapshot: indexing loaded archive sidecar texture bindings..."
+            if uses_external_sidecar_source
+            else "Building archive research snapshot: indexing sidecar texture bindings..."
+        ),
     )
 
     classification_rows: List[TextureClassificationRow] = []

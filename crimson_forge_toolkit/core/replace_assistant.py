@@ -17,8 +17,9 @@ from crimson_forge_toolkit.core.archive import (
 )
 from crimson_forge_toolkit.core.common import raise_if_cancelled, run_process_with_cancellation
 from crimson_forge_toolkit.core.mod_package import (
+    normalize_mod_package_payload_path,
     resolve_mod_package_root,
-    write_mod_package_info,
+    write_mod_package_manifest,
 )
 from crimson_forge_toolkit.core.pipeline import (
     _build_loose_sidecar_index,
@@ -47,6 +48,7 @@ from crimson_forge_toolkit.models import (
     ReplaceAssistantBuildSummary,
     ReplaceAssistantItem,
     ReplaceAssistantReviewItem,
+    RunCancelled,
 )
 
 
@@ -603,6 +605,7 @@ def build_replace_assistant_package(
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     on_current_file: Optional[Callable[[str], None]] = None,
 ) -> ReplaceAssistantBuildSummary:
+    raise_if_cancelled(stop_event, "Replace Assistant build cancelled by user.")
     archive_index = build_replace_assistant_archive_index(archive_entries, original_dds_root=original_dds_root)
     resolved_original_dds_root: Optional[Path] = None
     sidecars_by_group: Dict[str, List[Path]] = {}
@@ -633,11 +636,8 @@ def build_replace_assistant_package(
     final_package_root = resolve_mod_package_root(options.package_output_root, options.package_info)
 
     try:
-        write_mod_package_info(
-            stage_root,
-            options.package_info,
-            create_no_encrypt_file=options.create_no_encrypt_file,
-        )
+        raise_if_cancelled(stop_event, "Replace Assistant build cancelled by user.")
+        stage_root.mkdir(parents=True, exist_ok=True)
         if on_log:
             on_log(f"Building replace package stage in {stage_root}")
 
@@ -784,6 +784,9 @@ def build_replace_assistant_package(
                             size_mode=options.size_mode,
                         )
                     )
+            except RunCancelled:
+                cancelled = True
+                raise
             except Exception as exc:
                 failed_items += 1
                 if on_log:
@@ -793,9 +796,7 @@ def build_replace_assistant_package(
             if on_progress:
                 on_progress(index, total_items, f"{index} / {total_items} items")
 
-        if stop_event is not None and stop_event.is_set():
-            cancelled = True
-            raise RuntimeError("Replace Assistant build cancelled.")
+        raise_if_cancelled(stop_event, "Replace Assistant build cancelled by user.")
 
         if failed_items == 0 and unresolved_items == 0:
             if options.overwrite_existing_package_files and final_package_root.exists():
@@ -808,20 +809,13 @@ def build_replace_assistant_package(
                 dry_run=False,
                 on_log=None,
             )
-            info_json_path = final_package_root / "info.json"
-            no_encrypt_path = final_package_root / ".no_encrypt"
-            should_write_package_info = (
-                options.overwrite_existing_package_files
-                or not info_json_path.exists()
-                or (options.create_no_encrypt_file and not no_encrypt_path.exists())
-                or ((not options.create_no_encrypt_file) and no_encrypt_path.exists())
+            write_mod_package_manifest(
+                final_package_root,
+                options.package_info,
+                kind="dds_loose_mod",
+                extra_fields={"file_count": built_items},
+                create_no_encrypt_file=options.create_no_encrypt_file,
             )
-            if should_write_package_info:
-                write_mod_package_info(
-                    final_package_root,
-                    options.package_info,
-                    create_no_encrypt_file=options.create_no_encrypt_file,
-                )
             if on_log:
                 on_log(f"Replace package written to: {final_package_root}")
             return ReplaceAssistantBuildSummary(
@@ -836,7 +830,9 @@ def build_replace_assistant_package(
                     ReplaceAssistantReviewItem(
                         source_path=item.source_path,
                         relative_path=item.relative_path,
-                        output_dds_path=final_package_root / item.output_dds_path.relative_to(stage_root),
+                        output_dds_path=final_package_root / Path(
+                            normalize_mod_package_payload_path(item.output_dds_path.relative_to(stage_root)).as_posix()
+                        ),
                         original_dds_path=item.original_dds_path,
                         build_mode=item.build_mode,
                         size_mode=item.size_mode,
@@ -858,6 +854,20 @@ def build_replace_assistant_package(
             unresolved_items=unresolved_items,
             failed_items=failed_items,
             cancelled=cancelled,
+            output_root=None,
+            review_items=(),
+        )
+    except RunCancelled:
+        cancelled = True
+        if on_log:
+            on_log("Replace Assistant build cancelled by user.")
+        return ReplaceAssistantBuildSummary(
+            total_items=total_items,
+            built_items=built_items,
+            skipped_items=skipped_items,
+            unresolved_items=unresolved_items,
+            failed_items=failed_items,
+            cancelled=True,
             output_root=None,
             review_items=(),
         )

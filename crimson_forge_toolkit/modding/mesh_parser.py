@@ -88,6 +88,7 @@ class SubMesh:
     faces: list[tuple[int, int, int]] = field(default_factory=list)
     bone_indices: list[tuple[int, ...]] = field(default_factory=list)
     bone_weights: list[tuple[float, ...]] = field(default_factory=list)
+    source_vertex_map: list[int] = field(default_factory=list)
     vertex_count: int = 0
     face_count: int = 0
     source_vertex_offsets: list[int] = field(default_factory=list)
@@ -139,6 +140,60 @@ class PacDescriptor:
     palette: tuple[int, ...] = ()
     descriptor_offset: int = 0
     stored_lod_count: int = 0
+
+
+@dataclass
+class BinarySectionRange:
+    """A byte range inside the source mesh binary."""
+    name: str
+    offset: int
+    size: int
+    index: int = -1
+
+
+@dataclass
+class MaterialSlot:
+    """Original game material binding that replacement meshes can reuse."""
+    index: int
+    name: str = ""
+    texture: str = ""
+
+
+@dataclass
+class SubmeshDescriptor:
+    """Original submesh descriptor metadata needed for rebuild decisions."""
+    index: int
+    name: str = ""
+    material: str = ""
+    descriptor_offset: int = -1
+    vertex_count: int = 0
+    index_count: int = 0
+    face_count: int = 0
+    vertex_start_offset: int = -1
+    index_start_offset: int = -1
+    vertex_stride: int = 0
+    bbox_min: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    bbox_max: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    flags: int = 0
+    lod_count: int = 0
+
+
+@dataclass
+class MeshBinaryLayout:
+    """Best-effort description of a PAC/PAM/PAMLOD binary mesh layout."""
+    format: str = ""
+    geometry_offset: int = -1
+    geometry_size: int = 0
+    submesh_descriptors: list[SubmeshDescriptor] = field(default_factory=list)
+    vertex_buffer_offset: int = -1
+    index_buffer_offset: int = -1
+    vertex_stride: int = 0
+    index_size: int = 2
+    material_slots: list[MaterialSlot] = field(default_factory=list)
+    section_ranges: list[BinarySectionRange] = field(default_factory=list)
+    flags: int = 0
+    lod_count: int = 0
+    warnings: list[str] = field(default_factory=list)
 
 
 # ── Utility ──────────────────────────────────────────────────────────
@@ -1121,6 +1176,7 @@ def parse_pac(data: bytes, filename: str = "") -> ParsedMesh:
             normals=_compute_smooth_normals(verts, faces),
             bone_indices=bone_indices,
             bone_weights=bone_weights,
+            source_vertex_map=list(range(len(verts))),
             vertex_count=len(verts),
             face_count=len(faces),
             source_vertex_offsets=source_offsets,
@@ -1642,6 +1698,7 @@ def _parse_pac_geometry_section(
             faces=faces,
             bone_indices=bone_indices,
             bone_weights=bone_weights,
+            source_vertex_map=list(range(len(verts))),
             vertex_count=len(verts),
             face_count=len(faces),
             source_vertex_offsets=source_offsets,
@@ -1828,6 +1885,152 @@ def build_preview_mesh(data: bytes, filename: str = "") -> PreviewMesh:
 
 
 # ── Auto-detect and parse ────────────────────────────────────────────
+
+def inspect_mesh_binary_layout(data: bytes, filename: str = "") -> MeshBinaryLayout:
+    """Return best-effort layout metadata for mesh rebuild/replacement tools."""
+    ext = os.path.splitext(filename.lower())[1]
+    fmt = "pamlod" if ext == ".pamlod" else "pac" if ext == ".pac" else "pam"
+    layout = MeshBinaryLayout(format=fmt)
+    if not data or len(data) < 4 or data[:4] != PAR_MAGIC:
+        layout.warnings.append("Input is missing the PAR mesh header.")
+        return layout
+
+    if fmt == "pac":
+        return _inspect_pac_binary_layout(data, filename)
+    if fmt == "pamlod":
+        return _inspect_pamlod_binary_layout(data, filename)
+    return _inspect_pam_binary_layout(data, filename)
+
+
+def _compute_submesh_bbox(
+    vertices: list[tuple[float, float, float]],
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    if not vertices:
+        return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+    xs, ys, zs = zip(*vertices)
+    return (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs))
+
+
+def _submesh_descriptor_from_parsed(index: int, submesh: SubMesh) -> SubmeshDescriptor:
+    bbox_min, bbox_max = _compute_submesh_bbox(submesh.vertices)
+    vertex_start = submesh.source_vertex_offsets[0] if submesh.source_vertex_offsets else -1
+    return SubmeshDescriptor(
+        index=index,
+        name=submesh.name,
+        material=submesh.material,
+        descriptor_offset=submesh.source_descriptor_offset,
+        vertex_count=len(submesh.vertices),
+        index_count=len(submesh.faces) * 3,
+        face_count=len(submesh.faces),
+        vertex_start_offset=vertex_start,
+        index_start_offset=submesh.source_index_offset,
+        vertex_stride=submesh.source_vertex_stride,
+        bbox_min=bbox_min,
+        bbox_max=bbox_max,
+        lod_count=submesh.source_lod_count,
+    )
+
+
+def _inspect_pam_binary_layout(data: bytes, filename: str) -> MeshBinaryLayout:
+    layout = MeshBinaryLayout(format="pam", index_size=2)
+    try:
+        parsed = parse_pam(data, filename)
+    except Exception as exc:
+        layout.warnings.append(f"PAM parse failed while inspecting layout: {exc}")
+        return layout
+
+    if len(data) >= HDR_GEOM_OFF + 4:
+        layout.geometry_offset = struct.unpack_from("<I", data, HDR_GEOM_OFF)[0]
+        layout.geometry_size = max(0, len(data) - layout.geometry_offset)
+    layout.submesh_descriptors = [
+        _submesh_descriptor_from_parsed(index, submesh)
+        for index, submesh in enumerate(parsed.submeshes)
+    ]
+    layout.material_slots = [
+        MaterialSlot(index=index, name=submesh.material, texture=submesh.texture)
+        for index, submesh in enumerate(parsed.submeshes)
+    ]
+    layout.vertex_buffer_offset = min(
+        (desc.vertex_start_offset for desc in layout.submesh_descriptors if desc.vertex_start_offset >= 0),
+        default=-1,
+    )
+    layout.index_buffer_offset = min(
+        (desc.index_start_offset for desc in layout.submesh_descriptors if desc.index_start_offset >= 0),
+        default=-1,
+    )
+    strides = [desc.vertex_stride for desc in layout.submesh_descriptors if desc.vertex_stride > 0]
+    layout.vertex_stride = max(set(strides), key=strides.count) if strides else 0
+    if layout.geometry_offset >= 0:
+        layout.section_ranges.append(BinarySectionRange("geometry", layout.geometry_offset, layout.geometry_size))
+    return layout
+
+
+def _inspect_pamlod_binary_layout(data: bytes, filename: str) -> MeshBinaryLayout:
+    layout = MeshBinaryLayout(format="pamlod", index_size=2)
+    try:
+        parsed = parse_pamlod(data, filename)
+    except Exception as exc:
+        layout.warnings.append(f"PAMLOD parse failed while inspecting layout: {exc}")
+        return layout
+    if len(data) >= PAMLOD_GEOM_OFF + 4:
+        layout.geometry_offset = struct.unpack_from("<I", data, PAMLOD_GEOM_OFF)[0]
+        layout.geometry_size = max(0, len(data) - layout.geometry_offset)
+    source_level = parsed.submeshes or next((lod for lod in parsed.lod_levels if lod), [])
+    layout.submesh_descriptors = [
+        _submesh_descriptor_from_parsed(index, submesh)
+        for index, submesh in enumerate(source_level)
+    ]
+    layout.material_slots = [
+        MaterialSlot(index=index, name=submesh.material, texture=submesh.texture)
+        for index, submesh in enumerate(source_level)
+    ]
+    layout.lod_count = len(parsed.lod_levels)
+    if layout.geometry_offset >= 0:
+        layout.section_ranges.append(BinarySectionRange("geometry", layout.geometry_offset, layout.geometry_size))
+    return layout
+
+
+def _inspect_pac_binary_layout(data: bytes, filename: str) -> MeshBinaryLayout:
+    layout = MeshBinaryLayout(format="pac", index_size=2)
+    sections = _parse_par_sections(data)
+    layout.section_ranges = [
+        BinarySectionRange(f"section_{section['index']}", section["offset"], section["size"], section["index"])
+        for section in sections
+    ]
+    sec_by_idx = {section["index"]: section for section in sections}
+    sec0 = sec_by_idx.get(0)
+    if sec0 is not None and sec0["size"] >= 5:
+        layout.geometry_offset = sec0["offset"]
+        layout.geometry_size = sec0["size"]
+        layout.flags = struct.unpack_from("<I", data, sec0["offset"])[0]
+        layout.lod_count = data[sec0["offset"] + 4]
+
+    try:
+        parsed = parse_pac(data, filename)
+    except Exception as exc:
+        layout.warnings.append(f"PAC parse failed while inspecting layout: {exc}")
+        return layout
+
+    layout.submesh_descriptors = [
+        _submesh_descriptor_from_parsed(index, submesh)
+        for index, submesh in enumerate(parsed.submeshes)
+    ]
+    layout.material_slots = [
+        MaterialSlot(index=index, name=submesh.material or submesh.name, texture=submesh.texture)
+        for index, submesh in enumerate(parsed.submeshes)
+    ]
+    layout.vertex_buffer_offset = min(
+        (desc.vertex_start_offset for desc in layout.submesh_descriptors if desc.vertex_start_offset >= 0),
+        default=-1,
+    )
+    layout.index_buffer_offset = min(
+        (desc.index_start_offset for desc in layout.submesh_descriptors if desc.index_start_offset >= 0),
+        default=-1,
+    )
+    strides = [desc.vertex_stride for desc in layout.submesh_descriptors if desc.vertex_stride > 0]
+    layout.vertex_stride = max(set(strides), key=strides.count) if strides else 40
+    return layout
+
 
 def parse_mesh(data: bytes, filename: str = "") -> ParsedMesh:
     """Auto-detect file type and parse accordingly."""

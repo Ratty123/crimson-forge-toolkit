@@ -10,6 +10,7 @@ preserve metadata (names, materials, bones, flags) that OBJ cannot store.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import struct
 import math
@@ -33,6 +34,8 @@ from .logging import get_logger
 
 logger = get_logger("core.mesh_importer")
 
+_OBJ_ROUNDTRIP_SIDECAR_FORMATS = {"obj_meta_v1", "mesh_roundtrip_manifest_v2"}
+
 
 def _resolve_obj_index(raw_index: str, item_count: int) -> int:
     """Resolve a Wavefront OBJ index token to a zero-based Python index."""
@@ -42,6 +45,176 @@ def _resolve_obj_index(raw_index: str, item_count: int) -> int:
     if value < 0:
         return item_count + value
     raise ValueError("OBJ indices are 1-based and cannot be zero")
+
+
+def _obj_roundtrip_sidecar_candidates(obj_path: Path) -> tuple[Path, ...]:
+    return (Path(f"{obj_path}.meta.json"),)
+
+
+def _load_obj_roundtrip_sidecar(obj_path: str) -> Optional[dict[str, object]]:
+    for candidate in _obj_roundtrip_sidecar_candidates(Path(obj_path)):
+        if not candidate.is_file():
+            continue
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to read OBJ round-trip sidecar %s: %s", candidate, exc)
+            continue
+        if not isinstance(payload, dict):
+            logger.warning("Ignoring OBJ round-trip sidecar %s because it is not a JSON object.", candidate)
+            continue
+        payload_format = str(payload.get("format", "") or "").strip()
+        if payload_format and payload_format not in _OBJ_ROUNDTRIP_SIDECAR_FORMATS:
+            logger.warning(
+                "Ignoring OBJ round-trip sidecar %s because it uses unsupported format %r.",
+                candidate,
+                payload_format,
+            )
+            continue
+        logger.info("Loaded OBJ round-trip sidecar: %s", candidate)
+        return payload
+    return None
+
+
+def _normalize_obj_sidecar_texture_name(sidecar_submesh_entry: object) -> str:
+    if not isinstance(sidecar_submesh_entry, dict):
+        return ""
+    return str(sidecar_submesh_entry.get("texture", "") or "").strip()
+
+
+def _resolve_obj_material_library_paths(obj_path: Path) -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    try:
+        with obj_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line.lower().startswith("mtllib "):
+                    continue
+                raw_value = line[7:].strip()
+                if not raw_value:
+                    continue
+                candidate = (obj_path.parent / raw_value).expanduser().resolve()
+                lowered = str(candidate).lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                candidates.append(candidate)
+    except OSError:
+        return ()
+    fallback_candidate = obj_path.with_suffix(".mtl").expanduser().resolve()
+    fallback_key = str(fallback_candidate).lower()
+    if fallback_key not in seen:
+        candidates.append(fallback_candidate)
+    return tuple(candidates)
+
+
+def _load_obj_material_texture_map(obj_path: str) -> dict[str, str]:
+    texture_by_material: dict[str, str] = {}
+    for candidate in _resolve_obj_material_library_paths(Path(obj_path)):
+        if not candidate.is_file():
+            continue
+        current_material = ""
+        try:
+            with candidate.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    lowered = line.lower()
+                    if lowered.startswith("newmtl "):
+                        current_material = line[7:].strip()
+                        continue
+                    if not current_material or not lowered.startswith("map_kd "):
+                        continue
+                    texture_value = line[7:].strip()
+                    if texture_value and current_material not in texture_by_material:
+                        texture_by_material[current_material] = texture_value
+        except OSError as exc:
+            logger.warning("Failed to read OBJ material library %s: %s", candidate, exc)
+            continue
+    return texture_by_material
+
+
+def _normalize_obj_sidecar_source_vertex_map(
+    sidecar_submesh_entry: object,
+    *,
+    expected_count: Optional[int] = None,
+) -> list[int]:
+    if not isinstance(sidecar_submesh_entry, dict):
+        return []
+    raw_map = sidecar_submesh_entry.get("source_vertex_map")
+    if not isinstance(raw_map, list):
+        return []
+    normalized: list[int] = []
+    for value in raw_map:
+        try:
+            normalized.append(int(value))
+        except Exception:
+            return []
+    if expected_count is not None and len(normalized) != expected_count:
+        return []
+    return normalized
+
+
+def _match_obj_roundtrip_sidecar_submeshes(
+    sidecar_payload: Optional[dict[str, object]],
+    submesh_list: list[dict],
+    *,
+    source_path: str,
+    source_format: str,
+) -> list[Optional[dict[str, object]]]:
+    matched_entries: list[Optional[dict[str, object]]] = [None] * len(submesh_list)
+    if not sidecar_payload:
+        return matched_entries
+
+    sidecar_source_path = str(sidecar_payload.get("source_path", "") or "").strip()
+    if source_path and sidecar_source_path and sidecar_source_path != source_path:
+        logger.warning(
+            "Ignoring OBJ round-trip sidecar because source path mismatch: %s != %s",
+            sidecar_source_path,
+            source_path,
+        )
+        return matched_entries
+
+    sidecar_source_format = str(sidecar_payload.get("source_format", "") or "").strip().lower()
+    if source_format and sidecar_source_format and sidecar_source_format != source_format.strip().lower():
+        logger.warning(
+            "Ignoring OBJ round-trip sidecar because source format mismatch: %s != %s",
+            sidecar_source_format,
+            source_format,
+        )
+        return matched_entries
+
+    raw_submeshes = sidecar_payload.get("submeshes")
+    if not isinstance(raw_submeshes, list) or not raw_submeshes:
+        return matched_entries
+
+    sidecar_submeshes = [entry for entry in raw_submeshes if isinstance(entry, dict)]
+    if not sidecar_submeshes:
+        return matched_entries
+
+    by_name: dict[str, dict[str, object]] = {}
+    for sidecar_entry in sidecar_submeshes:
+        sidecar_name = str(sidecar_entry.get("name", "") or "").strip()
+        if not sidecar_name or sidecar_name in by_name:
+            continue
+        by_name[sidecar_name] = sidecar_entry
+
+    if len(sidecar_submeshes) == len(submesh_list):
+        by_name_matches: list[Optional[dict[str, object]]] = []
+        for sm_data in submesh_list:
+            submesh_name = str(sm_data.get("name", "") or "").strip()
+            by_name_matches.append(by_name.get(submesh_name) if submesh_name else None)
+        if all(entry is not None for entry in by_name_matches):
+            return [entry for entry in by_name_matches if entry is not None]
+        return [entry for entry in sidecar_submeshes]
+
+    for index, sm_data in enumerate(submesh_list):
+        submesh_name = str(sm_data.get("name", "") or "").strip()
+        if submesh_name and submesh_name in by_name:
+            matched_entries[index] = by_name[submesh_name]
+    return matched_entries
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -57,6 +230,8 @@ def import_obj(obj_path: str) -> ParsedMesh:
     Returns:
         ParsedMesh with vertices, UVs, normals, faces per submesh.
     """
+    sidecar_payload = _load_obj_roundtrip_sidecar(obj_path)
+    material_texture_map = _load_obj_material_texture_map(obj_path)
     source_path = ""
     source_format = ""
     submeshes: list[SubMesh] = []
@@ -154,6 +329,13 @@ def import_obj(obj_path: str) -> ParsedMesh:
     if not submesh_list:
         raise ValueError("OBJ import did not contain any face/object data.")
 
+    matched_sidecar_entries = _match_obj_roundtrip_sidecar_submeshes(
+        sidecar_payload,
+        submesh_list,
+        source_path=source_path,
+        source_format=source_format,
+    )
+
     # Convert global indices to per-submesh local indices.
     # Key: keep ALL vertices in each submesh's range (not just face-referenced ones).
     # Some meshes have unused vertices that must be preserved for correct rebuild.
@@ -167,12 +349,18 @@ def import_obj(obj_path: str) -> ParsedMesh:
         # We stored them in all_verts in order — need to find this submesh's range
         pass
 
-    def _build_generic_submesh(sm_data: dict) -> SubMesh:
+    def _build_generic_submesh(
+        sm_data: dict,
+        *,
+        sidecar_entry: Optional[dict[str, object]] = None,
+    ) -> SubMesh:
         vertex_key_to_local: dict[tuple[int, int, int], int] = {}
         local_verts: list[tuple[float, float, float]] = []
         local_uvs: list[tuple[float, float]] = []
         local_normals: list[tuple[float, float, float]] = []
         local_faces: list[tuple[int, int, int]] = []
+        local_source_vertex_map: list[int] = []
+        sidecar_source_map = _normalize_obj_sidecar_source_vertex_map(sidecar_entry)
 
         for face in sm_data["faces_global"]:
             local_face = []
@@ -191,6 +379,8 @@ def import_obj(obj_path: str) -> ParsedMesh:
                     local_normals.append(
                         all_normals[ni] if 0 <= ni < len(all_normals) else (0.0, 1.0, 0.0)
                     )
+                    if sidecar_source_map and 0 <= vi < len(sidecar_source_map):
+                        local_source_vertex_map.append(sidecar_source_map[vi])
                 local_face.append(local_index)
             if len(local_face) == 3:
                 local_faces.append(tuple(local_face))
@@ -198,10 +388,14 @@ def import_obj(obj_path: str) -> ParsedMesh:
         return SubMesh(
             name=sm_data["name"],
             material=sm_data["material"],
+            texture=_normalize_obj_sidecar_texture_name(sidecar_entry) or material_texture_map.get(sm_data["material"], ""),
             vertices=local_verts,
             uvs=local_uvs if len(local_uvs) == len(local_verts) else [],
             normals=local_normals if len(local_normals) == len(local_verts) else [],
             faces=local_faces,
+            source_vertex_map=(
+                local_source_vertex_map if len(local_source_vertex_map) == len(local_verts) else []
+            ),
             vertex_count=len(local_verts),
             face_count=len(local_faces),
         )
@@ -245,8 +439,9 @@ def import_obj(obj_path: str) -> ParsedMesh:
     vn_offset = 0
 
     for si, sm_data in enumerate(submesh_list):
+        matched_sidecar_entry = matched_sidecar_entries[si] if si < len(matched_sidecar_entries) else None
         if not saw_object_markers or si >= len(sm_vert_counts):
-            submeshes.append(_build_generic_submesh(sm_data))
+            submeshes.append(_build_generic_submesh(sm_data, sidecar_entry=matched_sidecar_entry))
             continue
 
         nv = sm_vert_counts[si] if si < len(sm_vert_counts) else 0
@@ -254,7 +449,7 @@ def import_obj(obj_path: str) -> ParsedMesh:
         nvn = sm_normal_counts[si] if si < len(sm_normal_counts) else 0
 
         if nv <= 0:
-            submeshes.append(_build_generic_submesh(sm_data))
+            submeshes.append(_build_generic_submesh(sm_data, sidecar_entry=matched_sidecar_entry))
             continue
 
         # Preserve the original exported vertex slots, including any unused vertices,
@@ -276,6 +471,10 @@ def import_obj(obj_path: str) -> ParsedMesh:
         local_verts = list(base_verts)
         local_uvs = list(base_uvs)
         local_normals = list(base_normals)
+        local_source_vertex_map = _normalize_obj_sidecar_source_vertex_map(
+            matched_sidecar_entry,
+            expected_count=nv,
+        )
 
         assigned_uvs: list[tuple[float, float] | None] = [None] * nv
         assigned_normals: list[tuple[float, float, float] | None] = [None] * nv
@@ -322,6 +521,8 @@ def import_obj(obj_path: str) -> ParsedMesh:
             local_verts.append(base_verts[local_vi])
             local_uvs.append(uv_value)
             local_normals.append(normal_value)
+            if local_source_vertex_map and local_vi < len(local_source_vertex_map):
+                local_source_vertex_map.append(local_source_vertex_map[local_vi])
             split_vertex_map[key] = clone_idx
             return clone_idx
 
@@ -336,10 +537,14 @@ def import_obj(obj_path: str) -> ParsedMesh:
         sm = SubMesh(
             name=sm_data["name"],
             material=sm_data["material"],
+            texture=_normalize_obj_sidecar_texture_name(matched_sidecar_entry) or material_texture_map.get(sm_data["material"], ""),
             vertices=local_verts,
             uvs=local_uvs if len(local_uvs) == len(local_verts) else [],
             normals=local_normals if len(local_normals) == len(local_verts) else [],
             faces=local_faces,
+            source_vertex_map=(
+                local_source_vertex_map if len(local_source_vertex_map) == len(local_verts) else []
+            ),
             vertex_count=len(local_verts),
             face_count=len(local_faces),
         )
@@ -2439,6 +2644,8 @@ def _merge_partial_pac_import(
         imported_unknown.name = best_original.name
         if not imported_unknown.material:
             imported_unknown.material = best_original.material
+        if not imported_unknown.texture:
+            imported_unknown.texture = best_original.texture
         heuristic_by_name[best_original.name] = imported_unknown
         unmatched_originals = [sm for sm in unmatched_originals if sm.name != best_original.name]
 
@@ -2450,14 +2657,24 @@ def _merge_partial_pac_import(
         if replacement is None:
             replacement = heuristic_by_name.get(original_sm.name)
         if replacement is not None:
+            if not replacement.material:
+                replacement.material = original_sm.material
+            if not replacement.texture:
+                replacement.texture = original_sm.texture
             merged_submeshes.append(replacement)
             used_named += 1
             continue
 
         try:
-            merged_submeshes.append(next(unnamed_iter))
+            fallback = next(unnamed_iter)
         except StopIteration:
             merged_submeshes.append(copy.deepcopy(original_sm))
+        else:
+            if not fallback.material:
+                fallback.material = original_sm.material
+            if not fallback.texture:
+                fallback.texture = original_sm.texture
+            merged_submeshes.append(fallback)
 
     try:
         extra_unnamed = next(unnamed_iter)
@@ -2504,8 +2721,15 @@ def _choose_pac_donor_indices(orig_sm: SubMesh, new_sm: SubMesh) -> list[int]:
         key = (round(pos[0] * 100000), round(pos[1] * 100000), round(pos[2] * 100000))
         exact_map.setdefault(key, []).append(orig_idx)
 
+    sidecar_source_map = list(getattr(new_sm, "source_vertex_map", ()) or ())
     donor_indices: list[int] = []
-    for new_pos in new_sm.vertices:
+    for vertex_index, new_pos in enumerate(new_sm.vertices):
+        if vertex_index < len(sidecar_source_map):
+            mapped_index = int(sidecar_source_map[vertex_index])
+            if 0 <= mapped_index < len(orig_sm.vertices):
+                donor_indices.append(mapped_index)
+                continue
+
         key = (round(new_pos[0] * 100000), round(new_pos[1] * 100000), round(new_pos[2] * 100000))
         exact_hits = exact_map.get(key)
         if exact_hits:
@@ -2831,6 +3055,32 @@ def _build_pac_full_rebuild(
     return bytes(assembled)
 
 
+def _format_roundtrip_topology_error(
+    *,
+    mesh_label: str,
+    original_mesh: ParsedMesh,
+    imported_mesh: ParsedMesh,
+) -> str:
+    return "\n".join(
+        [
+            f"{mesh_label} round-trip import failed.",
+            "",
+            "Original mesh:",
+            f"  submeshes: {len(original_mesh.submeshes)}",
+            f"  vertices: {sum(len(sm.vertices) for sm in original_mesh.submeshes)}",
+            f"  faces: {sum(len(sm.faces) for sm in original_mesh.submeshes)}",
+            "",
+            "Imported OBJ:",
+            f"  submeshes: {len(imported_mesh.submeshes)}",
+            f"  vertices: {sum(len(sm.vertices) for sm in imported_mesh.submeshes)}",
+            f"  faces: {sum(len(sm.faces) for sm in imported_mesh.submeshes)}",
+            "",
+            "This mode requires the imported OBJ to keep the original mesh structure. "
+            "Use Static Mesh Replacement mode to import a different model.",
+        ]
+    )
+
+
 def build_pac(mesh: ParsedMesh, original_data: bytes) -> bytes:
     """Rebuild a PAC binary from a modified mesh."""
     if not original_data or original_data[:4] != b"PAR ":
@@ -2846,7 +3096,11 @@ def build_pac(mesh: ParsedMesh, original_data: bytes) -> bytes:
 
     if len(original_mesh.submeshes) != len(working_mesh.submeshes):
         raise ValueError(
-            "PAC import currently requires the same submesh count as the original mesh."
+            _format_roundtrip_topology_error(
+                mesh_label="PAC",
+                original_mesh=original_mesh,
+                imported_mesh=working_mesh,
+            )
         )
 
     if _pac_needs_full_rebuild(original_mesh, working_mesh):

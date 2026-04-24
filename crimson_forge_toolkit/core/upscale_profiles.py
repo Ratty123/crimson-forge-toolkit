@@ -1342,12 +1342,83 @@ def copy_mod_ready_loose_tree(
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> LooseTreeCopyResult:
-    return copy_loose_tree_preserving_paths(
-        source_root,
-        destination_root,
-        selected_paths=selected_paths,
-        overwrite=overwrite,
-        dry_run=dry_run,
-        on_progress=on_progress,
-        on_log=on_log,
+    from crimson_forge_toolkit.core.mod_package import (
+        is_mod_package_payload_path,
+        normalize_mod_package_payload_path,
+    )
+
+    resolved_source = Path(source_root)
+    resolved_destination = Path(destination_root)
+    if not resolved_source.exists() or not resolved_source.is_dir():
+        raise ValueError(f"Source root does not exist: {resolved_source}")
+
+    if selected_paths is None:
+        source_files = [path for path in resolved_source.rglob("*") if path.is_file()]
+    else:
+        source_files = []
+        for entry in selected_paths:
+            candidate = Path(entry)
+            if not candidate.is_absolute():
+                candidate = resolved_source / candidate
+            source_files.append(candidate)
+
+    created_dirs: set[Path] = set()
+    copied_files = 0
+    skipped_files = 0
+    overwritten_files = 0
+    failed_files = 0
+    copied_paths: List[str] = []
+    skipped_paths: List[str] = []
+    failed_paths: List[str] = []
+
+    total = len(source_files)
+    for index, source_file in enumerate(source_files, start=1):
+        try:
+            source_file = source_file.resolve()
+            source_rel_path = source_file.relative_to(resolved_source.resolve())
+            if not is_mod_package_payload_path(source_rel_path):
+                if on_log:
+                    on_log(f"Skipping non-payload package file: {source_rel_path.as_posix()}")
+                if on_progress:
+                    on_progress(index, total, f"{index} / {total} files")
+                continue
+            rel_path = Path(normalize_mod_package_payload_path(source_rel_path).as_posix())
+            destination_file = resolved_destination / rel_path
+            destination_file.parent.mkdir(parents=True, exist_ok=True)
+            created_dirs.add(destination_file.parent)
+            if destination_file.exists() and not overwrite:
+                skipped_files += 1
+                skipped_paths.append(rel_path.as_posix())
+                if on_log:
+                    on_log(f"Skipping existing file: {rel_path.as_posix()}")
+            else:
+                if destination_file.exists():
+                    overwritten_files += 1
+                if not dry_run:
+                    shutil.copy2(source_file, destination_file)
+                copied_files += 1
+                copied_paths.append(rel_path.as_posix())
+                if on_log:
+                    action = "DRYRUN COPY" if dry_run else "COPY"
+                    on_log(f"{action} {rel_path.as_posix()}")
+        except Exception:
+            failed_files += 1
+            failed_paths.append(str(source_file))
+            if on_log:
+                on_log(f"Failed to copy {source_file}")
+        if on_progress:
+            on_progress(index, total, f"{index} / {total} files")
+
+    return LooseTreeCopyResult(
+        source_root=resolved_source,
+        destination_root=resolved_destination,
+        total_files=total,
+        copied_files=copied_files,
+        skipped_files=skipped_files,
+        overwritten_files=overwritten_files,
+        created_dirs=len(created_dirs),
+        failed_files=failed_files,
+        copied_paths=copied_paths,
+        skipped_paths=skipped_paths,
+        failed_paths=failed_paths,
     )

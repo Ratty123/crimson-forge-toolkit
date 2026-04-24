@@ -5,12 +5,14 @@ import dataclasses
 import json
 import os
 import platform
+import re
 import shutil
 import sys
 import threading
 import time
 import traceback
 import zipfile
+from collections.abc import Mapping
 from collections import Counter, OrderedDict
 from html import escape
 from pathlib import Path, PurePosixPath
@@ -19,6 +21,12 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from crimson_forge_toolkit.constants import *
 from crimson_forge_toolkit.models import *
 from crimson_forge_toolkit.core.archive import *
+from crimson_forge_toolkit.core.archive import (
+    _extract_archive_model_sidecar_texture_references,
+    _infer_model_preview_normal_strength,
+    _resolve_model_texture_semantic_details,
+    read_archive_entry_data,
+)
 from crimson_forge_toolkit.core.classification_registry import (
     configure_texture_classification_registry,
     get_registered_texture_classification,
@@ -34,18 +42,28 @@ from crimson_forge_toolkit.core.archive_modding import (
     MeshExportResult,
     MeshImportPreviewResult,
     build_archive_audio_patch_payload,
-    build_archive_texture_payload_from_dds,
-    build_archive_texture_payload_from_png,
     build_mesh_import_preview,
     export_archive_mesh_payloads_to_mod_ready_loose,
-    export_archive_payloads_to_mod_ready_loose,
     export_archive_audio_as_wav,
     export_archive_mesh,
-    get_archive_texture_patch_blocker,
     list_archive_patch_backups,
     patch_archive_entries,
+    parsed_mesh_to_preview_model,
     restore_archive_patch_backup,
 )
+from crimson_forge_toolkit.modding.mesh_parser import parse_mesh
+from crimson_forge_toolkit.modding.scene_importer import SCENE_TEXTURE_SOURCE_EXTENSIONS, discover_scene_texture_files, import_scene_mesh
+from crimson_forge_toolkit.modding.static_mesh_replacer import (
+    StaticMeshReplacementOptions,
+    StaticSubmeshMapping,
+    StaticReplacementTransform,
+    StaticTextureSlotOverride,
+    build_static_replacement_preview_mesh,
+    describe_static_placement_context,
+    suggest_static_submesh_mappings,
+    _semantic_tokens,
+)
+from crimson_forge_toolkit.modding.material_replacer import group_replacement_texture_sets
 from crimson_forge_toolkit.core.model_export import export_model_preview_to_obj
 from crimson_forge_toolkit.core.chainner import *
 from crimson_forge_toolkit.core.pipeline import *
@@ -74,6 +92,7 @@ def run_gui() -> int:
             QCheckBox,
             QComboBox,
             QDialog,
+            QDoubleSpinBox,
             QFileDialog,
             QFrame,
             QGridLayout,
@@ -109,6 +128,7 @@ def run_gui() -> int:
     from crimson_forge_toolkit.ui.themes import UI_THEME_SCHEMES, build_app_palette, build_app_stylesheet
     from crimson_forge_toolkit.ui.widgets import (
         AboutDialog,
+        ArchiveDetailsEditor,
         CodePreviewEditor,
         FlatSectionPanel,
         build_responsive_splitter_sizes,
@@ -124,6 +144,14 @@ def run_gui() -> int:
     )
     from crimson_forge_toolkit.ui.research_tab import ResearchTab
     from crimson_forge_toolkit.ui.settings_tab import SettingsTab
+    from crimson_forge_toolkit.ui.localization import (
+        LANGUAGE_WARNING,
+        UiLocalizer,
+        collect_translatable_source_strings,
+        language_name_for_code,
+        write_language_file,
+    )
+    from crimson_forge_toolkit.ui.model_preview_settings_dialog import ModelPreviewSettingsDialog
     from crimson_forge_toolkit.ui.policy_preview_dialog import TexturePolicyPreviewDialog
     from crimson_forge_toolkit.ui.safe_upscale_wizard import SafeUpscaleWizard
     from crimson_forge_toolkit.ui.replace_assistant_tab import ReplaceAssistantTab
@@ -235,6 +263,41 @@ def run_gui() -> int:
         )
         if _default_unraisablehook is not None:
             _default_unraisablehook(args)
+
+    def _timing_value(timings: Optional[Dict[str, float]], key: str) -> float:
+        if not timings:
+            return 0.0
+        raw_value = timings.get(key, 0.0)
+        try:
+            return max(0.0, float(raw_value))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _merge_timing_maps(*timing_maps: Optional[Dict[str, float]]) -> Dict[str, float]:
+        merged: Dict[str, float] = {}
+        for timing_map in timing_maps:
+            if not timing_map:
+                continue
+            for key, value in timing_map.items():
+                try:
+                    merged[str(key)] = max(0.0, float(value))
+                except (TypeError, ValueError):
+                    continue
+        return merged
+
+    def _format_timing_summary(
+        prefix: str,
+        source: str,
+        timings: Optional[Dict[str, float]],
+        ordered_fields: Sequence[Tuple[str, str]],
+    ) -> str:
+        parts = [prefix, f"source={str(source or '').strip() or 'unknown'}"]
+        for key, label in ordered_fields:
+            parts.append(f"{label}={_timing_value(timings, key):.2f}s")
+        return " | ".join(parts)
+
+    def _is_expected_cancellation_message(message: object) -> bool:
+        return "Processing stopped by user." in str(message or "")
 
     sys.excepthook = _handle_uncaught_exception
     if _default_threading_excepthook is not None:
@@ -355,10 +418,13 @@ def run_gui() -> int:
         window.log_view.document().setDefaultFont(log_font)
         window.archive_log_view.setFont(log_font)
         window.archive_log_view.document().setDefaultFont(log_font)
-        window.archive_preview_text_edit.apply_font_preferences(log_font, preserve_size=True)
+        window.archive_preview_text_edit.apply_font_preferences(log_font, preserve_size=False)
+        window.archive_preview_details_edit.apply_font_preferences(log_font, preserve_size=False)
+        window.archive_preview_info_edit.setFont(log_font)
+        window.archive_preview_info_edit.document().setDefaultFont(log_font)
         window.text_search_tab.log_view.setFont(log_font)
         window.text_search_tab.log_view.document().setDefaultFont(log_font)
-        window.text_search_tab.preview_text_edit.apply_font_preferences(log_font, preserve_size=True)
+        window.text_search_tab.preview_text_edit.apply_font_preferences(log_font, preserve_size=False)
         window.replace_assistant_tab.log_view.setFont(log_font)
         window.replace_assistant_tab.log_view.document().setDefaultFont(log_font)
         window.replace_assistant_tab.preview_details_edit.setFont(log_font)
@@ -440,11 +506,13 @@ def run_gui() -> int:
         @Slot()
         def run(self) -> None:
             try:
+                timings: Dict[str, float] = {}
+                started_at = time.perf_counter()
                 if self.force_refresh:
                     self.log_message.emit(f"Refreshing archive packages under {self.package_root}")
                 else:
                     self.log_message.emit(f"Loading archive packages under {self.package_root}")
-                entries, source, cache_path = scan_archive_entries_cached(
+                entries, source, cache_path, timings = scan_archive_entries_cached(
                     self.package_root,
                     self.cache_root,
                     force_refresh=self.force_refresh,
@@ -453,6 +521,7 @@ def run_gui() -> int:
                     stop_event=self.stop_event,
                 )
                 self.log_message.emit("Preparing archive browser state from loaded entries...")
+                browser_state_started_at = time.perf_counter()
                 browser_state = prepare_archive_browser_state(
                     entries,
                     filter_text=self.filter_text,
@@ -469,9 +538,33 @@ def run_gui() -> int:
                     on_progress=self.progress_changed.emit,
                     stop_event=self.stop_event,
                 )
+                timings["browser_state_s"] = max(0.0, float(time.perf_counter() - browser_state_started_at))
+                path_index_started_at = time.perf_counter()
                 path_index = build_archive_entry_path_index(entries)
+                timings["entry_path_index_s"] = max(0.0, float(time.perf_counter() - path_index_started_at))
+                basename_index_started_at = time.perf_counter()
                 basename_index = build_archive_entry_basename_index(entries)
+                timings["entry_basename_index_s"] = max(0.0, float(time.perf_counter() - basename_index_started_at))
+                extension_index_started_at = time.perf_counter()
                 extension_index = build_archive_entry_extension_index(entries)
+                timings["entry_extension_index_s"] = max(0.0, float(time.perf_counter() - extension_index_started_at))
+                timings["total_s"] = max(0.0, float(time.perf_counter() - started_at))
+                timing_summary = _format_timing_summary(
+                    "Archive scan timings",
+                    source,
+                    timings,
+                    (
+                        ("cache_check_s", "cache_check"),
+                        ("cache_load_s", "cache_load"),
+                        ("archive_scan_s", "archive_scan"),
+                        ("cache_write_s", "cache_write"),
+                        ("browser_state_s", "browser_state"),
+                        ("entry_path_index_s", "path_index"),
+                        ("entry_basename_index_s", "basename_index"),
+                        ("entry_extension_index_s", "extension_index"),
+                        ("total_s", "total"),
+                    ),
+                )
                 self.completed.emit(
                     {
                         "entries": entries,
@@ -481,12 +574,191 @@ def run_gui() -> int:
                         "path_index": path_index,
                         "basename_index": basename_index,
                         "extension_index": extension_index,
+                        "timings": timings,
+                        "timing_summary": timing_summary,
                     }
                 )
+            except RunCancelled as exc:
+                if not self.stop_event.is_set():
+                    self.error.emit(str(exc))
             except Exception as exc:
                 self.error.emit(str(exc))
             finally:
                 self.finished.emit()
+
+    class ArchiveSidecarIndexWorker(QObject):
+        log_message = Signal(str)
+        progress_changed = Signal(int, int, int, str)
+        completed = Signal(int, object)
+        error = Signal(int, str)
+        finished = Signal(int)
+
+        def __init__(
+            self,
+            request_id: int,
+            package_root: Path,
+            cache_root: Path,
+            entries: Sequence[ArchiveEntry],
+        ):
+            super().__init__()
+            self.request_id = int(request_id)
+            self.package_root = package_root
+            self.cache_root = cache_root
+            self.entries = entries
+            self.stop_event = threading.Event()
+
+        def stop(self) -> None:
+            self.stop_event.set()
+
+        @Slot()
+        def run(self) -> None:
+            try:
+                timings: Dict[str, float] = {}
+                started_at = time.perf_counter()
+                last_progress_emit_at = 0.0
+
+                def _emit_throttled_progress(current: int, total: int, detail: str) -> None:
+                    nonlocal last_progress_emit_at
+                    now = time.perf_counter()
+                    if total > 0 and current >= total:
+                        last_progress_emit_at = now
+                        self.progress_changed.emit(self.request_id, current, total, detail)
+                        return
+                    if now - last_progress_emit_at < 0.75:
+                        return
+                    last_progress_emit_at = now
+                    self.progress_changed.emit(self.request_id, current, total, detail)
+
+                cached = load_archive_texture_sidecar_cache_rows(
+                    self.package_root,
+                    self.cache_root,
+                    self.entries,
+                    on_log=self.log_message.emit,
+                    stop_event=self.stop_event,
+                    timings=timings,
+                    on_progress=_emit_throttled_progress,
+                )
+                if cached is not None:
+                    path_rows, basename_rows = cached
+                    sidecar_entries_by_texture_path = build_lazy_archive_texture_sidecar_entry_index(
+                        path_rows,
+                        self.entries,
+                    )
+                    sidecar_entries_by_texture_basename = build_lazy_archive_texture_sidecar_entry_index(
+                        basename_rows,
+                        self.entries,
+                    )
+                    timings.setdefault("path_row_build_s", 0.0)
+                    timings.setdefault("basename_row_build_s", 0.0)
+                    timings.setdefault("entry_resolve_s", 0.0)
+                    timings.setdefault("cache_write_s", 0.0)
+                    timings["total_s"] = max(0.0, float(time.perf_counter() - started_at))
+                    timing_summary = _format_timing_summary(
+                        "Texture sidecar timings",
+                        "cache",
+                        timings,
+                        (
+                            ("cache_check_s", "cache_check"),
+                            ("cache_load_s", "cache_load"),
+                            ("incremental_remap_s", "remap"),
+                            ("incremental_scan_s", "rescan_changed"),
+                            ("incremental_update_s", "incremental_update"),
+                            ("path_row_build_s", "path_rows"),
+                            ("basename_row_build_s", "basename_rows"),
+                            ("entry_resolve_s", "resolve"),
+                            ("cache_write_s", "cache_write"),
+                            ("total_s", "total"),
+                        ),
+                    )
+                    self.completed.emit(
+                        self.request_id,
+                        {
+                            "sidecar_entries_by_texture_path": sidecar_entries_by_texture_path,
+                            "sidecar_entries_by_texture_basename": sidecar_entries_by_texture_basename,
+                            "sidecar_path_rows": path_rows,
+                            "sidecar_basename_rows": basename_rows,
+                            "source": "cache",
+                            "cache_path": str(resolve_archive_sidecar_cache_path(self.package_root, self.cache_root)),
+                            "timings": timings,
+                            "timing_summary": timing_summary,
+                        },
+                    )
+                    return
+
+                self.log_message.emit("Indexing texture sidecar bindings for related-file discovery...")
+                path_rows_started_at = time.perf_counter()
+                path_rows = build_archive_texture_sidecar_path_rows(
+                    self.entries,
+                    stop_event=self.stop_event,
+                    on_progress=_emit_throttled_progress,
+                )
+                timings["path_row_build_s"] = max(0.0, float(time.perf_counter() - path_rows_started_at))
+                basename_rows_started_at = time.perf_counter()
+                basename_rows = build_archive_texture_sidecar_basename_rows(path_rows)
+                timings["basename_row_build_s"] = max(0.0, float(time.perf_counter() - basename_rows_started_at))
+                sidecar_entries_by_texture_path = build_lazy_archive_texture_sidecar_entry_index(path_rows, self.entries)
+                sidecar_entries_by_texture_basename = build_lazy_archive_texture_sidecar_entry_index(
+                    basename_rows,
+                    self.entries,
+                )
+                timings["entry_resolve_s"] = 0.0
+                if self.stop_event.is_set():
+                    return
+                cache_path_text = ""
+                try:
+                    cache_path = save_archive_texture_sidecar_cache(
+                        self.package_root,
+                        self.cache_root,
+                        self.entries,
+                        path_rows=path_rows,
+                        basename_rows=None,
+                        on_log=self.log_message.emit,
+                        on_progress=None,
+                        stop_event=self.stop_event,
+                        timings=timings,
+                    )
+                    cache_path_text = str(cache_path)
+                except Exception as exc:
+                    if not self.stop_event.is_set():
+                        self.log_message.emit(f"Warning: texture sidecar cache could not be written: {exc}")
+                    timings.setdefault("cache_write_s", 0.0)
+                timings["total_s"] = max(0.0, float(time.perf_counter() - started_at))
+                timing_summary = _format_timing_summary(
+                    "Texture sidecar timings",
+                    "scan",
+                    timings,
+                    (
+                        ("cache_check_s", "cache_check"),
+                        ("cache_load_s", "cache_load"),
+                        ("path_row_build_s", "path_rows"),
+                        ("basename_row_build_s", "basename_rows"),
+                        ("entry_resolve_s", "resolve"),
+                        ("cache_write_s", "cache_write"),
+                        ("total_s", "total"),
+                    ),
+                )
+                if not self.stop_event.is_set():
+                    self.completed.emit(
+                        self.request_id,
+                        {
+                            "sidecar_entries_by_texture_path": sidecar_entries_by_texture_path,
+                            "sidecar_entries_by_texture_basename": sidecar_entries_by_texture_basename,
+                            "sidecar_path_rows": path_rows,
+                            "sidecar_basename_rows": basename_rows,
+                            "source": "scan",
+                            "cache_path": cache_path_text,
+                            "timings": timings,
+                            "timing_summary": timing_summary,
+                        },
+                    )
+            except RunCancelled as exc:
+                if not self.stop_event.is_set():
+                    self.error.emit(self.request_id, str(exc))
+            except Exception as exc:
+                if not self.stop_event.is_set():
+                    self.error.emit(self.request_id, str(exc))
+            finally:
+                self.finished.emit(self.request_id)
 
     class ArchiveFilterWorker(QObject):
         progress_changed = Signal(int, int, str)
@@ -743,7 +1015,10 @@ def run_gui() -> int:
             companion_entry: Optional[ArchiveEntry],
             texture_entries_by_normalized_path: Dict[str, List[ArchiveEntry]],
             texture_entries_by_basename: Dict[str, List[ArchiveEntry]],
+            sidecar_entries_by_texture_path: Optional[Dict[str, Sequence[ArchiveEntry]]],
+            sidecar_entries_by_texture_basename: Optional[Dict[str, Sequence[ArchiveEntry]]],
             loose_search_roots: Sequence[Path],
+            visible_texture_mode: str = "mesh_base_first",
             include_loose_preview_assets: bool = False,
         ):
             super().__init__()
@@ -753,7 +1028,10 @@ def run_gui() -> int:
             self.companion_entry = companion_entry
             self.texture_entries_by_normalized_path = texture_entries_by_normalized_path
             self.texture_entries_by_basename = texture_entries_by_basename
+            self.sidecar_entries_by_texture_path = sidecar_entries_by_texture_path
+            self.sidecar_entries_by_texture_basename = sidecar_entries_by_texture_basename
             self.loose_search_roots = list(loose_search_roots)
+            self.visible_texture_mode = str(visible_texture_mode or "").strip().lower() or "mesh_base_first"
             self.include_loose_preview_assets = include_loose_preview_assets
             self.stop_event = threading.Event()
 
@@ -763,8 +1041,10 @@ def run_gui() -> int:
         @Slot()
         def run(self) -> None:
             try:
+                timings: Dict[str, float] = {}
                 if self.stop_event.is_set():
                     return
+                worker_build_started_at = time.perf_counter()
                 payload = build_archive_preview_result(
                     self.texconv_path,
                     self.entry,
@@ -772,16 +1052,40 @@ def run_gui() -> int:
                     companion_entry=self.companion_entry,
                     texture_entries_by_normalized_path=self.texture_entries_by_normalized_path,
                     texture_entries_by_basename=self.texture_entries_by_basename,
+                    sidecar_entries_by_texture_path=self.sidecar_entries_by_texture_path,
+                    sidecar_entries_by_texture_basename=self.sidecar_entries_by_texture_basename,
                     include_loose_preview_assets=self.include_loose_preview_assets,
+                    visible_texture_mode=self.visible_texture_mode,
                     stop_event=self.stop_event,
                 )
+                timings["worker_build_s"] = max(0.0, float(time.perf_counter() - worker_build_started_at))
                 if self.stop_event.is_set():
                     return
+                image_attach_started_at = time.perf_counter()
                 payload = self._attach_loaded_images(payload)
+                timings["image_attach_s"] = max(0.0, float(time.perf_counter() - image_attach_started_at))
+                if self.stop_event.is_set():
+                    return
+                prepared_model_started_at = time.perf_counter()
+                prepared_preview_model = None
+                if getattr(payload, "preview_model", None) is not None:
+                    prepared_model, prepared_preview_model = ModelPreviewWidget.prepare_model_preview(payload.preview_model)
+                    payload = dataclasses.replace(
+                        payload,
+                        preview_model=prepared_model,
+                        prepared_preview_model=prepared_preview_model,
+                    )
+                timings["prepared_model_s"] = max(0.0, float(time.perf_counter() - prepared_model_started_at))
                 if self.stop_event.is_set():
                     return
                 if not self.stop_event.is_set():
+                    payload = dataclasses.replace(
+                        payload,
+                        timings=_merge_timing_maps(getattr(payload, "timings", None), timings),
+                    )
                     self.completed.emit(self.request_id, payload)
+            except RunCancelled:
+                pass
             except Exception as exc:
                 if not self.stop_event.is_set():
                     self.error.emit(self.request_id, str(exc))
@@ -789,17 +1093,35 @@ def run_gui() -> int:
                 self.finished.emit()
 
         def _attach_loaded_images(self, result: ArchivePreviewResult) -> ArchivePreviewResult:
-            preview_image = self._load_image(result.preview_image_path)
-            loose_preview_image = self._load_image(result.loose_preview_image_path)
+            loaded_images: Dict[str, object] = {}
+
+            def load_image_cached(path: str) -> object:
+                normalized_path = str(path or "").strip()
+                if not normalized_path:
+                    return None
+                if normalized_path not in loaded_images:
+                    loaded_images[normalized_path] = self._load_image(normalized_path)
+                return loaded_images[normalized_path]
+
+            preview_image = load_image_cached(result.preview_image_path)
+            loose_preview_image = load_image_cached(result.loose_preview_image_path)
             preview_model = result.preview_model
             meshes = getattr(preview_model, "meshes", None)
             if meshes:
                 for mesh in meshes:
-                    preview_texture_path = str(getattr(mesh, "preview_texture_path", "") or "").strip()
-                    if preview_texture_path and getattr(mesh, "preview_texture_image", None) is None:
-                        texture_image = self._load_image(preview_texture_path)
+                    texture_slots = (
+                        ("preview_texture_path", "preview_texture_image"),
+                        ("preview_normal_texture_path", "preview_normal_texture_image"),
+                        ("preview_material_texture_path", "preview_material_texture_image"),
+                        ("preview_height_texture_path", "preview_height_texture_image"),
+                    )
+                    for path_attr, image_attr in texture_slots:
+                        preview_texture_path = str(getattr(mesh, path_attr, "") or "").strip()
+                        if not preview_texture_path or getattr(mesh, image_attr, None) is not None:
+                            continue
+                        texture_image = load_image_cached(preview_texture_path)
                         if texture_image is not None:
-                            mesh.preview_texture_image = texture_image
+                            setattr(mesh, image_attr, texture_image)
             if preview_image is None and loose_preview_image is None:
                 return result
             return dataclasses.replace(
@@ -827,20 +1149,31 @@ def run_gui() -> int:
             _set_crash_capture_enabled(self._preference_bool("capture_crash_details", False))
             self.settings_file_path = settings_file_path
             self.archive_cache_root = self.settings_file_path.parent / ARCHIVE_SCAN_CACHE_DIRNAME
+            self.language_dir = self.settings_file_path.parent / "languages"
+            self.ui_localizer = UiLocalizer(
+                language_dir=self.language_dir,
+                language_code=str(self.settings.value("appearance/language", "en") or "en"),
+            )
             self._settings_ready = False
             self.current_theme_key = str(self.settings.value("appearance/theme", DEFAULT_UI_THEME))
-            self.show_quick_start_on_launch = not self.settings.contains("ui/quick_start_shown")
+            self.show_quick_start_on_launch = not self.settings.contains("ui/startup_setup_shown")
+            self._model_preview_render_settings = clamp_model_preview_render_settings()
+            self.model_preview_settings_dialog: Optional[ModelPreviewSettingsDialog] = None
             self.resize(1360, 840)
             self.setMinimumSize(1120, 720)
             self.worker_thread: Optional[QThread] = None
             self.scan_worker: Optional[ScanWorker] = None
             self.archive_scan_worker: Optional[ArchiveScanWorker] = None
+            self.archive_sidecar_thread: Optional[QThread] = None
+            self.archive_sidecar_worker: Optional[ArchiveSidecarIndexWorker] = None
             self.archive_filter_worker: Optional[ArchiveFilterWorker] = None
             self.build_worker: Optional[BuildWorker] = None
             self.dds_to_png_worker: Optional[DdsToPngWorker] = None
             self.utility_worker: Optional[UtilityWorker] = None
             self._utility_completion_handler: Optional[Callable[[object], None]] = None
             self._utility_updates_archive_progress = False
+            self.archive_sidecar_request_id = 0
+            self.archive_sidecar_pending_start = False
             self.compare_relative_paths: List[Path] = []
             self.compare_preview_thread: Optional[QThread] = None
             self.compare_preview_worker: Optional[ComparePreviewWorker] = None
@@ -876,13 +1209,18 @@ def run_gui() -> int:
             self.current_archive_model_texture_references: List[ArchiveModelTextureReference] = []
             self.archive_preview_cache: OrderedDict[str, ArchivePreviewResult] = OrderedDict()
             self.archive_preview_cache_keys: Dict[int, str] = {}
-            self.archive_preview_cache_limit = 24
+            self.archive_preview_cache_limit = 12
+            self.archive_preview_request_started_at: Dict[int, float] = {}
+            self.archive_preview_request_phase_timings: Dict[int, Dict[str, float]] = {}
+            self.archive_preview_request_sources: Dict[int, str] = {}
             self.archive_preview_requested_loose = False
             self.archive_preview_showing_loose = False
             self.archive_entries: List[ArchiveEntry] = []
             self.archive_entries_by_normalized_path: Dict[str, List[ArchiveEntry]] = {}
             self.archive_entries_by_basename: Dict[str, List[ArchiveEntry]] = {}
             self.archive_entries_by_extension: Dict[str, List[ArchiveEntry]] = {}
+            self.archive_sidecar_entries_by_texture_path: Dict[str, List[ArchiveEntry]] = {}
+            self.archive_sidecar_entries_by_texture_basename: Dict[str, List[ArchiveEntry]] = {}
             self.archive_scan_finalize_pending = False
             self.archive_filtered_entries: List[ArchiveEntry] = []
             self.archive_filtered_dds_count = 0
@@ -894,8 +1232,14 @@ def run_gui() -> int:
             self.archive_tree_child_folders: Dict[Tuple[str, ...], List[Tuple[str, Tuple[str, ...]]]] = {}
             self.archive_tree_direct_files: Dict[Tuple[str, ...], List[int]] = {}
             self.archive_tree_folder_entry_indexes: Dict[Tuple[str, ...], List[int]] = {}
+            self.archive_tree_folder_preview_stats: Dict[Tuple[str, ...], Tuple[int, int, int]] = {}
             self.archive_tree_items_by_folder_key: Dict[Tuple[str, ...], QTreeWidgetItem] = {}
             self.archive_tree_index_ready = False
+            self.archive_tree_clear_active = False
+            self.archive_tree_clear_total_items = 0
+            self.archive_tree_clear_removed_items = 0
+            self.archive_tree_clear_batch_size = 0
+            self.archive_tree_clear_time_budget_ms = 10.0
             self.archive_tree_population_active = False
             self.archive_tree_population_next_index = 0
             self.archive_tree_population_preferred_path = ""
@@ -905,6 +1249,7 @@ def run_gui() -> int:
             self.archive_tree_population_continue_batch_size = 300
             self.archive_tree_population_time_budget_ms = 12.0
             self.archive_tree_population_last_progress_update = 0.0
+            self._archive_tree_clear_on_complete: Optional[Callable[[], None]] = None
             self._archive_tree_population_on_complete: Optional[Callable[[], None]] = None
             self.archive_preview_loading_started_at = 0.0
             self.archive_preview_loading_entry_name = ""
@@ -927,6 +1272,10 @@ def run_gui() -> int:
             self.archive_preview_loading_timer = QTimer(self)
             self.archive_preview_loading_timer.setInterval(250)
             self.archive_preview_loading_timer.timeout.connect(self._update_archive_preview_loading_indicator)
+            self.model_preview_refresh_timer = QTimer(self)
+            self.model_preview_refresh_timer.setSingleShot(True)
+            self.model_preview_refresh_timer.setInterval(260)
+            self.model_preview_refresh_timer.timeout.connect(self._refresh_current_model_preview_assets)
             self.archive_selection_state_timer = QTimer(self)
             self.archive_selection_state_timer.setSingleShot(True)
             self.archive_selection_state_timer.setInterval(30)
@@ -935,6 +1284,10 @@ def run_gui() -> int:
             self.archive_tree_population_timer.setSingleShot(True)
             self.archive_tree_population_timer.setInterval(0)
             self.archive_tree_population_timer.timeout.connect(self._continue_archive_tree_population)
+            self.archive_tree_clear_timer = QTimer(self)
+            self.archive_tree_clear_timer.setSingleShot(True)
+            self.archive_tree_clear_timer.setInterval(0)
+            self.archive_tree_clear_timer.timeout.connect(self._continue_archive_tree_clear)
             self._last_build_unknown_review_result: Optional[Dict[str, object]] = None
 
             icon_path = resolve_app_icon_path()
@@ -946,10 +1299,9 @@ def run_gui() -> int:
             self.export_profile_action = self.profile_menu.addAction("Export Profile...")
             self.import_profile_action = self.profile_menu.addAction("Import Profile...")
             self.quick_start_menu_action = menu_bar.addAction("Quick Start")
-            self.documentation_menu = menu_bar.addMenu("Documentation")
-            self.open_documentation_action = self.documentation_menu.addAction("Open Documentation")
-            self.documentation_menu.addSeparator()
-            self.export_diagnostics_action = self.documentation_menu.addAction("Export Diagnostics...")
+            self.open_documentation_action = menu_bar.addAction("Documentation")
+            self.help_menu = menu_bar.addMenu("Help")
+            self.export_diagnostics_action = self.help_menu.addAction("Export Diagnostics...")
 
             central = QWidget()
             central.setObjectName("AppRoot")
@@ -1097,8 +1449,6 @@ def run_gui() -> int:
             setup_layout.addWidget(setup_hint)
 
             self.setup_section.body_layout.addWidget(setup_group)
-            left_layout.addWidget(self.setup_section)
-            left_layout.addWidget(self.paths_section)
 
             self.settings_section = CollapsibleSection("Settings", expanded=False)
             settings_group = QWidget()
@@ -1773,7 +2123,7 @@ def run_gui() -> int:
             self.enable_mod_ready_loose_export_checkbox = QCheckBox("Create ready mod package after rebuild")
             self.mod_ready_export_root_edit = QLineEdit()
             self.mod_ready_export_browse_button = QPushButton("Browse")
-            self.mod_ready_create_no_encrypt_checkbox = QCheckBox("Create .no_encrypt file")
+            self.mod_ready_create_no_encrypt_checkbox = QCheckBox("Create .no_encrypt file (legacy)")
             self.mod_ready_create_no_encrypt_checkbox.setChecked(MOD_READY_CREATE_NO_ENCRYPT)
             self.mod_ready_package_title_edit = QLineEdit()
             self.mod_ready_package_version_edit = QLineEdit()
@@ -2417,11 +2767,25 @@ def run_gui() -> int:
             self.archive_preview_zoom_in_button.setToolTip("Zoom in.")
             self.archive_preview_zoom_value = QLabel("Fit")
             self.archive_preview_zoom_value.setObjectName("HintLabel")
-            self.archive_model_texture_toggle = QCheckBox("Use Textures")
-            self.archive_model_texture_toggle.setToolTip(
-                "Shade supported .pam/.pamlod/.pac previews with resolved archive DDS textures when available."
+            self.archive_model_preview_flip_v_checkbox = QCheckBox("Flip Base V")
+            self.archive_model_preview_flip_v_checkbox.setToolTip(
+                "Temporarily invert the preview texture V direction for this model preview only."
             )
-            self.archive_model_texture_toggle.setEnabled(False)
+            self.archive_model_preview_flip_v_checkbox.setVisible(False)
+            self.archive_model_preview_disable_support_checkbox = QCheckBox("Disable Support Maps")
+            self.archive_model_preview_disable_support_checkbox.setToolTip(
+                "Temporarily ignore normal, material, and height support textures for this preview."
+            )
+            self.archive_model_preview_disable_support_checkbox.setVisible(False)
+            self.archive_model_preview_reset_overrides_button = QPushButton("Reset Preview Overrides")
+            self.archive_model_preview_reset_overrides_button.setToolTip(
+                "Clear the temporary Flip Base V and Disable Support Maps preview overrides."
+            )
+            self.archive_model_preview_reset_overrides_button.setVisible(False)
+            self.archive_model_preview_settings_button = QPushButton("3D Preview Settings...")
+            self.archive_model_preview_settings_button.setToolTip(
+                "Open 3D preview controls for textures, quality, orbit, pan, and inversion."
+            )
             self.archive_model_export_obj_button = QPushButton("Export OBJ...")
             self.archive_model_export_obj_button.setToolTip(
                 "Export the selected archive mesh as Wavefront OBJ with MTL and resolved preview textures for Blender."
@@ -2432,14 +2796,19 @@ def run_gui() -> int:
                 "Export the selected archive mesh as FBX. PAC exports also try to attach the matching PAB skeleton."
             )
             self.archive_model_export_fbx_button.setEnabled(False)
-            self.archive_model_import_preview_button = QPushButton("Import OBJ Preview...")
+            self.archive_model_import_preview_button = QPushButton("Import Mesh Preview...")
             self.archive_model_import_preview_button.setToolTip(
-                "Rebuild the selected archive mesh from an OBJ and show the result in the preview without patching the game files."
+                "Rebuild the selected archive mesh from OBJ/DAE and show the result in the preview without patching the game files."
             )
             self.archive_model_import_preview_button.setEnabled(False)
-            self.archive_model_import_patch_button = QPushButton("Import OBJ...")
+            self.archive_model_import_dds_preview_button = QPushButton("Import DDS Preview...")
+            self.archive_model_import_dds_preview_button.setToolTip(
+                "Apply one local DDS onto the current archive mesh preview as a temporary import preview without patching the game files."
+            )
+            self.archive_model_import_dds_preview_button.setEnabled(False)
+            self.archive_model_import_patch_button = QPushButton("Import Mesh...")
             self.archive_model_import_patch_button.setToolTip(
-                "Rebuild the selected archive mesh from an OBJ, then choose whether to patch the game archives or write a mod-ready loose file."
+                "Rebuild the selected archive mesh from OBJ/DAE, then choose whether to patch the game archives or write a mod-ready loose file."
             )
             self.archive_model_import_patch_button.setEnabled(False)
             self.archive_restore_patch_backup_button = QPushButton("Restore Backup...")
@@ -2456,8 +2825,11 @@ def run_gui() -> int:
             archive_preview_controls_row.addWidget(self.archive_preview_zoom_100_button)
             archive_preview_controls_row.addWidget(self.archive_preview_zoom_in_button)
             archive_preview_controls_row.addWidget(self.archive_preview_zoom_value)
+            archive_preview_controls_row.addWidget(self.archive_model_preview_flip_v_checkbox)
+            archive_preview_controls_row.addWidget(self.archive_model_preview_disable_support_checkbox)
+            archive_preview_controls_row.addWidget(self.archive_model_preview_reset_overrides_button)
             archive_preview_controls_row.addStretch(1)
-            archive_preview_controls_row.addWidget(self.archive_model_texture_toggle)
+            archive_preview_controls_row.addWidget(self.archive_model_preview_settings_button)
             archive_model_actions_row = QGridLayout()
             archive_model_actions_row.setContentsMargins(0, 0, 0, 0)
             archive_model_actions_row.setHorizontalSpacing(8)
@@ -2465,8 +2837,9 @@ def run_gui() -> int:
             archive_model_actions_row.addWidget(self.archive_model_export_obj_button, 0, 0)
             archive_model_actions_row.addWidget(self.archive_model_export_fbx_button, 0, 1)
             archive_model_actions_row.addWidget(self.archive_model_import_preview_button, 1, 0)
-            archive_model_actions_row.addWidget(self.archive_model_import_patch_button, 1, 1)
-            archive_model_actions_row.addWidget(self.archive_restore_patch_backup_button, 2, 0, 1, 2)
+            archive_model_actions_row.addWidget(self.archive_model_import_dds_preview_button, 1, 1)
+            archive_model_actions_row.addWidget(self.archive_model_import_patch_button, 2, 0)
+            archive_model_actions_row.addWidget(self.archive_restore_patch_backup_button, 2, 1)
             archive_preview_header.addLayout(archive_preview_title_row)
             archive_preview_header.addLayout(archive_preview_controls_row)
             archive_preview_header.addLayout(archive_model_actions_row)
@@ -2517,24 +2890,14 @@ def run_gui() -> int:
             self.archive_texture_open_button = QPushButton("Open")
             self.archive_texture_export_button = QPushButton("Export Selected...")
             self.archive_texture_export_all_button = QPushButton("Export All...")
-            self.archive_texture_replace_dds_button = QPushButton("Replace DDS...")
-            self.archive_texture_replace_png_button = QPushButton("Replace From PNG...")
             self.archive_texture_open_button.setEnabled(False)
             self.archive_texture_export_button.setEnabled(False)
             self.archive_texture_export_all_button.setEnabled(False)
-            self.archive_texture_replace_dds_button.setEnabled(False)
-            self.archive_texture_replace_png_button.setEnabled(False)
             archive_texture_actions_row.addWidget(self.archive_texture_open_button)
             archive_texture_actions_row.addWidget(self.archive_texture_export_button)
             archive_texture_actions_row.addWidget(self.archive_texture_export_all_button)
             archive_texture_actions_row.addStretch(1)
             archive_texture_actions_layout.addLayout(archive_texture_actions_row)
-            archive_texture_replace_row = QHBoxLayout()
-            archive_texture_replace_row.setSpacing(8)
-            archive_texture_replace_row.addWidget(self.archive_texture_replace_dds_button)
-            archive_texture_replace_row.addWidget(self.archive_texture_replace_png_button)
-            archive_texture_replace_row.addStretch(1)
-            archive_texture_actions_layout.addLayout(archive_texture_replace_row)
             archive_texture_refs_layout.addLayout(archive_texture_actions_layout)
 
             self.archive_preview_stack = QStackedWidget()
@@ -2550,6 +2913,7 @@ def run_gui() -> int:
                 theme_key=self.current_theme_key,
             )
             self.archive_model_preview.view_state_changed.connect(self._handle_archive_model_view_state_changed)
+            self.archive_model_preview.debug_details_changed.connect(self._refresh_archive_preview_details_text)
             self.archive_media_preview = MediaPreviewWidget(
                 "Select an archive file to preview it here.",
                 theme_key=self.current_theme_key,
@@ -2564,9 +2928,9 @@ def run_gui() -> int:
             self.archive_preview_stack.addWidget(self.archive_media_preview)
             self.archive_preview_stack.addWidget(self.archive_preview_text_edit)
             self.archive_preview_stack.addWidget(self.archive_preview_info_edit)
-            self.archive_preview_details_edit = QPlainTextEdit()
-            self.archive_preview_details_edit.setReadOnly(True)
+            self.archive_preview_details_edit = ArchiveDetailsEditor(theme_key=self.current_theme_key)
             self.archive_preview_details_edit.document().setMaximumBlockCount(2000)
+            self._archive_preview_base_detail_text = ""
             self.archive_preview_tabs = QTabWidget()
             archive_preview_tab = QWidget()
             archive_preview_tab_layout = QVBoxLayout(archive_preview_tab)
@@ -2633,7 +2997,15 @@ def run_gui() -> int:
                 settings=self.settings,
                 theme_key=self.current_theme_key,
             )
+            self.settings_tab.set_language_options(
+                self.ui_localizer.available_languages(),
+                current_code=self.ui_localizer.language_code,
+            )
+            self.settings_tab.add_setup_paths_sections(self.setup_section, self.paths_section)
             self.settings_tab.theme_changed.connect(self._handle_theme_changed)
+            self.settings_tab.language_changed.connect(self._handle_language_changed)
+            self.settings_tab.export_language_requested.connect(self._export_language_file)
+            self.settings_tab.import_language_requested.connect(self._import_language_file)
             self.settings_tab.crash_capture_changed.connect(_set_crash_capture_enabled)
             self.main_tabs.addTab(self.settings_tab, "Settings")
             self.replace_assistant_tab = ReplaceAssistantTab(
@@ -2734,13 +3106,20 @@ def run_gui() -> int:
             self.archive_preview_zoom_100_button.clicked.connect(lambda: self._set_archive_preview_zoom_factor(1.0))
             self.archive_preview_zoom_out_button.clicked.connect(lambda: self._adjust_archive_preview_zoom(-1))
             self.archive_preview_zoom_in_button.clicked.connect(lambda: self._adjust_archive_preview_zoom(1))
-            self.archive_model_texture_toggle.toggled.connect(self._handle_archive_model_texture_toggle)
-            self.archive_model_texture_toggle.toggled.connect(self.schedule_settings_save)
+            self.archive_model_preview_flip_v_checkbox.toggled.connect(self._handle_archive_model_preview_flip_v_toggled)
+            self.archive_model_preview_disable_support_checkbox.toggled.connect(
+                self._handle_archive_model_preview_disable_support_maps_toggled
+            )
+            self.archive_model_preview_reset_overrides_button.clicked.connect(
+                self._handle_archive_model_preview_reset_overrides
+            )
+            self.archive_model_preview_settings_button.clicked.connect(self._open_model_preview_settings_dialog)
             self.archive_model_export_obj_button.clicked.connect(self._export_current_archive_model)
             self.archive_model_export_fbx_button.clicked.connect(
                 lambda: self._export_current_archive_mesh("fbx")
             )
             self.archive_model_import_preview_button.clicked.connect(self._preview_current_archive_mesh_import)
+            self.archive_model_import_dds_preview_button.clicked.connect(self._preview_current_archive_mesh_dds_import)
             self.archive_model_import_patch_button.clicked.connect(self._patch_current_archive_mesh_from_obj)
             self.archive_restore_patch_backup_button.clicked.connect(self._restore_archive_patch_backup_from_ui)
             self.archive_texture_refs_tree.itemSelectionChanged.connect(self._update_archive_texture_reference_action_controls)
@@ -2751,8 +3130,6 @@ def run_gui() -> int:
             self.archive_texture_open_button.clicked.connect(self._open_selected_archive_texture_reference)
             self.archive_texture_export_button.clicked.connect(self._export_selected_archive_texture_reference)
             self.archive_texture_export_all_button.clicked.connect(self._export_all_archive_texture_references)
-            self.archive_texture_replace_dds_button.clicked.connect(self._replace_selected_archive_texture_reference_from_dds)
-            self.archive_texture_replace_png_button.clicked.connect(self._replace_selected_archive_texture_reference_from_png)
             self.archive_preview_loose_toggle_button.clicked.connect(self._toggle_archive_loose_preview)
             self.compare_previous_button.clicked.connect(lambda: self._select_compare_offset(-1))
             self.compare_next_button.clicked.connect(lambda: self._select_compare_offset(1))
@@ -2800,6 +3177,7 @@ def run_gui() -> int:
 
             self._connect_auto_save()
             self._load_settings()
+            self._handle_model_preview_settings_changed(self._model_preview_render_settings)
             self._rebuild_archive_structure_filter_controls()
             self._refresh_chainner_chain_info()
             self._apply_csv_log_enabled_state()
@@ -2814,6 +3192,7 @@ def run_gui() -> int:
             self._update_archive_selection_state()
             self._update_compare_navigation_state()
             self.refresh_compare_list()
+            self._apply_ui_language()
             self._settings_ready = True
             self._schedule_workflow_match_refresh()
             self._save_settings()
@@ -2827,7 +3206,7 @@ def run_gui() -> int:
             QTimer.singleShot(260, self._maybe_autoload_archive_on_startup)
 
         def focus_quick_start_sections(self, *, include_chainner: bool) -> None:
-            self.main_tabs.setCurrentWidget(self.workflow_tab)
+            self.main_tabs.setCurrentWidget(self.workflow_tab if include_chainner else self.settings_tab)
             self.setup_section.set_expanded(True)
             self.paths_section.set_expanded(True)
             self.settings_section.set_expanded(False)
@@ -2837,6 +3216,7 @@ def run_gui() -> int:
 
         def show_quick_start_dialog(self) -> None:
             dialog = QuickStartDialog(self)
+            self.ui_localizer.apply(dialog)
             dialog.exec()
 
         def _build_about_intro_html(self) -> str:
@@ -2894,7 +3274,7 @@ def run_gui() -> int:
                     <p><b>Texture Workflow</b> is the main batch-processing tab. It scans loose DDS files under <b>Original DDS root</b>, plans what to do per file, optionally creates/stages PNG intermediates, optionally upscales them, rebuilds DDS output, and lets you review the result in Compare.</p>
                     <h4>Typical run</h4>
                     <ol>
-                      <li>Configure <b>Setup</b>, <b>Paths</b>, and <b>DDS Output</b>.</li>
+                      <li>Configure <b>Settings / Setup</b>, <b>Settings / Paths</b>, and <b>DDS Output</b>.</li>
                       <li>Review <a href="topic:workflow_profiles">Workflow Profiles</a>, <a href="topic:workflow_rules">Ordered Rules</a>, and <a href="topic:workflow_matched_files">Matched Files</a>.</li>
                       <li>Choose your backend in <a href="topic:upscaling_backends">Upscaling</a>.</li>
                       <li>Use <b>Preview Policy</b> to inspect the current per-file plan.</li>
@@ -3202,14 +3582,568 @@ def run_gui() -> int:
                 },
             ]
 
+        def _build_about_document_for_language(self, language_code: str) -> Tuple[str, str, List[Dict[str, str]]]:
+            normalized = str(language_code or "").strip().lower()
+            if normalized == "es":
+                title = f"Documentacion de {APP_TITLE}"
+                intro_html = f"""
+                <p><b>{APP_TITLE} v{APP_VERSION}</b> es una herramienta de escritorio para explorar archivos de Crimson Desert, previsualizar recursos, reconstruir DDS, editar texturas visibles, preparar reemplazos, investigar familias de archivos y buscar texto.</p>
+                <p>Usa la busqueda y la lista de temas de la izquierda, o abre directamente:
+                <a href="topic:workflow_overview">Flujo de texturas</a>,
+                <a href="topic:workflow_profiles">Perfiles de flujo</a>,
+                <a href="topic:workflow_rules">Reglas ordenadas</a>,
+                <a href="topic:workflow_planner_profiles">Perfiles del planificador</a>,
+                <a href="topic:workflow_planner_paths">Rutas del planificador</a>,
+                <a href="topic:archive_browser">Explorador de archivos</a>,
+                <a href="topic:texture_editor">Editor de texturas</a>,
+                <a href="topic:replace_assistant">Asistente de reemplazo</a>,
+                <a href="topic:research">Investigacion</a>,
+                <a href="topic:text_search">Busqueda de texto</a>.
+                </p>
+                """
+                settings_text = escape(str(self.settings_file_path))
+                cache_text = escape(str(self.archive_cache_root))
+                sections = [
+                    {
+                        "id": "overview",
+                        "title": "Vista general",
+                        "summary": "Resumen de las areas principales de la aplicacion.",
+                        "keywords": "vista general funciones pestanas archivo flujo editor reemplazo investigacion busqueda configuracion",
+                        "html": """
+                        <p>La aplicacion esta dividida en areas de trabajo para que no tengas que usar una sola tuberia para todo.</p>
+                        <ul>
+                          <li><b>Flujo de texturas</b>: proceso por lotes para DDS sueltos, escalado opcional, reconstruccion DDS, comparacion y exportacion mod-ready.</li>
+                          <li><b>Explorador de archivos</b>: escaneo, filtro, vista previa, extraccion, exportacion suelta y parches compatibles.</li>
+                          <li><b>Editor de texturas</b>: edicion por capas de texturas visibles y envio directo al flujo.</li>
+                          <li><b>Asistente de reemplazo</b>: reemplazos guiados para PNG/DDS editados.</li>
+                          <li><b>Investigacion</b>: familias DDS, clasificacion, referencias, analisis y notas.</li>
+                          <li><b>Busqueda de texto</b>: busqueda en archivos de texto de archivo o sueltos.</li>
+                          <li><b>Configuracion</b>: apariencia, rutas, cache, idioma, inicio y preferencias persistentes.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "workflow_overview",
+                        "title": "Flujo de texturas",
+                        "summary": "Pestana principal para procesar DDS sueltos por lotes.",
+                        "keywords": "flujo texturas lote dds png reconstruir comparar iniciar escanear politica resumen",
+                        "html": """
+                        <p>El flujo de texturas escanea los DDS bajo la raiz original, decide que hacer con cada archivo, crea PNG intermedios si hace falta, ejecuta el escalado opcional y reconstruye los DDS finales.</p>
+                        <ol>
+                          <li>Configura <b>Configuracion / Setup</b>, <b>Configuracion / Rutas</b> y <b>Salida DDS</b>.</li>
+                          <li>Revisa perfiles, reglas y archivos coincidentes.</li>
+                          <li>Elige el backend de escalado o deja el escalado desactivado.</li>
+                          <li>Usa la vista de politica para revisar el plan por archivo.</li>
+                          <li>Ejecuta el proceso y revisa el resultado en Comparar.</li>
+                        </ol>
+                        """,
+                    },
+                    {
+                        "id": "workflow_profiles",
+                        "title": "Perfiles de flujo",
+                        "summary": "Conjuntos reutilizables de anulaciones por archivo.",
+                        "keywords": "perfiles flujo accion formato tamano mips ncnn escala tile correccion",
+                        "html": """
+                        <p>Los perfiles de flujo son ajustes reutilizables asignados por reglas. Los campos vacios heredan la configuracion global actual.</p>
+                        <ul>
+                          <li><b>Accion</b>: permite heredar la decision del planificador o forzar reconstruccion, escalado, preservacion o salto.</li>
+                          <li><b>Formato, tamano y mipmaps DDS</b>: cambian la salida para los archivos que coinciden.</li>
+                          <li><b>Opciones NCNN</b>: modelo, escala, tile, argumentos extra y correccion posterior para Real-ESRGAN NCNN directo.</li>
+                          <li><b>Perfiles iniciales</b>: puntos de partida seguros para color, normal, altura y especular.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "workflow_rules",
+                        "title": "Reglas ordenadas",
+                        "summary": "Tabla de coincidencias donde gana la ultima regla valida.",
+                        "keywords": "reglas glob ruta exacta perfil semantica planificador colores alpha",
+                        "html": """
+                        <p>Las reglas se evaluan de arriba hacia abajo y gana la ultima coincidencia. Esto permite reglas amplias arriba y correcciones concretas al final.</p>
+                        <ul>
+                          <li><b>Coincidencia</b>: glob para patrones o ruta exacta para un archivo concreto.</li>
+                          <li><b>Perfil de flujo</b>: asigna el comportamiento reutilizable.</li>
+                          <li><b>Semantica</b>: fuerza un significado tecnico si la inferencia no basta.</li>
+                          <li><b>Perfil y ruta del planificador</b>: cambian las suposiciones tecnicas del plan para esa familia.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "workflow_planner_profiles",
+                        "title": "Perfiles del planificador",
+                        "summary": "Perfiles tecnicos que guian formato, color, alpha y preservacion.",
+                        "keywords": "planificador perfiles color normal mascara scalar vector alpha preservar",
+                        "html": """
+                        <p>Un perfil del planificador define las suposiciones tecnicas para una textura: espacio de color, compresion esperada, alpha, mipmaps y si debe preservarse antes de modificarla.</p>
+                        <ul>
+                          <li><code>color_default</code>: texturas visibles de color.</li>
+                          <li><code>normal_bc5</code>: mapas normales, lineales y de preservacion prioritaria.</li>
+                          <li><code>scalar_bc4</code>: mascaras o datos escalares.</li>
+                          <li><code>packed_mask_preserve_layout</code>: canales empaquetados que no deben mezclarse.</li>
+                          <li><code>float_or_vector_preserve_only</code>: datos de precision que deben conservarse.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "workflow_planner_paths",
+                        "title": "Rutas del planificador",
+                        "summary": "Ruta intermedia preferida para cada archivo coincidente.",
+                        "keywords": "rutas planificador png visible tecnico preservar alta precision",
+                        "html": """
+                        <p>La ruta del planificador decide si una textura debe pasar por la ruta PNG visible o por una ruta tecnica mas conservadora.</p>
+                        <ul>
+                          <li><code>visible_color_png_path</code>: adecuada para color visible y salidas revisables.</li>
+                          <li><code>technical_preserve_path</code>: mantiene el archivo original cuando modificarlo es demasiado arriesgado.</li>
+                          <li><code>technical_high_precision_path</code>: usa una ruta tecnica cuando hay datos de alta precision compatibles.</li>
+                        </ul>
+                        <p>Forzar mapas tecnicos por la ruta visible puede producir cambios de brillo, canales rotos o resultados inutilizables.</p>
+                        """,
+                    },
+                    {
+                        "id": "workflow_matched_files",
+                        "title": "Archivos coincidentes",
+                        "summary": "Vista viva de los DDS afectados por reglas y filtros actuales.",
+                        "keywords": "archivos coincidentes perfil regla accion dds ncnn filtro",
+                        "html": """
+                        <p>La tabla muestra los DDS bajo la raiz original que pasan el filtro actual y que ya tienen una accion calculada.</p>
+                        <ul>
+                          <li><b>Ruta</b>: ubicacion relativa del DDS.</li>
+                          <li><b>Semantica</b>: tipo inferido o forzado.</li>
+                          <li><b>Regla</b>: ultima regla que coincide.</li>
+                          <li><b>Accion</b>: resultado final combinado por reglas, perfil, backend y seguridad.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "dds_output",
+                        "title": "Salida DDS y staging",
+                        "summary": "Valores globales usados al reconstruir DDS.",
+                        "keywords": "dds salida formato tamano mipmaps staging texconv png",
+                        "html": """
+                        <p>Salida DDS define los valores globales para archivos sin anulacion de perfil.</p>
+                        <ul>
+                          <li><b>Formato</b>: conservar el formato original o forzar uno compatible con texconv.</li>
+                          <li><b>Tamano</b>: usar tamano PNG, tamano original o tamano personalizado.</li>
+                          <li><b>Mipmaps</b>: conservar, generar cadena completa, usar uno o fijar un recuento.</li>
+                          <li><b>Staging DDS</b>: crea PNG intermedios antes de ejecutar un backend externo.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "upscaling_backends",
+                        "title": "Escalado y backends",
+                        "summary": "Diferencias entre desactivado, NCNN directo y chaiNNer.",
+                        "keywords": "escalado backend ncnn chainner desactivado escala tile correccion",
+                        "html": """
+                        <p>El escalado puede estar desactivado, usar Real-ESRGAN NCNN directo o delegar el trabajo a chaiNNer.</p>
+                        <ul>
+                          <li><b>Desactivado</b>: reconstruye DDS desde PNG existentes sin escalar.</li>
+                          <li><b>Real-ESRGAN NCNN</b>: backend directo con modelo, escala, tile y correccion posterior.</li>
+                          <li><b>chaiNNer</b>: flujo externo donde la cadena decide el procesamiento real.</li>
+                        </ul>
+                        <p>Las reglas automaticas siguen aplicandose aunque el backend de escalado este activo.</p>
+                        """,
+                    },
+                    {
+                        "id": "compare_review",
+                        "title": "Comparar y revisar",
+                        "summary": "Revision lado a lado de DDS original y salida.",
+                        "keywords": "comparar revisar original salida brillo canales mips",
+                        "html": """
+                        <p>Comparar permite revisar la salida antes de confiar en un lote grande.</p>
+                        <ul>
+                          <li>Compara original y resultado visualmente.</li>
+                          <li>Busca cambios de brillo, color, alpha, detalles o canales tecnicos.</li>
+                          <li>Si algo parece incorrecto, cambia politica, perfil o backend antes de exportar.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "archive_browser",
+                        "title": "Explorador de archivos",
+                        "summary": "Escaneo, filtro, vista previa, extraccion y exportacion desde paquetes.",
+                        "keywords": "archivo explorador paquete vista previa extraccion parche obj fbx referencias",
+                        "html": """
+                        <p>El explorador de archivos trabaja sobre paquetes .pamt/.paz. Permite filtrar entradas, previsualizar formatos compatibles, extraer archivos y enviar recursos a investigacion o editor.</p>
+                        <ul>
+                          <li>La vista previa de modelos intenta resolver geometria, sidecars, texturas, esqueletos y metadatos relacionados.</li>
+                          <li>Las exportaciones OBJ/FBX pueden escribir un manifiesto con referencias para ayudar al reimportar.</li>
+                          <li>Los parches directos son compatibles solo para formatos donde la app puede reconstruir datos de forma segura.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "texture_editor",
+                        "title": "Editor de texturas",
+                        "summary": "Editor por capas para trabajo de texturas visibles.",
+                        "keywords": "editor texturas capas pintar canales mascara seleccion transformar",
+                        "html": """
+                        <p>El editor de texturas esta pensado para trabajos visibles: capas, seleccion, pintura, canales, mascaras, transformaciones y exportacion PNG.</p>
+                        <p>No convierte automaticamente mapas tecnicos en texturas visibles seguras. Para DDS tecnicos, revisa la semantica y la politica antes de reconstruir.</p>
+                        """,
+                    },
+                    {
+                        "id": "replace_assistant",
+                        "title": "Asistente de reemplazo",
+                        "summary": "Flujo guiado para reemplazos PNG/DDS individuales.",
+                        "keywords": "asistente reemplazo png dds original salida mod ready",
+                        "html": """
+                        <p>El asistente toma una imagen editada, la asocia con el DDS original correcto, reconstruye la salida con la politica actual y prepara una carpeta mod-ready.</p>
+                        <ul>
+                          <li>Usalo cuando ya tengas una textura editada fuera de la app.</li>
+                          <li>Comprueba siempre que el archivo original y la salida reconstruida coincidan con la textura esperada.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "research",
+                        "title": "Investigacion",
+                        "summary": "Revision de familias, clasificacion, referencias, analisis DDS y notas.",
+                        "keywords": "investigacion familias dds clasificacion referencias notas informes",
+                        "html": """
+                        <p>Investigacion agrupa datos para entender familias de texturas y archivos relacionados antes de crear reglas o exportar.</p>
+                        <ul>
+                          <li>Revisa familias DDS y roles inferidos.</li>
+                          <li>Clasifica desconocidos y guarda aprobaciones locales.</li>
+                          <li>Consulta referencias, restricciones UI, mapas de calor, notas e informes.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "text_search",
+                        "title": "Busqueda de texto",
+                        "summary": "Busqueda en archivos de texto de archivo o sueltos.",
+                        "keywords": "busqueda texto xml json cfg lua regex exportar vista previa",
+                        "html": """
+                        <p>Busqueda de texto localiza cadenas o patrones regex en archivos de texto de archivo o carpetas sueltas.</p>
+                        <ul>
+                          <li>Previsualiza coincidencias con contexto resaltado.</li>
+                          <li>Exporta resultados conservando la estructura de carpetas.</li>
+                          <li>Es util para .xml, .json, .cfg, .lua y formatos similares.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "settings_files",
+                        "title": "Configuracion, archivos y dependencias",
+                        "summary": "Configuracion local, cache, archivos de proyecto y herramientas externas.",
+                        "keywords": "configuracion archivos cache dependencias texconv ncnn chainner idioma",
+                        "html": f"""
+                        <p>La configuracion, el cache y las preferencias se guardan junto a la instalacion o al checkout local.</p>
+                        <ul>
+                          <li><b>Archivo de configuracion</b>: <code>{settings_text}</code></li>
+                          <li><b>Cache de archivos</b>: <code>{cache_text}</code></li>
+                          <li><b>texconv</b>: necesario para vista DDS, conversion DDS-a-PNG, comparacion y reconstruccion DDS.</li>
+                          <li><b>Real-ESRGAN NCNN</b> y <b>chaiNNer</b>: backends opcionales de escalado.</li>
+                          <li><b>Idiomas</b>: puedes exportar el archivo de idioma, editar los valores y volver a importarlo.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "troubleshooting",
+                        "title": "Solucion de problemas y limites",
+                        "summary": "Errores frecuentes y limitaciones actuales.",
+                        "keywords": "problemas limites texconv ncnn chainner png brillo cache vista previa",
+                        "html": """
+                        <ul>
+                          <li><b>Falta texconv</b>: la vista DDS, conversion, comparacion y reconstruccion no funcionaran bien.</li>
+                          <li><b>Faltan modelos NCNN</b>: NCNN directo necesita ejecutable y pares .param/.bin validos.</li>
+                          <li><b>No hay PNG de salida</b>: si el backend no produce PNG util, no hay nada que reconstruir.</li>
+                          <li><b>Rutas chaiNNer incorrectas</b>: una cadena puede leer o escribir en carpetas equivocadas.</li>
+                          <li><b>Cambios de brillo o detalle</b>: compara resultados y ajusta modelo, politica o correccion posterior.</li>
+                          <li><b>Texturas tecnicas</b>: normales, mascaras, vectores y canales empaquetados deben tratarse con preservacion primero.</li>
+                        </ul>
+                        """,
+                    },
+                ]
+                return title, intro_html, sections
+
+            if normalized == "de":
+                title = f"Dokumentation zu {APP_TITLE}"
+                intro_html = f"""
+                <p><b>{APP_TITLE} v{APP_VERSION}</b> ist ein Windows-Desktopwerkzeug fuer Archivsuche, Asset-Vorschau, DDS-Neuaufbau, sichtbare Texturbearbeitung, Ersatzpakete, Recherche und Textsuche in Crimson Desert.</p>
+                <p>Nutze Suche und Themenliste links, oder springe direkt zu:
+                <a href="topic:workflow_overview">Textur-Workflow</a>,
+                <a href="topic:workflow_profiles">Workflow-Profile</a>,
+                <a href="topic:workflow_rules">Geordnete Regeln</a>,
+                <a href="topic:workflow_planner_profiles">Planerprofile</a>,
+                <a href="topic:workflow_planner_paths">Planerpfade</a>,
+                <a href="topic:archive_browser">Archiv-Browser</a>,
+                <a href="topic:texture_editor">Textur-Editor</a>,
+                <a href="topic:replace_assistant">Ersetzungsassistent</a>,
+                <a href="topic:research">Recherche</a>,
+                <a href="topic:text_search">Textsuche</a>.
+                </p>
+                """
+                settings_text = escape(str(self.settings_file_path))
+                cache_text = escape(str(self.archive_cache_root))
+                sections = [
+                    {
+                        "id": "overview",
+                        "title": "Uebersicht",
+                        "summary": "Ueberblick ueber die Hauptbereiche der App.",
+                        "keywords": "uebersicht funktionen tabs archiv workflow editor ersetzung recherche suche einstellungen",
+                        "html": """
+                        <p>Die App ist in Arbeitsbereiche aufgeteilt, damit nicht jede Aufgabe durch dieselbe Pipeline laufen muss.</p>
+                        <ul>
+                          <li><b>Textur-Workflow</b>: Stapelverarbeitung loser DDS, optionales Upscaling, DDS-Neuaufbau, Vergleich und mod-fertiger Export.</li>
+                          <li><b>Archiv-Browser</b>: Scannen, Filtern, Vorschau, Extraktion, Loose-Export und kompatible Patches.</li>
+                          <li><b>Textur-Editor</b>: Ebenenbasierte Bearbeitung sichtbarer Texturen mit direkter Workflow-Uebergabe.</li>
+                          <li><b>Ersetzungsassistent</b>: Gefuehrte Ersetzungen fuer bearbeitete PNG/DDS-Dateien.</li>
+                          <li><b>Recherche</b>: DDS-Familien, Klassifizierung, Referenzen, Analyse und Notizen.</li>
+                          <li><b>Textsuche</b>: Suche in Textdateien aus Archiven oder losen Ordnern.</li>
+                          <li><b>Einstellungen</b>: Darstellung, Pfade, Cache, Sprache, Startverhalten und lokale Praeferenzen.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "workflow_overview",
+                        "title": "Textur-Workflow",
+                        "summary": "Haupttab fuer Stapelverarbeitung loser DDS-Dateien.",
+                        "keywords": "textur workflow stapel dds png neuaufbau vergleichen start scan richtlinie",
+                        "html": """
+                        <p>Der Textur-Workflow scannt DDS-Dateien unter dem Originalstamm, plant die Aktion pro Datei, erstellt bei Bedarf PNG-Zwischenstufen, fuehrt optionales Upscaling aus und baut DDS-Ausgaben neu.</p>
+                        <ol>
+                          <li>Konfiguriere <b>Einstellungen / Einrichtung</b>, <b>Einstellungen / Pfade</b> und <b>DDS-Ausgabe</b>.</li>
+                          <li>Pruefe Profile, Regeln und passende Dateien.</li>
+                          <li>Waehle ein Upscaling-Backend oder lasse Upscaling deaktiviert.</li>
+                          <li>Nutze die Richtlinienvorschau fuer den Plan pro Datei.</li>
+                          <li>Starte den Lauf und pruefe das Ergebnis in Vergleichen.</li>
+                        </ol>
+                        """,
+                    },
+                    {
+                        "id": "workflow_profiles",
+                        "title": "Workflow-Profile",
+                        "summary": "Wiederverwendbare Override-Sets pro Datei.",
+                        "keywords": "profile workflow aktion format groesse mips ncnn skalierung tile korrektur",
+                        "html": """
+                        <p>Workflow-Profile sind wiederverwendbare Einstellungen, die durch Regeln zugewiesen werden. Leere Felder erben die aktuellen globalen Werte.</p>
+                        <ul>
+                          <li><b>Aktion</b>: Planerentscheidung erben oder Neuaufbau, Upscaling, Erhalt oder Ueberspringen erzwingen.</li>
+                          <li><b>DDS-Format, Groesse und Mipmaps</b>: aendern die Ausgabe fuer passende Dateien.</li>
+                          <li><b>NCNN-Optionen</b>: Modell, Skalierung, Tile, Extra-Argumente und Nachkorrektur fuer direktes Real-ESRGAN NCNN.</li>
+                          <li><b>Starterprofile</b>: sichere Ausgangspunkte fuer Farbe, Normalen, Hoehe und Specular.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "workflow_rules",
+                        "title": "Geordnete Regeln",
+                        "summary": "Treffertabelle, in der die letzte passende Regel gewinnt.",
+                        "keywords": "regeln glob exakter pfad profil semantik planer farben alpha",
+                        "html": """
+                        <p>Regeln werden von oben nach unten ausgewertet; der letzte Treffer gewinnt. Breite Familienregeln gehoeren nach oben, konkrete Korrekturen nach unten.</p>
+                        <ul>
+                          <li><b>Treffer</b>: Glob fuer Muster oder exakter Pfad fuer eine einzelne Datei.</li>
+                          <li><b>Workflow-Profil</b>: weist das wiederverwendbare Verhalten zu.</li>
+                          <li><b>Semantik</b>: erzwingt eine technische Bedeutung, wenn die Erkennung nicht reicht.</li>
+                          <li><b>Planerprofil und Planerpfad</b>: aendern technische Annahmen fuer diese Familie.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "workflow_planner_profiles",
+                        "title": "Planerprofile",
+                        "summary": "Technische Profile fuer Format, Farbe, Alpha und Erhalt.",
+                        "keywords": "planer profile farbe normal maske scalar vector alpha erhalten",
+                        "html": """
+                        <p>Ein Planerprofil beschreibt technische Annahmen fuer eine Textur: Farbraum, erwartete Kompression, Alpha, Mipmaps und ob die Datei zuerst erhalten bleiben soll.</p>
+                        <ul>
+                          <li><code>color_default</code>: sichtbare Farbtexturen.</li>
+                          <li><code>normal_bc5</code>: lineare Normalmaps mit Erhalt als sicherem Standard.</li>
+                          <li><code>scalar_bc4</code>: skalare Masken oder Ein-Kanal-Daten.</li>
+                          <li><code>packed_mask_preserve_layout</code>: gepackte Kanaele, deren Layout nicht driften darf.</li>
+                          <li><code>float_or_vector_preserve_only</code>: praezise Daten, die erhalten bleiben sollten.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "workflow_planner_paths",
+                        "title": "Planerpfade",
+                        "summary": "Bevorzugter Zwischenpfad fuer passende Dateien.",
+                        "keywords": "planerpfade png sichtbar technisch erhalten hohe praezision",
+                        "html": """
+                        <p>Der Planerpfad legt fest, ob eine Textur durch den sichtbaren PNG-Pfad oder durch einen vorsichtigeren technischen Pfad gehen soll.</p>
+                        <ul>
+                          <li><code>visible_color_png_path</code>: geeignet fuer sichtbare Farbtexturen und pruefbare Ausgaben.</li>
+                          <li><code>technical_preserve_path</code>: behaelt das Original, wenn eine Aenderung zu riskant ist.</li>
+                          <li><code>technical_high_precision_path</code>: nutzt einen technischen Pfad fuer kompatible Hochpraezisionsdaten.</li>
+                        </ul>
+                        <p>Technische Maps in den sichtbaren Pfad zu zwingen kann Helligkeit, Kanaele oder Nutzbarkeit beschaedigen.</p>
+                        """,
+                    },
+                    {
+                        "id": "workflow_matched_files",
+                        "title": "Passende Dateien",
+                        "summary": "Live-Ansicht der DDS-Dateien, die von Regeln und Filtern betroffen sind.",
+                        "keywords": "passende dateien profil regel aktion dds ncnn filter",
+                        "html": """
+                        <p>Die Tabelle zeigt DDS-Dateien unter dem Originalstamm, die den aktuellen Filter passieren und eine berechnete Aktion haben.</p>
+                        <ul>
+                          <li><b>Pfad</b>: relativer Speicherort des DDS.</li>
+                          <li><b>Semantik</b>: erkannter oder erzwungener Typ.</li>
+                          <li><b>Regel</b>: letzte passende Regel.</li>
+                          <li><b>Aktion</b>: Endergebnis aus Regel, Profil, Backend und Sicherheitslogik.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "dds_output",
+                        "title": "DDS-Ausgabe und Staging",
+                        "summary": "Globale Werte fuer den DDS-Neuaufbau.",
+                        "keywords": "dds ausgabe format groesse mipmaps staging texconv png",
+                        "html": """
+                        <p>DDS-Ausgabe definiert globale Werte fuer Dateien ohne Profil-Override.</p>
+                        <ul>
+                          <li><b>Format</b>: Originalformat behalten oder ein texconv-Format erzwingen.</li>
+                          <li><b>Groesse</b>: PNG-Groesse, Originalgroesse oder benutzerdefinierte Groesse verwenden.</li>
+                          <li><b>Mipmaps</b>: behalten, voll erzeugen, eine verwenden oder Anzahl festlegen.</li>
+                          <li><b>DDS-Staging</b>: erstellt PNG-Zwischenstufen vor externem Backend-Lauf.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "upscaling_backends",
+                        "title": "Upscaling und Backends",
+                        "summary": "Unterschiede zwischen deaktiviert, direktem NCNN und chaiNNer.",
+                        "keywords": "upscaling backend ncnn chainner deaktiviert skalierung tile korrektur",
+                        "html": """
+                        <p>Upscaling kann deaktiviert sein, direktes Real-ESRGAN NCNN verwenden oder Arbeit an chaiNNer uebergeben.</p>
+                        <ul>
+                          <li><b>Deaktiviert</b>: DDS aus vorhandenen PNG-Eingaben neu aufbauen, ohne Upscaling.</li>
+                          <li><b>Real-ESRGAN NCNN</b>: direktes Backend mit Modell, Skalierung, Tile und Nachkorrektur.</li>
+                          <li><b>chaiNNer</b>: externer Workflow, dessen Kette die echte Verarbeitung bestimmt.</li>
+                        </ul>
+                        <p>Automatische Texturregeln gelten weiterhin, auch wenn ein Upscaling-Backend aktiv ist.</p>
+                        """,
+                    },
+                    {
+                        "id": "compare_review",
+                        "title": "Vergleichen und pruefen",
+                        "summary": "Seit-an-Seit-Pruefung von Original-DDS und Ausgabe.",
+                        "keywords": "vergleichen pruefen original ausgabe helligkeit kanaele mips",
+                        "html": """
+                        <p>Vergleichen hilft, Ausgaben zu pruefen, bevor ein grosser Stapellauf vertrauenswuerdig ist.</p>
+                        <ul>
+                          <li>Vergleiche Original und Ergebnis visuell.</li>
+                          <li>Achte auf Helligkeit, Farbe, Alpha, Details oder technische Kanaele.</li>
+                          <li>Wenn etwas falsch aussieht, passe Richtlinie, Profil oder Backend vor dem Export an.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "archive_browser",
+                        "title": "Archiv-Browser",
+                        "summary": "Scannen, Filtern, Vorschau, Extraktion und Export aus Paketen.",
+                        "keywords": "archiv browser paket vorschau extraktion patch obj fbx referenzen",
+                        "html": """
+                        <p>Der Archiv-Browser arbeitet mit .pamt/.paz-Paketen. Er filtert Eintraege, zeigt kompatible Formate an, extrahiert Dateien und sendet Assets an Recherche oder Editor.</p>
+                        <ul>
+                          <li>Die Modellvorschau versucht Geometrie, Sidecars, Texturen, Skelette und Metadaten aufzuloesen.</li>
+                          <li>OBJ/FBX-Exporte koennen ein Manifest mit Referenzen fuer den Reimport schreiben.</li>
+                          <li>Direkte Patches sind nur fuer Formate sinnvoll, die die App sicher rekonstruieren kann.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "texture_editor",
+                        "title": "Textur-Editor",
+                        "summary": "Ebeneneditor fuer sichtbare Texturarbeit.",
+                        "keywords": "textur editor ebenen malen kanaele maske auswahl transformieren",
+                        "html": """
+                        <p>Der Textur-Editor ist fuer sichtbare Arbeiten gedacht: Ebenen, Auswahl, Malen, Kanaele, Masken, Transformationen und PNG-Export.</p>
+                        <p>Er macht technische Maps nicht automatisch sicher. Pruefe Semantik und Richtlinie, bevor du technische DDS-Dateien neu aufbaust.</p>
+                        """,
+                    },
+                    {
+                        "id": "replace_assistant",
+                        "title": "Ersetzungsassistent",
+                        "summary": "Gefuehrter Ablauf fuer einzelne PNG/DDS-Ersetzungen.",
+                        "keywords": "ersetzungsassistent png dds original ausgabe mod ready",
+                        "html": """
+                        <p>Der Assistent nimmt ein bearbeitetes Bild, ordnet es dem richtigen Original-DDS zu, baut die Ausgabe mit aktueller Richtlinie neu auf und erstellt einen mod-fertigen Ordner.</p>
+                        <ul>
+                          <li>Nutze ihn, wenn die Textur bereits ausserhalb der App bearbeitet wurde.</li>
+                          <li>Pruefe immer, dass Originaldatei und rekonstruierte Ausgabe zur erwarteten Textur gehoeren.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "research",
+                        "title": "Recherche",
+                        "summary": "Pruefung von Familien, Klassifizierung, Referenzen, DDS-Analyse und Notizen.",
+                        "keywords": "recherche familien dds klassifizierung referenzen notizen berichte",
+                        "html": """
+                        <p>Recherche buendelt Daten, um Texturfamilien und zusammenhaengende Dateien vor Regeln oder Exporten zu verstehen.</p>
+                        <ul>
+                          <li>Pruefe DDS-Familien und erkannte Rollen.</li>
+                          <li>Klassifiziere unbekannte Dateien und speichere lokale Freigaben.</li>
+                          <li>Nutze Referenzen, UI-Einschraenkungen, Heatmaps, Notizen und Berichte.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "text_search",
+                        "title": "Textsuche",
+                        "summary": "Suche in Textdateien aus Archiven oder losen Ordnern.",
+                        "keywords": "textsuche xml json cfg lua regex export vorschau",
+                        "html": """
+                        <p>Textsuche findet Zeichenketten oder Regex-Muster in Textdateien aus Archiven oder losen Ordnern.</p>
+                        <ul>
+                          <li>Zeigt Treffer mit hervorgehobenem Kontext an.</li>
+                          <li>Exportiert Ergebnisse mit erhaltener Ordnerstruktur.</li>
+                          <li>Hilfreich fuer .xml, .json, .cfg, .lua und aehnliche Formate.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "settings_files",
+                        "title": "Einstellungen, Dateien und Abhaengigkeiten",
+                        "summary": "Lokale Konfiguration, Cache, Projektdateien und externe Werkzeuge.",
+                        "keywords": "einstellungen dateien cache abhaengigkeiten texconv ncnn chainner sprache",
+                        "html": f"""
+                        <p>Konfiguration, Cache und Praeferenzen werden neben Installation oder lokalem Checkout gespeichert.</p>
+                        <ul>
+                          <li><b>Konfigurationsdatei</b>: <code>{settings_text}</code></li>
+                          <li><b>Archiv-Cache</b>: <code>{cache_text}</code></li>
+                          <li><b>texconv</b>: noetig fuer DDS-Vorschau, DDS-zu-PNG, Vergleich und DDS-Neuaufbau.</li>
+                          <li><b>Real-ESRGAN NCNN</b> und <b>chaiNNer</b>: optionale Upscaling-Backends.</li>
+                          <li><b>Sprachen</b>: Sprachdatei exportieren, Werte bearbeiten und wieder importieren.</li>
+                        </ul>
+                        """,
+                    },
+                    {
+                        "id": "troubleshooting",
+                        "title": "Fehlerbehebung und Grenzen",
+                        "summary": "Haeufige Fehler und aktuelle Einschraenkungen.",
+                        "keywords": "fehlerbehebung grenzen texconv ncnn chainner png helligkeit cache vorschau",
+                        "html": """
+                        <ul>
+                          <li><b>texconv fehlt</b>: DDS-Vorschau, Konvertierung, Vergleich und Neuaufbau funktionieren dann nicht richtig.</li>
+                          <li><b>NCNN-Modelle fehlen</b>: direktes NCNN braucht eine gueltige EXE und passende .param/.bin-Paare.</li>
+                          <li><b>Keine PNG-Ausgabe</b>: wenn das Backend kein nutzbares PNG erzeugt, gibt es nichts zum Neuaufbauen.</li>
+                          <li><b>Falsche chaiNNer-Pfade</b>: eine Kette kann aus falschen Ordnern lesen oder dorthin schreiben.</li>
+                          <li><b>Helligkeits- oder Detaildrift</b>: vergleiche Ergebnisse und passe Modell, Richtlinie oder Nachkorrektur an.</li>
+                          <li><b>Technische Texturen</b>: Normalen, Masken, Vektoren und gepackte Kanaele sollten zuerst erhalten bleiben.</li>
+                        </ul>
+                        """,
+                    },
+                ]
+                return title, intro_html, sections
+
+            return f"{APP_TITLE} Documentation", self._build_about_intro_html(), self._build_about_sections()
+
         def show_about_dialog(self, _checked: bool = False, topic_id: str = "") -> None:
+            title, intro_html, sections = self._build_about_document_for_language(self.ui_localizer.language_code)
             dialog = AboutDialog(
                 self,
-                title=f"{APP_TITLE} Documentation",
-                intro_html=self._build_about_intro_html(),
-                sections=self._build_about_sections(),
+                title=title,
+                intro_html=intro_html,
+                sections=sections,
                 initial_section_id=topic_id or "overview",
             )
+            self.ui_localizer.apply(dialog)
             dialog.exec()
 
         def _collect_profile_payload(self) -> Dict[str, object]:
@@ -3546,7 +4480,7 @@ def run_gui() -> int:
             if not self.show_quick_start_on_launch:
                 return
             self.show_quick_start_on_launch = False
-            self.settings.setValue("ui/quick_start_shown", True)
+            self.settings.setValue("ui/startup_setup_shown", True)
             self.settings.sync()
             self.focus_quick_start_sections(include_chainner=False)
             self.show_quick_start_dialog()
@@ -3582,12 +4516,91 @@ def run_gui() -> int:
             self.archive_model_preview.set_theme(self.current_theme_key)
             self.archive_media_preview.set_theme(self.current_theme_key)
             self.archive_preview_text_edit.set_theme(self.current_theme_key)
+            self.archive_preview_details_edit.set_theme(self.current_theme_key)
             self.text_search_tab.set_theme(self.current_theme_key)
             self.research_tab.set_theme(self.current_theme_key)
             self.texture_editor_tab.sync_ui_font(app.font())
             self.settings_tab.sync_appearance_controls(self.current_theme_key)
             self._schedule_column_autofit()
             self.schedule_settings_save()
+
+        def _apply_ui_language(self) -> None:
+            self.settings_tab.set_language_options(
+                self.ui_localizer.available_languages(),
+                current_code=self.ui_localizer.language_code,
+            )
+            self.ui_localizer.apply(self)
+            self._update_ncnn_preset_hint()
+            self._schedule_column_autofit()
+
+        def _handle_language_changed(self, language_code: str) -> None:
+            try:
+                self.ui_localizer.load_language(language_code)
+            except Exception as exc:
+                QMessageBox.warning(self, "Language", f"Could not load language:\n{exc}")
+                self.ui_localizer.load_language("en")
+            self.settings.setValue("appearance/language", self.ui_localizer.language_code)
+            self.settings.sync()
+            self._apply_ui_language()
+            self.set_status_message(f"Language changed to {self.ui_localizer.language_name}.")
+
+        def _export_language_file(self) -> None:
+            language_code = self.ui_localizer.language_code or "en"
+            language_name = self.ui_localizer.language_name or language_name_for_code(language_code)
+            default_name = self.settings_file_path.parent / f"{language_code}_language.json"
+            selected, _selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Export Language File",
+                str(default_name),
+                "JSON Files (*.json);;All Files (*)",
+            )
+            if not selected:
+                return
+            try:
+                source_roots = (
+                    Path(__file__).resolve().parents[1],
+                )
+                translations = collect_translatable_source_strings(source_roots)
+                translations.update(self.ui_localizer.collect_source_strings(self))
+                for key in list(translations):
+                    translations[key] = self.ui_localizer.translations.get(key, translations.get(key, ""))
+                write_language_file(
+                    Path(selected),
+                    language_code=language_code,
+                    language_name=language_name,
+                    translations=translations,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "Export Language File", f"Could not export language file:\n{exc}")
+                return
+            QMessageBox.information(
+                self,
+                "Export Language File",
+                f"Exported language file:\n{selected}\n\n{LANGUAGE_WARNING}",
+            )
+
+        def _import_language_file(self) -> None:
+            selected, _selected_filter = QFileDialog.getOpenFileName(
+                self,
+                "Import Language File",
+                str(self.language_dir if self.language_dir.exists() else self.settings_file_path.parent),
+                "JSON Files (*.json);;All Files (*)",
+            )
+            if not selected:
+                return
+            try:
+                language_code, language_name, target_path = self.ui_localizer.import_language_file(Path(selected))
+            except Exception as exc:
+                QMessageBox.warning(self, "Import Language File", f"Could not import language file:\n{exc}")
+                return
+            self.settings.setValue("appearance/language", language_code)
+            self.settings.sync()
+            self._apply_ui_language()
+            QMessageBox.information(
+                self,
+                "Import Language File",
+                f"Imported language: {language_name} ({language_code})\nStored at:\n{target_path}\n\n{LANGUAGE_WARNING}",
+            )
 
         def _archive_preview_text_language_extension_for_entry(
             self,
@@ -3744,6 +4757,96 @@ def run_gui() -> int:
                 force_refresh=not self._preference_bool("prefer_archive_cache_on_startup", True),
                 activate_archive_tab=False,
             )
+
+        def _load_game_executable_fingerprints(self) -> Dict[str, Dict[str, object]]:
+            raw_value = self.settings.value("archive/game_executable_fingerprints", "{}")
+            try:
+                payload = json.loads(str(raw_value or "{}"))
+            except Exception:
+                return {}
+            if not isinstance(payload, dict):
+                return {}
+            records: Dict[str, Dict[str, object]] = {}
+            for key, value in payload.items():
+                if isinstance(value, dict):
+                    records[str(key)] = dict(value)
+            return records
+
+        def _save_game_executable_fingerprints(self, records: Mapping[str, Mapping[str, object]]) -> None:
+            payload = {str(key): dict(value) for key, value in records.items()}
+            self.settings.setValue(
+                "archive/game_executable_fingerprints",
+                json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            )
+            self.settings.sync()
+
+        def _check_game_update_and_invalidate_archive_cache(self, package_root: Path) -> bool:
+            executable_path = resolve_crimson_desert_executable(package_root)
+            if executable_path is None:
+                return False
+
+            try:
+                stat_result = executable_path.stat()
+            except OSError as exc:
+                self.append_archive_log(f"Game update check skipped: could not read {executable_path}: {exc}")
+                return False
+
+            executable_key = str(executable_path).strip().lower()
+            current_size = int(stat_result.st_size)
+            current_mtime_ns = int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000)))
+            records = self._load_game_executable_fingerprints()
+            previous_record = records.get(executable_key, {})
+            previous_hash = str(previous_record.get("sha256", "") or "").strip()
+            previous_size = int(previous_record.get("size", -1) or -1)
+            previous_mtime_ns = int(previous_record.get("mtime_ns", -1) or -1)
+
+            if (
+                previous_hash
+                and previous_size == current_size
+                and previous_mtime_ns == current_mtime_ns
+            ):
+                return False
+
+            try:
+                current_hash = sha256_file(executable_path)
+            except OSError as exc:
+                self.append_archive_log(f"Game update check skipped: could not hash {executable_path}: {exc}")
+                return False
+
+            records[executable_key] = {
+                "path": str(executable_path),
+                "sha256": current_hash,
+                "size": current_size,
+                "mtime_ns": current_mtime_ns,
+                "checked_at": time.time(),
+            }
+            self._save_game_executable_fingerprints(records)
+
+            if not previous_hash:
+                self.append_archive_log(f"Recorded CrimsonDesert.exe hash baseline: {executable_path}")
+                return False
+            if previous_hash == current_hash:
+                return False
+
+            deleted_paths = invalidate_archive_browser_cache(
+                package_root,
+                self.archive_cache_root,
+                on_log=self.append_archive_log,
+            )
+            if deleted_paths:
+                self.append_archive_log(
+                    "Game update detected via CrimsonDesert.exe hash. "
+                    f"Archive Browser cache invalidated ({len(deleted_paths):,} file(s))."
+                )
+                self.append_log("Game update detected via CrimsonDesert.exe hash. Archive Browser cache invalidated.")
+                self.set_status_message("Game update detected. Archive Browser cache invalidated.")
+            else:
+                self.append_archive_log(
+                    "Game update detected via CrimsonDesert.exe hash. No existing Archive Browser cache file needed deletion."
+                )
+                self.append_log("Game update detected via CrimsonDesert.exe hash.")
+                self.set_status_message("Game update detected.")
+            return True
 
         def _apply_responsive_window_defaults(self) -> None:
             screen = self.screen() or QApplication.primaryScreen()
@@ -4704,6 +5807,7 @@ def run_gui() -> int:
             if not self._settings_ready:
                 return
             self.settings.setValue("appearance/theme", self.current_theme_key)
+            self.settings.setValue("appearance/language", self.ui_localizer.language_code)
             self.settings.setValue("paths/original_dds_root", self.original_dds_edit.text())
             self.settings.setValue("paths/png_root", self.png_root_edit.text())
             self.settings.setValue("paths/texture_editor_png_root", self.texture_editor_png_root_edit.text())
@@ -4725,7 +5829,16 @@ def run_gui() -> int:
             self.settings.setValue("archive/min_size_kb", self.archive_min_size_spin.value())
             self.settings.setValue("archive/previewable_only", self.archive_previewable_only_checkbox.isChecked())
             self.settings.setValue("archive/tree_view", self.archive_tree_view_checkbox.isChecked())
-            self.settings.setValue("archive/model_use_textures", self.archive_model_texture_toggle.isChecked())
+            preview_settings = self._current_model_preview_render_settings()
+            self.settings.setValue("archive/model_use_textures", preview_settings.use_textures_by_default)
+            self.settings.setValue("archive/model_high_quality", preview_settings.high_quality_by_default)
+            self.settings.setValue("preview/visible_texture_mode", preview_settings.visible_texture_mode)
+            self.settings.setValue("preview/orbit_sensitivity", preview_settings.orbit_sensitivity)
+            self.settings.setValue("preview/pan_sensitivity", preview_settings.pan_sensitivity)
+            self.settings.setValue("preview/invert_orbit_x", preview_settings.invert_orbit_x)
+            self.settings.setValue("preview/invert_orbit_y", preview_settings.invert_orbit_y)
+            self.settings.setValue("preview/invert_pan_x", preview_settings.invert_pan_x)
+            self.settings.setValue("preview/invert_pan_y", preview_settings.invert_pan_y)
             self.settings.setValue("dds_output/format_mode", self._combo_value(self.dds_format_mode_combo))
             self.settings.setValue("dds_output/custom_format", self._combo_value(self.dds_custom_format_combo))
             self.settings.setValue("dds_output/size_mode", self._combo_value(self.dds_size_mode_combo))
@@ -4901,7 +6014,7 @@ def run_gui() -> int:
                 self._read_bool("archive/previewable_only", defaults.archive_previewable_only)
             )
             self.archive_tree_view_checkbox.setChecked(self._read_bool("archive/tree_view", True))
-            self.archive_model_texture_toggle.setChecked(self._read_bool("archive/model_use_textures", False))
+            self._model_preview_render_settings = self._read_model_preview_render_settings()
             size_mode_value = self.settings.value("dds_output/size_mode")
             if size_mode_value is None:
                 old_keep_original_size = self._read_bool("settings/keep_original_size", False)
@@ -5153,6 +6266,20 @@ def run_gui() -> int:
                 return value
             return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
+        def _read_int(self, key: str, default: int) -> int:
+            value = self.settings.value(key, default)
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return int(default)
+
+        def _read_float(self, key: str, default: float) -> float:
+            value = self.settings.value(key, default)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float(default)
+
         def _apply_csv_log_enabled_state(self) -> None:
             enabled = self.csv_log_enabled_checkbox.isChecked()
             self.csv_log_path_edit.setEnabled(enabled)
@@ -5344,22 +6471,23 @@ def run_gui() -> int:
                 )
 
         def _update_ncnn_preset_hint(self) -> None:
+            tr = self.ui_localizer.translate
             preset_definition = get_texture_preset_definition(self._combo_value(self.upscale_texture_preset_combo))
             upscale_list = ", ".join(preset_definition.upscale_types)
-            copy_list = ", ".join(preset_definition.copy_types) if preset_definition.copy_types else "nothing"
+            copy_list = ", ".join(preset_definition.copy_types) if preset_definition.copy_types else tr("nothing")
             policy_lines = [
-                preset_definition.description,
-                f"Upscaled: {upscale_list}.",
-                f"Copied unchanged: {copy_list}.",
-                "This policy applies before DDS rebuild for every backend. Files kept out of the PNG path are copied through as original DDS when the current rules say they are safer untouched.",
-                "Automatic rules still control final color space, compression, alpha-aware hints, and technical-map preservation after that policy is applied.",
+                tr(preset_definition.description),
+                f"{tr('Upscaled')}: {upscale_list}.",
+                f"{tr('Copied unchanged')}: {copy_list}.",
+                tr("This policy applies before DDS rebuild for every backend. Files kept out of the PNG path are copied through as original DDS when the current rules say they are safer untouched."),
+                tr("Automatic rules still control final color space, compression, alpha-aware hints, and technical-map preservation after that policy is applied."),
             ]
             if self.enable_unsafe_technical_override_checkbox.isChecked():
                 policy_lines.append(
-                    "Expert override is enabled: technical textures can be forced through the generic visible-color PNG/upscale path even when the planner would normally preserve them."
+                    tr("Expert override is enabled: technical textures can be forced through the generic visible-color PNG/upscale path even when the planner would normally preserve them.")
                 )
             if preset_definition.warning:
-                policy_lines.append(preset_definition.warning)
+                policy_lines.append(tr(preset_definition.warning))
             self.texture_policy_hint_label.setText(" ".join(policy_lines))
 
             backend = self._current_upscale_backend()
@@ -5379,7 +6507,7 @@ def run_gui() -> int:
                     "Direct upscale controls are only used when Real-ESRGAN NCNN is selected. "
                     "With no backend selected, the Texture Policy still affects how existing PNG or preserve-original paths are handled."
                 )
-            self.direct_backend_hint_label.setText(direct_text)
+            self.direct_backend_hint_label.setText(tr(direct_text))
 
         def open_run_summary(self) -> None:
             dialog = SafeUpscaleWizard(theme_key=self.current_theme_key, parent=self)
@@ -5523,6 +6651,9 @@ def run_gui() -> int:
             details_view = QPlainTextEdit()
             details_view.setReadOnly(True)
             details_view.setMinimumWidth(340)
+            details_font = build_monospace_font(self.settings)
+            details_view.setFont(details_font)
+            details_view.document().setDefaultFont(details_font)
             content_row.addWidget(catalog_tree, stretch=1)
             content_row.addWidget(details_view, stretch=2)
 
@@ -5943,6 +7074,45 @@ def run_gui() -> int:
             self.set_busy(True, build_mode=False)
             thread.start()
 
+        def _run_utility_task_when_idle(
+            self,
+            *,
+            status_message: str,
+            task: Callable[[Callable[[str], None]], object],
+            on_complete: Optional[Callable[[object], None]] = None,
+            show_archive_progress: bool = False,
+            attempt: int = 0,
+        ) -> None:
+            if self.worker_thread is None:
+                self._run_utility_task(
+                    status_message=status_message,
+                    task=task,
+                    on_complete=on_complete,
+                    show_archive_progress=show_archive_progress,
+                )
+                return
+            if attempt == 0:
+                self.append_log("Waiting for the current background task to finish before starting the next step.")
+                if show_archive_progress:
+                    self.append_archive_log("Waiting for the current background task to finish before starting the next step.")
+            if attempt >= 100:
+                message = "Could not start the next background step because the previous task did not finish cleanly."
+                self.set_status_message(message, error=True)
+                self.append_log(f"ERROR: {message}")
+                if show_archive_progress:
+                    self.append_archive_log(f"ERROR: {message}")
+                return
+            QTimer.singleShot(
+                50,
+                lambda: self._run_utility_task_when_idle(
+                    status_message=status_message,
+                    task=task,
+                    on_complete=on_complete,
+                    show_archive_progress=show_archive_progress,
+                    attempt=attempt + 1,
+                ),
+            )
+
         def _handle_utility_log_message(self, message: str) -> None:
             self.append_log(message)
             if not self._utility_updates_archive_progress:
@@ -6261,16 +7431,27 @@ def run_gui() -> int:
                 return suggested_workspace_paths(common).get("archive_extract_root", common / "archive_extract")
             return Path.cwd() / "archive_extract"
 
+        def _stop_archive_sidecar_worker(self) -> None:
+            if self.archive_sidecar_worker is not None:
+                try:
+                    self.archive_sidecar_worker.stop()
+                except Exception:
+                    pass
+
         def scan_archives(self, force_refresh: bool = False, *, activate_archive_tab: bool = True) -> None:
             self._cancel_archive_tree_population()
             if self._background_task_active():
                 return
+            self._stop_archive_sidecar_worker()
+            self.archive_sidecar_request_id += 1
+            self.archive_sidecar_pending_start = False
             package_root_text = self.archive_package_root_edit.text().strip()
             if not package_root_text:
                 self.set_status_message("Set an archive package root first.", error=True)
                 return
 
             package_root = Path(package_root_text).expanduser()
+            self._check_game_update_and_invalidate_archive_cache(package_root)
             self._activate_archive_browser_on_scan_complete = activate_archive_tab
             if activate_archive_tab:
                 self.main_tabs.setCurrentWidget(self.archive_browser_tab)
@@ -6352,6 +7533,17 @@ def run_gui() -> int:
                 if isinstance(payload.get("extension_index"), dict)
                 else {}
             )
+            self.archive_sidecar_entries_by_texture_path = (
+                payload.get("sidecar_entries_by_texture_path", {})
+                if isinstance(payload.get("sidecar_entries_by_texture_path"), Mapping)
+                else {}
+            )
+            self.archive_sidecar_entries_by_texture_basename = (
+                payload.get("sidecar_entries_by_texture_basename", {})
+                if isinstance(payload.get("sidecar_entries_by_texture_basename"), Mapping)
+                else {}
+            )
+            self.archive_sidecar_pending_start = bool(self.archive_entries)
             if not self.archive_entries_by_extension and self.archive_entries:
                 self.archive_entries_by_extension = build_archive_entry_extension_index(self.archive_entries)
             package_root_text = self.archive_package_root_edit.text().strip()
@@ -6388,6 +7580,11 @@ def run_gui() -> int:
                 if isinstance(browser_state.get("tree_folder_entry_indexes"), dict)
                 else {}
             )
+            self.archive_tree_folder_preview_stats = (
+                browser_state.get("tree_folder_preview_stats", {})
+                if isinstance(browser_state.get("tree_folder_preview_stats"), dict)
+                else {}
+            )
             self.archive_tree_index_ready = bool(browser_state.get("tree_index_ready", True))
             self._rebuild_archive_extension_filter_choices()
             self.archive_tree_items_by_folder_key = {}
@@ -6403,6 +7600,8 @@ def run_gui() -> int:
             )
             source = str(payload.get("source", "scan"))
             cache_path_text = str(payload.get("cache_path", "")).strip()
+            timings = payload.get("timings", {}) if isinstance(payload.get("timings"), dict) else {}
+            timing_summary = str(payload.get("timing_summary", "")).strip()
             rendering_archive_view = (
                 self._activate_archive_browser_on_scan_complete
                 or self.main_tabs.currentWidget() is self.archive_browser_tab
@@ -6417,13 +7616,21 @@ def run_gui() -> int:
             self.archive_scan_finalize_pending = True
             QTimer.singleShot(
                 0,
-                lambda source=source, cache_path_text=cache_path_text: self._finalize_archive_scan_complete(
+                lambda source=source, cache_path_text=cache_path_text, timings=timings, timing_summary=timing_summary: self._finalize_archive_scan_complete(
                     source,
                     cache_path_text,
+                    timings,
+                    timing_summary,
                 ),
             )
 
-        def _finalize_archive_scan_complete(self, source: str, cache_path_text: str) -> None:
+        def _finalize_archive_scan_complete(
+            self,
+            source: str,
+            cache_path_text: str,
+            timings: Optional[Dict[str, float]] = None,
+            timing_summary: str = "",
+        ) -> None:
             try:
                 self._refresh_or_defer_archive_browser_view(
                     activate_tab=self._activate_archive_browser_on_scan_complete,
@@ -6443,10 +7650,162 @@ def run_gui() -> int:
                 self.append_archive_log(completion_text)
                 if cache_path_text and source == "scan":
                     self.append_archive_log(f"Archive cache ready: {cache_path_text}")
+                if timing_summary:
+                    self.append_archive_log(timing_summary)
+                if source == "cache" and _timing_value(timings, "total_s") > 2.0:
+                    self.append_archive_log(
+                        f"WARNING: Archive cache hit is slower than expected: total={_timing_value(timings, 'total_s'):.2f}s."
+                    )
             finally:
                 self.archive_scan_finalize_pending = False
                 if self.worker_thread is None:
                     self.set_busy(False, build_mode=False)
+
+        def _start_archive_sidecar_index_worker(self) -> None:
+            if self._shutting_down:
+                self.archive_sidecar_pending_start = False
+                return
+            if self.archive_sidecar_thread is not None:
+                self.archive_sidecar_pending_start = True
+                return
+            if not self.archive_entries:
+                self.archive_sidecar_pending_start = False
+                return
+            package_root_text = self.archive_package_root_edit.text().strip()
+            if not package_root_text:
+                self.archive_sidecar_pending_start = False
+                return
+
+            self.archive_sidecar_pending_start = False
+            request_id = self.archive_sidecar_request_id + 1
+            self.archive_sidecar_request_id = request_id
+            self._archive_sidecar_last_ui_progress_at = 0.0
+            package_root = Path(package_root_text).expanduser()
+
+            self.append_archive_log("Checking texture sidecar cache in background...")
+            self.set_status_message("Checking texture sidecar cache in background...")
+            self.archive_scan_progress_label.setText("Checking texture sidecar cache in background...")
+            self.archive_scan_progress_bar.setRange(0, 0)
+            self.archive_scan_progress_bar.setFormat("Working...")
+
+            worker = ArchiveSidecarIndexWorker(
+                request_id,
+                package_root,
+                self.archive_cache_root,
+                self.archive_entries,
+            )
+            thread = QThread(self)
+            worker.moveToThread(thread)
+
+            thread.started.connect(worker.run)
+            worker.log_message.connect(self.append_log)
+            worker.log_message.connect(self.append_archive_log)
+            worker.progress_changed.connect(self._handle_archive_sidecar_progress)
+            worker.completed.connect(self._handle_archive_sidecar_complete)
+            worker.error.connect(self._handle_archive_sidecar_error)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._cleanup_archive_sidecar_refs)
+
+            self.archive_sidecar_worker = worker
+            self.archive_sidecar_thread = thread
+            try:
+                thread.start(QThread.LowPriority)
+            except Exception:
+                thread.start()
+
+        def _handle_archive_sidecar_progress(self, request_id: int, current: int, total: int, detail: str) -> None:
+            if self._shutting_down or request_id != self.archive_sidecar_request_id:
+                return
+            if self.worker_thread is not None or self._utility_updates_archive_progress:
+                return
+            now = time.perf_counter()
+            last_update_at = float(getattr(self, "_archive_sidecar_last_ui_progress_at", 0.0) or 0.0)
+            if total <= 0 or current < total:
+                if now - last_update_at < 0.75:
+                    return
+            self._archive_sidecar_last_ui_progress_at = now
+            self.archive_scan_progress_label.setText(detail)
+            if total > 0:
+                completed_value = min(max(current, 0), total)
+                self.archive_scan_progress_bar.setRange(0, total)
+                self.archive_scan_progress_bar.setValue(completed_value)
+                self.archive_scan_progress_bar.setFormat(f"{completed_value} / {total}")
+            else:
+                self.archive_scan_progress_bar.setRange(0, 0)
+                self.archive_scan_progress_bar.setFormat("Working...")
+
+        def _handle_archive_sidecar_complete(self, request_id: int, result: object) -> None:
+            if self._shutting_down or request_id != self.archive_sidecar_request_id:
+                return
+            payload = result if isinstance(result, dict) else {}
+            self.archive_sidecar_entries_by_texture_path = (
+                payload.get("sidecar_entries_by_texture_path", {})
+                if isinstance(payload.get("sidecar_entries_by_texture_path"), Mapping)
+                else {}
+            )
+            self.archive_sidecar_entries_by_texture_basename = (
+                payload.get("sidecar_entries_by_texture_basename", {})
+                if isinstance(payload.get("sidecar_entries_by_texture_basename"), Mapping)
+                else {}
+            )
+            source = str(payload.get("source", "scan")).strip().lower() or "scan"
+            cache_path_text = str(payload.get("cache_path", "")).strip()
+            timings = payload.get("timings", {}) if isinstance(payload.get("timings"), dict) else {}
+            timing_summary = str(payload.get("timing_summary", "")).strip()
+            completion_text = (
+                "Texture sidecar bindings loaded from cache."
+                if source == "cache"
+                else "Texture sidecar bindings indexed."
+            )
+            if self.worker_thread is None and not self._utility_updates_archive_progress:
+                self.archive_scan_progress_label.setText(completion_text)
+                self.archive_scan_progress_bar.setRange(0, 1)
+                self.archive_scan_progress_bar.setValue(1)
+                self.archive_scan_progress_bar.setFormat("Ready")
+            self.set_status_message(completion_text)
+            self.append_archive_log(completion_text)
+            if cache_path_text and source == "scan":
+                self.append_archive_log(f"Texture sidecar cache ready: {cache_path_text}")
+            if timing_summary:
+                self.append_archive_log(timing_summary)
+            if source == "cache" and _timing_value(timings, "total_s") > 1.0:
+                self.append_archive_log(
+                    f"WARNING: Texture sidecar cache hit is slower than expected: total={_timing_value(timings, 'total_s'):.2f}s."
+                )
+
+            self._clear_archive_preview_cache()
+            current_entry = self._current_archive_entry()
+            if (
+                current_entry is not None
+                and self.archive_preview_thread is None
+                and not self.archive_preview_showing_loose
+                and (self.current_archive_preview_result is None or not self.current_archive_model_texture_references)
+            ):
+                QTimer.singleShot(0, lambda entry=current_entry: self._render_archive_preview(entry))
+
+        def _handle_archive_sidecar_error(self, request_id: int, message: str) -> None:
+            if self._shutting_down or request_id != self.archive_sidecar_request_id:
+                return
+            error_text = f"Texture sidecar indexing failed: {message}"
+            self.set_status_message(error_text, error=True)
+            self.append_log(f"ERROR: {error_text}")
+            self.append_archive_log(f"ERROR: {error_text}")
+            if self.worker_thread is None and not self._utility_updates_archive_progress:
+                self.archive_scan_progress_label.setText(error_text)
+                self.archive_scan_progress_bar.setRange(0, 1)
+                self.archive_scan_progress_bar.setValue(0)
+                self.archive_scan_progress_bar.setFormat("Ready")
+
+        def _cleanup_archive_sidecar_refs(self) -> None:
+            self.archive_sidecar_thread = None
+            self.archive_sidecar_worker = None
+            if self._shutting_down:
+                self.archive_sidecar_pending_start = False
+                return
+            if self.archive_sidecar_pending_start:
+                QTimer.singleShot(0, self._start_archive_sidecar_index_worker)
 
         def _current_archive_filter_signature(self) -> Tuple[object, ...]:
             return (
@@ -6464,6 +7823,14 @@ def run_gui() -> int:
 
         def _mark_archive_filters_dirty(self) -> None:
             self.archive_filters_dirty = True
+            if self.archive_tree_clear_active:
+                self._cancel_archive_tree_clear()
+                pause_text = "Archive list update paused while filters are being edited. Press Apply Filters to refresh."
+                self.archive_scan_progress_label.setText(pause_text)
+                self.archive_scan_progress_bar.setRange(0, 1)
+                self.archive_scan_progress_bar.setValue(0)
+                self.archive_scan_progress_bar.setFormat("Paused")
+                self.set_status_message(pause_text)
             if self.archive_tree_population_active:
                 self._cancel_archive_tree_population()
                 pause_text = "Archive list update paused while filters are being edited. Press Apply Filters to refresh."
@@ -6583,6 +7950,7 @@ def run_gui() -> int:
             return self.archive_tree_view_checkbox.isChecked()
 
         def _handle_archive_tree_view_toggled(self, checked: bool) -> None:
+            self._cancel_archive_tree_clear()
             self._cancel_archive_tree_population()
             self.archive_tree.setRootIsDecorated(bool(checked))
             if self.worker_thread is not None:
@@ -6614,7 +7982,17 @@ def run_gui() -> int:
             self._apply_archive_filter()
 
         def _apply_archive_filter(self) -> None:
+            self._cancel_archive_tree_clear()
             self._cancel_archive_tree_population()
+            self.pending_archive_preview_request = None
+            self.scheduled_archive_preview_request = None
+            self.archive_preview_debounce_timer.stop()
+            if self.archive_preview_worker is not None:
+                try:
+                    self.archive_preview_worker.stop()
+                except Exception:
+                    pass
+            self._stop_archive_preview_loading_indicator(success=None)
             if self.worker_thread is not None:
                 if self.archive_filter_worker is not None:
                     self.archive_filter_apply_pending = True
@@ -6655,6 +8033,9 @@ def run_gui() -> int:
             self.archive_scan_progress_bar.setFormat("Working...")
             self.set_status_message("Applying archive filters...")
             self.append_archive_log("Applying archive filters...")
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
 
             worker = ArchiveFilterWorker(
                 self.archive_entries,
@@ -6724,6 +8105,11 @@ def run_gui() -> int:
                 if isinstance(browser_state.get("tree_folder_entry_indexes"), dict)
                 else {}
             )
+            self.archive_tree_folder_preview_stats = (
+                browser_state.get("tree_folder_preview_stats", {})
+                if isinstance(browser_state.get("tree_folder_preview_stats"), dict)
+                else {}
+            )
             self.archive_tree_index_ready = bool(browser_state.get("tree_index_ready", True))
             self.archive_tree_items_by_folder_key = {}
             self.archive_filtered_dds_count = int(browser_state.get("dds_count", 0))
@@ -6772,6 +8158,7 @@ def run_gui() -> int:
                 self.archive_tree_child_folders,
                 self.archive_tree_direct_files,
                 self.archive_tree_folder_entry_indexes,
+                self.archive_tree_folder_preview_stats,
             ) = build_archive_tree_index(self.archive_filtered_entries)
             self.archive_tree_items_by_folder_key = {}
             self.archive_tree_index_ready = True
@@ -6823,6 +8210,16 @@ def run_gui() -> int:
             item.setData(0, Qt.UserRole + 1, entry_index)
             item.setToolTip(0, entry.path)
 
+        def _cancel_archive_tree_clear(self) -> None:
+            self.archive_tree_clear_timer.stop()
+            self.archive_tree_clear_active = False
+            self.archive_tree_clear_total_items = 0
+            self.archive_tree_clear_removed_items = 0
+            self.archive_tree_clear_batch_size = 0
+            self._archive_tree_clear_on_complete = None
+            self.archive_tree.setUpdatesEnabled(True)
+            self.archive_tree.setEnabled(True)
+
         def _cancel_archive_tree_population(self) -> None:
             self.archive_tree_population_timer.stop()
             self.archive_tree_population_active = False
@@ -6836,17 +8233,91 @@ def run_gui() -> int:
             self.archive_tree.blockSignals(False)
             self.archive_tree.setEnabled(True)
 
+        def _suggest_archive_tree_clear_batch_size(self, total_items: int) -> int:
+            if total_items >= 100_000:
+                return 2400
+            if total_items >= 50_000:
+                return 1800
+            if total_items >= 20_000:
+                return 1200
+            if total_items >= 5_000:
+                return 800
+            return 400
+
+        def _begin_archive_tree_clear(self, on_complete: Callable[[], None]) -> bool:
+            total_items = self.archive_tree.topLevelItemCount()
+            if total_items <= 0:
+                return False
+            if total_items < 800:
+                return False
+
+            self.archive_tree_clear_active = True
+            self.archive_tree_clear_total_items = total_items
+            self.archive_tree_clear_removed_items = 0
+            self.archive_tree_clear_batch_size = self._suggest_archive_tree_clear_batch_size(total_items)
+            self._archive_tree_clear_on_complete = on_complete
+            self.archive_tree.setEnabled(False)
+            self.archive_tree.setUpdatesEnabled(False)
+            progress_text = f"Clearing previous archive browser view... 0 / {total_items:,}"
+            self.archive_scan_progress_label.setText(progress_text)
+            self.archive_scan_progress_bar.setRange(0, max(1, total_items))
+            self.archive_scan_progress_bar.setValue(0)
+            self.archive_scan_progress_bar.setFormat("%v / %m")
+            self.set_status_message(progress_text)
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
+            self.archive_tree_clear_timer.start()
+            return True
+
+        def _continue_archive_tree_clear(self) -> None:
+            if not self.archive_tree_clear_active:
+                return
+
+            total_items = self.archive_tree_clear_total_items
+            budget_seconds = max(0.002, float(self.archive_tree_clear_time_budget_ms) / 1000.0)
+            started_at = time.perf_counter()
+            removed_this_pass = 0
+
+            while self.archive_tree.topLevelItemCount() > 0 and removed_this_pass < max(1, self.archive_tree_clear_batch_size):
+                top_level_index = self.archive_tree.topLevelItemCount() - 1
+                item = self.archive_tree.takeTopLevelItem(top_level_index)
+                if item is not None:
+                    removed_this_pass += 1
+                    del item
+                if removed_this_pass and (time.perf_counter() - started_at) >= budget_seconds:
+                    break
+
+            remaining = self.archive_tree.topLevelItemCount()
+            removed_total = total_items - remaining
+            self.archive_tree_clear_removed_items = removed_total
+            progress_text = f"Clearing previous archive browser view... {removed_total:,} / {total_items:,}"
+            self.archive_scan_progress_label.setText(progress_text)
+            self.archive_scan_progress_bar.setRange(0, max(1, total_items))
+            self.archive_scan_progress_bar.setValue(removed_total)
+            self.archive_scan_progress_bar.setFormat("%v / %m")
+            self.set_status_message(progress_text)
+
+            if remaining > 0:
+                self.archive_tree_clear_timer.start()
+                return
+
+            callback = self._archive_tree_clear_on_complete
+            self._cancel_archive_tree_clear()
+            if callback is not None:
+                callback()
+
         def _suggest_archive_tree_population_batch_sizes(self, total_entries: int) -> Tuple[int, int]:
             if total_entries >= 100_000:
-                return 1800, 520
-            if total_entries >= 50_000:
-                return 1500, 460
-            if total_entries >= 20_000:
-                return 1200, 360
-            if total_entries >= 5_000:
                 return 900, 260
+            if total_entries >= 50_000:
+                return 760, 220
+            if total_entries >= 20_000:
+                return 620, 180
+            if total_entries >= 5_000:
+                return 460, 140
             base = max(self.archive_tree_population_default_batch_size, 500)
-            return base, base
+            return min(base, 320), min(base, 220)
 
         def _build_archive_tree_population_chunk(
             self,
@@ -7006,6 +8477,7 @@ def run_gui() -> int:
             preferred_path: str = "",
             *,
             target_item: Optional[QTreeWidgetItem] = None,
+            defer_default_selection: bool = False,
         ) -> None:
             total_entries = len(self.archive_entries)
             filtered_entries = len(self.archive_filtered_entries)
@@ -7017,18 +8489,23 @@ def run_gui() -> int:
             if target_item is None and current_item is not None:
                 target_item = current_item
             if target_item is None:
-                preferred_index = next(
-                    (index for index, entry in enumerate(self.archive_filtered_entries) if preferred_path and entry.path == preferred_path),
-                    -1,
-                )
+                preferred_index = -1
+                if preferred_path:
+                    preferred_index = next(
+                        (index for index, entry in enumerate(self.archive_filtered_entries) if entry.path == preferred_path),
+                        -1,
+                    )
                 target_item = self._select_archive_tree_entry(preferred_index) if preferred_index >= 0 else None
-            if target_item is None and self.archive_tree.topLevelItemCount() > 0:
+            if target_item is None and not defer_default_selection and self.archive_tree.topLevelItemCount() > 0:
                 target_item = self.archive_tree.topLevelItem(0)
             if target_item is not None:
                 self.archive_tree.setCurrentItem(target_item)
                 target_item.setSelected(True)
             else:
-                self._clear_archive_preview("No archive entries match the current filter.")
+                if defer_default_selection and self.archive_tree.topLevelItemCount() > 0:
+                    self._clear_archive_preview("Rendering archive browser view... Select a file when the list is ready.")
+                else:
+                    self._clear_archive_preview("No archive entries match the current filter.")
             self._update_archive_selection_state()
 
         def _populate_archive_tree(
@@ -7038,75 +8515,93 @@ def run_gui() -> int:
             rebuild_index: bool = True,
             on_complete: Optional[Callable[[], None]] = None,
         ) -> None:
+            self._cancel_archive_tree_clear()
             self._cancel_archive_tree_population()
             if rebuild_index:
                 self._rebuild_archive_tree_index()
             self.archive_tree.blockSignals(True)
-            self.archive_tree.clear()
-            self.archive_tree_items_by_folder_key = {}
-            tree_view_enabled = self._archive_tree_view_enabled()
-            self.archive_tree.setRootIsDecorated(tree_view_enabled)
-            if tree_view_enabled:
-                for _leaf, child_key in self.archive_tree_child_folders.get((), []):
-                    self._create_archive_folder_item(self.archive_tree, child_key)
-                for entry_index in self.archive_tree_direct_files.get((), []):
-                    self._create_archive_file_item(self.archive_tree, entry_index)
-            else:
-                if len(self.archive_filtered_entries) > self.archive_tree_population_batch_size:
-                    total_entries = len(self.archive_filtered_entries)
-                    self.archive_tree_population_active = True
-                    self.archive_tree_population_next_index = 0
-                    self.archive_tree_population_preferred_path = preferred_path
-                    self.archive_tree_population_target_item = None
-                    (
-                        self.archive_tree_population_batch_size,
-                        self.archive_tree_population_continue_batch_size,
-                    ) = self._suggest_archive_tree_population_batch_sizes(
-                        total_entries
-                    )
-                    self.archive_tree_population_last_progress_update = time.perf_counter()
-                    self._archive_tree_population_on_complete = on_complete
-                    initial_items, initial_end_index, target_item = self._build_archive_tree_population_chunk(
-                        0,
-                        self.archive_tree_population_batch_size,
-                        preferred_path=preferred_path,
-                        target_item=None,
-                    )
-                    if initial_items:
-                        self.archive_tree.addTopLevelItems(initial_items)
-                    self.archive_tree_population_next_index = initial_end_index
-                    self.archive_tree_population_target_item = target_item
-                    self.archive_tree.blockSignals(False)
-                    self.archive_tree.setEnabled(True)
-                    self._finalize_archive_tree_render(preferred_path, target_item=target_item)
-                    if initial_end_index >= total_entries:
-                        self.archive_tree_population_active = False
+
+            def render_into_empty_tree() -> None:
+                self.archive_tree_items_by_folder_key = {}
+                tree_view_enabled = self._archive_tree_view_enabled()
+                self.archive_tree.setRootIsDecorated(tree_view_enabled)
+                if tree_view_enabled:
+                    for _leaf, child_key in self.archive_tree_child_folders.get((), []):
+                        self._create_archive_folder_item(self.archive_tree, child_key)
+                    for entry_index in self.archive_tree_direct_files.get((), []):
+                        self._create_archive_file_item(self.archive_tree, entry_index)
+                else:
+                    if len(self.archive_filtered_entries) > self.archive_tree_population_batch_size:
+                        total_entries = len(self.archive_filtered_entries)
+                        self.archive_tree_population_active = True
                         self.archive_tree_population_next_index = 0
-                        self.archive_tree_population_preferred_path = ""
+                        self.archive_tree_population_preferred_path = preferred_path
                         self.archive_tree_population_target_item = None
-                        self.archive_tree_population_batch_size = self.archive_tree_population_default_batch_size
-                        self.archive_tree_population_continue_batch_size = self.archive_tree_population_default_batch_size
-                        self._archive_tree_population_on_complete = None
-                        if on_complete is not None:
-                            on_complete()
+                        (
+                            self.archive_tree_population_batch_size,
+                            self.archive_tree_population_continue_batch_size,
+                        ) = self._suggest_archive_tree_population_batch_sizes(
+                            total_entries
+                        )
+                        self.archive_tree_population_last_progress_update = time.perf_counter()
+                        self._archive_tree_population_on_complete = on_complete
+                        initial_items, initial_end_index, target_item = self._build_archive_tree_population_chunk(
+                            0,
+                            self.archive_tree_population_batch_size,
+                            preferred_path=preferred_path,
+                            target_item=None,
+                        )
+                        if initial_items:
+                            self.archive_tree.addTopLevelItems(initial_items)
+                        self.archive_tree_population_next_index = initial_end_index
+                        self.archive_tree_population_target_item = target_item
+                        self.archive_tree.setUpdatesEnabled(True)
+                        self.archive_tree.blockSignals(False)
+                        self.archive_tree.setEnabled(True)
+                        defer_default_selection = initial_end_index < total_entries and target_item is None and not preferred_path
+                        self._finalize_archive_tree_render(
+                            preferred_path,
+                            target_item=target_item,
+                            defer_default_selection=defer_default_selection,
+                        )
+                        if initial_end_index >= total_entries:
+                            self.archive_tree_population_active = False
+                            self.archive_tree_population_next_index = 0
+                            self.archive_tree_population_preferred_path = ""
+                            self.archive_tree_population_target_item = None
+                            self.archive_tree_population_batch_size = self.archive_tree_population_default_batch_size
+                            self.archive_tree_population_continue_batch_size = self.archive_tree_population_default_batch_size
+                            self._archive_tree_population_on_complete = None
+                            if on_complete is not None:
+                                on_complete()
+                            return
+                        progress_text = (
+                            "Rendering archive browser items in batches to keep the UI responsive... "
+                            f"{initial_end_index:,} / {total_entries:,}"
+                        )
+                        self.archive_scan_progress_label.setText(progress_text)
+                        self.archive_scan_progress_bar.setRange(0, max(1, total_entries))
+                        self.archive_scan_progress_bar.setValue(initial_end_index)
+                        self.archive_scan_progress_bar.setFormat("%v / %m")
+                        self.set_status_message(progress_text)
+                        self.archive_tree_population_timer.start()
                         return
-                    progress_text = (
-                        "Rendering remaining archive browser items in batches... "
-                        f"{initial_end_index:,} / {total_entries:,}"
-                    )
-                    self.archive_scan_progress_label.setText(progress_text)
-                    self.archive_scan_progress_bar.setRange(0, max(1, total_entries))
-                    self.archive_scan_progress_bar.setValue(initial_end_index)
-                    self.archive_scan_progress_bar.setFormat("%v / %m")
-                    self.set_status_message(progress_text)
-                    self.archive_tree_population_timer.start()
-                    return
-                for entry_index in range(len(self.archive_filtered_entries)):
-                    self._create_archive_file_item(self.archive_tree, entry_index, show_full_path=True)
-            self.archive_tree.blockSignals(False)
-            self._finalize_archive_tree_render(preferred_path)
-            if on_complete is not None:
-                on_complete()
+                    for entry_index in range(len(self.archive_filtered_entries)):
+                        self._create_archive_file_item(self.archive_tree, entry_index, show_full_path=True)
+                self.archive_tree.setUpdatesEnabled(True)
+                self.archive_tree.blockSignals(False)
+                self.archive_tree.setEnabled(True)
+                self._finalize_archive_tree_render(preferred_path)
+                if on_complete is not None:
+                    on_complete()
+
+            top_level_items = self.archive_tree.topLevelItemCount()
+            if top_level_items > 0 and self._begin_archive_tree_clear(render_into_empty_tree):
+                return
+            self.archive_tree.setEnabled(False)
+            self.archive_tree.setUpdatesEnabled(False)
+            self.archive_tree.clear()
+            render_into_empty_tree()
 
         def _collect_archive_entries_from_item(
             self,
@@ -8072,6 +9567,9 @@ def run_gui() -> int:
         def _clear_archive_preview(self, message: str) -> None:
             self.archive_preview_request_id += 1
             self.archive_preview_cache_keys.clear()
+            self.archive_preview_request_started_at.clear()
+            self.archive_preview_request_phase_timings.clear()
+            self.archive_preview_request_sources.clear()
             self.pending_archive_preview_request = None
             self.scheduled_archive_preview_request = None
             self.archive_preview_debounce_timer.stop()
@@ -8081,6 +9579,7 @@ def run_gui() -> int:
             self.current_archive_preview_result = None
             self.archive_preview_requested_loose = False
             self.archive_preview_showing_loose = False
+            self._archive_preview_base_detail_text = str(message or "")
             self.archive_preview_title_label.setText("Select an archive file")
             self.archive_preview_meta_label.setText(message)
             self._populate_archive_texture_reference_list(())
@@ -8091,12 +9590,11 @@ def run_gui() -> int:
             self.archive_preview_loose_toggle_button.setVisible(False)
             self.archive_preview_loose_toggle_button.setEnabled(False)
             self.archive_preview_label.clear_preview(message)
-            self.archive_model_preview.clear_model(message)
             self.archive_media_preview.clear_media(message)
             self._update_archive_model_action_controls(None)
             self.archive_preview_text_edit.clear()
             self.archive_preview_info_edit.setPlainText(message)
-            self.archive_preview_details_edit.clear()
+            self._refresh_archive_preview_details_text()
             self.archive_preview_stack.setCurrentWidget(self.archive_preview_info_edit)
             self.archive_preview_tabs.setCurrentIndex(0)
             self._set_archive_preview_image_controls_enabled(False)
@@ -8130,7 +9628,7 @@ def run_gui() -> int:
             )
             if self.archive_preview_stack.currentWidget() is self.archive_preview_info_edit:
                 self.archive_preview_info_edit.setPlainText(loading_text)
-            self.archive_preview_details_edit.setPlainText(loading_text)
+            self._set_archive_preview_base_detail_text(loading_text, include_current_model_debug=False)
 
         def _stop_archive_preview_loading_indicator(self, *, success: Optional[bool]) -> None:
             elapsed = (
@@ -8165,6 +9663,9 @@ def run_gui() -> int:
         def _show_archive_folder_preview(self, item: Optional[QTreeWidgetItem]) -> None:
             self.archive_preview_request_id += 1
             self.archive_preview_cache_keys.clear()
+            self.archive_preview_request_started_at.clear()
+            self.archive_preview_request_phase_timings.clear()
+            self.archive_preview_request_sources.clear()
             self.pending_archive_preview_request = None
             self.scheduled_archive_preview_request = None
             self.archive_preview_debounce_timer.stop()
@@ -8174,16 +9675,17 @@ def run_gui() -> int:
             self.current_archive_preview_result = None
             self.archive_preview_requested_loose = False
             self.archive_preview_showing_loose = False
-            collected_indexes: set[int] = set()
-            self._collect_archive_entries_from_item(item, collected_indexes)
-            entries = [self.archive_filtered_entries[index] for index in sorted(collected_indexes)]
             folder_path = item.toolTip(0) if item is not None else ""
-            total_original = sum(entry.orig_size for entry in entries)
-            total_stored = sum(entry.comp_size for entry in entries)
+            folder_key_value = self._archive_tree_item_value(item) if item is not None else ()
+            folder_key = folder_key_value if isinstance(folder_key_value, tuple) else ()
+            folder_entry_count, total_original, total_stored = self.archive_tree_folder_preview_stats.get(
+                folder_key,
+                (0, 0, 0),
+            )
             preview_text = "\n".join(
                 [
                     f"Folder: {folder_path or '(root)'}",
-                    f"Entries: {len(entries):,}",
+                    f"Entries: {folder_entry_count:,}",
                     f"Total original size: {format_byte_size(total_original)}",
                     f"Total stored size: {format_byte_size(total_stored)}",
                     "",
@@ -8191,7 +9693,7 @@ def run_gui() -> int:
                 ]
             )
             self.archive_preview_title_label.setText(item.text(0) if item is not None else "Select an archive file")
-            self.archive_preview_meta_label.setText(f"Folder | {len(entries):,} entries")
+            self.archive_preview_meta_label.setText(f"Folder | {folder_entry_count:,} entries")
             self.archive_preview_warning_badge.clear()
             self.archive_preview_warning_badge.setVisible(False)
             self.archive_preview_warning_label.clear()
@@ -8200,14 +9702,146 @@ def run_gui() -> int:
             self.archive_preview_loose_toggle_button.setEnabled(False)
             self._populate_archive_texture_reference_list(())
             self.archive_preview_info_edit.setPlainText(preview_text)
-            self.archive_preview_details_edit.setPlainText(preview_text)
+            self._set_archive_preview_base_detail_text(preview_text, include_current_model_debug=False)
             self.archive_preview_stack.setCurrentWidget(self.archive_preview_info_edit)
             self.archive_preview_tabs.setCurrentIndex(0)
             self.archive_preview_label.clear_preview("Select a file to preview it here.")
-            self.archive_model_preview.clear_model("Select a file to preview it here.")
             self.archive_media_preview.clear_media("Select a file to preview it here.")
             self._update_archive_model_action_controls(None)
             self._set_archive_preview_image_controls_enabled(False)
+
+        def _clone_archive_preview_model(
+            self,
+            preview_model: Optional[object],
+            *,
+            strip_images: bool = False,
+        ) -> Optional[object]:
+            if not isinstance(preview_model, ModelPreviewData):
+                return preview_model
+            cloned_meshes: List[object] = []
+            for mesh in getattr(preview_model, "meshes", []) or []:
+                if isinstance(mesh, ModelPreviewMesh):
+                    mesh_values = {
+                        field_info.name: getattr(mesh, field_info.name)
+                        for field_info in dataclasses.fields(ModelPreviewMesh)
+                    }
+                    if strip_images:
+                        mesh_values["preview_texture_image"] = None
+                        mesh_values["preview_normal_texture_image"] = None
+                        mesh_values["preview_material_texture_image"] = None
+                        mesh_values["preview_height_texture_image"] = None
+                    cloned_meshes.append(ModelPreviewMesh(**mesh_values))
+                else:
+                    cloned_meshes.append(mesh)
+            return ModelPreviewData(
+                **{
+                    field_info.name: (
+                        cloned_meshes
+                        if field_info.name == "meshes"
+                        else getattr(preview_model, field_info.name)
+                    )
+                    for field_info in dataclasses.fields(ModelPreviewData)
+                }
+            )
+
+        def _clone_archive_preview_result_for_cache(self, result: ArchivePreviewResult) -> ArchivePreviewResult:
+            return dataclasses.replace(
+                result,
+                preview_image=None,
+                loose_preview_image=None,
+                preview_model=self._clone_archive_preview_model(result.preview_model, strip_images=True),
+            )
+
+        def _load_preview_image_if_available(self, image_path: str) -> object:
+            normalized_path = str(image_path or "").strip()
+            if not normalized_path:
+                return None
+            reader = QImageReader(normalized_path)
+            image = reader.read()
+            if image.isNull():
+                return None
+            return image
+
+        def _attach_archive_preview_result_images(self, result: ArchivePreviewResult) -> ArchivePreviewResult:
+            preview_model = self._clone_archive_preview_model(result.preview_model, strip_images=False)
+            loaded_images: Dict[str, object] = {}
+
+            def load_image_cached(path: str) -> object:
+                normalized_path = str(path or "").strip()
+                if not normalized_path:
+                    return None
+                if normalized_path not in loaded_images:
+                    loaded_images[normalized_path] = self._load_preview_image_if_available(normalized_path)
+                return loaded_images[normalized_path]
+
+            preview_image = result.preview_image
+            if preview_image is None and result.preview_image_path:
+                preview_image = load_image_cached(result.preview_image_path)
+            loose_preview_image = result.loose_preview_image
+            if loose_preview_image is None and result.loose_preview_image_path:
+                loose_preview_image = load_image_cached(result.loose_preview_image_path)
+            meshes = getattr(preview_model, "meshes", None) or []
+            for mesh in meshes:
+                texture_slots = (
+                    ("preview_texture_path", "preview_texture_image"),
+                    ("preview_normal_texture_path", "preview_normal_texture_image"),
+                    ("preview_material_texture_path", "preview_material_texture_image"),
+                    ("preview_height_texture_path", "preview_height_texture_image"),
+                )
+                for path_attr, image_attr in texture_slots:
+                    preview_texture_path = str(getattr(mesh, path_attr, "") or "").strip()
+                    if not preview_texture_path or getattr(mesh, image_attr, None) is not None:
+                        continue
+                    texture_image = load_image_cached(preview_texture_path)
+                    if texture_image is not None:
+                        setattr(mesh, image_attr, texture_image)
+            return dataclasses.replace(
+                result,
+                preview_image=preview_image,
+                loose_preview_image=loose_preview_image,
+                preview_model=preview_model,
+            )
+
+        def _archive_preview_timing_summary(self, source: str, timings: Optional[Dict[str, float]]) -> str:
+            return _format_timing_summary(
+                "Archive preview timings",
+                source,
+                timings,
+                (
+                    ("cache_lookup_s", "cache_lookup"),
+                    ("worker_build_s", "worker_build"),
+                    ("image_attach_s", "image_attach"),
+                    ("ui_apply_s", "ui_apply"),
+                    ("model_apply_s", "model_apply"),
+                    ("total_s", "total"),
+                ),
+            )
+
+        def _archive_preview_timing_warning(self, source: str, timings: Optional[Dict[str, float]]) -> str:
+            total_s = _timing_value(timings, "total_s")
+            model_apply_s = _timing_value(timings, "model_apply_s")
+            if source == "preview_cache" and total_s > 2.0:
+                return f"Archive preview cache hit is slower than expected: total={total_s:.2f}s."
+            if model_apply_s > 0.50:
+                return f"Archive preview model apply is slower than expected: model_apply={model_apply_s:.2f}s."
+            return ""
+
+        def _log_archive_preview_timing_if_needed(
+            self,
+            entry_name: str,
+            source: str,
+            timings: Optional[Dict[str, float]],
+            timing_summary: str,
+        ) -> None:
+            total_s = _timing_value(timings, "total_s")
+            model_apply_s = _timing_value(timings, "model_apply_s")
+            warning_text = self._archive_preview_timing_warning(source, timings)
+            if total_s < 0.35 and model_apply_s < 0.15 and not warning_text:
+                return
+            label = str(entry_name or "selected entry").strip()
+            self.append_archive_log(f"{timing_summary} | entry={label}")
+            if warning_text:
+                self.append_archive_log(f"WARNING: {warning_text}")
 
         def _clear_archive_preview_cache(self) -> None:
             self.archive_preview_cache.clear()
@@ -8253,7 +9887,7 @@ def run_gui() -> int:
         def _store_cached_archive_preview_result(self, cache_key: str, result: ArchivePreviewResult) -> None:
             if not cache_key:
                 return
-            self.archive_preview_cache[cache_key] = result
+            self.archive_preview_cache[cache_key] = self._clone_archive_preview_result_for_cache(result)
             self.archive_preview_cache.move_to_end(cache_key)
             while len(self.archive_preview_cache) > self.archive_preview_cache_limit:
                 self.archive_preview_cache.popitem(last=False)
@@ -8272,7 +9906,6 @@ def run_gui() -> int:
                     self._schedule_archive_selection_state_update()
                     return
                 if self._archive_tree_item_kind(current) == "folder":
-                    self._ensure_archive_folder_item_populated(current)
                     self._show_archive_folder_preview(current)
                 else:
                     entry = self._current_archive_entry()
@@ -8308,6 +9941,24 @@ def run_gui() -> int:
                 for existing_request_id, cache_key in self.archive_preview_cache_keys.items()
                 if existing_request_id >= request_id
             }
+            self.archive_preview_request_started_at = {
+                existing_request_id: started_at
+                for existing_request_id, started_at in self.archive_preview_request_started_at.items()
+                if existing_request_id >= request_id
+            }
+            self.archive_preview_request_phase_timings = {
+                existing_request_id: timing_map
+                for existing_request_id, timing_map in self.archive_preview_request_phase_timings.items()
+                if existing_request_id >= request_id
+            }
+            self.archive_preview_request_sources = {
+                existing_request_id: source
+                for existing_request_id, source in self.archive_preview_request_sources.items()
+                if existing_request_id >= request_id
+            }
+            self.archive_preview_request_started_at[request_id] = time.perf_counter()
+            self.archive_preview_request_phase_timings[request_id] = {}
+            self.archive_preview_request_sources[request_id] = "worker"
             self.archive_preview_requested_loose = bool(entry is not None and prefer_loose_preview)
             self.archive_preview_title_label.setText(entry.basename if entry is not None else "Select an archive file")
             self.archive_preview_meta_label.setText(
@@ -8320,17 +9971,15 @@ def run_gui() -> int:
             self.archive_preview_warning_label.setVisible(False)
             self.archive_preview_loose_toggle_button.setVisible(False)
             self.archive_preview_loose_toggle_button.setEnabled(False)
-            self.archive_preview_details_edit.setPlainText(
-                "Preparing loose-file preview..." if self.archive_preview_requested_loose else "Preparing archive preview..."
+            self._set_archive_preview_base_detail_text(
+                "Preparing loose-file preview..." if self.archive_preview_requested_loose else "Preparing archive preview...",
+                include_current_model_debug=False,
             )
             self.archive_preview_info_edit.setPlainText(
                 "Preparing loose-file preview..." if self.archive_preview_requested_loose else "Preparing archive preview..."
             )
             self.archive_preview_text_edit.clear()
             self.archive_preview_label.clear_preview(
-                "Preparing loose-file preview..." if self.archive_preview_requested_loose else "Preparing archive preview..."
-            )
-            self.archive_model_preview.clear_model(
                 "Preparing loose-file preview..." if self.archive_preview_requested_loose else "Preparing archive preview..."
             )
             self.archive_media_preview.clear_media(
@@ -8362,8 +10011,14 @@ def run_gui() -> int:
             )
             self.archive_preview_cache_keys[request_id] = cache_key
 
+            cache_lookup_started_at = time.perf_counter()
             cached_result = self._get_cached_archive_preview_result(cache_key)
+            self.archive_preview_request_phase_timings.setdefault(request_id, {})["cache_lookup_s"] = max(
+                0.0,
+                float(time.perf_counter() - cache_lookup_started_at),
+            )
             if cached_result is not None:
+                self.archive_preview_request_sources[request_id] = "preview_cache"
                 self._handle_archive_preview_ready(request_id, cached_result)
                 return
 
@@ -8391,6 +10046,7 @@ def run_gui() -> int:
             include_loose_preview_assets: bool = False,
         ) -> None:
             companion_entry = self._find_archive_preview_companion_entry(entry)
+            preview_settings = self._current_model_preview_render_settings()
             worker = ArchivePreviewWorker(
                 request_id,
                 texconv_path,
@@ -8398,7 +10054,10 @@ def run_gui() -> int:
                 companion_entry,
                 self.archive_entries_by_normalized_path,
                 self.archive_entries_by_basename,
+                self.archive_sidecar_entries_by_texture_path,
+                self.archive_sidecar_entries_by_texture_basename,
                 loose_search_roots,
+                visible_texture_mode=preview_settings.visible_texture_mode,
                 include_loose_preview_assets=include_loose_preview_assets,
             )
             thread = QThread(self)
@@ -8418,13 +10077,30 @@ def run_gui() -> int:
 
         def _handle_archive_preview_ready(self, request_id: int, payload: object) -> None:
             cache_key = self.archive_preview_cache_keys.pop(request_id, "")
+            request_started_at = self.archive_preview_request_started_at.pop(request_id, None)
+            request_phase_timings = self.archive_preview_request_phase_timings.pop(request_id, {})
+            source = self.archive_preview_request_sources.pop(request_id, "worker")
             if self._shutting_down or request_id != self.archive_preview_request_id:
                 return
             try:
                 if isinstance(payload, ArchivePreviewResult):
+                    result = payload
+                    if source == "preview_cache":
+                        image_attach_started_at = time.perf_counter()
+                        result = self._attach_archive_preview_result_images(result)
+                        request_phase_timings["image_attach_s"] = max(
+                            0.0,
+                            float(time.perf_counter() - image_attach_started_at),
+                        )
+                    self._store_cached_archive_preview_result(cache_key, result)
+                    self._apply_archive_preview_result(
+                        result,
+                        request_id=request_id,
+                        source=source,
+                        base_timings=request_phase_timings,
+                        request_started_at=request_started_at,
+                    )
                     self._stop_archive_preview_loading_indicator(success=True)
-                    self._store_cached_archive_preview_result(cache_key, payload)
-                    self._apply_archive_preview_result(payload)
             except Exception as exc:
                 _write_crash_report(
                     "archive_preview_ready_error",
@@ -8437,6 +10113,9 @@ def run_gui() -> int:
 
         def _handle_archive_preview_error(self, request_id: int, message: str) -> None:
             self.archive_preview_cache_keys.pop(request_id, None)
+            self.archive_preview_request_started_at.pop(request_id, None)
+            self.archive_preview_request_phase_timings.pop(request_id, None)
+            self.archive_preview_request_sources.pop(request_id, None)
             if self._shutting_down or request_id != self.archive_preview_request_id:
                 return
             self._stop_archive_preview_loading_indicator(success=False)
@@ -8512,6 +10191,71 @@ def run_gui() -> int:
                 return None
             return current_entry
 
+        def _archive_model_preview_controls_target(self) -> Optional[object]:
+            if self.archive_preview_showing_loose:
+                return None
+            if self.archive_preview_stack.currentWidget() is not self.archive_model_preview:
+                return None
+            if self.current_archive_preview_result is None:
+                return None
+            return self.current_archive_preview_result.preview_model
+
+        def _sync_archive_model_preview_debug_controls(self, preview_model: Optional[object]) -> None:
+            controls_visible = (
+                preview_model is not None
+                and not self.archive_preview_showing_loose
+                and self.archive_preview_stack.currentWidget() is self.archive_model_preview
+            )
+            supports_textures = bool(controls_visible and self.archive_model_preview.textures_available())
+            supports_support_maps = bool(controls_visible and self.archive_model_preview.support_maps_available())
+            for widget in (
+                self.archive_model_preview_flip_v_checkbox,
+                self.archive_model_preview_disable_support_checkbox,
+                self.archive_model_preview_reset_overrides_button,
+            ):
+                widget.setVisible(controls_visible)
+            self.archive_model_preview_flip_v_checkbox.setEnabled(supports_textures)
+            self.archive_model_preview_disable_support_checkbox.setEnabled(supports_support_maps)
+            self.archive_model_preview_reset_overrides_button.setEnabled(
+                bool(controls_visible and self.archive_model_preview.debug_overrides_active())
+            )
+            self.archive_model_preview_flip_v_checkbox.blockSignals(True)
+            self.archive_model_preview_flip_v_checkbox.setChecked(
+                bool(controls_visible and self.archive_model_preview.base_flip_override_enabled())
+            )
+            self.archive_model_preview_flip_v_checkbox.blockSignals(False)
+            self.archive_model_preview_disable_support_checkbox.blockSignals(True)
+            self.archive_model_preview_disable_support_checkbox.setChecked(
+                bool(controls_visible and self.archive_model_preview.support_maps_disabled())
+            )
+            self.archive_model_preview_disable_support_checkbox.blockSignals(False)
+
+        def _handle_archive_model_preview_flip_v_toggled(self, checked: bool) -> None:
+            self.archive_model_preview.set_base_texture_flip_override_enabled(bool(checked))
+            self._sync_current_archive_preview_model_from_widget()
+            self._sync_archive_model_preview_debug_controls(self._archive_model_preview_controls_target())
+
+        def _handle_archive_model_preview_disable_support_maps_toggled(self, checked: bool) -> None:
+            self.archive_model_preview.set_support_maps_disabled(bool(checked))
+            self._sync_current_archive_preview_model_from_widget()
+            self._sync_archive_model_preview_debug_controls(self._archive_model_preview_controls_target())
+
+        def _handle_archive_model_preview_reset_overrides(self) -> None:
+            self.archive_model_preview.reset_preview_overrides()
+            self._sync_current_archive_preview_model_from_widget()
+            self._sync_archive_model_preview_debug_controls(self._archive_model_preview_controls_target())
+
+        def _sync_current_archive_preview_model_from_widget(self) -> None:
+            if self.current_archive_preview_result is None or self.archive_preview_showing_loose:
+                return
+            preview_model = self.archive_model_preview.current_model_preview()
+            if preview_model is None:
+                return
+            self.current_archive_preview_result = dataclasses.replace(
+                self.current_archive_preview_result,
+                preview_model=preview_model,
+            )
+
         def _update_archive_model_action_controls(self, preview_model: Optional[object]) -> None:
             mesh_entry = self._current_archive_mesh_entry()
             can_mesh_actions = mesh_entry is not None
@@ -8520,18 +10264,138 @@ def run_gui() -> int:
             self.archive_model_export_obj_button.setEnabled(can_mesh_actions or can_export_preview)
             self.archive_model_export_fbx_button.setEnabled(can_mesh_actions)
             self.archive_model_import_preview_button.setEnabled(can_mesh_actions)
+            self.archive_model_import_dds_preview_button.setEnabled(can_mesh_actions)
             self.archive_model_import_patch_button.setEnabled(can_mesh_actions)
-            self.archive_model_texture_toggle.setEnabled(supports_textures)
+            self.archive_model_preview_settings_button.setEnabled(True)
+            preview_settings = self._current_model_preview_render_settings()
             self.archive_model_preview.set_use_textures(
-                bool(self.archive_model_texture_toggle.isChecked() and supports_textures)
+                bool(preview_settings.use_textures_by_default and supports_textures)
+            )
+            self.archive_model_preview.set_high_quality_textures(
+                bool(preview_settings.high_quality_by_default and supports_textures)
+            )
+            self._sync_archive_model_preview_debug_controls(preview_model)
+            self._update_archive_texture_reference_action_controls()
+
+        def _current_model_preview_render_settings(self) -> ModelPreviewRenderSettings:
+            return clamp_model_preview_render_settings(self._model_preview_render_settings)
+
+        def _read_model_preview_render_settings(self) -> ModelPreviewRenderSettings:
+            defaults = clamp_model_preview_render_settings()
+            return clamp_model_preview_render_settings(
+                ModelPreviewRenderSettings(
+                    use_textures_by_default=self._read_bool("archive/model_use_textures", defaults.use_textures_by_default),
+                    high_quality_by_default=self._read_bool("archive/model_high_quality", defaults.high_quality_by_default),
+                    visible_texture_mode=str(
+                        self.settings.value("preview/visible_texture_mode", defaults.visible_texture_mode)
+                        or defaults.visible_texture_mode
+                    ),
+                    preview_texture_max_dimension=defaults.preview_texture_max_dimension,
+                    low_quality_texture_max_dimension=defaults.low_quality_texture_max_dimension,
+                    max_anisotropy=defaults.max_anisotropy,
+                    ambient_strength=defaults.ambient_strength,
+                    diffuse_wrap_bias=defaults.diffuse_wrap_bias,
+                    diffuse_light_scale=defaults.diffuse_light_scale,
+                    orbit_sensitivity=self._read_float("preview/orbit_sensitivity", defaults.orbit_sensitivity),
+                    pan_sensitivity=self._read_float("preview/pan_sensitivity", defaults.pan_sensitivity),
+                    invert_orbit_x=self._read_bool("preview/invert_orbit_x", defaults.invert_orbit_x),
+                    invert_orbit_y=self._read_bool("preview/invert_orbit_y", defaults.invert_orbit_y),
+                    invert_pan_x=self._read_bool("preview/invert_pan_x", defaults.invert_pan_x),
+                    invert_pan_y=self._read_bool("preview/invert_pan_y", defaults.invert_pan_y),
+                    normal_strength_cap=defaults.normal_strength_cap,
+                    normal_strength_floor=defaults.normal_strength_floor,
+                    height_effect_max=defaults.height_effect_max,
+                    cavity_clamp_min=defaults.cavity_clamp_min,
+                    cavity_clamp_max=defaults.cavity_clamp_max,
+                    specular_base=defaults.specular_base,
+                    specular_min=defaults.specular_min,
+                    specular_max=defaults.specular_max,
+                    shininess_base=defaults.shininess_base,
+                    shininess_min=defaults.shininess_min,
+                    shininess_max=defaults.shininess_max,
+                    height_shininess_boost=defaults.height_shininess_boost,
+                )
             )
 
-        def _handle_archive_model_texture_toggle(self, checked: bool) -> None:
+        def _sync_model_preview_settings_dialog(self) -> None:
+            dialog = getattr(self, "model_preview_settings_dialog", None)
+            if dialog is None:
+                return
+            dialog.set_settings(self._current_model_preview_render_settings())
+
+        def _open_model_preview_settings_dialog(self) -> None:
+            dialog = getattr(self, "model_preview_settings_dialog", None)
+            if dialog is None:
+                dialog = ModelPreviewSettingsDialog(
+                    settings=self._current_model_preview_render_settings(),
+                    parent=self,
+                )
+                dialog.settings_changed.connect(self._handle_model_preview_settings_changed)
+                self.model_preview_settings_dialog = dialog
+            else:
+                dialog.set_settings(self._current_model_preview_render_settings())
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+
+        def _configure_model_preview_widget(
+            self,
+            widget: ModelPreviewWidget,
+            *,
+            apply_toggle_defaults: bool,
+        ) -> None:
+            preview_settings = self._current_model_preview_render_settings()
+            set_model_texture_display_preview_max_dimension(preview_settings.preview_texture_max_dimension)
+            widget.set_render_settings(preview_settings)
+            if apply_toggle_defaults:
+                widget.set_use_textures(bool(preview_settings.use_textures_by_default))
+                widget.set_high_quality_textures(bool(preview_settings.high_quality_by_default))
+
+        def _schedule_current_model_preview_asset_refresh(self) -> None:
+            current_entry = self._current_archive_entry()
+            if current_entry is None or current_entry.extension not in ARCHIVE_MESH_EXTENSIONS:
+                return
+            self.model_preview_refresh_timer.start()
+
+        def _refresh_current_model_preview_assets(self) -> None:
+            current_entry = self._current_archive_entry()
+            if current_entry is None or current_entry.extension not in ARCHIVE_MESH_EXTENSIONS:
+                return
+            include_loose_preview_assets = bool(
+                self.archive_preview_requested_loose
+                or (
+                    self.current_archive_preview_result is not None
+                    and bool(self.current_archive_preview_result.loose_file_path)
+                )
+            )
+            self._clear_archive_preview_cache()
+            self._render_archive_preview(
+                current_entry,
+                include_loose_preview_assets=include_loose_preview_assets,
+                prefer_loose_preview=self.archive_preview_requested_loose,
+            )
+
+        def _handle_model_preview_settings_changed(self, settings: Optional[object] = None) -> None:
+            previous_settings = self._current_model_preview_render_settings()
+            preview_settings = settings if isinstance(settings, ModelPreviewRenderSettings) else self._current_model_preview_render_settings()
+            preview_settings = clamp_model_preview_render_settings(preview_settings)
+            self._model_preview_render_settings = preview_settings
+            set_model_texture_display_preview_max_dimension(preview_settings.preview_texture_max_dimension)
+            for widget in self.findChildren(ModelPreviewWidget):
+                widget.set_render_settings(preview_settings)
+                widget.set_use_textures(bool(preview_settings.use_textures_by_default))
+                widget.set_high_quality_textures(bool(preview_settings.high_quality_by_default))
+            if (
+                previous_settings.preview_texture_max_dimension != preview_settings.preview_texture_max_dimension
+                or previous_settings.visible_texture_mode != preview_settings.visible_texture_mode
+            ):
+                self._schedule_current_model_preview_asset_refresh()
             preview_model = None
             if self.current_archive_preview_result is not None and not self.archive_preview_showing_loose:
                 preview_model = self.current_archive_preview_result.preview_model
-            supports_textures = self._archive_model_preview_supports_textures(preview_model)
-            self.archive_model_preview.set_use_textures(bool(checked and supports_textures))
+            self._update_archive_model_action_controls(preview_model)
+            if self._settings_ready:
+                self.schedule_settings_save()
 
         def _archive_texture_reference_status_text(self, reference: ArchiveModelTextureReference) -> str:
             status = str(getattr(reference, "resolution_status", "") or "").strip().lower()
@@ -8550,14 +10414,27 @@ def run_gui() -> int:
         ) -> None:
             self.current_archive_model_texture_references = list(references)
             self.archive_texture_refs_tree.clear()
+            group_items: Dict[str, QTreeWidgetItem] = {}
             for index, reference in enumerate(self.current_archive_model_texture_references):
+                relation_group = str(getattr(reference, "relation_group", "") or "").strip() or "Metadata / Other"
+                group_item = group_items.get(relation_group)
+                if group_item is None:
+                    group_item = QTreeWidgetItem([relation_group, "", "", "", "", ""])
+                    group_item.setFlags(Qt.ItemIsEnabled)
+                    self.archive_texture_refs_tree.addTopLevelItem(group_item)
+                    group_item.setExpanded(True)
+                    group_items[relation_group] = group_item
                 resolved_archive_path = str(getattr(reference, "resolved_archive_path", "") or "").strip()
                 resolved_package_label = str(getattr(reference, "resolved_package_label", "") or "").strip()
+                semantic_text = str(getattr(reference, "semantic_label", "") or "").strip() or "-"
+                sidecar_parameter_name = str(getattr(reference, "sidecar_parameter_name", "") or "").strip()
+                if relation_group == "Textures" and sidecar_parameter_name:
+                    semantic_text = f"{semantic_text} [{sidecar_parameter_name}]"
                 item = QTreeWidgetItem(
                     [
                         str(getattr(reference, "reference_name", "") or "").strip() or "-",
                         self._archive_texture_reference_status_text(reference),
-                        str(getattr(reference, "semantic_label", "") or "").strip() or "-",
+                        semantic_text,
                         resolved_archive_path or "-",
                         resolved_package_label or "-",
                         str(max(1, int(getattr(reference, "usage_count", 0) or 0))),
@@ -8569,10 +10446,17 @@ def run_gui() -> int:
                 semantic_hint = str(getattr(reference, "semantic_hint", "") or "").strip()
                 if semantic_hint:
                     item.setToolTip(2, semantic_hint)
+                relation_reason = str(getattr(reference, "relation_reason", "") or "").strip()
+                relation_confidence = str(getattr(reference, "relation_confidence", "") or "").strip()
+                if relation_reason or relation_confidence:
+                    reason_parts = [part for part in [relation_reason, relation_confidence] if part]
+                    item.setToolTip(0, "\n".join(part for part in [item.toolTip(0), "Why: " + " | ".join(reason_parts)] if part))
                 if resolved_archive_path:
                     item.setToolTip(3, resolved_archive_path)
                 item.setData(0, Qt.UserRole, index)
-                self.archive_texture_refs_tree.addTopLevelItem(item)
+                group_item.addChild(item)
+            for relation_group, group_item in group_items.items():
+                group_item.setText(0, f"{relation_group} ({group_item.childCount()})")
             self.archive_texture_refs_group.setVisible(bool(self.current_archive_model_texture_references))
             if self.current_archive_model_texture_references:
                 if self.archive_preview_content_splitter.sizes()[0] <= 8:
@@ -8654,6 +10538,301 @@ def run_gui() -> int:
                 seen_paths.add(normalized_path)
                 resolved_entries.append(resolved_entry)
             return resolved_entries
+
+        @staticmethod
+        def _preview_slot_label(slot: str) -> str:
+            normalized_slot = str(slot or "").strip().lower()
+            return {
+                "base": "Base",
+                "normal": "Normal",
+                "material": "Material",
+                "height": "Height",
+            }.get(normalized_slot, normalized_slot.title() or "Preview")
+
+        def _build_local_dds_preview_override_path(
+            self,
+            source_path: Path,
+            *,
+            texconv_path: Optional[Path] = None,
+        ) -> str:
+            resolved_texconv_path = texconv_path
+            if resolved_texconv_path is None:
+                texconv_text = self.texconv_path_edit.text().strip()
+                resolved_texconv_path = Path(texconv_text).expanduser() if texconv_text else None
+            if resolved_texconv_path is None or not resolved_texconv_path.is_file():
+                raise FileNotFoundError("Set a valid texconv.exe path before previewing an imported DDS.")
+            resolved_source = source_path.expanduser().resolve()
+            if not resolved_source.is_file():
+                raise FileNotFoundError(f"Imported DDS was not found: {resolved_source}")
+            dds_info = parse_dds(resolved_source)
+            preview_path = ensure_dds_display_preview_png(
+                resolved_texconv_path.resolve(),
+                resolved_source,
+                dds_info=dds_info,
+            )
+            return str(preview_path)
+
+        def _apply_archive_entry_dds_preview_to_model(
+            self,
+            preview_model: Optional[object],
+            *,
+            slot: str,
+            preview_path: str,
+            texture_name: str,
+            semantic_reference_path: str,
+        ) -> bool:
+            normalized_slot = str(slot or "").strip().lower()
+            if normalized_slot not in {"base", "normal", "material", "height"}:
+                return False
+            preview_path_text = str(preview_path or "").strip()
+            texture_name_text = str(texture_name or "").strip()
+            if not preview_path_text or not isinstance(preview_model, ModelPreviewData):
+                return False
+            meshes = [
+                mesh
+                for mesh in (getattr(preview_model, "meshes", None) or [])
+                if isinstance(mesh, ModelPreviewMesh)
+            ]
+            if not meshes:
+                return False
+
+            texture_type, semantic_subtype, _confidence, packed_channels = _resolve_model_texture_semantic_details(
+                semantic_reference_path,
+            )
+            packed_channels_tuple = tuple(
+                str(channel or "").strip().lower()
+                for channel in packed_channels
+                if str(channel or "").strip()
+            )
+            changed = False
+            for mesh in meshes:
+                if normalized_slot == "base":
+                    if str(getattr(mesh, "preview_texture_path", "") or "").strip() != preview_path_text:
+                        mesh.preview_texture_path = preview_path_text
+                        mesh.preview_texture_image = None
+                        changed = True
+                    if str(getattr(mesh, "texture_name", "") or "").strip() != texture_name_text:
+                        mesh.texture_name = texture_name_text
+                        changed = True
+                    if getattr(mesh, "preview_texture_flip_vertical", None) is not False:
+                        mesh.preview_texture_flip_vertical = False
+                        changed = True
+                    continue
+                if normalized_slot == "normal":
+                    material_name = str(getattr(mesh, "material_name", "") or "").strip()
+                    base_texture_name = str(getattr(mesh, "texture_name", "") or "").strip()
+                    normal_strength = _infer_model_preview_normal_strength(
+                        base_texture_path=base_texture_name,
+                        normal_texture_path=semantic_reference_path,
+                        material_name=material_name,
+                        prefer_stronger=True,
+                    )
+                    if str(getattr(mesh, "preview_normal_texture_path", "") or "").strip() != preview_path_text:
+                        mesh.preview_normal_texture_path = preview_path_text
+                        mesh.preview_normal_texture_image = None
+                        changed = True
+                    if str(getattr(mesh, "preview_normal_texture_name", "") or "").strip() != texture_name_text:
+                        mesh.preview_normal_texture_name = texture_name_text
+                        changed = True
+                    if abs(float(getattr(mesh, "preview_normal_texture_strength", 0.0) or 0.0) - float(normal_strength)) > 1e-6:
+                        mesh.preview_normal_texture_strength = float(normal_strength)
+                        changed = True
+                    continue
+                if normalized_slot == "material":
+                    if str(getattr(mesh, "preview_material_texture_path", "") or "").strip() != preview_path_text:
+                        mesh.preview_material_texture_path = preview_path_text
+                        mesh.preview_material_texture_image = None
+                        changed = True
+                    if str(getattr(mesh, "preview_material_texture_name", "") or "").strip() != texture_name_text:
+                        mesh.preview_material_texture_name = texture_name_text
+                        changed = True
+                    if str(getattr(mesh, "preview_material_texture_type", "") or "").strip().lower() != str(texture_type or "").strip().lower():
+                        mesh.preview_material_texture_type = str(texture_type or "").strip().lower()
+                        changed = True
+                    if str(getattr(mesh, "preview_material_texture_subtype", "") or "").strip().lower() != str(semantic_subtype or "").strip().lower():
+                        mesh.preview_material_texture_subtype = str(semantic_subtype or "").strip().lower()
+                        changed = True
+                    if tuple(
+                        str(channel or "").strip().lower()
+                        for channel in (getattr(mesh, "preview_material_texture_packed_channels", ()) or ())
+                        if str(channel or "").strip()
+                    ) != packed_channels_tuple:
+                        mesh.preview_material_texture_packed_channels = packed_channels_tuple
+                        changed = True
+                    continue
+                if str(getattr(mesh, "preview_height_texture_path", "") or "").strip() != preview_path_text:
+                    mesh.preview_height_texture_path = preview_path_text
+                    mesh.preview_height_texture_image = None
+                    changed = True
+                if str(getattr(mesh, "preview_height_texture_name", "") or "").strip() != texture_name_text:
+                    mesh.preview_height_texture_name = texture_name_text
+                    changed = True
+            return changed
+
+        def _build_archive_mesh_dds_import_preview_result(
+            self,
+            entry: ArchiveEntry,
+            source_path: Path,
+            slot: str,
+            *,
+            texconv_path: Optional[Path],
+            companion_entry: Optional[ArchiveEntry],
+            visible_texture_mode: str,
+        ) -> ArchivePreviewResult:
+            normalized_slot = str(slot or "").strip().lower()
+            slot_label = self._preview_slot_label(normalized_slot)
+            resolved_source_path = source_path.expanduser().resolve()
+            preview_result = build_archive_preview_result(
+                texconv_path,
+                entry,
+                companion_entry=companion_entry,
+                texture_entries_by_normalized_path=self.archive_entries_by_normalized_path,
+                texture_entries_by_basename=self.archive_entries_by_basename,
+                sidecar_entries_by_texture_path=self.archive_sidecar_entries_by_texture_path,
+                sidecar_entries_by_texture_basename=self.archive_sidecar_entries_by_texture_basename,
+                visible_texture_mode=visible_texture_mode,
+            )
+            preview_model = self._clone_archive_preview_model(preview_result.preview_model, strip_images=False)
+            if not isinstance(preview_model, ModelPreviewData) or not getattr(preview_model, "meshes", None):
+                failure_reason = (
+                    str(preview_result.warning_text or "").strip()
+                    or str(preview_result.detail_text or "").strip()
+                    or "No renderable model preview is available."
+                )
+                raise RuntimeError(f"Could not prepare a model preview for {entry.basename}: {failure_reason}")
+
+            preview_path = self._build_local_dds_preview_override_path(
+                resolved_source_path,
+                texconv_path=texconv_path,
+            )
+            applied = self._apply_archive_entry_dds_preview_to_model(
+                preview_model,
+                slot=normalized_slot,
+                preview_path=preview_path,
+                texture_name=resolved_source_path.name,
+                semantic_reference_path=str(resolved_source_path),
+            )
+            if not applied:
+                raise RuntimeError(
+                    f"Could not apply the imported DDS to the {slot_label.lower()} preview slot for {entry.basename}."
+                )
+
+            detail_text = "\n\n".join(
+                part
+                for part in (
+                    str(preview_result.detail_text or "").strip(),
+                    "\n".join(
+                        [
+                            "DDS Import Preview:",
+                            f"Selected DDS: {resolved_source_path.name}",
+                            f"Selected slot: {slot_label}",
+                        ]
+                    ),
+                )
+                if part
+            )
+            warning_text = "This DDS preview has not been written back to the game archives yet."
+            existing_warning = str(preview_result.warning_text or "").strip()
+            if existing_warning:
+                warning_text = f"{warning_text}\n{existing_warning}"
+            return dataclasses.replace(
+                preview_result,
+                detail_text=detail_text,
+                preview_model=preview_model,
+                preferred_view="model",
+                warning_badge="Import preview",
+                warning_text=warning_text,
+                loose_file_path="",
+                loose_preview_image_path="",
+                loose_preview_image=None,
+                loose_preview_media_path="",
+                loose_preview_media_kind="",
+                loose_preview_title="",
+                loose_preview_metadata_summary="",
+                loose_preview_detail_text="",
+            )
+
+        def _show_archive_dds_import_preview_result(
+            self,
+            preview_result: ArchivePreviewResult,
+            *,
+            enable_high_quality: bool,
+        ) -> None:
+            result_with_images = self._attach_archive_preview_result_images(preview_result)
+            self.archive_preview_requested_loose = False
+            self.current_archive_preview_result = result_with_images
+            self._show_archive_preview_result(result_with_images, use_loose=False)
+            if (
+                result_with_images.preview_model is None
+                or self.archive_preview_stack.currentWidget() is not self.archive_model_preview
+            ):
+                return
+            if self.archive_model_preview.textures_available():
+                self.archive_model_preview.set_use_textures(True)
+                if enable_high_quality:
+                    self.archive_model_preview.set_high_quality_textures(True)
+            self._sync_current_archive_preview_model_from_widget()
+            self._sync_archive_model_preview_debug_controls(self._archive_model_preview_controls_target())
+            self._refresh_archive_preview_details_text()
+
+        def _start_archive_mesh_dds_import_preview(self, entry: ArchiveEntry) -> None:
+            source_path, _selected = QFileDialog.getOpenFileName(
+                self,
+                "Select DDS File",
+                str(self.settings_file_path.parent),
+                "DDS (*.dds)",
+            )
+            if not source_path:
+                return
+            slot_labels = ["Base", "Normal", "Material", "Height"]
+            selected_slot_label, accepted = QInputDialog.getItem(
+                self,
+                "Preview Slot",
+                "Apply the imported DDS to which preview slot?",
+                slot_labels,
+                0,
+                False,
+            )
+            if not accepted or not selected_slot_label:
+                return
+
+            resolved_source_path = Path(source_path).expanduser().resolve()
+            normalized_slot = str(selected_slot_label or "").strip().lower()
+            texconv_text = self.texconv_path_edit.text().strip()
+            texconv_path = Path(texconv_text).expanduser() if texconv_text else None
+            companion_entry = self._find_archive_preview_companion_entry(entry)
+            preview_settings = self._current_model_preview_render_settings()
+
+            def _task(log: Callable[[str], None]) -> ArchivePreviewResult:
+                log(f"Preparing DDS import preview for {entry.path} using {resolved_source_path.name}...")
+                return self._build_archive_mesh_dds_import_preview_result(
+                    entry,
+                    resolved_source_path,
+                    normalized_slot,
+                    texconv_path=texconv_path,
+                    companion_entry=companion_entry,
+                    visible_texture_mode=preview_settings.visible_texture_mode,
+                )
+
+            def _handle_complete(result: object) -> None:
+                if not isinstance(result, ArchivePreviewResult):
+                    self.set_status_message("DDS import preview finished with an unexpected result payload.", error=True)
+                    return
+                self._show_archive_dds_import_preview_result(
+                    result,
+                    enable_high_quality=normalized_slot in {"normal", "material", "height"},
+                )
+                self.set_status_message(
+                    f"Prepared {self._preview_slot_label(normalized_slot).lower()} DDS import preview for {entry.basename}.",
+                    error=False,
+                )
+
+            self._run_utility_task(
+                status_message=f"Preparing DDS import preview for {entry.basename}...",
+                task=_task,
+                on_complete=_handle_complete,
+                show_archive_progress=True,
+            )
 
         def _current_archive_related_references_for_entry(
             self,
@@ -8825,13 +11004,31 @@ def run_gui() -> int:
             header.setSectionResizeMode(3, QHeaderView.Stretch)
             header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
 
+            def _reference_type_label(reference: ArchiveModelTextureReference) -> str:
+                relation_group = str(getattr(reference, "relation_group", "") or "").strip().lower()
+                resolved_entry = getattr(reference, "resolved_entry", None)
+                extension = str(getattr(resolved_entry, "extension", "") or "").strip().lower()
+                reference_kind = str(getattr(reference, "reference_kind", "") or "").strip().lower()
+                if relation_group == "textures" or reference_kind == "texture" or extension == ".dds":
+                    return "Texture"
+                if relation_group == "material sidecars" or extension in {".xml", ".pami", ".pac_xml", ".pam_xml", ".pamlod_xml"}:
+                    return "Material Sidecar"
+                if relation_group == "mesh / model" or reference_kind in {"mesh", "lod"} or extension in {".pac", ".pam", ".pamlod"}:
+                    return "Mesh / Model"
+                if relation_group == "skeleton / rig" or extension == ".pab":
+                    return "Skeleton / Rig"
+                if relation_group == "animation / motion" or extension in {".hkx", ".motionblending", ".paa", ".pae", ".paem"}:
+                    return "Animation / Motion"
+                if extension:
+                    return extension.lstrip(".").upper()
+                return "Related File"
+
             for index, reference in enumerate(resolved_references):
                 resolved_entry = reference.resolved_entry
                 if not isinstance(resolved_entry, ArchiveEntry):
                     continue
                 label = str(getattr(reference, "reference_name", "") or "").strip() or resolved_entry.basename
-                reference_kind = str(getattr(reference, "reference_kind", "") or "").strip().lower()
-                type_label = "Sidecar" if reference_kind == "sidecar" else "Texture"
+                type_label = _reference_type_label(reference)
                 item = QTreeWidgetItem(
                     [
                         label,
@@ -8948,7 +11145,12 @@ def run_gui() -> int:
             preview_info_edit = QPlainTextEdit()
             preview_info_edit.setReadOnly(True)
             preview_info_edit.document().setMaximumBlockCount(2000)
+            dialog_font = build_monospace_font(self.settings)
+            preview_text_edit.apply_font_preferences(dialog_font, preserve_size=False)
+            preview_info_edit.setFont(dialog_font)
+            preview_info_edit.document().setDefaultFont(dialog_font)
             preview_model = ModelPreviewWidget("No model preview available.", theme_key=self.current_theme_key)
+            self._configure_model_preview_widget(preview_model, apply_toggle_defaults=True)
             preview_media = MediaPreviewWidget("No media preview available.", theme_key=self.current_theme_key)
             preview_stack.addWidget(preview_scroll)
             preview_stack.addWidget(preview_model)
@@ -8965,7 +11167,20 @@ def run_gui() -> int:
             details_edit = QPlainTextEdit()
             details_edit.setReadOnly(True)
             details_edit.document().setMaximumBlockCount(2000)
-            details_edit.setPlainText(result.detail_text or result.metadata_summary or "No details available.")
+            details_edit.setFont(dialog_font)
+            details_edit.document().setDefaultFont(dialog_font)
+            base_detail_text = result.detail_text or result.metadata_summary or "No details available."
+
+            def _update_preview_dialog_details(_debug_text: str = "") -> None:
+                details_edit.setPlainText(
+                    self._compose_model_preview_detail_text(
+                        base_detail_text,
+                        preview_model.debug_details_text(),
+                    )
+                )
+
+            preview_model.debug_details_changed.connect(_update_preview_dialog_details)
+            _update_preview_dialog_details()
 
             details_tab = QWidget()
             details_tab_layout = QVBoxLayout(details_tab)
@@ -9033,12 +11248,9 @@ def run_gui() -> int:
             all_entries = self._resolved_archive_reference_entries(self.current_archive_model_texture_references)
             single_selected_entry = selected_entries[0] if len(selected_entries) == 1 else None
             can_open = isinstance(single_selected_entry, ArchiveEntry)
-            can_replace = isinstance(single_selected_entry, ArchiveEntry) and single_selected_entry.extension == ".dds"
             self.archive_texture_open_button.setEnabled(can_open)
             self.archive_texture_export_button.setEnabled(bool(selected_entries))
             self.archive_texture_export_all_button.setEnabled(bool(all_entries))
-            self.archive_texture_replace_dds_button.setEnabled(can_replace)
-            self.archive_texture_replace_png_button.setEnabled(can_replace)
 
         def _open_selected_archive_texture_reference(self) -> None:
             selected_references = self._selected_archive_texture_references()
@@ -9055,12 +11267,16 @@ def run_gui() -> int:
                 log(f"Preparing referenced-file preview for {resolved_entry.path}...")
                 texconv_text = self.texconv_path_edit.text().strip()
                 texconv_path = Path(texconv_text).expanduser() if texconv_text else None
+                preview_settings = self._current_model_preview_render_settings()
                 return build_archive_preview_result(
                     texconv_path,
                     resolved_entry,
                     texture_entries_by_normalized_path=self.archive_entries_by_normalized_path,
                     texture_entries_by_basename=self.archive_entries_by_basename,
+                    sidecar_entries_by_texture_path=self.archive_sidecar_entries_by_texture_path,
+                    sidecar_entries_by_texture_basename=self.archive_sidecar_entries_by_texture_basename,
                     semantic_sidecar_texts=semantic_sidecar_texts,
+                    visible_texture_mode=preview_settings.visible_texture_mode,
                 )
 
             def _handle_complete(result: object) -> None:
@@ -9148,8 +11364,8 @@ def run_gui() -> int:
             layout.setSpacing(10)
 
             intro_label = QLabel(
-                "Choose the loose package parent folder and the basic metadata that should be written into info.json. "
-                "The same title, version, author, and description are then reused for the basic manifest.json metadata."
+                "Choose the loose package parent folder and the metadata that should be written into manifest.json. "
+                "The exported mod files are written with game-relative paths instead of an extra files/ wrapper."
                 + (
                     " You can also include the resolved related DDS and sidecar files that were detected for the selected mesh."
                     if show_include_related_files_option
@@ -9170,7 +11386,7 @@ def run_gui() -> int:
             version_edit = QLineEdit(str(getattr(initial_package_info, "version", "") or "").strip())
             author_edit = QLineEdit(str(getattr(initial_package_info, "author", "") or "").strip())
             description_edit = QLineEdit(str(getattr(initial_package_info, "description", "") or "").strip())
-            no_encrypt_checkbox = QCheckBox("Create .no_encrypt file")
+            no_encrypt_checkbox = QCheckBox("Create .no_encrypt file (legacy)")
             no_encrypt_checkbox.setChecked(bool(initial_create_no_encrypt))
             include_related_files_checkbox = QCheckBox("Include resolved related files (textures, .xml, .pami)")
             include_related_files_checkbox.setChecked(bool(initial_include_related_files))
@@ -9320,198 +11536,6 @@ def run_gui() -> int:
                 False,
             )
 
-        def _replace_selected_archive_texture_reference_from_dds(self) -> None:
-            selected_references = self._selected_archive_texture_references()
-            reference = selected_references[0] if len(selected_references) == 1 else self._current_archive_texture_reference()
-            resolved_entry = getattr(reference, "resolved_entry", None) if reference is not None else None
-            if not isinstance(resolved_entry, ArchiveEntry) or resolved_entry.extension != ".dds":
-                self.set_status_message("Select a resolved DDS texture reference first.", error=True)
-                return
-
-            source_path, _selected = QFileDialog.getOpenFileName(
-                self,
-                "Select Replacement DDS",
-                str(self.settings_file_path.parent),
-                "DDS (*.dds)",
-            )
-            if not source_path:
-                return
-
-            patch_blocker = get_archive_texture_patch_blocker(resolved_entry)
-            destination = self._choose_archive_write_target(
-                title="Replace Texture",
-                message=f"Replace {resolved_entry.path} using {Path(source_path).name}?",
-                allow_archive_patch=not bool(patch_blocker),
-            )
-            if not destination:
-                return
-            if destination == "patch" and patch_blocker:
-                QMessageBox.warning(self, "Replace Texture", patch_blocker)
-                return
-
-            loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool, bool]] = None
-            if destination == "loose":
-                loose_export_settings = self._collect_archive_mod_ready_export_target(
-                    browse_title="Select Mod-Ready Export Parent Root",
-                    prompt_for_metadata=True,
-                    dialog_title="Texture Loose Export Metadata",
-                )
-                if loose_export_settings is None:
-                    return
-
-            def _task(log: Callable[[str], None]) -> object:
-                log(f"Preparing replacement DDS payload for {resolved_entry.path}...")
-                payload = build_archive_texture_payload_from_dds(resolved_entry, Path(source_path))
-                requests = [ArchivePatchRequest(entry=resolved_entry, payload_data=payload)]
-                if destination == "patch":
-                    log(f"Patching {resolved_entry.path} back into the game archives...")
-                    return patch_archive_entries(requests, on_log=log)
-                if loose_export_settings is None:
-                    raise RuntimeError("Mod-ready export target is not available.")
-                parent_root, package_info, create_no_encrypt, _include_related_files = loose_export_settings
-                log(f"Writing loose mod payload for {resolved_entry.path}...")
-                return export_archive_payloads_to_mod_ready_loose(
-                    requests,
-                    parent_root=parent_root,
-                    package_info=package_info,
-                    create_no_encrypt_file=create_no_encrypt,
-                    on_log=log,
-                )
-
-            def _handle_complete(result: object) -> None:
-                if destination == "patch":
-                    if not isinstance(result, ArchivePatchResult):
-                        self.set_status_message("Texture replacement finished with an unexpected result payload.", error=True)
-                        return
-                    self._apply_archive_patch_result(result)
-                    current_entry = self._current_archive_entry()
-                    if current_entry is not None:
-                        self._render_archive_preview(current_entry)
-                    QMessageBox.information(
-                        self,
-                        "Texture Patch Complete",
-                        f"Patched {resolved_entry.path}\n\nBackup: {result.backup_dir}",
-                    )
-                    self.set_status_message(f"Patched {resolved_entry.basename}.")
-                    return
-                if not isinstance(result, ArchiveLooseExportResult):
-                    self.set_status_message("Loose texture export finished with an unexpected result payload.", error=True)
-                    return
-                QMessageBox.information(
-                    self,
-                    "Loose Texture Export Complete",
-                    f"Wrote replacement DDS into:\n{result.package_root}",
-                )
-                self.set_status_message(f"Wrote loose replacement for {resolved_entry.basename}.")
-
-            self._run_utility_task(
-                status_message=f"Replacing {resolved_entry.basename}...",
-                task=_task,
-                on_complete=_handle_complete,
-                show_archive_progress=True,
-            )
-
-        def _replace_selected_archive_texture_reference_from_png(self) -> None:
-            selected_references = self._selected_archive_texture_references()
-            reference = selected_references[0] if len(selected_references) == 1 else self._current_archive_texture_reference()
-            resolved_entry = getattr(reference, "resolved_entry", None) if reference is not None else None
-            if not isinstance(resolved_entry, ArchiveEntry) or resolved_entry.extension != ".dds":
-                self.set_status_message("Select a resolved DDS texture reference first.", error=True)
-                return
-
-            source_path, _selected = QFileDialog.getOpenFileName(
-                self,
-                "Select Replacement PNG",
-                str(self.settings_file_path.parent),
-                "PNG (*.png)",
-            )
-            if not source_path:
-                return
-
-            texconv_text = self.texconv_path_edit.text().strip()
-            if not texconv_text:
-                self.set_status_message("Set texconv.exe before replacing an archive DDS from PNG.", error=True)
-                return
-
-            patch_blocker = get_archive_texture_patch_blocker(resolved_entry)
-            destination = self._choose_archive_write_target(
-                title="Replace Texture From PNG",
-                message=f"Rebuild and replace {resolved_entry.path} using {Path(source_path).name}?",
-                allow_archive_patch=not bool(patch_blocker),
-            )
-            if not destination:
-                return
-            if destination == "patch" and patch_blocker:
-                QMessageBox.warning(self, "Replace Texture From PNG", patch_blocker)
-                return
-
-            loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool, bool]] = None
-            if destination == "loose":
-                loose_export_settings = self._collect_archive_mod_ready_export_target(
-                    browse_title="Select Mod-Ready Export Parent Root",
-                    prompt_for_metadata=True,
-                    dialog_title="Texture Loose Export Metadata",
-                )
-                if loose_export_settings is None:
-                    return
-
-            def _task(log: Callable[[str], None]) -> object:
-                log(f"Preparing PNG-based DDS rebuild for {resolved_entry.path}...")
-                payload = build_archive_texture_payload_from_png(
-                    resolved_entry,
-                    Path(source_path),
-                    texconv_path=Path(texconv_text),
-                    on_log=log,
-                )
-                requests = [ArchivePatchRequest(entry=resolved_entry, payload_data=payload)]
-                if destination == "patch":
-                    log(f"Patching rebuilt DDS for {resolved_entry.path} back into the game archives...")
-                    return patch_archive_entries(requests, on_log=log)
-                if loose_export_settings is None:
-                    raise RuntimeError("Mod-ready export target is not available.")
-                parent_root, package_info, create_no_encrypt, _include_related_files = loose_export_settings
-                log(f"Writing rebuilt DDS for {resolved_entry.path} into a loose mod package...")
-                return export_archive_payloads_to_mod_ready_loose(
-                    requests,
-                    parent_root=parent_root,
-                    package_info=package_info,
-                    create_no_encrypt_file=create_no_encrypt,
-                    on_log=log,
-                )
-
-            def _handle_complete(result: object) -> None:
-                if destination == "patch":
-                    if not isinstance(result, ArchivePatchResult):
-                        self.set_status_message("Texture rebuild finished with an unexpected result payload.", error=True)
-                        return
-                    self._apply_archive_patch_result(result)
-                    current_entry = self._current_archive_entry()
-                    if current_entry is not None:
-                        self._render_archive_preview(current_entry)
-                    QMessageBox.information(
-                        self,
-                        "Texture Patch Complete",
-                        f"Patched {resolved_entry.path}\n\nBackup: {result.backup_dir}",
-                    )
-                    self.set_status_message(f"Patched {resolved_entry.basename} from PNG.")
-                    return
-                if not isinstance(result, ArchiveLooseExportResult):
-                    self.set_status_message("Loose texture export finished with an unexpected result payload.", error=True)
-                    return
-                QMessageBox.information(
-                    self,
-                    "Loose Texture Export Complete",
-                    f"Wrote rebuilt DDS into:\n{result.package_root}",
-                )
-                self.set_status_message(f"Wrote loose replacement for {resolved_entry.basename}.")
-
-            self._run_utility_task(
-                status_message=f"Rebuilding {resolved_entry.basename} from PNG...",
-                task=_task,
-                on_complete=_handle_complete,
-                show_archive_progress=True,
-            )
-
         def _archive_entry_at_tree_position(self, position) -> Optional[ArchiveEntry]:
             item = self.archive_tree.itemAt(position)
             if item is None:
@@ -9541,11 +11565,11 @@ def run_gui() -> int:
                 export_fbx_action = menu.addAction("Export FBX...")
                 export_fbx_action.triggered.connect(lambda _checked=False, current_entry=entry: self._start_archive_mesh_export(current_entry, "fbx"))
                 menu.addSeparator()
-                import_preview_action = menu.addAction("Import OBJ (preview rebuilt mesh)...")
+                import_preview_action = menu.addAction("Import Mesh (preview rebuilt mesh)...")
                 import_preview_action.triggered.connect(
                     lambda _checked=False, current_entry=entry: self._start_archive_mesh_import_preview(current_entry)
                 )
-                import_patch_action = menu.addAction("Import OBJ...")
+                import_patch_action = menu.addAction("Import Mesh...")
                 import_patch_action.triggered.connect(
                     lambda _checked=False, current_entry=entry: self._start_archive_mesh_patch(current_entry)
                 )
@@ -9591,6 +11615,18 @@ def run_gui() -> int:
         ) -> None:
             self._attach_archive_model_preview_images(import_result.preview_model)
             detail_lines = list(import_result.summary_lines)
+            if import_result.import_issues:
+                detail_lines.append("")
+                detail_lines.append("Import validation:")
+                for issue in import_result.import_issues:
+                    detail_lines.append(f"- {issue.status}: {issue.title} - {issue.detail}")
+                    for diff in tuple(getattr(issue, "diffs", ()) or ())[:3]:
+                        diff_detail = str(getattr(diff, "detail", "") or "").strip()
+                        if diff_detail:
+                            detail_lines.append(f"  * {diff_detail}")
+                    extra_diff_count = max(0, len(tuple(getattr(issue, "diffs", ()) or ())) - 3)
+                    if extra_diff_count > 0:
+                        detail_lines.append(f"  * ... {extra_diff_count:,} more difference(s)")
             if patched and backup_dir is not None:
                 detail_lines.append(f"Backup: {backup_dir}")
             if not patched and loose_package_root is not None:
@@ -9603,6 +11639,7 @@ def run_gui() -> int:
             elif not patched:
                 warning_badge = "Import preview"
                 warning_text = "This rebuilt mesh preview has not been written back to the game archives yet."
+            prepared_model, prepared_preview_model = ModelPreviewWidget.prepare_model_preview(import_result.preview_model)
             preview_result = ArchivePreviewResult(
                 status="ok",
                 title=entry.basename,
@@ -9611,7 +11648,8 @@ def run_gui() -> int:
                     f" | {import_result.parsed_mesh.total_faces:,} faces"
                 ),
                 detail_text="\n".join(detail_lines),
-                preview_model=import_result.preview_model,
+                preview_model=prepared_model,
+                prepared_preview_model=prepared_preview_model,
                 model_texture_references=tuple(import_result.texture_references),
                 preferred_view="model",
                 warning_badge=warning_badge,
@@ -9621,6 +11659,72 @@ def run_gui() -> int:
             self.current_archive_preview_result = preview_result
             self._show_archive_preview_result(preview_result, use_loose=False)
 
+        def _confirm_archive_mesh_import_commit(
+            self,
+            entry: ArchiveEntry,
+            import_result: MeshImportPreviewResult,
+            *,
+            destination: str,
+            source_obj_path: Path,
+        ) -> bool:
+            issues = tuple(import_result.import_issues or ())
+            actionable_issues = [
+                issue for issue in issues if issue.status != ImportIssueStatus.AUTO_FIXED.value
+            ]
+            if not actionable_issues:
+                return True
+
+            status_counts = Counter(issue.status for issue in issues)
+            message_lines = [
+                f"{source_obj_path.name} for {entry.basename} has import validation findings.",
+                "",
+                "Summary:",
+                ", ".join(
+                    f"{status_counts.get(status, 0):,} {status}"
+                    for status in (
+                        ImportIssueStatus.AUTO_FIXED.value,
+                        ImportIssueStatus.WARNING.value,
+                        ImportIssueStatus.REQUIRES_MANUAL_REVIEW.value,
+                    )
+                    if status_counts.get(status, 0) > 0
+                ),
+                "",
+                "Actionable findings:",
+            ]
+            for issue in actionable_issues[:6]:
+                message_lines.append(f"- {issue.status}: {issue.title}")
+                if issue.detail:
+                    message_lines.append(f"  {issue.detail}")
+            remaining_count = len(actionable_issues) - 6
+            if remaining_count > 0:
+                message_lines.append(f"... and {remaining_count:,} more issue(s) in the preview details.")
+            message_lines.append("")
+            message_lines.append(
+                "Continue anyway?"
+                if any(issue.status == ImportIssueStatus.REQUIRES_MANUAL_REVIEW.value for issue in actionable_issues)
+                else "Continue with the import?"
+            )
+
+            prompt = QMessageBox(self)
+            prompt.setIcon(QMessageBox.Warning)
+            prompt.setWindowTitle(
+                "Review Import Compatibility"
+                if any(issue.status == ImportIssueStatus.REQUIRES_MANUAL_REVIEW.value for issue in actionable_issues)
+                else "Review Import Warnings"
+            )
+            prompt.setText("\n".join(message_lines))
+            prompt.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            prompt.setDefaultButton(QMessageBox.No)
+            yes_button = prompt.button(QMessageBox.Yes)
+            if yes_button is not None:
+                yes_button.setText(
+                    "Patch Anyway" if destination == "patch" else "Export Anyway"
+                )
+            no_button = prompt.button(QMessageBox.No)
+            if no_button is not None:
+                no_button.setText("Cancel")
+            return prompt.exec() == QMessageBox.Yes
+
         def _attach_archive_model_preview_images(self, preview_model: Optional[object]) -> None:
             if preview_model is None:
                 return
@@ -9628,14 +11732,21 @@ def run_gui() -> int:
             if not meshes:
                 return
             for mesh in meshes:
-                preview_texture_path = str(getattr(mesh, "preview_texture_path", "") or "").strip()
-                if not preview_texture_path or getattr(mesh, "preview_texture_image", None) is not None:
-                    continue
-                reader = QImageReader(preview_texture_path)
-                image = reader.read()
-                if image.isNull():
-                    continue
-                mesh.preview_texture_image = image
+                texture_slots = (
+                    ("preview_texture_path", "preview_texture_image"),
+                    ("preview_normal_texture_path", "preview_normal_texture_image"),
+                    ("preview_material_texture_path", "preview_material_texture_image"),
+                    ("preview_height_texture_path", "preview_height_texture_image"),
+                )
+                for path_attr, image_attr in texture_slots:
+                    preview_texture_path = str(getattr(mesh, path_attr, "") or "").strip()
+                    if not preview_texture_path or getattr(mesh, image_attr, None) is not None:
+                        continue
+                    reader = QImageReader(preview_texture_path)
+                    image = reader.read()
+                    if image.isNull():
+                        continue
+                    setattr(mesh, image_attr, image)
 
         def _prompt_archive_mesh_related_file_selection(
             self,
@@ -9665,10 +11776,11 @@ def run_gui() -> int:
                 (
                     f"Do you want to add local supplemental files for {entry.basename}?\n\n"
                     "Supported files:\n"
+                    "  - .png / .jpg / .jpeg replacement texture sources for static scene imports\n"
                     "  - .dds texture overrides\n"
-                    "  - .xml PAC material sidecars\n"
+                    "  - .xml / .pac_xml PAC material sidecars\n"
                     "  - .pami PAM material sidecars\n\n"
-                    "Selected files will be used for rebuilt preview, and mapped files can also be included in loose export or archive patch."
+                    "Selected files will be used for rebuilt preview, and mapped files can also be included in the loose export package."
                 ),
                 QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
                 QMessageBox.No,
@@ -9678,11 +11790,41 @@ def run_gui() -> int:
             if decision != QMessageBox.Yes:
                 return ()
 
+            source_dialog = QMessageBox(self)
+            source_dialog.setWindowTitle(title)
+            source_dialog.setIcon(QMessageBox.Question)
+            source_dialog.setText("Select supplemental files or a folder?")
+            source_dialog.setInformativeText(
+                "Use a folder when replacement textures are already grouped together, such as a Blender export texture folder."
+            )
+            files_button = source_dialog.addButton("Select Files", QMessageBox.AcceptRole)
+            folder_button = source_dialog.addButton("Select Folder", QMessageBox.ActionRole)
+            source_dialog.addButton(QMessageBox.Cancel)
+            source_dialog.setDefaultButton(files_button)
+            source_dialog.exec()
+            clicked_source = source_dialog.clickedButton()
+            supported_suffixes = set(SCENE_TEXTURE_SOURCE_EXTENSIONS) | {".xml", ".pami", ".pac_xml", ".pam_xml", ".pamlod_xml"}
+            if clicked_source == folder_button:
+                selected_dir = QFileDialog.getExistingDirectory(
+                    self,
+                    title,
+                    str(self.settings_file_path.parent),
+                )
+                if not selected_dir:
+                    return ()
+                return tuple(
+                    path
+                    for path in sorted(Path(selected_dir).rglob("*"))
+                    if path.is_file() and path.suffix.lower() in supported_suffixes
+                )
+            if clicked_source != files_button:
+                return None
+
             selected_files, _selected_filter = QFileDialog.getOpenFileNames(
                 self,
                 title,
                 str(self.settings_file_path.parent),
-                "Supplemental Files (*.dds *.xml *.pami);;DDS Files (*.dds);;Material Sidecars (*.xml *.pami)",
+                "Supplemental Files (*.png *.jpg *.jpeg *.dds *.xml *.pami *.pac_xml *.pam_xml *.pamlod_xml);;Texture Sources (*.png *.jpg *.jpeg *.dds);;DDS Files (*.dds);;Image Files (*.png *.jpg *.jpeg);;Material Sidecars (*.xml *.pami *.pac_xml *.pam_xml *.pamlod_xml)",
             )
             if not selected_files:
                 return ()
@@ -9714,65 +11856,1078 @@ def run_gui() -> int:
                     return
                 selected_related_entries = selected_related_entries_result
 
-            def _task(log: Callable[[str], None]) -> MeshExportResult:
-                return export_archive_mesh(
-                    entry,
-                    Path(output_dir),
-                    export_format,
-                    archive_entries_by_normalized_path=self.archive_entries_by_normalized_path,
-                    related_entries=selected_related_entries,
-                    on_log=log,
+            def _launch_export(*, allow_missing_skeleton: bool = False) -> None:
+                def _task(log: Callable[[str], None]) -> MeshExportResult:
+                    return export_archive_mesh(
+                        entry,
+                        Path(output_dir),
+                        export_format,
+                        archive_entries_by_normalized_path=self.archive_entries_by_normalized_path,
+                        archive_entries_by_basename=self.archive_entries_by_basename,
+                        related_entries=selected_related_entries,
+                        allow_missing_skeleton=allow_missing_skeleton,
+                        on_log=log,
+                    )
+
+                def _handle_complete(result: object) -> None:
+                    if not isinstance(result, MeshExportResult):
+                        self.set_status_message("Mesh export finished with an unexpected result payload.", error=True)
+                        return
+                    if result.requires_confirmation:
+                        confirmation = QMessageBox.question(
+                            self,
+                            result.confirmation_title or "Export FBX Without Skeleton?",
+                            result.confirmation_message or (
+                                "No usable skeleton could be resolved. Continue with a mesh-only FBX export?"
+                            ),
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.No,
+                        )
+                        if confirmation == QMessageBox.Yes:
+                            QTimer.singleShot(0, lambda: _launch_export(allow_missing_skeleton=True))
+                        else:
+                            self.set_status_message(f"Cancelled {export_format.upper()} export for {entry.basename}.")
+                        return
+
+                    displayed_paths = [str(path) for path in result.output_paths[:15]]
+                    if len(result.output_paths) > 15:
+                        displayed_paths.append(f"... {len(result.output_paths) - 15} more file(s)")
+                    exported_files = "\n".join(displayed_paths)
+                    summary_text = "\n".join(result.summary_lines)
+                    QMessageBox.information(
+                        self,
+                        "Mesh Export Complete",
+                        f"{summary_text}\n\nExported files:\n{exported_files}",
+                    )
+                    self.set_status_message(f"Exported {entry.basename} as {export_format.upper()}.")
+
+                self._run_utility_task(
+                    status_message=f"Exporting {entry.basename} as {export_format.upper()}...",
+                    task=_task,
+                    on_complete=_handle_complete,
+                    show_archive_progress=True,
                 )
 
-            def _handle_complete(result: object) -> None:
-                if not isinstance(result, MeshExportResult):
-                    self.set_status_message("Mesh export finished with an unexpected result payload.", error=True)
-                    return
-                displayed_paths = [str(path) for path in result.output_paths[:15]]
-                if len(result.output_paths) > 15:
-                    displayed_paths.append(f"... {len(result.output_paths) - 15} more file(s)")
-                exported_files = "\n".join(displayed_paths)
-                summary_text = "\n".join(result.summary_lines)
-                QMessageBox.information(
-                    self,
-                    "Mesh Export Complete",
-                    f"{summary_text}\n\nExported files:\n{exported_files}",
-                )
-                self.set_status_message(f"Exported {entry.basename} as {export_format.upper()}.")
+            _launch_export()
 
-            self._run_utility_task(
-                status_message=f"Exporting {entry.basename} as {export_format.upper()}...",
-                task=_task,
-                on_complete=_handle_complete,
-                show_archive_progress=True,
+        def _prompt_archive_mesh_import_mode(self) -> Optional[str]:
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("Choose Mesh Import Mode")
+            dialog.setIcon(QMessageBox.Question)
+            dialog.setText("Choose how to import this mesh file.")
+            dialog.setInformativeText(
+                "Round-trip edit expects an OBJ to keep the original exported mesh structure. "
+                "Static mesh replacement maps a different OBJ/DAE model onto the original material/draw slots."
+            )
+            roundtrip_button = dialog.addButton("Round-trip Edit", QMessageBox.AcceptRole)
+            static_button = dialog.addButton("Static Mesh Replacement", QMessageBox.ActionRole)
+            dialog.addButton(QMessageBox.Cancel)
+            dialog.setDefaultButton(roundtrip_button)
+            dialog.exec()
+            clicked = dialog.clickedButton()
+            if clicked == static_button:
+                return "static_replacement"
+            if clicked == roundtrip_button:
+                return "roundtrip"
+            return None
+
+        @staticmethod
+        def _format_static_alignment_number(value: object) -> str:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return str(value)
+            if abs(number) < 0.000005:
+                number = 0.0
+            return f"{number:.5f}"
+
+        @classmethod
+        def _format_static_alignment_vec(cls, value: object) -> str:
+            if not isinstance(value, (list, tuple)) or len(value) != 3:
+                return str(value)
+            return "(" + ", ".join(cls._format_static_alignment_number(part) for part in value) + ")"
+
+        @classmethod
+        def _build_archive_static_placement_context_html(cls, entry: ArchiveEntry, obj_path: Path) -> Tuple[str, Dict[str, object]]:
+            try:
+                original_data, _decompressed, _note = read_archive_entry_data(entry)
+                original_mesh = parse_mesh(original_data, entry.path)
+                replacement_mesh = import_scene_mesh(obj_path)
+                context_lines = describe_static_placement_context(original_mesh, replacement_mesh)
+                parsed: Dict[str, object] = {}
+                for line in context_lines:
+                    if ": " in line:
+                        key, value = line.split(": ", 1)
+                        parsed[key.strip().lower()] = value.strip()
+
+                def _parse_axis_length(key: str) -> Tuple[str, float]:
+                    value = str(parsed.get(key, "unknown / 0") or "")
+                    axis, _sep, raw_length = value.partition("/")
+                    try:
+                        length = float(raw_length.strip())
+                    except ValueError:
+                        length = 0.0
+                    return axis.strip().upper() or "?", length
+
+                def _parse_vec_from_text(key: str) -> str:
+                    value = str(parsed.get(key, "") or "")
+                    match = re.search(r"\(([^)]*)\)", value)
+                    if not match:
+                        return value
+                    parts = []
+                    for raw_part in match.group(1).split(","):
+                        try:
+                            parts.append(float(raw_part.strip()))
+                        except ValueError:
+                            parts.append(raw_part.strip())
+                    return cls._format_static_alignment_vec(tuple(parts))
+
+                original_axis, original_length = _parse_axis_length("original axis/length")
+                replacement_axis, replacement_length = _parse_axis_length("replacement axis/length")
+                try:
+                    auto_scale = float(str(parsed.get("auto length scale", "1") or "1"))
+                except ValueError:
+                    auto_scale = 1.0
+                guidance: List[str] = []
+                if original_axis != replacement_axis and original_axis != "?" and replacement_axis != "?":
+                    guidance.append(
+                        f"Axis: replacement is along <b>{replacement_axis}</b>, original is along <b>{original_axis}</b>; auto alignment will rotate between these axes."
+                    )
+                if auto_scale < 0.95:
+                    guidance.append(
+                        f"Scale: auto length scale is <b>{cls._format_static_alignment_number(auto_scale)}</b>, so enabled auto-scale will shrink the replacement."
+                    )
+                elif auto_scale > 1.05:
+                    guidance.append(
+                        f"Scale: auto length scale is <b>{cls._format_static_alignment_number(auto_scale)}</b>, so enabled auto-scale will enlarge the replacement."
+                    )
+                else:
+                    guidance.append("Scale: replacement and original are already close in length.")
+                guidance.append(
+                    "Offset: after import, move X/Y/Z in small steps if the anchor point is close but not exactly aligned."
+                )
+                guidance.append(
+                    "Rotation: use this after Auto/Flip if the asset is tilted or rolled around the anchor."
+                )
+                html = f"""
+                <style>
+                  .muted {{ color: #9aa0a6; }}
+                  .value {{ color: #8ab4f8; font-weight: 600; }}
+                  .warn {{ color: #fdd663; font-weight: 600; }}
+                  .ok {{ color: #81c995; font-weight: 600; }}
+                  table {{ border-collapse: collapse; }}
+                  td {{ padding: 2px 10px 2px 0; vertical-align: top; }}
+                </style>
+                <div>
+                  <div class="muted">Tiny values like 3.2471e-07 mean almost zero; this dialog rounds them to 0.00000.</div>
+                  <table>
+                    <tr><td>Original length axis</td><td class="value">{original_axis}</td><td class="value">{cls._format_static_alignment_number(original_length)}</td></tr>
+                    <tr><td>Replacement length axis</td><td class="value">{replacement_axis}</td><td class="value">{cls._format_static_alignment_number(replacement_length)}</td></tr>
+                    <tr><td>Auto length scale</td><td colspan="2" class="{'warn' if auto_scale < 0.95 or auto_scale > 1.05 else 'ok'}">{cls._format_static_alignment_number(auto_scale)}</td></tr>
+                    <tr><td>Original inferred anchor</td><td colspan="2" class="value">{_parse_vec_from_text("original inferred anchor")}</td></tr>
+                    <tr><td>Replacement inferred anchor</td><td colspan="2" class="value">{_parse_vec_from_text("replacement inferred anchor")}</td></tr>
+                    <tr><td>Original far end</td><td colspan="2" class="value">{_parse_vec_from_text("original inferred far end")}</td></tr>
+                    <tr><td>Replacement far end</td><td colspan="2" class="value">{_parse_vec_from_text("replacement inferred far end")}</td></tr>
+                  </table>
+                  <div style="margin-top:8px;"><b>Suggested starting point</b></div>
+                  <ul>
+                    {''.join(f'<li>{item}</li>' for item in guidance)}
+                  </ul>
+                </div>
+                """
+                return html, {
+                    "auto_scale": auto_scale,
+                    "original_axis": original_axis,
+                    "replacement_axis": replacement_axis,
+                }
+            except Exception as exc:
+                return f"<span style='color:#fdd663;'>Placement values could not be read automatically: {escape(str(exc))}</span>", {}
+
+        def _prompt_archive_static_replacement_options(
+            self,
+            entry: ArchiveEntry,
+            obj_path: Path,
+            supplemental_files: Sequence[Path] = (),
+        ) -> Optional[StaticMeshReplacementOptions]:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Static Mesh Alignment")
+            dialog.setMinimumSize(1280, 760)
+            dialog.resize(1640, 920)
+            dialog.setSizeGripEnabled(True)
+            root_layout = QVBoxLayout(dialog)
+            main_splitter = QSplitter(Qt.Horizontal, dialog)
+            content_scroll = QScrollArea(dialog)
+            content_scroll.setWidgetResizable(True)
+            content_scroll.setMinimumWidth(560)
+            content_container = QWidget()
+            layout = QVBoxLayout(content_container)
+            content_scroll.setWidget(content_container)
+            main_splitter.addWidget(content_scroll)
+            preview_panel = QWidget(dialog)
+            preview_panel.setMinimumWidth(560)
+            preview_panel_layout = QVBoxLayout(preview_panel)
+            preview_panel_layout.addWidget(QLabel("Live Alignment Preview"))
+            preview_splitter = QSplitter(Qt.Horizontal, preview_panel)
+            original_preview_container = QWidget(preview_splitter)
+            original_preview_layout = QVBoxLayout(original_preview_container)
+            original_preview_layout.setContentsMargins(0, 0, 0, 0)
+            original_preview_layout.addWidget(QLabel("Original Reference"))
+            original_dialog_preview = ModelPreviewWidget("Original asset reference preview.", theme_key=self.current_theme_key)
+            original_dialog_preview.setMinimumSize(360, 360)
+            original_preview_layout.addWidget(original_dialog_preview, 1)
+            replacement_preview_container = QWidget(preview_splitter)
+            replacement_preview_layout = QVBoxLayout(replacement_preview_container)
+            replacement_preview_layout.setContentsMargins(0, 0, 0, 0)
+            replacement_preview_layout.addWidget(QLabel("Replacement With Current Mapping"))
+            static_dialog_preview = ModelPreviewWidget("Select texture slots to preview.", theme_key=self.current_theme_key)
+            static_dialog_preview.setMinimumSize(420, 360)
+            replacement_preview_layout.addWidget(static_dialog_preview, 1)
+            preview_splitter.addWidget(original_preview_container)
+            preview_splitter.addWidget(replacement_preview_container)
+            preview_splitter.setCollapsible(0, False)
+            preview_splitter.setCollapsible(1, False)
+            preview_splitter.setStretchFactor(0, 1)
+            preview_splitter.setStretchFactor(1, 2)
+            preview_splitter.setSizes([420, 620])
+            preview_panel_layout.addWidget(preview_splitter, 1)
+            preview_help = QLabel(
+                "The left view is the original asset reference. The right view rebuilds the replacement using the current "
+                "mapping, scale, rotation, offset, and selected texture slots before the package is built."
+            )
+            preview_help.setWordWrap(True)
+            preview_help.setObjectName("HintLabel")
+            preview_panel_layout.addWidget(preview_help)
+            main_splitter.addWidget(preview_panel)
+            main_splitter.setCollapsible(0, False)
+            main_splitter.setCollapsible(1, False)
+            main_splitter.setStretchFactor(0, 2)
+            main_splitter.setStretchFactor(1, 3)
+            main_splitter.setSizes([680, 940])
+            root_layout.addWidget(main_splitter, 1)
+            intro = QLabel(
+                "Auto anchor aligns the replacement to the original asset. Scaling can be disabled so the replacement keeps its own imported size."
+            )
+            intro.setWordWrap(True)
+            intro.setObjectName("HintLabel")
+            layout.addWidget(intro)
+
+            context_html, context_values = self._build_archive_static_placement_context_html(entry, obj_path)
+            context_label = QLabel(context_html)
+            context_label.setWordWrap(True)
+            context_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            context_label.setOpenExternalLinks(False)
+            context_group = QGroupBox("Alignment Guidance")
+            context_layout = QVBoxLayout(context_group)
+            context_layout.addWidget(context_label)
+            layout.addWidget(context_group)
+
+            suggested_mappings: List[StaticSubmeshMapping] = []
+            mapping_edits: List[Tuple[int, QLineEdit]] = []
+            texture_override_rows: List[Tuple[QCheckBox, QComboBox, str, str, str, Tuple[int, ...]]] = []
+            replacement_mesh_for_mapping = None
+            original_mesh_for_mapping = None
+            replacement_preview_model = None
+            preview_controls_ready = {"ready": False}
+
+            def _is_marker_source(submesh: object) -> bool:
+                label = f"{getattr(submesh, 'name', '')} {getattr(submesh, 'material', '')}".lower()
+                return "cft_anchor" in label or "cft_grip_anchor" in label or "cft_tip_anchor" in label
+
+            def _mapping_role_hint(label: str) -> str:
+                tokens = _semantic_tokens(label)
+                ordered_roles = (
+                    ("blade", ("blade", "body", "edge", "tip")),
+                    ("handle", ("handle", "hilt", "grip")),
+                    ("guard", ("guard", "crossguard", "support")),
+                    ("accessory/detail", ("acc", "accessory", "detail", "trim", "spike")),
+                    ("cloth", ("cloth", "cape", "fabric")),
+                    ("armor/body", ("armor", "plate", "body")),
+                )
+                for role, role_tokens in ordered_roles:
+                    if any(token in tokens for token in role_tokens):
+                        return role
+                return "unknown"
+
+            def _source_display_name(source_index: int) -> str:
+                if replacement_mesh_for_mapping is None:
+                    return f"source {source_index}"
+                if source_index < 0 or source_index >= len(replacement_mesh_for_mapping.submeshes):
+                    return f"{source_index}: invalid"
+                source = replacement_mesh_for_mapping.submeshes[source_index]
+                label = getattr(source, "material", "") or getattr(source, "name", "") or f"source {source_index}"
+                return f"{source_index}: {label}"
+
+            def _selected_source_summary(raw_text: str) -> tuple[str, bool]:
+                if replacement_mesh_for_mapping is None:
+                    return "No replacement mesh loaded.", False
+                parts = [part.strip() for part in re.split(r"[,;\s]+", raw_text or "") if part.strip()]
+                if not parts:
+                    return "Empty target: this original draw section will not emit replacement geometry.", True
+                names: List[str] = []
+                for part in parts:
+                    try:
+                        source_index = int(part)
+                    except ValueError:
+                        return f"Invalid source index: {part}", False
+                    if source_index < 0 or source_index >= len(replacement_mesh_for_mapping.submeshes):
+                        return f"Invalid source index: {source_index}", False
+                    source = replacement_mesh_for_mapping.submeshes[source_index]
+                    if _is_marker_source(source):
+                        return f"Source {source_index} is an anchor marker, not render geometry.", False
+                    names.append(_source_display_name(source_index))
+                return "Selected: " + " + ".join(names), True
+
+            def _refresh_static_dialog_preview() -> None:
+                if replacement_preview_model is not None:
+                    static_dialog_preview.set_model(replacement_preview_model)
+
+            try:
+                original_data, _decompressed, _note = read_archive_entry_data(entry)
+                original_mesh_for_mapping = parse_mesh(original_data, entry.path)
+                replacement_mesh_for_mapping = import_scene_mesh(obj_path)
+                original_dialog_preview.set_model(parsed_mesh_to_preview_model(original_mesh_for_mapping))
+                replacement_preview_model = parsed_mesh_to_preview_model(replacement_mesh_for_mapping)
+                static_dialog_preview.set_model(replacement_preview_model)
+                suggested_mappings = suggest_static_submesh_mappings(original_mesh_for_mapping, replacement_mesh_for_mapping)
+
+                mapping_group = QGroupBox("Submesh / Material Mapping")
+                mapping_layout = QVBoxLayout(mapping_group)
+                mapping_hint = QLabel(
+                    "Auto-suggest maps replacement OBJ parts into the original draw/material slots. "
+                    "Edit source indexes when the guess is wrong. Use commas to merge sources; leave blank to keep an original draw section empty. "
+                    "For randomly named assets, assign the source index from the list below to the intended original slot, such as blade or handle."
+                )
+                mapping_hint.setWordWrap(True)
+                mapping_hint.setObjectName("HintLabel")
+                mapping_layout.addWidget(mapping_hint)
+
+                source_lines: List[str] = []
+                for source_index, source in enumerate(replacement_mesh_for_mapping.submeshes):
+                    if _is_marker_source(source):
+                        continue
+                    label = getattr(source, "material", "") or getattr(source, "name", "") or f"source {source_index}"
+                    role_hint = _mapping_role_hint(f"{getattr(source, 'name', '')} {getattr(source, 'material', '')}")
+                    details = []
+                    if getattr(source, "name", "") and getattr(source, "name", "") != label:
+                        details.append(str(getattr(source, "name", "")))
+                    details.append(f"role: {role_hint}")
+                    details.append(f"{len(getattr(source, 'vertices', ()) or ()):,.0f} vertices")
+                    details.append(f"{len(getattr(source, 'faces', ()) or ()):,.0f} faces")
+                    source_lines.append(f"{source_index}: {label} ({', '.join(details)})")
+                source_label = QLabel("Replacement sources:\n" + "\n".join(source_lines))
+                source_label.setWordWrap(True)
+                source_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                source_label.setStyleSheet("color: #cbd5e1; font-family: Consolas, 'Courier New', monospace;")
+                mapping_layout.addWidget(source_label)
+
+                mapping_scroll = QScrollArea()
+                mapping_scroll.setWidgetResizable(True)
+                mapping_scroll.setMinimumHeight(140)
+                mapping_scroll.setMaximumHeight(260)
+                mapping_container = QWidget()
+                mapping_grid = QGridLayout(mapping_container)
+                mapping_grid.addWidget(QLabel("Original target draw/material slot"), 0, 0)
+                mapping_grid.addWidget(QLabel("Replacement source index(es)"), 0, 1)
+                mapping_grid.addWidget(QLabel("Selected source names"), 0, 2)
+                mapping_grid.addWidget(QLabel("Suggestion confidence"), 0, 3)
+                mappings_by_target = {mapping.target_submesh_index: mapping for mapping in suggested_mappings}
+                for row, target in enumerate(original_mesh_for_mapping.submeshes, start=1):
+                    target_label_text = getattr(target, "material", "") or getattr(target, "name", "") or f"target {row - 1}"
+                    target_role_hint = _mapping_role_hint(f"{getattr(target, 'name', '')} {getattr(target, 'material', '')}")
+                    target_details = (
+                        f"{row - 1}: {target_label_text}\n"
+                        f"role: {target_role_hint}\n"
+                        f"{len(getattr(target, 'vertices', ()) or ()):,.0f} vertices, "
+                        f"{len(getattr(target, 'faces', ()) or ()):,.0f} faces"
+                    )
+                    target_label = QLabel(target_details)
+                    target_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                    edit = QLineEdit()
+                    mapping = mappings_by_target.get(row - 1)
+                    if mapping is not None:
+                        edit.setText(", ".join(str(index) for index in mapping.source_submesh_indices))
+                    confidence_label_text = "manual"
+                    confidence_color = "#94a3b8"
+                    if mapping is not None and mapping.source_submesh_indices:
+                        confidence = str(getattr(mapping, "confidence_label", "") or "low").lower()
+                        confidence_score = float(getattr(mapping, "confidence_score", 0.0) or 0.0)
+                        confidence_label_text = f"{confidence.title()} ({confidence_score:.1f})"
+                        if confidence == "high":
+                            confidence_color = "#86efac"
+                        elif confidence == "medium":
+                            confidence_color = "#facc15"
+                        else:
+                            confidence_color = "#fb923c"
+                    elif mapping is not None:
+                        confidence_label_text = "Empty target"
+                        confidence_color = "#fb923c"
+                    confidence_label = QLabel(confidence_label_text)
+                    confidence_label.setToolTip(
+                        "Low confidence means the source name, size, or position did not strongly match this original slot. "
+                        "Override by typing the correct replacement source index."
+                    )
+                    confidence_label.setStyleSheet(f"color: {confidence_color}; font-weight: 600;")
+                    selected_text, selected_ok = _selected_source_summary(edit.text())
+                    selected_label = QLabel(selected_text)
+                    selected_label.setWordWrap(True)
+                    selected_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                    selected_label.setStyleSheet(
+                        "color: #cbd5e1;" if selected_ok else "color: #fca5a5; font-weight: 600;"
+                    )
+
+                    def _update_selected_source_label(
+                        text: str,
+                        *,
+                        label: QLabel = selected_label,
+                    ) -> None:
+                        summary, ok = _selected_source_summary(text)
+                        label.setText(summary)
+                        label.setStyleSheet(
+                            "color: #cbd5e1;" if ok else "color: #fca5a5; font-weight: 600;"
+                        )
+                        try:
+                            _refresh_static_dialog_preview()
+                        except NameError:
+                            pass
+
+                    edit.textChanged.connect(_update_selected_source_label)
+                    edit.setPlaceholderText("blank, 0, or 0, 1")
+                    edit.setToolTip(
+                        "Comma-separated replacement source indexes. Blank means this original draw section will be empty. "
+                        "Example: if source 6 is the blade, put 6 on the blade target row."
+                    )
+                    mapping_grid.addWidget(target_label, row, 0)
+                    mapping_grid.addWidget(edit, row, 1)
+                    mapping_grid.addWidget(selected_label, row, 2)
+                    mapping_grid.addWidget(confidence_label, row, 3)
+                    mapping_edits.append((row - 1, edit))
+                mapping_scroll.setWidget(mapping_container)
+                mapping_layout.addWidget(mapping_scroll)
+                layout.addWidget(mapping_group)
+
+                texture_files_for_mapping: List[Path] = []
+                seen_texture_file_keys: set[str] = set()
+                for source_path in tuple(supplemental_files or ()) + tuple(discover_scene_texture_files(obj_path, replacement_mesh_for_mapping)):
+                    resolved_source = source_path.expanduser().resolve()
+                    if not resolved_source.is_file() or resolved_source.suffix.lower() not in SCENE_TEXTURE_SOURCE_EXTENSIONS:
+                        continue
+                    key = str(resolved_source).lower()
+                    if key in seen_texture_file_keys:
+                        continue
+                    seen_texture_file_keys.add(key)
+                    texture_files_for_mapping.append(resolved_source)
+
+                def _ui_slot_kind(parameter_name: str, texture_path: str) -> str:
+                    text = f"{parameter_name} {texture_path}".lower()
+                    if "normal" in text or texture_path.lower().endswith("_n.dds"):
+                        return "normal"
+                    if any(token in text for token in ("height", "disp", "displacement")):
+                        return "height"
+                    if any(token in text for token in ("base", "diffuse", "albedo", "overlaycolor", "_o.dds")):
+                        return "base"
+                    return "material"
+
+                def _important_tokens(value: str) -> set[str]:
+                    return _semantic_tokens(value) & {
+                        "acc",
+                        "accessory",
+                        "blade",
+                        "body",
+                        "cape",
+                        "cloth",
+                        "edge",
+                        "guard",
+                        "handle",
+                        "helmet",
+                        "hilt",
+                        "plate",
+                        "trim",
+                    }
+
+                def _binding_matches_target(binding: object, target_name: str) -> bool:
+                    target_tokens = _important_tokens(target_name)
+                    path_tokens = _important_tokens(str(getattr(binding, "texture_path", "") or ""))
+                    submesh_tokens = _important_tokens(str(getattr(binding, "submesh_name", "") or ""))
+                    if path_tokens and target_tokens:
+                        return bool(path_tokens & target_tokens)
+                    if submesh_tokens and target_tokens:
+                        return bool(submesh_tokens & target_tokens)
+                    return False
+
+                def _best_source_for_slot(target_name: str, source_indices: Sequence[int], slot_kind: str, texture_sets_by_key: Mapping[str, object]) -> str:
+                    candidates: List[Path] = []
+                    for source_index in source_indices:
+                        if source_index < 0 or source_index >= len(replacement_mesh_for_mapping.submeshes):
+                            continue
+                        source_submesh = replacement_mesh_for_mapping.submeshes[source_index]
+                        material_key = str(getattr(source_submesh, "material", "") or getattr(source_submesh, "name", "") or "").strip().lower()
+                        texture_set = texture_sets_by_key.get(material_key)
+                        slot = getattr(texture_set, "slots", {}).get(slot_kind) if texture_set is not None else None
+                        source_path = getattr(slot, "source_path", None)
+                        if isinstance(source_path, Path):
+                            candidates.append(source_path)
+                    if candidates:
+                        return str(candidates[0])
+                    target_tokens = _semantic_tokens(target_name)
+                    best_path = ""
+                    best_score = 0.0
+                    for texture_set in texture_sets_by_key.values():
+                        slot = getattr(texture_set, "slots", {}).get(slot_kind)
+                        source_path = getattr(slot, "source_path", None)
+                        if not isinstance(source_path, Path):
+                            continue
+                        score = float(len(target_tokens & _semantic_tokens(str(getattr(texture_set, "material_name", "") or ""))) * 10)
+                        if "blade" in target_tokens and "cuchilla" in _semantic_tokens(str(getattr(texture_set, "material_name", "") or "")):
+                            score += 20.0
+                        if "handle" in target_tokens and "mango" in _semantic_tokens(str(getattr(texture_set, "material_name", "") or "")):
+                            score += 20.0
+                        if score > best_score:
+                            best_score = score
+                            best_path = str(source_path)
+                    return best_path if best_score >= 10.0 else ""
+
+                def _current_dialog_mappings_for_preview() -> List[StaticSubmeshMapping]:
+                    if not mapping_edits or original_mesh_for_mapping is None or replacement_mesh_for_mapping is None:
+                        return list(suggested_mappings or [])
+                    render_source_indices = {
+                        source_index
+                        for source_index, source in enumerate(replacement_mesh_for_mapping.submeshes)
+                        if not _is_marker_source(source)
+                    }
+                    parsed_mappings: List[StaticSubmeshMapping] = []
+                    for target_index, edit in mapping_edits:
+                        source_indices: List[int] = []
+                        for raw_part in re.split(r"[,;\s]+", edit.text().strip()):
+                            part = raw_part.strip()
+                            if not part:
+                                continue
+                            try:
+                                source_index = int(part)
+                            except ValueError:
+                                continue
+                            if source_index not in render_source_indices:
+                                continue
+                            if source_index not in source_indices:
+                                source_indices.append(source_index)
+                        target = original_mesh_for_mapping.submeshes[target_index]
+                        parsed_mappings.append(
+                            StaticSubmeshMapping(
+                                target_submesh_index=target_index,
+                                target_submesh_name=getattr(target, "material", "") or getattr(target, "name", "") or f"target {target_index}",
+                                source_submesh_indices=source_indices,
+                                target_material_slot_index=target_index,
+                                merge_sources=True,
+                            )
+                        )
+                    return parsed_mappings
+
+                def _preview_target_mesh_indices(
+                    preview_model: object,
+                    target_name: str,
+                    fallback_indices: Sequence[int],
+                    *,
+                    mapped_preview: bool,
+                    current_mappings: Sequence[StaticSubmeshMapping],
+                ) -> List[int]:
+                    meshes = list(getattr(preview_model, "meshes", ()) or ())
+                    if not mapped_preview:
+                        return [index for index in fallback_indices if 0 <= index < len(meshes)]
+                    target_key = str(target_name or "").strip().lower()
+                    target_tokens = _semantic_tokens(target_name)
+                    matched_indices: List[int] = []
+                    for mesh_index, mesh in enumerate(meshes):
+                        mesh_text = f"{getattr(mesh, 'name', '')} {getattr(mesh, 'material_name', '')}".strip()
+                        mesh_key = mesh_text.lower()
+                        if target_key and target_key in mesh_key:
+                            matched_indices.append(mesh_index)
+                            continue
+                        if target_tokens and (target_tokens & _semantic_tokens(mesh_text)):
+                            matched_indices.append(mesh_index)
+                    if matched_indices:
+                        return matched_indices
+                    return [
+                        mapping.target_submesh_index
+                        for mapping in current_mappings
+                        if mapping.target_submesh_name == target_name and 0 <= mapping.target_submesh_index < len(meshes)
+                    ]
+
+                def _refresh_static_dialog_preview() -> None:
+                    if replacement_preview_model is None:
+                        return
+                    current_mappings = _current_dialog_mappings_for_preview()
+                    mapped_preview = False
+                    if (
+                        preview_controls_ready.get("ready")
+                        and original_mesh_for_mapping is not None
+                        and replacement_mesh_for_mapping is not None
+                    ):
+                        try:
+                            preview_mesh = build_static_replacement_preview_mesh(
+                                original_mesh_for_mapping,
+                                replacement_mesh_for_mapping,
+                                StaticMeshReplacementOptions(
+                                    transform=StaticReplacementTransform(
+                                        rotate_xyz_degrees=(
+                                            float(rotate_x_spin.value()),
+                                            float(rotate_y_spin.value()),
+                                            float(rotate_z_spin.value()),
+                                        ),
+                                        scale=float(uniform_scale_spin.value()),
+                                        offset_xyz=(
+                                            float(offset_x_spin.value()),
+                                            float(offset_y_spin.value()),
+                                            float(offset_z_spin.value()),
+                                        ),
+                                        scale_to_original_length=bool(scale_to_length_checkbox.isChecked()),
+                                        alignment_mode=str(alignment_mode_combo.currentData() or "auto_fit_original"),
+                                        flip_target_axis=bool(flip_direction_checkbox.isChecked()),
+                                    ),
+                                    submesh_mappings=current_mappings,
+                                ),
+                            )
+                            source_model = parsed_mesh_to_preview_model(preview_mesh)
+                            mapped_preview = True
+                        except Exception:
+                            source_model = replacement_preview_model
+                    else:
+                        source_model = replacement_preview_model
+                    preview_model = dataclasses.replace(
+                        source_model,
+                        meshes=[
+                            dataclasses.replace(mesh)
+                            for mesh in getattr(source_model, "meshes", ()) or ()
+                        ],
+                    )
+                    def _source_preview_path(source_path_text: str) -> str:
+                        source = Path(source_path_text).expanduser()
+                        if source.suffix.lower() != ".dds":
+                            return str(source)
+                        texconv_text = self.texconv_path_edit.text().strip()
+                        if not texconv_text:
+                            return str(source)
+                        try:
+                            dds_info = parse_dds(source)
+                            return ensure_dds_display_preview_png(Path(texconv_text).expanduser(), source, dds_info=dds_info)
+                        except Exception:
+                            return str(source)
+
+                    for checkbox, combo, _target_path, slot_kind, target_name, source_indices in texture_override_rows:
+                        if not checkbox.isChecked():
+                            continue
+                        source_path = str(combo.currentData() or "").strip()
+                        if not source_path:
+                            continue
+                        preview_texture_path = _source_preview_path(source_path)
+                        target_mesh_indices = _preview_target_mesh_indices(
+                            preview_model,
+                            target_name,
+                            source_indices,
+                            mapped_preview=mapped_preview,
+                            current_mappings=current_mappings,
+                        )
+                        for source_index in target_mesh_indices:
+                            if source_index < 0 or source_index >= len(preview_model.meshes):
+                                continue
+                            mesh = preview_model.meshes[source_index]
+                            source_name = Path(source_path).name
+                            if slot_kind == "base":
+                                mesh.preview_texture_path = preview_texture_path
+                                mesh.texture_name = source_name
+                                mesh.preview_texture_flip_vertical = False
+                            elif slot_kind == "normal":
+                                mesh.preview_normal_texture_path = preview_texture_path
+                                mesh.preview_normal_texture_name = source_name
+                                mesh.preview_normal_texture_strength = 0.75
+                            elif slot_kind == "height":
+                                mesh.preview_height_texture_path = preview_texture_path
+                                mesh.preview_height_texture_name = source_name
+                            elif slot_kind == "material":
+                                semantic_type, semantic_subtype, _confidence, packed_channels = _resolve_model_texture_semantic_details(source_name)
+                                mesh.preview_material_texture_path = preview_texture_path
+                                mesh.preview_material_texture_name = source_name
+                                mesh.preview_material_texture_type = semantic_type
+                                mesh.preview_material_texture_subtype = semantic_subtype
+                                mesh.preview_material_texture_packed_channels = tuple(packed_channels)
+                    static_dialog_preview.set_model(preview_model)
+
+                if texture_files_for_mapping:
+                    texture_group = QGroupBox("Texture Slot Mapping")
+                    texture_layout = QVBoxLayout(texture_group)
+                    texture_hint = QLabel(
+                        "Choose which selected PNG/DDS replaces each original texture slot. "
+                        "Only slots for original draw sections that currently receive replacement geometry are listed. "
+                        "Leave a row unchecked to let auto mapping decide or keep the original slot."
+                    )
+                    texture_hint.setWordWrap(True)
+                    texture_hint.setObjectName("HintLabel")
+                    texture_layout.addWidget(texture_hint)
+                    try:
+                        sidecar_bindings, _sidecar_paths, _texts_by_path, _texts_by_name = _extract_archive_model_sidecar_texture_references(
+                            entry,
+                            archive_entries_by_basename=dict(self.archive_entries_by_basename),
+                        )
+                    except Exception:
+                        sidecar_bindings = ()
+                    texture_sets = group_replacement_texture_sets(texture_files_for_mapping, obj_mesh=replacement_mesh_for_mapping)
+                    texture_scroll = QScrollArea()
+                    texture_scroll.setWidgetResizable(True)
+                    texture_scroll.setMinimumHeight(180)
+                    texture_scroll.setMaximumHeight(340)
+                    texture_container = QWidget()
+                    texture_grid = QGridLayout(texture_container)
+                    texture_grid.addWidget(QLabel("Use"), 0, 0)
+                    texture_grid.addWidget(QLabel("Original slot"), 0, 1)
+                    texture_grid.addWidget(QLabel("Shader parameter"), 0, 2)
+                    texture_grid.addWidget(QLabel("Current DDS"), 0, 3)
+                    texture_grid.addWidget(QLabel("Replacement source"), 0, 4)
+                    active_mappings = [mapping for mapping in suggested_mappings if mapping.source_submesh_indices]
+                    seen_texture_rows: set[tuple[str, str]] = set()
+                    row_index = 1
+                    for mapping in active_mappings:
+                        for binding in sidecar_bindings:
+                            target_path = str(getattr(binding, "texture_path", "") or "").replace("\\", "/").strip()
+                            if not target_path.lower().endswith(".dds"):
+                                continue
+                            if not _binding_matches_target(binding, mapping.target_submesh_name):
+                                continue
+                            parameter_name = str(getattr(binding, "parameter_name", "") or "").strip()
+                            slot_kind = _ui_slot_kind(parameter_name, target_path)
+                            row_key = (target_path.lower(), slot_kind)
+                            if row_key in seen_texture_rows:
+                                continue
+                            seen_texture_rows.add(row_key)
+                            checkbox = QCheckBox()
+                            combo = QComboBox()
+                            combo.addItem("Auto / keep original", "")
+                            for texture_file in texture_files_for_mapping:
+                                combo.addItem(texture_file.name, str(texture_file))
+                            suggested_source = _best_source_for_slot(
+                                mapping.target_submesh_name,
+                                mapping.source_submesh_indices,
+                                slot_kind,
+                                texture_sets,
+                            )
+                            if suggested_source:
+                                source_index = combo.findData(suggested_source)
+                                if source_index >= 0:
+                                    combo.setCurrentIndex(source_index)
+                                    checkbox.setChecked(True)
+                            def _texture_combo_changed(
+                                _index: int,
+                                *,
+                                checkbox: QCheckBox = checkbox,
+                                combo: QComboBox = combo,
+                            ) -> None:
+                                if str(combo.currentData() or "").strip():
+                                    checkbox.setChecked(True)
+                                _refresh_static_dialog_preview()
+
+                            combo.currentIndexChanged.connect(_texture_combo_changed)
+                            checkbox.toggled.connect(lambda _checked: _refresh_static_dialog_preview())
+                            texture_grid.addWidget(checkbox, row_index, 0)
+                            texture_grid.addWidget(QLabel(mapping.target_submesh_name), row_index, 1)
+                            texture_grid.addWidget(QLabel(parameter_name or slot_kind), row_index, 2)
+                            texture_grid.addWidget(QLabel(PurePosixPath(target_path).name), row_index, 3)
+                            texture_grid.addWidget(combo, row_index, 4)
+                            texture_override_rows.append(
+                                (
+                                    checkbox,
+                                    combo,
+                                    target_path,
+                                    slot_kind,
+                                    mapping.target_submesh_name,
+                                    tuple(mapping.source_submesh_indices),
+                                )
+                            )
+                            row_index += 1
+                    if row_index == 1:
+                        texture_layout.addWidget(
+                            QLabel("No editable texture slots were found for the currently suggested replacement mapping.")
+                        )
+                    else:
+                        texture_scroll.setWidget(texture_container)
+                        texture_layout.addWidget(texture_scroll)
+                    layout.addWidget(texture_group)
+                    _refresh_static_dialog_preview()
+            except Exception as exc:
+                mapping_warning = QLabel(
+                    f"Submesh mapping could not be prepared automatically. Static replacement can still continue with built-in suggestions.\n{exc}"
+                )
+                mapping_warning.setWordWrap(True)
+                mapping_warning.setStyleSheet("color: #fdd663;")
+                layout.addWidget(mapping_warning)
+
+            form = QGridLayout()
+            layout.addLayout(form)
+
+            alignment_mode_combo = QComboBox()
+            alignment_mode_combo.addItem("Auto: preserve original placement", "auto_fit_original")
+            alignment_mode_combo.addItem("Auto: handheld/grip anchor", "auto_anchor")
+            alignment_mode_combo.addItem("Manual only", "manual")
+            alignment_mode_combo.setToolTip(
+                "Preserve original placement aligns bbox centers and dominant axes, which is the safest generic fallback. "
+                "Handheld/grip anchor tries to place the grip/root point and is better for weapons when the handle is detected."
+            )
+            form.addWidget(QLabel("Alignment mode"), 0, 0)
+            form.addWidget(alignment_mode_combo, 0, 1)
+
+            scale_to_length_checkbox = QCheckBox("Scale replacement to original asset length")
+            scale_to_length_checkbox.setChecked(True)
+            scale_to_length_checkbox.setToolTip(
+                "When checked, the replacement length is multiplied by the shown Auto length scale. Disable it to keep the imported model size."
+            )
+            flip_direction_checkbox = QCheckBox("Flip direction 180")
+            flip_direction_checkbox.setToolTip("Use this when the replacement is positioned correctly but points the opposite way.")
+            rebuild_sidecar_checkbox = QCheckBox("Rebuild/patch .pac_xml from rebuilt PAC draw sections")
+            rebuild_sidecar_checkbox.setChecked(True)
+            rebuild_sidecar_checkbox.setToolTip(
+                "Recommended for static replacement. The app clones the original material sidecar, "
+                "patches only rebuilt draw sections with geometry, and packages the patched .pac_xml automatically."
+            )
+            inject_base_color_checkbox = QCheckBox("Risky: inject missing base/overlay color parameter")
+            inject_base_color_checkbox.setChecked(False)
+            inject_base_color_checkbox.setToolTip(
+                "Use this when a target material has a Base_Color PNG but the original sidecar has no base/overlay color texture slot. "
+                "This writes a patched .pac_xml and can make some shaders render untextured, so leave it off unless you are testing material injection."
+            )
+            form.addWidget(scale_to_length_checkbox, 1, 0, 1, 2)
+            form.addWidget(flip_direction_checkbox, 2, 0, 1, 2)
+            form.addWidget(rebuild_sidecar_checkbox, 3, 0, 1, 2)
+            form.addWidget(inject_base_color_checkbox, 4, 0, 1, 2)
+
+            def _double_spin(
+                *,
+                value: float,
+                minimum: float,
+                maximum: float,
+                decimals: int,
+                step: float,
+                suffix: str = "",
+            ) -> QDoubleSpinBox:
+                spin = QDoubleSpinBox()
+                spin.setRange(minimum, maximum)
+                spin.setDecimals(decimals)
+                spin.setSingleStep(step)
+                spin.setValue(value)
+                if suffix:
+                    spin.setSuffix(suffix)
+                return spin
+
+            uniform_scale_spin = _double_spin(value=1.0, minimum=0.001, maximum=100.0, decimals=4, step=0.05)
+            form.addWidget(QLabel("Manual uniform scale"), 5, 0)
+            form.addWidget(uniform_scale_spin, 5, 1)
+            scale_hint = QLabel(
+                "Start at 1.0000. Increase if the replacement is too small; decrease if it is too large. "
+                "This is applied in addition to Auto length scale when that checkbox is enabled."
+            )
+            scale_hint.setWordWrap(True)
+            scale_hint.setObjectName("HintLabel")
+            form.addWidget(scale_hint, 6, 0, 1, 2)
+
+            offset_group = QGroupBox("Manual Anchor Offset")
+            offset_layout = QGridLayout(offset_group)
+            offset_x_spin = _double_spin(value=0.0, minimum=-10.0, maximum=10.0, decimals=5, step=0.005)
+            offset_y_spin = _double_spin(value=0.0, minimum=-10.0, maximum=10.0, decimals=5, step=0.005)
+            offset_z_spin = _double_spin(value=0.0, minimum=-10.0, maximum=10.0, decimals=5, step=0.005)
+            offset_layout.addWidget(QLabel("X"), 0, 0)
+            offset_layout.addWidget(offset_x_spin, 0, 1)
+            offset_layout.addWidget(QLabel("Y"), 1, 0)
+            offset_layout.addWidget(offset_y_spin, 1, 1)
+            offset_layout.addWidget(QLabel("Z"), 2, 0)
+            offset_layout.addWidget(offset_z_spin, 2, 1)
+            offset_hint = QLabel(
+                "Use small values first, for example 0.005 or -0.005. "
+                "X/Y/Z are in the original asset coordinate space shown above."
+            )
+            offset_hint.setWordWrap(True)
+            offset_hint.setObjectName("HintLabel")
+            offset_layout.addWidget(offset_hint, 3, 0, 1, 2)
+            layout.addWidget(offset_group)
+
+            rotation_group = QGroupBox("Manual Rotation")
+            rotation_layout = QGridLayout(rotation_group)
+            rotate_x_spin = _double_spin(value=0.0, minimum=-360.0, maximum=360.0, decimals=2, step=5.0, suffix=" deg")
+            rotate_y_spin = _double_spin(value=0.0, minimum=-360.0, maximum=360.0, decimals=2, step=5.0, suffix=" deg")
+            rotate_z_spin = _double_spin(value=0.0, minimum=-360.0, maximum=360.0, decimals=2, step=5.0, suffix=" deg")
+            rotation_layout.addWidget(QLabel("X"), 0, 0)
+            rotation_layout.addWidget(rotate_x_spin, 0, 1)
+            rotation_layout.addWidget(QLabel("Y"), 1, 0)
+            rotation_layout.addWidget(rotate_y_spin, 1, 1)
+            rotation_layout.addWidget(QLabel("Z"), 2, 0)
+            rotation_layout.addWidget(rotate_z_spin, 2, 1)
+            rotation_hint = QLabel(
+                "Use Flip Direction 180 for a fully backwards asset. Use manual rotation for smaller tilt/roll corrections."
+            )
+            rotation_hint.setWordWrap(True)
+            rotation_hint.setObjectName("HintLabel")
+            rotation_layout.addWidget(rotation_hint, 3, 0, 1, 2)
+            layout.addWidget(rotation_group)
+
+            def _queue_static_preview_refresh(*_args: object) -> None:
+                _refresh_static_dialog_preview()
+
+            for spin in (
+                uniform_scale_spin,
+                offset_x_spin,
+                offset_y_spin,
+                offset_z_spin,
+                rotate_x_spin,
+                rotate_y_spin,
+                rotate_z_spin,
+            ):
+                spin.valueChanged.connect(_queue_static_preview_refresh)
+            alignment_mode_combo.currentIndexChanged.connect(_queue_static_preview_refresh)
+            scale_to_length_checkbox.toggled.connect(_queue_static_preview_refresh)
+            flip_direction_checkbox.toggled.connect(_queue_static_preview_refresh)
+            preview_controls_ready["ready"] = True
+            _refresh_static_dialog_preview()
+
+            buttons = QHBoxLayout()
+            buttons.addStretch(1)
+            cancel_button = QPushButton("Cancel")
+            import_button = QPushButton("Continue")
+            import_button.setDefault(True)
+            buttons.addWidget(cancel_button)
+            buttons.addWidget(import_button)
+            layout.addLayout(buttons)
+            cancel_button.clicked.connect(dialog.reject)
+
+            def _accept_static_options() -> None:
+                if mapping_edits and original_mesh_for_mapping is not None and replacement_mesh_for_mapping is not None:
+                    render_source_indices = {
+                        source_index
+                        for source_index, source in enumerate(replacement_mesh_for_mapping.submeshes)
+                        if not _is_marker_source(source)
+                    }
+                    parsed_mappings: List[StaticSubmeshMapping] = []
+                    for target_index, edit in mapping_edits:
+                        raw_text = edit.text().strip()
+                        source_indices: List[int] = []
+                        if raw_text:
+                            for raw_part in re.split(r"[,;\s]+", raw_text):
+                                part = raw_part.strip()
+                                if not part:
+                                    continue
+                                try:
+                                    source_index = int(part)
+                                except ValueError:
+                                    QMessageBox.warning(
+                                        dialog,
+                                        "Invalid Submesh Mapping",
+                                        f"Target {target_index} contains a non-numeric source index: {part}",
+                                    )
+                                    return
+                                if source_index not in render_source_indices:
+                                    QMessageBox.warning(
+                                        dialog,
+                                        "Invalid Submesh Mapping",
+                                        f"Target {target_index} references source index {source_index}, but that source does not exist or is an anchor marker.",
+                                    )
+                                    return
+                                if source_index not in source_indices:
+                                    source_indices.append(source_index)
+                        target = original_mesh_for_mapping.submeshes[target_index]
+                        parsed_mappings.append(
+                            StaticSubmeshMapping(
+                                target_submesh_index=target_index,
+                                target_submesh_name=getattr(target, "material", "") or getattr(target, "name", "") or f"target {target_index}",
+                                source_submesh_indices=source_indices,
+                                target_material_slot_index=target_index,
+                                merge_sources=True,
+                            )
+                        )
+                    dialog._static_mappings = parsed_mappings  # type: ignore[attr-defined]
+                dialog.accept()
+
+            import_button.clicked.connect(_accept_static_options)
+
+            if dialog.exec() != QDialog.Accepted:
+                return None
+
+            selected_mappings = getattr(dialog, "_static_mappings", suggested_mappings)
+            texture_slot_overrides: List[StaticTextureSlotOverride] = []
+            for checkbox, combo, target_texture_path, slot_kind, target_material_name, _source_indices in texture_override_rows:
+                source_path = str(combo.currentData() or "").strip()
+                if not checkbox.isChecked() or not source_path:
+                    continue
+                texture_slot_overrides.append(
+                    StaticTextureSlotOverride(
+                        target_texture_path=target_texture_path,
+                        source_path=source_path,
+                        slot_kind=slot_kind,
+                        target_material_name=target_material_name,
+                        enabled=True,
+                    )
+                )
+            return StaticMeshReplacementOptions(
+                transform=StaticReplacementTransform(
+                    rotate_xyz_degrees=(
+                        float(rotate_x_spin.value()),
+                        float(rotate_y_spin.value()),
+                        float(rotate_z_spin.value()),
+                    ),
+                    scale=float(uniform_scale_spin.value()),
+                    offset_xyz=(
+                        float(offset_x_spin.value()),
+                        float(offset_y_spin.value()),
+                        float(offset_z_spin.value()),
+                    ),
+                    scale_to_original_length=bool(scale_to_length_checkbox.isChecked()),
+                    alignment_mode=str(alignment_mode_combo.currentData() or "auto_fit_original"),
+                    flip_target_axis=bool(flip_direction_checkbox.isChecked()),
+                ),
+                submesh_mappings=list(selected_mappings or []),
+                rebuild_material_sidecar=bool(rebuild_sidecar_checkbox.isChecked()),
+                enable_missing_base_color_parameters=bool(inject_base_color_checkbox.isChecked()),
+                texture_slot_overrides=texture_slot_overrides,
             )
 
         def _start_archive_mesh_import_preview(self, entry: ArchiveEntry) -> None:
-            obj_path, _selected = QFileDialog.getOpenFileName(
+            scene_path, _selected = QFileDialog.getOpenFileName(
                 self,
-                "Select OBJ File",
+                "Select Mesh File",
                 str(self.settings_file_path.parent),
-                "Wavefront OBJ (*.obj)",
+                "Mesh Files (*.obj *.dae);;Wavefront OBJ (*.obj);;Collada DAE (*.dae)",
             )
-            if not obj_path:
+            if not scene_path:
                 return
+            if Path(scene_path).suffix.lower() == ".obj":
+                import_mode = self._prompt_archive_mesh_import_mode()
+                if import_mode is None:
+                    return
+            else:
+                import_mode = "static_replacement"
+                self.append_archive_log("DAE imports use Static Mesh Replacement mode.")
+            static_replacement_options: Optional[StaticMeshReplacementOptions] = None
             supplemental_files = self._prompt_archive_mesh_import_supplemental_files(
                 entry,
-                title="Select Supplemental Files For OBJ Preview",
+                title="Select Supplemental Files For Mesh Preview",
             )
             if supplemental_files is None:
                 return
+            if import_mode == "static_replacement":
+                static_replacement_options = self._prompt_archive_static_replacement_options(
+                    entry,
+                    Path(scene_path),
+                    supplemental_files=supplemental_files,
+                )
+                if static_replacement_options is None:
+                    return
             texconv_text = self.texconv_path_edit.text().strip()
 
             def _task(log: Callable[[str], None]) -> MeshImportPreviewResult:
-                log(f"Rebuilding {entry.path} from {Path(obj_path).name}...")
+                log(f"Rebuilding {entry.path} from {Path(scene_path).name}...")
+                preview_settings = self._current_model_preview_render_settings()
                 return build_mesh_import_preview(
                     entry,
-                    Path(obj_path),
+                    Path(scene_path),
+                    import_mode=import_mode,
+                    static_replacement_options=static_replacement_options,
                     archive_entries_by_normalized_path=self.archive_entries_by_normalized_path,
                     texconv_path=(Path(texconv_text).expanduser() if texconv_text else None),
                     texture_entries_by_normalized_path=self.archive_entries_by_normalized_path,
                     texture_entries_by_basename=self.archive_entries_by_basename,
+                    visible_texture_mode=preview_settings.visible_texture_mode,
                     supplemental_files=supplemental_files,
                 )
 
@@ -9791,186 +12946,173 @@ def run_gui() -> int:
             )
 
         def _start_archive_mesh_patch(self, entry: ArchiveEntry) -> None:
-            obj_path, _selected = QFileDialog.getOpenFileName(
+            scene_path, _selected = QFileDialog.getOpenFileName(
                 self,
-                "Select OBJ File",
+                "Select Mesh File",
                 str(self.settings_file_path.parent),
-                "Wavefront OBJ (*.obj)",
+                "Mesh Files (*.obj *.dae);;Wavefront OBJ (*.obj);;Collada DAE (*.dae)",
             )
-            if not obj_path:
+            if not scene_path:
                 return
+            if Path(scene_path).suffix.lower() == ".obj":
+                import_mode = self._prompt_archive_mesh_import_mode()
+                if import_mode is None:
+                    return
+            else:
+                import_mode = "static_replacement"
+                self.append_archive_log("DAE imports use Static Mesh Replacement mode.")
+            static_replacement_options: Optional[StaticMeshReplacementOptions] = None
 
-            destination = self._choose_archive_write_target(
-                title="Import OBJ",
-                message=f"Import {Path(obj_path).name} for {entry.path}?",
-                allow_archive_patch=True,
-            )
-            if not destination:
-                return
+            destination = "loose"
 
             supplemental_files = self._prompt_archive_mesh_import_supplemental_files(
                 entry,
-                title="Select Supplemental Files For OBJ Import",
+                title="Select Supplemental Files For Mesh Import",
             )
             if supplemental_files is None:
                 return
-
-            if destination == "patch":
-                confirmation = QMessageBox.question(
-                    self,
-                    "Patch Mesh To Game",
-                    (
-                        f"Patch {entry.path} using {Path(obj_path).name}?\n\n"
-                        "A backup of the touched archive files will be created before anything is written."
-                    ),
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
+            if import_mode == "static_replacement":
+                static_replacement_options = self._prompt_archive_static_replacement_options(
+                    entry,
+                    Path(scene_path),
+                    supplemental_files=supplemental_files,
                 )
-                if confirmation != QMessageBox.Yes:
+                if static_replacement_options is None:
                     return
 
             loose_export_settings: Optional[Tuple[Path, ModPackageInfo, bool, bool]] = None
             selected_related_entries: Tuple[ArchiveEntry, ...] = ()
-            if destination == "loose":
-                loose_export_settings = self._collect_archive_mod_ready_export_target(
-                    browse_title="Select Mod-Ready Export Parent Root",
-                    prompt_for_metadata=True,
-                    initial_include_related_files=False,
-                    show_include_related_files_option=False,
-                    dialog_title="Mesh Loose Export Metadata",
-                )
-                if loose_export_settings is None:
-                    return
-                selected_related_entries_result = self._prompt_archive_mesh_related_file_selection(
-                    entry,
-                    title="Include Referenced Files In Loose Package",
-                    intro_text=(
-                        "Select which resolved referenced files should be copied into the mod-ready loose package together with the rebuilt mesh. "
-                        "Leave everything unchecked if you only want the rebuilt mesh payload."
-                    ),
-                    confirm_button_text="Continue",
-                )
-                if selected_related_entries_result is None:
-                    return
-                selected_related_entries = selected_related_entries_result
+            loose_export_settings = self._collect_archive_mod_ready_export_target(
+                browse_title="Select Mod-Ready Export Parent Root",
+                prompt_for_metadata=True,
+                initial_include_related_files=False,
+                show_include_related_files_option=False,
+                dialog_title="Mesh Loose Export Metadata",
+            )
+            if loose_export_settings is None:
+                return
 
             paired_entry = None
             if entry.extension == ".pam":
                 paired_entry = self._find_archive_entry_by_virtual_path(str(PurePosixPath(entry.path).with_suffix(".pamlod")))
             texconv_text = self.texconv_path_edit.text().strip()
 
-            def _task(log: Callable[[str], None]) -> object:
-                log(f"Rebuilding {entry.path} from {Path(obj_path).name}...")
-                preview_result = build_mesh_import_preview(
+            def _preview_task(log: Callable[[str], None]) -> MeshImportPreviewResult:
+                log(f"Rebuilding {entry.path} from {Path(scene_path).name}...")
+                preview_settings = self._current_model_preview_render_settings()
+                return build_mesh_import_preview(
                     entry,
-                    Path(obj_path),
+                    Path(scene_path),
+                    import_mode=import_mode,
+                    static_replacement_options=static_replacement_options,
                     archive_entries_by_normalized_path=self.archive_entries_by_normalized_path,
                     texconv_path=(Path(texconv_text).expanduser() if texconv_text else None),
                     texture_entries_by_normalized_path=self.archive_entries_by_normalized_path,
                     texture_entries_by_basename=self.archive_entries_by_basename,
+                    visible_texture_mode=preview_settings.visible_texture_mode,
                     supplemental_files=supplemental_files,
                 )
-                request_by_normalized_path: dict[str, ArchivePatchRequest] = {
-                    entry.path.replace("\\", "/").strip().lower(): ArchivePatchRequest(
-                        entry=entry,
-                        payload_data=preview_result.rebuilt_data,
+            def _start_commit(preview_result: MeshImportPreviewResult) -> None:
+                def _commit_task(log: Callable[[str], None]) -> object:
+                    request_by_normalized_path: dict[str, ArchivePatchRequest] = {
+                        entry.path.replace("\\", "/").strip().lower(): ArchivePatchRequest(
+                            entry=entry,
+                            payload_data=preview_result.rebuilt_data,
+                        )
+                    }
+                    if paired_entry is not None and preview_result.paired_lod_data is not None:
+                        request_by_normalized_path[paired_entry.path.replace("\\", "/").strip().lower()] = ArchivePatchRequest(
+                            entry=paired_entry,
+                            payload_data=preview_result.paired_lod_data,
+                        )
+                    skipped_supplemental_specs = 0
+                    if destination == "patch":
+                        for spec in preview_result.supplemental_file_specs:
+                            if not isinstance(spec.target_entry, ArchiveEntry):
+                                skipped_supplemental_specs += 1
+                                continue
+                            request_by_normalized_path[spec.target_entry.path.replace("\\", "/").strip().lower()] = ArchivePatchRequest(
+                                entry=spec.target_entry,
+                                payload_data=spec.source_path.read_bytes(),
+                            )
+                    requests = list(request_by_normalized_path.values())
+                    if skipped_supplemental_specs > 0:
+                        log(
+                            f"Skipping {skipped_supplemental_specs} selected supplemental file(s) that could not be mapped to an archive patch target."
+                        )
+                    if loose_export_settings is None:
+                        raise RuntimeError("Mod-ready export target is not available.")
+                    parent_root, package_info, create_no_encrypt, include_related_files = loose_export_settings
+                    log(f"Writing {len(requests)} rebuilt entrie(s) into a mod-ready loose package...")
+                    loose_result = export_archive_mesh_payloads_to_mod_ready_loose(
+                        requests,
+                        primary_entry=entry,
+                        preview_result=preview_result,
+                        source_obj_path=Path(scene_path),
+                        parent_root=parent_root,
+                        package_info=package_info,
+                        create_no_encrypt_file=create_no_encrypt,
+                        include_related_files=include_related_files,
+                        related_entries_to_include=selected_related_entries,
+                        supplemental_files_to_include=preview_result.supplemental_file_specs,
+                        on_log=log,
                     )
-                }
-                if paired_entry is not None and preview_result.paired_lod_data is not None:
-                    request_by_normalized_path[paired_entry.path.replace("\\", "/").strip().lower()] = ArchivePatchRequest(
-                        entry=paired_entry,
-                        payload_data=preview_result.paired_lod_data,
-                    )
-                skipped_supplemental_specs = 0
-                for spec in preview_result.supplemental_file_specs:
-                    if not isinstance(spec.target_entry, ArchiveEntry):
-                        skipped_supplemental_specs += 1
-                        continue
-                    request_by_normalized_path[spec.target_entry.path.replace("\\", "/").strip().lower()] = ArchivePatchRequest(
-                        entry=spec.target_entry,
-                        payload_data=spec.source_path.read_bytes(),
-                    )
-                requests = list(request_by_normalized_path.values())
-                if skipped_supplemental_specs > 0:
-                    log(
-                        f"Skipping {skipped_supplemental_specs} selected supplemental file(s) that could not be mapped to an archive patch target."
-                    )
-                if destination == "patch":
-                    log(f"Patching {len(requests)} archive entrie(s) back into the game files...")
-                    patch_result = patch_archive_entries(requests, on_log=log)
                     return {
                         "preview": preview_result,
-                        "patch": patch_result,
+                        "loose": loose_result,
                     }
-                if loose_export_settings is None:
-                    raise RuntimeError("Mod-ready export target is not available.")
-                parent_root, package_info, create_no_encrypt, include_related_files = loose_export_settings
-                log(f"Writing {len(requests)} rebuilt entrie(s) into a mod-ready loose package...")
-                loose_result = export_archive_mesh_payloads_to_mod_ready_loose(
-                    requests,
-                    primary_entry=entry,
-                    preview_result=preview_result,
-                    source_obj_path=Path(obj_path),
-                    parent_root=parent_root,
-                    package_info=package_info,
-                    create_no_encrypt_file=create_no_encrypt,
-                    include_related_files=include_related_files,
-                    related_entries_to_include=selected_related_entries,
-                    supplemental_files_to_include=preview_result.supplemental_file_specs,
-                    on_log=log,
-                )
-                return {
-                    "preview": preview_result,
-                    "loose": loose_result,
-                }
 
-            def _handle_complete(result: object) -> None:
-                if not isinstance(result, dict):
-                    self.set_status_message("Mesh import finished with an unexpected result payload.", error=True)
-                    return
-                preview_result = result.get("preview")
-                patch_result = result.get("patch")
-                loose_result = result.get("loose")
-                if not isinstance(preview_result, MeshImportPreviewResult):
-                    self.set_status_message("Mesh import finished with an incomplete result payload.", error=True)
-                    return
-                if destination == "patch":
-                    if not isinstance(patch_result, ArchivePatchResult):
-                        self.set_status_message("Mesh patch finished with an incomplete result payload.", error=True)
+                def _handle_commit_complete(result: object) -> None:
+                    if not isinstance(result, dict):
+                        self.set_status_message("Mesh import finished with an unexpected result payload.", error=True)
                         return
-                    self._apply_archive_patch_result(patch_result)
-                    self._show_archive_import_preview(entry, preview_result, patched=True, backup_dir=patch_result.backup_dir)
+                    preview_payload = result.get("preview")
+                    loose_result = result.get("loose")
+                    if not isinstance(preview_payload, MeshImportPreviewResult):
+                        self.set_status_message("Mesh import finished with an incomplete result payload.", error=True)
+                        return
+                    if not isinstance(loose_result, ArchiveLooseExportResult):
+                        self.set_status_message("Mesh loose export finished with an incomplete result payload.", error=True)
+                        return
+                    self._show_archive_import_preview(
+                        entry,
+                        preview_payload,
+                        patched=False,
+                        loose_package_root=loose_result.package_root,
+                    )
                     QMessageBox.information(
                         self,
-                        "Patch Complete",
-                        f"Patched {entry.path}\n\nBackup: {patch_result.backup_dir}",
+                        "Loose Export Complete",
+                        f"Wrote rebuilt mesh payload(s) into:\n{loose_result.package_root}",
                     )
-                    self.set_status_message(f"Patched {entry.basename} to the game archives.")
+                    self.set_status_message(f"Wrote rebuilt {entry.basename} into a mod-ready loose package.")
+
+                self._run_utility_task_when_idle(
+                    status_message=f"Writing {entry.basename} into a mod-ready loose package...",
+                    task=_commit_task,
+                    on_complete=_handle_commit_complete,
+                    show_archive_progress=True,
+                )
+
+            def _handle_preview_complete(result: object) -> None:
+                if not isinstance(result, MeshImportPreviewResult):
+                    self.set_status_message("Mesh import preview finished with an unexpected result payload.", error=True)
                     return
-                if not isinstance(loose_result, ArchiveLooseExportResult):
-                    self.set_status_message("Mesh loose export finished with an incomplete result payload.", error=True)
-                    return
-                self._show_archive_import_preview(
+                self._show_archive_import_preview(entry, result, patched=False)
+                if not self._confirm_archive_mesh_import_commit(
                     entry,
-                    preview_result,
-                    patched=False,
-                    loose_package_root=loose_result.package_root,
-                )
-                QMessageBox.information(
-                    self,
-                    "Loose Export Complete",
-                    f"Wrote rebuilt mesh payload(s) into:\n{loose_result.package_root}",
-                )
-                self.set_status_message(f"Wrote rebuilt {entry.basename} into a mod-ready loose package.")
+                    result,
+                    destination=destination,
+                    source_obj_path=Path(scene_path),
+                ):
+                    self.set_status_message("Mesh import cancelled after validation review.")
+                    return
+                _start_commit(result)
 
             self._run_utility_task(
-                status_message=(
-                    f"Patching {entry.basename} into the game archives..."
-                    if destination == "patch"
-                    else f"Writing {entry.basename} into a mod-ready loose package..."
-                ),
-                task=_task,
-                on_complete=_handle_complete,
+                status_message=f"Rebuilding mesh preview for {entry.basename}...",
+                task=_preview_task,
+                on_complete=_handle_preview_complete,
                 show_archive_progress=True,
             )
 
@@ -10167,6 +13309,13 @@ def run_gui() -> int:
                 return
             self._start_archive_mesh_import_preview(current_entry)
 
+        def _preview_current_archive_mesh_dds_import(self) -> None:
+            current_entry = self._current_archive_mesh_entry()
+            if current_entry is None:
+                self.set_status_message("Select a supported archive mesh before previewing an imported DDS.", error=True)
+                return
+            self._start_archive_mesh_dds_import_preview(current_entry)
+
         def _patch_current_archive_mesh_from_obj(self) -> None:
             current_entry = self._current_archive_mesh_entry()
             if current_entry is None:
@@ -10174,7 +13323,130 @@ def run_gui() -> int:
                 return
             self._start_archive_mesh_patch(current_entry)
 
-        def _show_archive_preview_result(self, result: ArchivePreviewResult, *, use_loose: bool) -> None:
+        @staticmethod
+        def _split_archive_detail_blocks(detail_text: str) -> Tuple[List[str], List[str], str, str]:
+            text = str(detail_text or "").strip()
+            if not text:
+                return [], [], "", ""
+
+            lines = text.splitlines()
+            metadata_prefixes = (
+                "Path:",
+                "Package:",
+                "PAMT:",
+                "PAZ:",
+                "Offset:",
+                "Original size:",
+                "Stored size:",
+                "Compression:",
+                "Encrypted:",
+            )
+            metadata_lines: List[str] = []
+            line_index = 0
+            while line_index < len(lines):
+                current_line = lines[line_index].strip()
+                if not current_line:
+                    line_index += 1
+                    if metadata_lines:
+                        break
+                    continue
+                if any(current_line.startswith(prefix) for prefix in metadata_prefixes):
+                    metadata_lines.append(current_line)
+                    line_index += 1
+                    continue
+                break
+
+            remainder = "\n".join(lines[line_index:]).strip()
+            note_blocks: List[str] = []
+            readable_strings_block = ""
+            binary_header_block = ""
+            if remainder:
+                for block in re.split(r"\n\s*\n", remainder):
+                    normalized_block = block.strip()
+                    if not normalized_block:
+                        continue
+                    if normalized_block.startswith("Binary header preview:"):
+                        binary_header_block = normalized_block.partition(":")[2].strip() or normalized_block
+                        continue
+                    if normalized_block.startswith("Readable strings from") or normalized_block.startswith("Readable strings:"):
+                        readable_strings_block = normalized_block
+                        continue
+                    if normalized_block.startswith("String scan truncated") and readable_strings_block:
+                        readable_strings_block = f"{readable_strings_block}\n\n{normalized_block}".strip()
+                        continue
+                    note_blocks.append(normalized_block)
+            return metadata_lines, note_blocks, readable_strings_block, binary_header_block
+
+        @classmethod
+        def _compose_model_preview_detail_text(cls, base_detail_text: str, debug_details_text: str) -> str:
+            base_text = str(base_detail_text or "").strip()
+            debug_text = str(debug_details_text or "").strip()
+            metadata_lines, note_blocks, readable_strings_block, binary_header_block = cls._split_archive_detail_blocks(
+                base_text
+            )
+
+            sections: List[Tuple[str, str]] = []
+            if metadata_lines:
+                sections.append(("Entry Metadata", "\n".join(metadata_lines)))
+
+            note_text = "\n\n".join(block for block in note_blocks if block.strip()).strip()
+            if note_text:
+                sections.append(("Preview / Texture Notes", note_text))
+            elif base_text and not metadata_lines and not readable_strings_block and not binary_header_block:
+                sections.append(("Import Summary", base_text))
+
+            if debug_text:
+                sections.append(("Preview Diagnostics", debug_text))
+            if readable_strings_block:
+                sections.append(("Readable Strings", readable_strings_block))
+            if binary_header_block:
+                sections.append(("Binary Header Preview", binary_header_block))
+            if not sections:
+                return "No details available."
+            return "\n\n".join(
+                f"{title}\n{content}".strip()
+                for title, content in sections
+                if str(content or "").strip()
+            )
+
+        def _refresh_archive_preview_details_text(
+            self,
+            _debug_text: str = "",
+            *,
+            include_current_model_debug: bool = True,
+        ) -> None:
+            base_detail_text = str(getattr(self, "_archive_preview_base_detail_text", "") or "").strip()
+            debug_detail_text = ""
+            if (
+                include_current_model_debug
+                and
+                self.current_archive_preview_result is not None
+                and not self.archive_preview_showing_loose
+                and self.current_archive_preview_result.preview_model is not None
+            ):
+                debug_detail_text = self.archive_model_preview.debug_details_text()
+            self.archive_preview_details_edit.setPlainText(
+                self._compose_model_preview_detail_text(base_detail_text, debug_detail_text)
+            )
+
+        def _set_archive_preview_base_detail_text(
+            self,
+            detail_text: str,
+            *,
+            include_current_model_debug: bool = True,
+        ) -> None:
+            self._archive_preview_base_detail_text = str(detail_text or "")
+            self._refresh_archive_preview_details_text(include_current_model_debug=include_current_model_debug)
+
+        def _show_archive_preview_result(
+            self,
+            result: ArchivePreviewResult,
+            *,
+            use_loose: bool,
+            request_id: Optional[int] = None,
+        ) -> float:
+            if request_id is not None and request_id != self.archive_preview_request_id:
+                return 0.0
             self.archive_preview_showing_loose = use_loose and bool(result.loose_file_path)
             if self.archive_preview_showing_loose:
                 title = result.loose_preview_title or result.title or "Archive Preview"
@@ -10210,7 +13482,7 @@ def run_gui() -> int:
 
             self.archive_preview_title_label.setText(title)
             self.archive_preview_meta_label.setText(metadata_summary)
-            self.archive_preview_details_edit.setPlainText(detail_text)
+            self._set_archive_preview_base_detail_text(detail_text, include_current_model_debug=False)
             self._update_archive_preview_warning_controls(
                 badge_text=warning_badge,
                 warning_text=warning_text,
@@ -10227,16 +13499,22 @@ def run_gui() -> int:
                 else:
                     self.archive_preview_label.set_preview_image_path(preview_image_path, title or "Preview image")
                 self.archive_media_preview.clear_media("No media preview available.")
-                self.archive_model_preview.clear_model("No model preview available.")
                 self.archive_preview_stack.setCurrentWidget(self.archive_preview_scroll)
                 self.archive_preview_tabs.setCurrentIndex(0)
                 self._update_archive_model_action_controls(None)
                 self._set_archive_preview_image_controls_enabled(True)
                 self._apply_archive_preview_zoom()
-                return
+                return 0.0
 
             if preferred_view == "model" and result.preview_model is not None and not self.archive_preview_showing_loose:
-                self.archive_model_preview.set_model(result.preview_model)
+                if request_id is not None and request_id != self.archive_preview_request_id:
+                    return 0.0
+                model_apply_started_at = time.perf_counter()
+                self.archive_model_preview.set_prepared_model(
+                    result.preview_model,
+                    getattr(result, "prepared_preview_model", None),
+                )
+                model_apply_s = max(0.0, float(time.perf_counter() - model_apply_started_at))
                 self.archive_media_preview.clear_media("No media preview available.")
                 self.archive_preview_label.clear_preview("No image preview available.")
                 self.archive_preview_stack.setCurrentWidget(self.archive_model_preview)
@@ -10244,11 +13522,10 @@ def run_gui() -> int:
                 self._update_archive_model_action_controls(result.preview_model)
                 self._set_archive_preview_image_controls_enabled(True)
                 self._apply_archive_preview_zoom()
-                return
+                return model_apply_s
 
             if preferred_view == "media" and preview_media_path:
                 self.archive_preview_label.clear_preview("No image preview available.")
-                self.archive_model_preview.clear_model("No model preview available.")
                 self.archive_media_preview.set_media(
                     preview_media_path,
                     media_kind=preview_media_kind,
@@ -10258,7 +13535,7 @@ def run_gui() -> int:
                 self.archive_preview_tabs.setCurrentIndex(0)
                 self._update_archive_model_action_controls(None)
                 self._set_archive_preview_image_controls_enabled(False)
-                return
+                return 0.0
 
             if preferred_view == "text":
                 preview_text = result.preview_text or "No text preview available."
@@ -10269,20 +13546,19 @@ def run_gui() -> int:
                 self.archive_preview_stack.setCurrentWidget(self.archive_preview_text_edit)
                 self.archive_preview_tabs.setCurrentIndex(0)
                 self.archive_preview_label.clear_preview("No image preview available.")
-                self.archive_model_preview.clear_model("No model preview available.")
                 self.archive_media_preview.clear_media("No media preview available.")
                 self._update_archive_model_action_controls(None)
                 self._set_archive_preview_image_controls_enabled(False)
-                return
+                return 0.0
 
             self.archive_preview_info_edit.setPlainText(detail_text or metadata_summary or "No preview available.")
             self.archive_preview_stack.setCurrentWidget(self.archive_preview_info_edit)
             self.archive_preview_tabs.setCurrentIndex(0)
             self.archive_preview_label.clear_preview("No image preview available.")
-            self.archive_model_preview.clear_model("No model preview available.")
             self.archive_media_preview.clear_media("No media preview available.")
             self._update_archive_model_action_controls(None)
             self._set_archive_preview_image_controls_enabled(False)
+            return 0.0
 
         def _toggle_archive_loose_preview(self) -> None:
             if self.current_archive_preview_result is None or not self.current_archive_preview_result.loose_file_path:
@@ -10310,10 +13586,46 @@ def run_gui() -> int:
                 prefer_loose_preview=True,
             )
 
-        def _apply_archive_preview_result(self, result: ArchivePreviewResult) -> None:
+        def _apply_archive_preview_result(
+            self,
+            result: ArchivePreviewResult,
+            *,
+            request_id: Optional[int] = None,
+            source: str = "worker",
+            base_timings: Optional[Dict[str, float]] = None,
+            request_started_at: Optional[float] = None,
+        ) -> None:
             try:
+                if request_id is not None and request_id != self.archive_preview_request_id:
+                    return
+                ui_apply_started_at = time.perf_counter()
                 self.current_archive_preview_result = result
-                self._show_archive_preview_result(result, use_loose=self.archive_preview_requested_loose)
+                model_apply_s = self._show_archive_preview_result(
+                    result,
+                    use_loose=self.archive_preview_requested_loose,
+                    request_id=request_id,
+                )
+                ui_apply_s = max(0.0, float(time.perf_counter() - ui_apply_started_at))
+                result_timings = getattr(result, "timings", None) if source != "preview_cache" else {}
+                timings = _merge_timing_maps(
+                    result_timings,
+                    base_timings,
+                    {
+                        "ui_apply_s": ui_apply_s,
+                        "model_apply_s": model_apply_s,
+                    },
+                )
+                if request_started_at is not None:
+                    timings["total_s"] = max(0.0, float(time.perf_counter() - request_started_at))
+                timing_summary = self._archive_preview_timing_summary(source, timings)
+                finalized_result = dataclasses.replace(
+                    result,
+                    timings=timings,
+                    timing_summary=timing_summary,
+                )
+                self.current_archive_preview_result = finalized_result
+                entry_name = finalized_result.title or getattr(self._current_archive_entry(), "basename", "") or "selected entry"
+                self._log_archive_preview_timing_if_needed(entry_name, source, timings, timing_summary)
             except Exception as exc:
                 _write_crash_report(
                     "archive_preview_result_error",
@@ -11387,6 +14699,16 @@ def run_gui() -> int:
                 self._utility_completion_handler(result)
 
         def _handle_worker_error(self, message: str) -> None:
+            if _is_expected_cancellation_message(message):
+                self.set_status_message(message, error=True)
+                self.append_log(message)
+                if self.archive_scan_worker is not None or self.archive_filter_worker is not None or self._utility_updates_archive_progress:
+                    self.append_archive_log(message)
+                    self.archive_scan_progress_label.setText(message)
+                    self.archive_scan_progress_bar.setRange(0, 1)
+                    self.archive_scan_progress_bar.setValue(0)
+                    self.archive_scan_progress_bar.setFormat("%v / %m")
+                return
             _write_crash_report(
                 "worker_error",
                 "Background worker error",
@@ -11825,6 +15147,8 @@ def run_gui() -> int:
             self.archive_filter_apply_pending = False
             if not archive_finalize_pending:
                 self.set_busy(False, build_mode=False)
+            if self.archive_sidecar_pending_start and self.archive_sidecar_thread is None and self.archive_entries:
+                QTimer.singleShot(0, self._start_archive_sidecar_index_worker)
             if utility_updates_archive_progress and self.archive_scan_worker is None and self.archive_filter_worker is None:
                 self.archive_scan_progress_bar.setRange(0, 1)
                 self.archive_scan_progress_bar.setValue(1)
@@ -11851,6 +15175,7 @@ def run_gui() -> int:
             self._shutting_down = True
             nonlocal _active_main_window
             _active_main_window = None
+            self._cancel_archive_tree_clear()
             self._cancel_archive_tree_population()
             self._settings_save_timer.stop()
             self._chainner_analysis_timer.stop()
@@ -11871,6 +15196,8 @@ def run_gui() -> int:
                 self.scan_worker.stop()
             if self.archive_scan_worker is not None:
                 self.archive_scan_worker.stop()
+            if self.archive_sidecar_worker is not None:
+                self.archive_sidecar_worker.stop()
             if self.archive_filter_worker is not None:
                 self.archive_filter_worker.stop()
             if self.build_worker is not None:
@@ -11885,6 +15212,7 @@ def run_gui() -> int:
             self.replace_assistant_tab.shutdown()
             self.texture_editor_tab.shutdown()
             _stop_thread(self.worker_thread)
+            _stop_thread(self.archive_sidecar_thread, self.archive_sidecar_worker)
             _stop_thread(self.compare_preview_thread, self.compare_preview_worker)
             _stop_thread(self.archive_preview_thread, self.archive_preview_worker)
             super().closeEvent(event)

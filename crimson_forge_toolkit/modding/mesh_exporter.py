@@ -10,11 +10,12 @@ No external libraries required — pure Python binary FBX writer.
 from __future__ import annotations
 
 import io
+import json
 import os
 import struct
 import zlib
 import math
-from pathlib import Path
+from pathlib import Path, PurePath
 from datetime import datetime
 from typing import Optional
 
@@ -22,6 +23,77 @@ from .mesh_parser import ParsedMesh, SubMesh
 from .logging import get_logger
 
 logger = get_logger("core.mesh_exporter")
+
+_OBJ_ROUNDTRIP_SIDECAR_FORMAT = "mesh_roundtrip_manifest_v2"
+
+
+def _obj_roundtrip_sidecar_path(obj_path: str | Path) -> Path:
+    return Path(f"{obj_path}.meta.json")
+
+
+def _coerce_submesh_source_vertex_map(submesh: SubMesh) -> list[int]:
+    raw_map = list(getattr(submesh, "source_vertex_map", ()) or ())
+    vertex_count = len(getattr(submesh, "vertices", ()) or ())
+    if len(raw_map) == vertex_count:
+        return [
+            int(value) if isinstance(value, (int, float)) else -1
+            for value in raw_map
+        ]
+    return list(range(vertex_count))
+
+
+def _build_roundtrip_manifest_payload(
+    mesh: ParsedMesh,
+    export_path: str,
+    *,
+    companion_path: str = "",
+    extra_payload: Optional[dict] = None,
+) -> dict:
+    payload = {
+        "format": _OBJ_ROUNDTRIP_SIDECAR_FORMAT,
+        "source_path": str(mesh.path or "").strip(),
+        "source_format": str(mesh.format or "").strip(),
+        "export_path": Path(export_path).name,
+        "companion_filename": Path(companion_path).name if companion_path else "",
+        "exported_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "roundtrip_policy": {
+            "primary_workflow": "obj_first",
+            "default_import_policy": "auto-fix safe, warn risky",
+        },
+        "submeshes": [
+            {
+                "index": index,
+                "name": str(submesh.name or "").strip(),
+                "material": str(submesh.material or "").strip(),
+                "texture": str(submesh.texture or "").strip(),
+                "vertex_count": len(submesh.vertices),
+                "face_count": len(submesh.faces),
+                "source_vertex_map": _coerce_submesh_source_vertex_map(submesh),
+            }
+            for index, submesh in enumerate(mesh.submeshes)
+        ],
+    }
+    if extra_payload:
+        payload.update(extra_payload)
+    return payload
+
+
+def write_roundtrip_manifest(
+    mesh: ParsedMesh,
+    export_path: str | Path,
+    *,
+    companion_path: str | Path = "",
+    extra_payload: Optional[dict] = None,
+) -> Path:
+    sidecar_path = _obj_roundtrip_sidecar_path(export_path)
+    payload = _build_roundtrip_manifest_payload(
+        mesh,
+        str(export_path),
+        companion_path=str(companion_path or ""),
+        extra_payload=extra_payload,
+    )
+    sidecar_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return sidecar_path
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -111,9 +183,11 @@ def export_obj(mesh: ParsedMesh, output_dir: str, name: str = "",
     with open(obj_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
+    sidecar_path = write_roundtrip_manifest(mesh, obj_path, companion_path=mtl_path)
+
     logger.info("Exported OBJ: %s (%d verts, %d faces)", obj_path,
                 mesh.total_vertices, mesh.total_faces)
-    return [obj_path, mtl_path]
+    return [obj_path, mtl_path, str(sidecar_path)]
 
 
 def _export_obj_split(mesh, output_dir, base, scale):
@@ -130,6 +204,16 @@ def _export_obj_split(mesh, output_dir, base, scale):
         )
         results.extend(export_obj(sub_mesh, output_dir, sub_name, scale=scale))
     return results
+
+
+def _format_mtl_texture_reference(texture_name: str) -> str:
+    """Make material-library texture references friendly to OBJ/MTL readers."""
+    normalized = str(texture_name or "").strip().replace("\\", "/")
+    if not normalized:
+        return ""
+    if PurePath(normalized).suffix:
+        return normalized
+    return f"{normalized}.dds"
 
 
 def _write_mtl(path, submeshes):
@@ -151,7 +235,9 @@ def _write_mtl(path, submeshes):
             "illum 2",
         ])
         if sm.texture:
-            lines.append(f"map_Kd {sm.texture}")
+            texture_reference = _format_mtl_texture_reference(sm.texture)
+            if texture_reference:
+                lines.append(f"map_Kd {texture_reference}")
         lines.append("")
 
     with open(path, "w", encoding="utf-8") as f:

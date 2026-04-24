@@ -79,6 +79,7 @@ from crimson_forge_toolkit.models import (
     ReplaceAssistantBuildSummary,
     ReplaceAssistantItem,
     ReplaceAssistantReviewItem,
+    RunCancelled,
     TextureEditorSourceBinding,
 )
 from crimson_forge_toolkit.ui.widgets import (
@@ -192,6 +193,8 @@ class ReplaceAssistantBuildWorker(QObject):
                 self.cancelled.emit("Replace Assistant build stopped by user.")
             else:
                 self.completed.emit(summary)
+        except RunCancelled as exc:
+            self.cancelled.emit(str(exc) or "Replace Assistant build stopped by user.")
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -1794,7 +1797,9 @@ class ReplaceAssistantTab(QWidget):
         raw = current.data(0, Qt.UserRole)
         if not isinstance(raw, int) or raw < 0 or raw >= len(self.items):
             return
-        self._schedule_preview(self.items[raw])
+        item = self.items[raw]
+        self._ensure_ui_constraint_warning(item)
+        self._schedule_preview(item)
 
     def _build_texture_editor_binding(self, item: ReplaceAssistantItem) -> TextureEditorSourceBinding:
         matched = item.matched_original
@@ -2026,7 +2031,9 @@ class ReplaceAssistantTab(QWidget):
         target_path = self._ui_constraint_target_path_for_item(item)
         ui_warning = self._ui_constraint_warning_for_item(item)
         if target_path:
-            lines.append(f"UI constraint warning: {ui_warning or 'checking...'}")
+            cache_key = target_path.casefold()
+            display_warning = ui_warning if ui_warning else ("none" if cache_key in self._ui_constraint_warning_cache else "checking...")
+            lines.append(f"UI constraint warning: {display_warning}")
         else:
             lines.append("UI constraint warning: none")
         self.preview_details_edit.setPlainText("\n".join(line for line in lines if line))
@@ -2049,9 +2056,39 @@ class ReplaceAssistantTab(QWidget):
         self.ui_constraint_thread = thread
         thread.start()
 
+    def _looks_like_ui_constraint_candidate(self, target_path: str) -> bool:
+        normalized = str(target_path or "").replace("\\", "/").lower()
+        if not normalized:
+            return False
+        ui_tokens = ("/ui/", "/icon/", "/hud/", "/menu/", "/widget/")
+        name_tokens = ("itemicon", "ui_", "icon_", "hud_", "menu_")
+        name = PurePosixPath(normalized).name
+        return any(token in normalized for token in ui_tokens) or any(token in name for token in name_tokens)
+
     def _ensure_ui_constraint_warning(self, item: Optional[ReplaceAssistantItem]) -> None:
-        del item
-        return
+        target_path = self._ui_constraint_target_path_for_item(item)
+        if not target_path:
+            self._pending_ui_constraint_target = ""
+            return
+        cache_key = target_path.casefold()
+        if cache_key in self._ui_constraint_warning_cache:
+            self._pending_ui_constraint_target = ""
+            return
+        if not self._looks_like_ui_constraint_candidate(target_path):
+            self._ui_constraint_warning_cache[cache_key] = ""
+            self._pending_ui_constraint_target = ""
+            return
+        if self._active_ui_constraint_target.casefold() == cache_key:
+            self._pending_ui_constraint_target = ""
+            return
+        pending_target = self._pending_ui_constraint_target.strip()
+        if pending_target and pending_target.casefold() == cache_key:
+            return
+        if self.ui_constraint_thread is not None:
+            self._pending_ui_constraint_target = target_path
+            return
+        self._pending_ui_constraint_target = ""
+        self._start_ui_constraint_worker(target_path)
 
     def _handle_ui_constraint_ready(self, request_id: int, target_path: str, warning_text: str) -> None:
         if request_id != self.ui_constraint_request_id:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import html
+import json
 import math
 import os
 import pickle
@@ -12,10 +14,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Iterator, Mapping
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple
 
 try:
     import lz4.block as lz4_block
@@ -54,12 +58,21 @@ from crimson_forge_toolkit.core.upscale_profiles import (
     normalize_texture_reference_for_sidecar_lookup,
     parse_texture_sidecar_bindings,
 )
+from crimson_forge_toolkit.modding.skeleton_parser import iter_pab_candidate_basenames
+
+if TYPE_CHECKING:
+    from crimson_forge_toolkit.modding.mesh_parser import ParsedMesh
 
 _PATHC_COLLECTION_CACHE: Dict[str, Tuple[str, "PathcCollection"]] = {}
 _ARCHIVE_SCAN_CACHE_MAGIC = b"CTFARCH1"
 _ARCHIVE_SCAN_CACHE_VERSION = 2
 _ARCHIVE_SCAN_CACHE_LEGACY_DIRNAMES: Tuple[str, ...] = ("cache", "archive_scan_cache")
-_MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION = 4096
+_ARCHIVE_SIDECAR_CACHE_MAGIC = b"CTFSIDE1"
+_ARCHIVE_SIDECAR_CACHE_VERSION = 2
+# Keep model textures closer to their source resolution in the 3D preview.
+# This only affects the PNG preview cache used for model shading; low-quality
+# mode still downsamples at upload time inside the OpenGL widget.
+_MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION = clamp_model_preview_render_settings().preview_texture_max_dimension
 _MODEL_TEXTURE_VISIBLE_FAMILY_SUFFIXES: Tuple[str, ...] = (
     "",
     "_ct",
@@ -69,6 +82,139 @@ _MODEL_TEXTURE_VISIBLE_FAMILY_SUFFIXES: Tuple[str, ...] = (
     "_basecolor",
     "_base_color",
     "_diffuse",
+)
+
+
+class LazyArchiveEntryRowIndex(Mapping[str, Sequence[ArchiveEntry]]):
+    def __init__(
+        self,
+        rows: Optional[Dict[str, Tuple[int, ...]]],
+        entries: Sequence[ArchiveEntry],
+    ) -> None:
+        self._rows: Dict[str, Tuple[int, ...]] = {
+            str(key or "").strip().lower(): tuple(int(index) for index in value)
+            for key, value in (rows or {}).items()
+            if str(key or "").strip()
+        }
+        self._entries = list(entries)
+        self._resolved: Dict[str, Tuple[ArchiveEntry, ...]] = {}
+
+    def __getitem__(self, key: str) -> Sequence[ArchiveEntry]:
+        normalized_key = str(key or "").strip().lower()
+        if normalized_key not in self._rows:
+            raise KeyError(key)
+        cached = self._resolved.get(normalized_key)
+        if cached is not None:
+            return cached
+        resolved_entries: List[ArchiveEntry] = []
+        seen_indexes: set[int] = set()
+        for raw_index in self._rows.get(normalized_key, ()):
+            entry_index = int(raw_index)
+            if entry_index < 0 or entry_index >= len(self._entries) or entry_index in seen_indexes:
+                continue
+            seen_indexes.add(entry_index)
+            resolved_entries.append(self._entries[entry_index])
+        resolved_tuple = tuple(resolved_entries)
+        self._resolved[normalized_key] = resolved_tuple
+        return resolved_tuple
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._rows)
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def get(self, key: object, default: Optional[Sequence[ArchiveEntry]] = None) -> Optional[Sequence[ArchiveEntry]]:
+        normalized_key = str(key or "").strip().lower()
+        if normalized_key not in self._rows:
+            return default
+        return self[normalized_key]
+
+    @property
+    def row_count(self) -> int:
+        return len(self._rows)
+_MODEL_TEXTURE_SUPPORT_FAMILY_SUFFIXES: Dict[str, Tuple[str, ...]] = {
+    "normal": (
+        "_n",
+        "_normal",
+        "_normalmap",
+    ),
+    "material": (
+        "_sp",
+        "_material",
+        "_mask",
+        "_ma",
+        "_mg",
+        "_m",
+        "_orm",
+        "_mra",
+        "_rma",
+        "_arm",
+        "_ao",
+        "_spec",
+        "_specular",
+    ),
+    "height": (
+        "_disp",
+        "_displacement",
+        "_height",
+        "_hgt",
+        "_dmap",
+        "_bump",
+        "_parallax",
+        "_pom",
+        "_ssdm",
+    ),
+}
+
+
+def set_model_texture_display_preview_max_dimension(value: int) -> None:
+    global _MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION
+    settings = clamp_model_preview_render_settings(
+        ModelPreviewRenderSettings(preview_texture_max_dimension=int(value))
+    )
+    _MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION = int(settings.preview_texture_max_dimension)
+_ARCHIVE_TEXTURE_FAMILY_SUFFIXES: Tuple[str, ...] = (
+    "",
+    "_ct",
+    "_color",
+    "_col",
+    "_albedo",
+    "_basecolor",
+    "_base_color",
+    "_diffuse",
+    "_n",
+    "_normal",
+    "_normalmap",
+    "_sp",
+    "_spec",
+    "_specular",
+    "_m",
+    "_mask",
+    "_ma",
+    "_mg",
+    "_orm",
+    "_mra",
+    "_rma",
+    "_arm",
+    "_ao",
+    "_o",
+    "_height",
+    "_hgt",
+    "_disp",
+    "_displacement",
+    "_dmap",
+    "_d",
+    "_bump",
+    "_parallax",
+    "_pom",
+    "_ssdm",
+    "_em",
+    "_emi",
+    "_emissive",
+    "_glow",
+    "_material",
+    "_mat",
 )
 
 
@@ -140,8 +286,40 @@ _COMMON_TECHNICAL_DDS_EXCLUDE_PATTERNS: Tuple[str, ...] = (
     "*_d.dds",
 )
 _STRUCTURED_BINARY_IDENTIFIER_RE = re.compile(r"^[_A-Za-z][A-Za-z0-9_:<>-]{2,127}$")
-_STRUCTURED_BINARY_ASSET_REFERENCE_RE = re.compile(
-    r"(?i)(?:[a-z0-9_./-]+(?:/[a-z0-9_./-]+)*\.(?:dds|xml|pami|meshinfo|hkx|pam|pamlod|pac|pab|paa|pae|paem|paseq|paschedule|paschedulepath|pastage|prefab|seqmt|wem|bnk|mp4|bk2|json))"
+_STRUCTURED_BINARY_ASSET_TOKEN_RE = re.compile(r"[A-Za-z0-9_./\\-]+")
+_STRUCTURED_BINARY_ASSET_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+_STRUCTURED_BINARY_ASSET_REFERENCE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".dds",
+        ".xml",
+        ".pac_xml",
+        ".pam_xml",
+        ".pamlod_xml",
+        ".prefabdata_xml",
+        ".pami",
+        ".meshinfo",
+        ".hkx",
+        ".pam",
+        ".pamlod",
+        ".pac",
+        ".pab",
+        ".pabc",
+        ".papr",
+        ".paa",
+        ".pae",
+        ".paem",
+        ".paseq",
+        ".paschedule",
+        ".paschedulepath",
+        ".pastage",
+        ".prefab",
+        ".seqmt",
+        ".wem",
+        ".bnk",
+        ".mp4",
+        ".bk2",
+        ".json",
+    }
 )
 _ARCHIVE_STRUCTURED_BINARY_PREVIEW_EXTENSIONS: Tuple[str, ...] = (
     ".bnk",
@@ -168,6 +346,7 @@ _ARCHIVE_STRUCTURED_BINARY_PREVIEW_EXTENSIONS: Tuple[str, ...] = (
     ".wem",
 )
 _ARCHIVE_SCAN_CACHE_SUPPORTED_VERSIONS = {1, 2}
+_ARCHIVE_SIDECAR_CACHE_SUPPORTED_VERSIONS = {1, 2}
 CHACHA20_HASH_INITVAL = 0x000C5EDE
 CHACHA20_IV_XOR = 0x60616263
 CHACHA20_XOR_DELTAS = (
@@ -180,6 +359,26 @@ CHACHA20_XOR_DELTAS = (
     0x06060606,
     0x02020202,
 )
+
+_ARCHIVE_MATERIAL_SIDECAR_EXTENSIONS: frozenset[str] = frozenset({".pami", ".pac_xml", ".pam_xml", ".pamlod_xml"})
+_ARCHIVE_METADATA_XML_EXTENSIONS: frozenset[str] = frozenset({".xml", ".prefabdata_xml"})
+_ARCHIVE_XML_LIKE_EXTENSIONS: frozenset[str] = _ARCHIVE_MATERIAL_SIDECAR_EXTENSIONS | _ARCHIVE_METADATA_XML_EXTENSIONS
+_ARCHIVE_SCAN_IGNORED_TOP_LEVEL_DIRS: frozenset[str] = frozenset({"cdmods", "_jmm_backups"})
+_ARCHIVE_SIDECAR_TEXTURE_ATTR_RE = re.compile(
+    r"""\b(?:_path|path|Value|_value|value)\s*=\s*(['"])(?P<value>[^'"<>]{1,1024}?dds)\1""",
+    re.IGNORECASE,
+)
+_ARCHIVE_DDS_BYTES_RE = re.compile(br"dds", re.IGNORECASE)
+
+
+def _is_material_sidecar_extension(extension: str, basename: str = "") -> bool:
+    normalized_extension = str(extension or "").strip().lower()
+    normalized_basename = str(basename or "").strip().lower()
+    if normalized_extension in _ARCHIVE_MATERIAL_SIDECAR_EXTENSIONS:
+        return True
+    if normalized_extension == ".xml" and normalized_basename.endswith((".pac.xml", ".pam.xml", ".pamlod.xml")):
+        return True
+    return False
 _PRINTABLE_BINARY_STRING_RE = re.compile(rb"[\x20-\x7E]{4,}")
 _TEXT_DDS_REFERENCE_RE = re.compile(r"[A-Za-z0-9_./\\-]{3,255}\.dds", re.IGNORECASE)
 
@@ -371,6 +570,8 @@ def try_decrypt_archive_entry_data(entry: ArchiveEntry, data: bytes) -> Tuple[by
         raise ValueError(f"Unsupported archive encryption type {entry.encryption_type} for {entry.path}")
     candidate = crypt_chacha20_filename(data, entry.basename)
     if not _looks_like_decrypted_payload(entry, candidate):
+        if entry.extension in _ARCHIVE_XML_LIKE_EXTENSIONS and _looks_like_decrypted_payload(entry, data):
+            return data, "ChaCha20FlagMismatch"
         raise ValueError(f"ChaCha20 decryption validation failed for {entry.path}")
     return candidate, "ChaCha20"
 
@@ -380,7 +581,18 @@ def discover_pamt_files(package_root: Path) -> List[Path]:
         return [root]
     if not root.exists() or not root.is_dir():
         raise ValueError(f"Archive package root does not exist or is not a folder: {root}")
-    files = sorted(path for path in root.rglob("*.pamt") if path.is_file())
+    files: List[Path] = []
+    for path in root.rglob("*.pamt"):
+        if not path.is_file():
+            continue
+        try:
+            top_level_dir = path.relative_to(root).parts[0].lower()
+        except (IndexError, ValueError):
+            top_level_dir = ""
+        if top_level_dir in _ARCHIVE_SCAN_IGNORED_TOP_LEVEL_DIRS:
+            continue
+        files.append(path)
+    files.sort()
     return files
 
 
@@ -391,6 +603,94 @@ def resolve_archive_scan_cache_path(package_root: Path, cache_root: Path) -> Pat
         resolved_root = package_root.expanduser()
     digest = hashlib.sha256(str(resolved_root).lower().encode("utf-8", errors="replace")).hexdigest()[:24]
     return cache_root / f"archive_scan_{digest}.bin"
+
+
+def resolve_archive_sidecar_cache_path(package_root: Path, cache_root: Path) -> Path:
+    try:
+        resolved_root = package_root.expanduser().resolve()
+    except OSError:
+        resolved_root = package_root.expanduser()
+    digest = hashlib.sha256(str(resolved_root).lower().encode("utf-8", errors="replace")).hexdigest()[:24]
+    return cache_root / f"archive_sidecars_{digest}.bin"
+
+
+def resolve_archive_sidecar_cache_metadata_path(package_root: Path, cache_root: Path) -> Path:
+    return resolve_archive_sidecar_cache_path(package_root, cache_root).with_suffix(".meta.json")
+
+
+def resolve_crimson_desert_executable(package_root: Path) -> Optional[Path]:
+    base_dir = _archive_base_dir(package_root)
+    candidate_roots: List[Path] = []
+    for candidate_root in (base_dir, *base_dir.parents[:4]):
+        normalized = str(candidate_root).strip().lower()
+        if not normalized or any(str(existing).strip().lower() == normalized for existing in candidate_roots):
+            continue
+        candidate_roots.append(candidate_root)
+
+    for candidate_root in candidate_roots:
+        for relative_path in (
+            Path("bin64") / "CrimsonDesert.exe",
+            Path("CrimsonDesert.exe"),
+        ):
+            candidate = candidate_root / relative_path
+            if candidate.is_file():
+                try:
+                    return candidate.expanduser().resolve()
+                except OSError:
+                    return candidate.expanduser()
+    return None
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def invalidate_archive_browser_cache(
+    package_root: Path,
+    cache_root: Path,
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> List[Path]:
+    try:
+        resolved_cache_root = cache_root.expanduser().resolve()
+    except OSError:
+        resolved_cache_root = cache_root.expanduser()
+
+    candidate_roots = [resolved_cache_root]
+    sibling_parent = resolved_cache_root.parent
+    for dirname in _ARCHIVE_SCAN_CACHE_LEGACY_DIRNAMES:
+        candidate_roots.append(sibling_parent / dirname)
+
+    cache_paths: List[Path] = []
+    seen: set[str] = set()
+    for candidate_root in candidate_roots:
+        for candidate_path in (
+            resolve_archive_scan_cache_path(package_root, candidate_root),
+            resolve_archive_sidecar_cache_path(package_root, candidate_root),
+            resolve_archive_sidecar_cache_metadata_path(package_root, candidate_root),
+        ):
+            normalized_path = str(candidate_path).strip().lower()
+            if not normalized_path or normalized_path in seen:
+                continue
+            seen.add(normalized_path)
+            cache_paths.append(candidate_path)
+
+    deleted_paths: List[Path] = []
+    for cache_path in cache_paths:
+        if not cache_path.exists():
+            continue
+        try:
+            cache_path.unlink()
+            deleted_paths.append(cache_path)
+        except OSError as exc:
+            if on_log:
+                on_log(f"Warning: could not delete archive cache file {cache_path}: {exc}")
+
+    return deleted_paths
 
 
 def _candidate_archive_scan_cache_paths(package_root: Path, cache_root: Path) -> List[Path]:
@@ -453,28 +753,192 @@ def _collect_archive_scan_sources(
     return base_dir, sources
 
 
-def _serialize_archive_scan_cache_payload(payload: dict) -> bytes:
+def _collect_archive_scan_sources_from_entries(
+    package_root: Path,
+    entries: Sequence[ArchiveEntry],
+) -> Tuple[Path, List[Tuple[str, int, int]]]:
+    base_dir = _archive_base_dir(package_root)
+    unique_pamt_paths: Dict[str, Path] = {}
+    for entry in entries:
+        pamt_path = getattr(entry, "pamt_path", None)
+        if pamt_path is None:
+            continue
+        try:
+            resolved_path = Path(pamt_path).expanduser().resolve()
+        except OSError:
+            resolved_path = Path(pamt_path).expanduser()
+        normalized_key = str(resolved_path).strip().lower()
+        if not normalized_key or normalized_key in unique_pamt_paths:
+            continue
+        unique_pamt_paths[normalized_key] = resolved_path
+
+    sources: List[Tuple[str, int, int]] = []
+    for pamt_path in sorted(unique_pamt_paths.values(), key=lambda value: str(value).lower()):
+        stat_result = pamt_path.stat()
+        sources.append(
+            (
+                _archive_relative_source_path(base_dir, pamt_path),
+                int(stat_result.st_size),
+                int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))),
+            )
+        )
+    return base_dir, sources
+
+
+def _normalize_archive_source_rows(rows: object) -> Optional[List[Tuple[str, int, int]]]:
+    if not isinstance(rows, list):
+        return None
+    normalized_rows: List[Tuple[str, int, int]] = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != 3:
+            return None
+        relative_path, raw_size, raw_mtime_ns = row
+        normalized_rows.append((str(relative_path), int(raw_size), int(raw_mtime_ns)))
+    return normalized_rows
+
+
+def _serialize_cache_payload(payload: dict, *, magic: bytes, compress: Optional[bool] = None) -> bytes:
     raw = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
-    if lz4_block is not None:
-        return _ARCHIVE_SCAN_CACHE_MAGIC + b"L" + lz4_block.compress(raw, store_size=True)
-    return _ARCHIVE_SCAN_CACHE_MAGIC + b"R" + raw
+    use_compression = lz4_block is not None if compress is None else bool(compress and lz4_block is not None)
+    if use_compression:
+        return magic + b"L" + lz4_block.compress(raw, store_size=True)
+    return magic + b"R" + raw
+
+
+def _deserialize_cache_payload(blob: bytes, *, magic: bytes, invalid_message: str) -> dict:
+    if not blob.startswith(magic):
+        raise ValueError(invalid_message)
+    mode = blob[len(magic) : len(magic) + 1]
+    payload = blob[len(magic) + 1 :]
+    if mode == b"L":
+        if lz4_block is None:
+            raise ValueError("Compressed cache requires lz4, but python-lz4 is not available.")
+        payload = lz4_block.decompress(payload)
+    elif mode != b"R":
+        raise ValueError("Cache compression mode is not supported.")
+    data = pickle.loads(payload)
+    if not isinstance(data, dict):
+        raise ValueError("Cache payload is invalid.")
+    return data
+
+
+def _deserialize_cache_payload_from_path(
+    cache_path: Path,
+    *,
+    magic: bytes,
+    invalid_message: str,
+) -> dict:
+    with cache_path.open("rb") as handle:
+        header = handle.read(len(magic) + 1)
+        if len(header) < len(magic) + 1 or not header.startswith(magic):
+            raise ValueError(invalid_message)
+        mode = header[len(magic) : len(magic) + 1]
+        if mode == b"R":
+            data = pickle.load(handle)
+            if not isinstance(data, dict):
+                raise ValueError("Cache payload is invalid.")
+            return data
+        payload = handle.read()
+    return _deserialize_cache_payload(header + payload, magic=magic, invalid_message=invalid_message)
+
+
+def _write_raw_pickle_cache_payload_to_path(
+    cache_path: Path,
+    *,
+    magic: bytes,
+    payload: dict,
+) -> None:
+    temp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with temp_path.open("wb") as handle:
+        handle.write(magic)
+        handle.write(b"R")
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    temp_path.replace(cache_path)
+
+
+def _serialize_archive_scan_cache_payload(payload: dict) -> bytes:
+    return _serialize_cache_payload(payload, magic=_ARCHIVE_SCAN_CACHE_MAGIC)
+
+
+def _serialize_archive_sidecar_cache_payload(payload: dict) -> bytes:
+    # Sidecar caches are loaded after the archive browser becomes usable, so
+    # faster writes/reads are more valuable than smaller files here.
+    return _serialize_cache_payload(payload, magic=_ARCHIVE_SIDECAR_CACHE_MAGIC, compress=False)
 
 
 def _deserialize_archive_scan_cache_payload(blob: bytes) -> dict:
-    if not blob.startswith(_ARCHIVE_SCAN_CACHE_MAGIC):
-        raise ValueError("Archive cache header is not recognized.")
-    mode = blob[len(_ARCHIVE_SCAN_CACHE_MAGIC) : len(_ARCHIVE_SCAN_CACHE_MAGIC) + 1]
-    payload = blob[len(_ARCHIVE_SCAN_CACHE_MAGIC) + 1 :]
-    if mode == b"L":
-        if lz4_block is None:
-            raise ValueError("Archive cache requires lz4, but python-lz4 is not available.")
-        payload = lz4_block.decompress(payload)
-    elif mode != b"R":
-        raise ValueError("Archive cache compression mode is not supported.")
-    data = pickle.loads(payload)
-    if not isinstance(data, dict):
-        raise ValueError("Archive cache payload is invalid.")
-    return data
+    return _deserialize_cache_payload(
+        blob,
+        magic=_ARCHIVE_SCAN_CACHE_MAGIC,
+        invalid_message="Archive cache header is not recognized.",
+    )
+
+
+def _deserialize_archive_sidecar_cache_payload(blob: bytes) -> dict:
+    return _deserialize_cache_payload(
+        blob,
+        magic=_ARCHIVE_SIDECAR_CACHE_MAGIC,
+        invalid_message="Texture sidecar cache header is not recognized.",
+    )
+
+
+def _write_archive_sidecar_cache_metadata(
+    metadata_path: Path,
+    *,
+    version: int,
+    sources: Sequence[Tuple[str, int, int]],
+    entry_count: int,
+) -> None:
+    payload = {
+        "version": int(version),
+        "created_at": time.time(),
+        "entry_count": int(entry_count),
+        "sources": [[relative_path, int(size), int(mtime_ns)] for relative_path, size, mtime_ns in sources],
+    }
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    temp_path.replace(metadata_path)
+
+
+def _read_archive_sidecar_cache_metadata(metadata_path: Path) -> Optional[dict]:
+    if not metadata_path.is_file():
+        return None
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Texture sidecar cache metadata is invalid.")
+    return payload
+
+
+def _archive_entry_cache_signature(package_root: Path, entry: ArchiveEntry) -> Tuple[object, ...]:
+    base_dir = _archive_base_dir(package_root)
+    return (
+        str(getattr(entry, "path", "") or "").replace("\\", "/"),
+        _archive_relative_source_path(base_dir, Path(getattr(entry, "pamt_path", ""))),
+        _archive_relative_source_path(base_dir, Path(getattr(entry, "paz_file", ""))),
+        int(getattr(entry, "offset", 0)),
+        int(getattr(entry, "comp_size", 0)),
+        int(getattr(entry, "orig_size", 0)),
+        int(getattr(entry, "flags", 0)),
+        int(getattr(entry, "paz_index", 0)),
+    )
+
+
+def _build_archive_entry_cache_signatures(
+    package_root: Path,
+    entries: Sequence[ArchiveEntry],
+) -> Tuple[Tuple[object, ...], ...]:
+    return tuple(_archive_entry_cache_signature(package_root, entry) for entry in entries)
+
+
+def _record_timing(
+    timings: Optional[Dict[str, float]],
+    key: str,
+    started_at: float,
+) -> None:
+    if timings is None:
+        return
+    timings[key] = max(0.0, float(time.perf_counter() - started_at))
 
 
 def save_archive_scan_cache(
@@ -485,7 +949,9 @@ def save_archive_scan_cache(
     on_log: Optional[Callable[[str], None]] = None,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     stop_event: Optional[threading.Event] = None,
+    timings: Optional[Dict[str, float]] = None,
 ) -> Path:
+    started_at = time.perf_counter()
     cache_root.mkdir(parents=True, exist_ok=True)
     cache_path = resolve_archive_scan_cache_path(package_root, cache_root)
     base_dir, sources = _collect_archive_scan_sources(package_root)
@@ -537,6 +1003,7 @@ def save_archive_scan_cache(
         on_progress(1, 1, "Archive cache is ready.")
     if on_log:
         on_log(f"Archive cache updated: {cache_path}")
+    _record_timing(timings, "cache_write_s", started_at)
     return cache_path
 
 
@@ -547,11 +1014,16 @@ def load_archive_scan_cache(
     on_log: Optional[Callable[[str], None]] = None,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     stop_event: Optional[threading.Event] = None,
+    timings: Optional[Dict[str, float]] = None,
 ) -> Optional[List[ArchiveEntry]]:
+    check_started_at = time.perf_counter()
     candidate_paths = _candidate_archive_scan_cache_paths(package_root, cache_root)
     preferred_cache_path = candidate_paths[0]
     existing_candidate_paths = [candidate for candidate in candidate_paths if candidate.exists()]
     if not existing_candidate_paths:
+        if timings is not None:
+            timings.setdefault("cache_check_s", max(0.0, float(time.perf_counter() - check_started_at)))
+            timings.setdefault("cache_load_s", 0.0)
         return None
 
     if on_progress:
@@ -561,6 +1033,9 @@ def load_archive_scan_cache(
     except Exception as exc:
         if on_log:
             on_log(f"Archive cache check failed; will rescan instead: {exc}")
+        if timings is not None:
+            timings.setdefault("cache_check_s", max(0.0, float(time.perf_counter() - check_started_at)))
+            timings.setdefault("cache_load_s", 0.0)
         return None
 
     last_failure_message = "Archive cache is unavailable; performing a full rescan."
@@ -609,9 +1084,15 @@ def load_archive_scan_cache(
         if total_rows == 0:
             if on_progress:
                 on_progress(1, 1, "Archive cache loaded. No entries were cached.")
+            if timings is not None:
+                timings["cache_check_s"] = max(0.0, float(time.perf_counter() - check_started_at))
+                timings["cache_load_s"] = 0.0
             return []
 
         try:
+            if timings is not None:
+                timings["cache_check_s"] = max(0.0, float(time.perf_counter() - check_started_at))
+            load_started_at = time.perf_counter()
             update_every = 50_000 if total_rows >= 500_000 else 10_000 if total_rows >= 100_000 else 2_000
             pamt_path_cache: Dict[str, Path] = {}
             paz_path_cache: Dict[Tuple[str, int], Path] = {}
@@ -645,6 +1126,7 @@ def load_archive_scan_cache(
                 )
                 if on_progress and (index == 1 or index % update_every == 0 or index == total_rows):
                     on_progress(index, total_rows, f"Loading archive cache... {index:,} / {total_rows:,} entries")
+            _record_timing(timings, "cache_load_s", load_started_at)
         except Exception as exc:
             last_failure_message = f"{cache_label.capitalize()} could not be loaded; will try another cache or rescan: {exc}"
             if on_log:
@@ -668,6 +1150,9 @@ def load_archive_scan_cache(
 
     if on_log:
         on_log(last_failure_message)
+    if timings is not None:
+        timings.setdefault("cache_check_s", max(0.0, float(time.perf_counter() - check_started_at)))
+        timings.setdefault("cache_load_s", 0.0)
     return None
 
 
@@ -679,11 +1164,15 @@ def scan_archive_entries_cached(
     on_log: Optional[Callable[[str], None]] = None,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     stop_event: Optional[threading.Event] = None,
-) -> Tuple[List[ArchiveEntry], str, Optional[Path]]:
+) -> Tuple[List[ArchiveEntry], str, Optional[Path], Dict[str, float]]:
+    started_at = time.perf_counter()
+    timings: Dict[str, float] = {}
     cache_path = resolve_archive_scan_cache_path(package_root, cache_root)
     if force_refresh:
         if on_log:
             on_log("Ignoring archive cache and performing a full rescan.")
+        timings["cache_check_s"] = 0.0
+        timings["cache_load_s"] = 0.0
     else:
         cached_entries = load_archive_scan_cache(
             package_root,
@@ -691,16 +1180,22 @@ def scan_archive_entries_cached(
             on_log=on_log,
             on_progress=on_progress,
             stop_event=stop_event,
+            timings=timings,
         )
         if cached_entries is not None:
-            return cached_entries, "cache", cache_path
+            timings.setdefault("archive_scan_s", 0.0)
+            timings.setdefault("cache_write_s", 0.0)
+            timings["total_s"] = max(0.0, float(time.perf_counter() - started_at))
+            return cached_entries, "cache", cache_path, timings
 
+    scan_started_at = time.perf_counter()
     entries = scan_archive_entries(
         package_root,
         on_log=on_log,
         on_progress=on_progress,
         stop_event=stop_event,
     )
+    _record_timing(timings, "archive_scan_s", scan_started_at)
     try:
         cache_path = save_archive_scan_cache(
             package_root,
@@ -709,12 +1204,15 @@ def scan_archive_entries_cached(
             on_log=on_log,
             on_progress=on_progress,
             stop_event=stop_event,
+            timings=timings,
         )
     except Exception as exc:
         if on_log:
             on_log(f"Warning: archive cache could not be written: {exc}")
         cache_path = None
-    return entries, "scan", cache_path
+        timings.setdefault("cache_write_s", 0.0)
+    timings["total_s"] = max(0.0, float(time.perf_counter() - started_at))
+    return entries, "scan", cache_path, timings
 
 
 def parse_steam_library_paths(libraryfolders_path: Path) -> List[Path]:
@@ -1254,6 +1752,8 @@ def archive_entry_role(entry: ArchiveEntry) -> str:
 
     if extension in ARCHIVE_MODEL_EXTENSIONS or extension in {".hkx"}:
         return "model"
+    if extension == ".pathc":
+        return "metadata"
     if extension in ARCHIVE_VIDEO_EXTENSIONS:
         return "video"
     if extension in ARCHIVE_AUDIO_EXTENSIONS:
@@ -1283,6 +1783,7 @@ def archive_entry_is_previewable(entry: ArchiveEntry) -> bool:
         or extension in ARCHIVE_TEXT_EXTENSIONS
         or extension in ARCHIVE_MODEL_EXTENSIONS
         or extension in _ARCHIVE_STRUCTURED_BINARY_PREVIEW_EXTENSIONS
+        or extension == ".pathc"
     )
 
 
@@ -1500,6 +2001,686 @@ def build_archive_entry_extension_index(entries: Sequence[ArchiveEntry]) -> Dict
     return index
 
 
+def _extract_archive_sidecar_texture_lookup_paths(sidecar_text: str) -> Tuple[str, ...]:
+    if not sidecar_text:
+        return ()
+
+    texture_paths: List[str] = []
+    seen_paths: set[str] = set()
+    for match in _ARCHIVE_SIDECAR_TEXTURE_ATTR_RE.finditer(sidecar_text):
+        texture_path = html.unescape(str(match.group("value") or "")).replace("\\", "/").strip()
+        normalized_texture = normalize_texture_reference_for_sidecar_lookup(texture_path)
+        if not normalized_texture or normalized_texture in seen_paths:
+            continue
+        seen_paths.add(normalized_texture)
+        texture_paths.append(normalized_texture)
+    return tuple(texture_paths)
+
+
+def _build_archive_texture_sidecar_path_rows_for_group(
+    group_entries: Sequence[Tuple[int, ArchiveEntry]],
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Dict[str, List[int]]:
+    path_rows_lists: Dict[str, List[int]] = defaultdict(list)
+    if not group_entries:
+        return path_rows_lists
+
+    paz_path = group_entries[0][1].paz_file
+    try:
+        with paz_path.open("rb") as handle:
+            for entry_index, entry in group_entries:
+                raise_if_cancelled(stop_event)
+                try:
+                    raw_data, _decompressed, _note = _read_archive_entry_data_from_handle(
+                        handle,
+                        entry,
+                        stop_event=stop_event,
+                    )
+                except RunCancelled:
+                    raise
+                except Exception:
+                    continue
+                if not raw_data or _ARCHIVE_DDS_BYTES_RE.search(raw_data) is None:
+                    continue
+                text = try_decode_text_like_archive_data(raw_data)
+                if not text:
+                    continue
+                for normalized_texture in _extract_archive_sidecar_texture_lookup_paths(text):
+                    path_rows_lists[normalized_texture].append(entry_index)
+    except RunCancelled:
+        raise
+    except Exception:
+        return {}
+    return path_rows_lists
+
+
+def build_archive_texture_sidecar_path_rows(
+    entries: Sequence[ArchiveEntry],
+    *,
+    stop_event: Optional[threading.Event] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    progress_label: str = "Indexing archive texture sidecars...",
+) -> Dict[str, Tuple[int, ...]]:
+    grouped_sidecar_entries: Dict[str, List[Tuple[int, ArchiveEntry]]] = defaultdict(list)
+    total_sidecars = 0
+    for entry_index, entry in enumerate(entries):
+        if entry.extension not in _ARCHIVE_XML_LIKE_EXTENSIONS:
+            continue
+        paz_key = str(entry.paz_file).strip().lower()
+        grouped_sidecar_entries[paz_key].append((entry_index, entry))
+        total_sidecars += 1
+    if total_sidecars <= 0:
+        return {}
+
+    path_rows_lists: Dict[str, List[int]] = defaultdict(list)
+    progress_interval = max(total_sidecars // 100, 1) if total_sidecars > 0 else 1
+    processed_count = 0
+    sorted_groups = [
+        (paz_key, sorted(grouped_sidecar_entries[paz_key], key=lambda item: item[1].offset))
+        for paz_key in sorted(grouped_sidecar_entries)
+    ]
+    try:
+        configured_workers = int(os.environ.get("CFT_ARCHIVE_SIDECAR_WORKERS", "1"))
+    except ValueError:
+        configured_workers = 1
+    worker_count = min(max(configured_workers, 1), 4, len(sorted_groups))
+
+    def merge_group_rows(group_rows: Dict[str, List[int]]) -> None:
+        for normalized_texture, entry_indexes in group_rows.items():
+            if entry_indexes:
+                path_rows_lists[normalized_texture].extend(entry_indexes)
+
+    def publish_progress(force: bool = False) -> None:
+        if on_progress is None:
+            return
+        if force or processed_count == total_sidecars or processed_count % progress_interval == 0:
+            on_progress(
+                processed_count,
+                total_sidecars,
+                f"{progress_label} {processed_count:,} / {total_sidecars:,}",
+            )
+
+    if worker_count <= 1 or total_sidecars < 2_000:
+        for _paz_key, group_entries in sorted_groups:
+            raise_if_cancelled(stop_event)
+            group_rows = _build_archive_texture_sidecar_path_rows_for_group(
+                group_entries,
+                stop_event=stop_event,
+            )
+            merge_group_rows(group_rows)
+            processed_count += len(group_entries)
+            publish_progress(force=True)
+    else:
+        group_results: Dict[str, Dict[str, List[int]]] = {}
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="ArchiveSidecarIndex") as executor:
+            future_by_key = {
+                executor.submit(
+                    _build_archive_texture_sidecar_path_rows_for_group,
+                    group_entries,
+                    stop_event=stop_event,
+                ): (paz_key, len(group_entries))
+                for paz_key, group_entries in sorted_groups
+            }
+            for future in as_completed(future_by_key):
+                paz_key, group_count = future_by_key[future]
+                raise_if_cancelled(stop_event)
+                try:
+                    group_results[paz_key] = future.result()
+                except RunCancelled:
+                    raise
+                except Exception:
+                    group_results[paz_key] = {}
+                processed_count += group_count
+                publish_progress(force=True)
+        for paz_key, _group_entries in sorted_groups:
+            merge_group_rows(group_results.get(paz_key, {}))
+
+    return {key: tuple(value) for key, value in path_rows_lists.items() if value}
+
+
+def _build_archive_texture_sidecar_path_rows_for_indices(
+    entries: Sequence[ArchiveEntry],
+    entry_indices: Sequence[int],
+    *,
+    stop_event: Optional[threading.Event] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    progress_label: str = "Indexing changed archive texture sidecars...",
+) -> Dict[str, Tuple[int, ...]]:
+    grouped_sidecar_entries: Dict[str, List[Tuple[int, ArchiveEntry]]] = defaultdict(list)
+    for raw_index in entry_indices:
+        entry_index = int(raw_index)
+        if entry_index < 0 or entry_index >= len(entries):
+            continue
+        entry = entries[entry_index]
+        if entry.extension not in _ARCHIVE_XML_LIKE_EXTENSIONS:
+            continue
+        paz_key = str(entry.paz_file).strip().lower()
+        grouped_sidecar_entries[paz_key].append((entry_index, entry))
+    total_sidecars = sum(len(group_entries) for group_entries in grouped_sidecar_entries.values())
+    if total_sidecars <= 0:
+        return {}
+
+    path_rows_lists: Dict[str, List[int]] = defaultdict(list)
+    processed_count = 0
+    if on_progress is not None:
+        on_progress(0, total_sidecars, f"{progress_label} 0 / {total_sidecars:,}")
+    for paz_key in sorted(grouped_sidecar_entries):
+        raise_if_cancelled(stop_event)
+        group_entries = sorted(grouped_sidecar_entries[paz_key], key=lambda item: item[1].offset)
+        group_rows = _build_archive_texture_sidecar_path_rows_for_group(
+            group_entries,
+            stop_event=stop_event,
+        )
+        for normalized_texture, row_indices in group_rows.items():
+            if row_indices:
+                path_rows_lists[normalized_texture].extend(row_indices)
+        processed_count += len(group_entries)
+        if on_progress is not None:
+            on_progress(
+                processed_count,
+                total_sidecars,
+                f"{progress_label} {processed_count:,} / {total_sidecars:,}",
+            )
+    return {key: tuple(value) for key, value in path_rows_lists.items() if value}
+
+
+def _incremental_archive_texture_sidecar_path_rows(
+    package_root: Path,
+    entries: Sequence[ArchiveEntry],
+    cached_path_rows: Dict[str, Tuple[int, ...]],
+    cached_entry_signatures: object,
+    *,
+    stop_event: Optional[threading.Event] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    timings: Optional[Dict[str, float]] = None,
+) -> Optional[Dict[str, Tuple[int, ...]]]:
+    if not isinstance(cached_entry_signatures, (list, tuple)):
+        return None
+    try:
+        old_signatures = tuple(tuple(signature) for signature in cached_entry_signatures)
+    except Exception:
+        return None
+    current_signatures = _build_archive_entry_cache_signatures(package_root, entries)
+
+    current_by_signature: Dict[Tuple[object, ...], int] = {}
+    duplicate_current_signatures: set[Tuple[object, ...]] = set()
+    for current_index, signature in enumerate(current_signatures):
+        if signature in current_by_signature:
+            duplicate_current_signatures.add(signature)
+            continue
+        current_by_signature[signature] = current_index
+    for signature in duplicate_current_signatures:
+        current_by_signature.pop(signature, None)
+
+    old_to_current: Dict[int, int] = {}
+    reused_current_indices: set[int] = set()
+    for old_index, signature in enumerate(old_signatures):
+        current_index = current_by_signature.get(signature)
+        if current_index is None:
+            continue
+        old_to_current[old_index] = current_index
+        reused_current_indices.add(current_index)
+
+    changed_sidecar_indices = [
+        index
+        for index, entry in enumerate(entries)
+        if entry.extension in _ARCHIVE_XML_LIKE_EXTENSIONS and index not in reused_current_indices
+    ]
+    if old_to_current and not changed_sidecar_indices and len(current_signatures) == len(old_signatures):
+        if on_log is not None:
+            on_log("Texture sidecar cache metadata changed, but all sidecar rows remapped without rescanning.")
+    elif on_log is not None:
+        on_log(
+            "Texture sidecar cache is partially out of date; "
+            f"reusing {len(reused_current_indices):,} unchanged entrie(s), rescanning {len(changed_sidecar_indices):,} sidecar entrie(s)."
+        )
+
+    merge_started_at = time.perf_counter()
+    remapped_rows_lists: Dict[str, List[int]] = defaultdict(list)
+    for normalized_texture, old_indices in cached_path_rows.items():
+        for old_index in old_indices:
+            current_index = old_to_current.get(int(old_index))
+            if current_index is not None:
+                remapped_rows_lists[normalized_texture].append(current_index)
+    _record_timing(timings, "incremental_remap_s", merge_started_at)
+
+    scan_started_at = time.perf_counter()
+    changed_rows = _build_archive_texture_sidecar_path_rows_for_indices(
+        entries,
+        changed_sidecar_indices,
+        stop_event=stop_event,
+        on_progress=on_progress,
+    )
+    _record_timing(timings, "incremental_scan_s", scan_started_at)
+    for normalized_texture, current_indices in changed_rows.items():
+        remapped_rows_lists[normalized_texture].extend(int(index) for index in current_indices)
+
+    return {
+        key: tuple(dict.fromkeys(value))
+        for key, value in remapped_rows_lists.items()
+        if value
+    }
+
+
+def _build_archive_sidecar_basename_rows_from_path_rows(
+    path_rows: Dict[str, Tuple[int, ...]],
+) -> Dict[str, Tuple[int, ...]]:
+    basename_rows_lists: Dict[str, List[int]] = defaultdict(list)
+    for normalized_texture, raw_indexes in path_rows.items():
+        texture_basename = PurePosixPath(str(normalized_texture or "").strip().lower()).name
+        if not texture_basename or not raw_indexes:
+            continue
+        basename_rows_lists[texture_basename].extend(int(index) for index in raw_indexes)
+    return {key: tuple(value) for key, value in basename_rows_lists.items() if value}
+
+
+def build_archive_texture_sidecar_basename_rows(
+    path_rows: Dict[str, Tuple[int, ...]],
+) -> Dict[str, Tuple[int, ...]]:
+    return _build_archive_sidecar_basename_rows_from_path_rows(path_rows)
+
+
+def resolve_archive_texture_sidecar_entry_rows(
+    rows: object,
+    entries: Sequence[ArchiveEntry],
+) -> Dict[str, List[ArchiveEntry]]:
+    return _deserialize_archive_sidecar_entry_rows(rows, entries)
+
+
+def build_lazy_archive_texture_sidecar_entry_index(
+    rows: Optional[Dict[str, Tuple[int, ...]]],
+    entries: Sequence[ArchiveEntry],
+) -> LazyArchiveEntryRowIndex:
+    return LazyArchiveEntryRowIndex(rows, entries)
+
+
+def build_archive_texture_sidecar_entry_index(
+    entries: Sequence[ArchiveEntry],
+    *,
+    stop_event: Optional[threading.Event] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    progress_label: str = "Indexing archive texture sidecars...",
+) -> Tuple[Dict[str, List[ArchiveEntry]], Dict[str, List[ArchiveEntry]]]:
+    path_rows = build_archive_texture_sidecar_path_rows(
+        entries,
+        stop_event=stop_event,
+        on_progress=on_progress,
+        progress_label=progress_label,
+    )
+    if not path_rows:
+        return {}, {}
+    basename_rows = _build_archive_sidecar_basename_rows_from_path_rows(path_rows)
+    return (
+        _deserialize_archive_sidecar_entry_rows(path_rows, entries),
+        _deserialize_archive_sidecar_entry_rows(basename_rows, entries),
+    )
+
+
+def _serialize_archive_sidecar_entry_rows(
+    index: Dict[str, List[ArchiveEntry]],
+    *,
+    entry_positions_by_identity: Dict[int, int],
+) -> Dict[str, Tuple[int, ...]]:
+    rows: Dict[str, Tuple[int, ...]] = {}
+    for key, entries_for_key in index.items():
+        normalized_key = str(key or "").strip().lower()
+        if not normalized_key:
+            continue
+        entry_indexes: List[int] = []
+        seen_indexes: set[int] = set()
+        for entry in entries_for_key:
+            entry_index = entry_positions_by_identity.get(id(entry))
+            if entry_index is None or entry_index in seen_indexes:
+                continue
+            seen_indexes.add(entry_index)
+            entry_indexes.append(entry_index)
+        if entry_indexes:
+            rows[normalized_key] = tuple(entry_indexes)
+    return rows
+
+
+def _deserialize_archive_sidecar_entry_rows(
+    rows: object,
+    entries: Sequence[ArchiveEntry],
+) -> Dict[str, List[ArchiveEntry]]:
+    if not isinstance(rows, dict):
+        raise ValueError("Texture sidecar cache rows are invalid.")
+    resolved_entries = list(entries)
+    entry_count = len(resolved_entries)
+    index: Dict[str, List[ArchiveEntry]] = {}
+    for key, raw_indexes in rows.items():
+        normalized_key = str(key or "").strip().lower()
+        if not normalized_key:
+            continue
+        if not isinstance(raw_indexes, (list, tuple)):
+            raise ValueError("Texture sidecar cache entry references are invalid.")
+        resolved_for_key: List[ArchiveEntry] = []
+        seen_indexes: set[int] = set()
+        for raw_index in raw_indexes:
+            entry_index = int(raw_index)
+            if entry_index < 0 or entry_index >= entry_count:
+                raise ValueError("Texture sidecar cache entry index is out of range.")
+            if entry_index in seen_indexes:
+                continue
+            seen_indexes.add(entry_index)
+            resolved_for_key.append(resolved_entries[entry_index])
+        if resolved_for_key:
+            index[normalized_key] = resolved_for_key
+    return index
+
+
+def save_archive_texture_sidecar_cache(
+    package_root: Path,
+    cache_root: Path,
+    entries: Sequence[ArchiveEntry],
+    *,
+    entries_by_texture_path: Optional[Dict[str, List[ArchiveEntry]]] = None,
+    entries_by_texture_basename: Optional[Dict[str, List[ArchiveEntry]]] = None,
+    path_rows: Optional[Dict[str, Tuple[int, ...]]] = None,
+    basename_rows: Optional[Dict[str, Tuple[int, ...]]] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    stop_event: Optional[threading.Event] = None,
+    timings: Optional[Dict[str, float]] = None,
+) -> Path:
+    started_at = time.perf_counter()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_path = resolve_archive_sidecar_cache_path(package_root, cache_root)
+    metadata_path = resolve_archive_sidecar_cache_metadata_path(package_root, cache_root)
+    _base_dir, sources = _collect_archive_scan_sources(package_root)
+    if on_progress is not None:
+        on_progress(0, 0, "Writing texture sidecar cache...")
+    raise_if_cancelled(stop_event)
+    entry_positions_by_identity: Optional[Dict[int, int]] = None
+    if path_rows is None:
+        if entries_by_texture_path is None:
+            raise ValueError("entries_by_texture_path is required when path_rows is not provided.")
+        entry_positions_by_identity = {id(entry): index for index, entry in enumerate(entries)}
+        path_rows = _serialize_archive_sidecar_entry_rows(
+            entries_by_texture_path,
+            entry_positions_by_identity=entry_positions_by_identity,
+        )
+    if basename_rows is None and int(_ARCHIVE_SIDECAR_CACHE_VERSION) <= 1:
+        if entries_by_texture_basename is None:
+            raise ValueError("entries_by_texture_basename is required when basename_rows is not provided.")
+        if entry_positions_by_identity is None:
+            entry_positions_by_identity = {id(entry): index for index, entry in enumerate(entries)}
+        basename_rows = _serialize_archive_sidecar_entry_rows(
+            entries_by_texture_basename,
+            entry_positions_by_identity=entry_positions_by_identity,
+        )
+    payload = {
+        "version": _ARCHIVE_SIDECAR_CACHE_VERSION,
+        "created_at": time.time(),
+        "sources": sources,
+        "entry_count": len(entries),
+        "entry_signatures": _build_archive_entry_cache_signatures(package_root, entries),
+        "path_rows": path_rows,
+    }
+    if basename_rows:
+        payload["basename_rows"] = basename_rows
+    _write_raw_pickle_cache_payload_to_path(
+        cache_path,
+        magic=_ARCHIVE_SIDECAR_CACHE_MAGIC,
+        payload=payload,
+    )
+    try:
+        _write_archive_sidecar_cache_metadata(
+            metadata_path,
+            version=_ARCHIVE_SIDECAR_CACHE_VERSION,
+            sources=sources,
+            entry_count=len(entries),
+        )
+    except Exception as exc:
+        if on_log is not None:
+            on_log(f"Warning: texture sidecar cache metadata could not be written: {exc}")
+    if on_progress is not None:
+        on_progress(1, 1, "Texture sidecar cache is ready.")
+    if on_log is not None:
+        on_log(f"Texture sidecar cache updated: {cache_path}")
+    _record_timing(timings, "cache_write_s", started_at)
+    return cache_path
+
+
+def load_archive_texture_sidecar_cache_rows(
+    package_root: Path,
+    cache_root: Path,
+    entries: Sequence[ArchiveEntry],
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    stop_event: Optional[threading.Event] = None,
+    timings: Optional[Dict[str, float]] = None,
+) -> Optional[Tuple[Dict[str, Tuple[int, ...]], Dict[str, Tuple[int, ...]]]]:
+    check_started_at = time.perf_counter()
+    cache_path = resolve_archive_sidecar_cache_path(package_root, cache_root)
+    metadata_path = resolve_archive_sidecar_cache_metadata_path(package_root, cache_root)
+    if not cache_path.exists():
+        if timings is not None:
+            timings.setdefault("cache_check_s", max(0.0, float(time.perf_counter() - check_started_at)))
+            timings.setdefault("cache_load_s", 0.0)
+        return None
+    if on_progress is not None:
+        on_progress(0, 0, "Checking texture sidecar cache...")
+    try:
+        _base_dir, current_sources = _collect_archive_scan_sources(package_root)
+    except Exception as exc:
+        if on_log is not None:
+            on_log(f"Texture sidecar cache check failed; rebuilding it now: {exc}")
+        if timings is not None:
+            timings.setdefault("cache_check_s", max(0.0, float(time.perf_counter() - check_started_at)))
+            timings.setdefault("cache_load_s", 0.0)
+        return None
+
+    metadata_payload: Optional[dict] = None
+    metadata_requires_incremental_check = False
+    if metadata_path.exists():
+        try:
+            metadata_payload = _read_archive_sidecar_cache_metadata(metadata_path)
+        except Exception as exc:
+            if on_log is not None:
+                on_log(f"Texture sidecar cache metadata could not be read; falling back to the full cache payload: {exc}")
+
+    if metadata_payload is not None:
+        cached_version = int(metadata_payload.get("version", 0))
+        if cached_version not in _ARCHIVE_SIDECAR_CACHE_SUPPORTED_VERSIONS:
+            if on_log is not None:
+                on_log("Texture sidecar cache metadata format changed; rebuilding it now.")
+            return None
+        cached_sources = _normalize_archive_source_rows(metadata_payload.get("sources"))
+        if cached_sources is None or cached_sources != current_sources:
+            metadata_requires_incremental_check = True
+        cached_entry_count = int(metadata_payload.get("entry_count", -1))
+        if cached_entry_count != len(entries):
+            metadata_requires_incremental_check = True
+
+    if on_progress is not None:
+        on_progress(0, 0, "Loading texture sidecar cache...")
+    try:
+        if timings is not None:
+            timings["cache_check_s"] = max(0.0, float(time.perf_counter() - check_started_at))
+        load_started_at = time.perf_counter()
+        data = _deserialize_cache_payload_from_path(
+            cache_path,
+            magic=_ARCHIVE_SIDECAR_CACHE_MAGIC,
+            invalid_message="Texture sidecar cache header is not recognized.",
+        )
+    except Exception as exc:
+        if on_log is not None:
+            on_log(f"Texture sidecar cache could not be read; rebuilding it now: {exc}")
+        return None
+
+    if int(data.get("version", 0)) not in _ARCHIVE_SIDECAR_CACHE_SUPPORTED_VERSIONS:
+        if on_log is not None:
+            on_log("Texture sidecar cache format changed; rebuilding it now.")
+        return None
+
+    if metadata_payload is None:
+        cached_sources = _normalize_archive_source_rows(data.get("sources"))
+        if cached_sources is None or cached_sources != current_sources:
+            metadata_requires_incremental_check = True
+        cached_entry_count = int(data.get("entry_count", -1))
+        if cached_entry_count != len(entries):
+            metadata_requires_incremental_check = True
+
+    try:
+        raise_if_cancelled(stop_event)
+        raw_path_rows = {
+            str(key or "").strip().lower(): tuple(int(index) for index in value)
+            for key, value in (data.get("path_rows", {}) or {}).items()
+            if isinstance(value, (list, tuple)) and str(key or "").strip()
+        }
+        raw_basename_rows = data.get("basename_rows")
+        if isinstance(raw_basename_rows, dict):
+            basename_rows = {
+                str(key or "").strip().lower(): tuple(int(index) for index in value)
+                for key, value in raw_basename_rows.items()
+                if isinstance(value, (list, tuple)) and str(key or "").strip()
+            }
+        else:
+            basename_rows = _build_archive_sidecar_basename_rows_from_path_rows(raw_path_rows)
+        if metadata_requires_incremental_check:
+            incremental_started_at = time.perf_counter()
+            incremental_path_rows = _incremental_archive_texture_sidecar_path_rows(
+                package_root,
+                entries,
+                raw_path_rows,
+                data.get("entry_signatures"),
+                stop_event=stop_event,
+                on_log=on_log,
+                on_progress=on_progress,
+                timings=timings,
+            )
+            if incremental_path_rows is None:
+                if on_log is not None:
+                    on_log("Texture sidecar cache is out of date and cannot be remapped; rebuilding it now.")
+                return None
+            raw_path_rows = incremental_path_rows
+            basename_rows = _build_archive_sidecar_basename_rows_from_path_rows(raw_path_rows)
+            _record_timing(timings, "incremental_update_s", incremental_started_at)
+            try:
+                save_archive_texture_sidecar_cache(
+                    package_root,
+                    cache_root,
+                    entries,
+                    path_rows=raw_path_rows,
+                    basename_rows=None,
+                    on_log=None,
+                    on_progress=None,
+                    stop_event=stop_event,
+                    timings=timings,
+                )
+            except Exception as exc:
+                if on_log is not None:
+                    on_log(f"Warning: incrementally updated texture sidecar cache could not be written: {exc}")
+        _record_timing(timings, "cache_load_s", load_started_at)
+    except Exception as exc:
+        if on_log is not None:
+            on_log(f"Texture sidecar cache could not be applied; rebuilding it now: {exc}")
+        return None
+
+    if metadata_payload is None:
+        try:
+            _write_archive_sidecar_cache_metadata(
+                metadata_path,
+                version=int(data.get("version", _ARCHIVE_SIDECAR_CACHE_VERSION)),
+                sources=current_sources,
+                entry_count=len(entries),
+            )
+        except Exception:
+            pass
+
+    if on_progress is not None:
+        on_progress(1, 1, "Texture sidecar cache loaded.")
+    if on_log is not None:
+        on_log("Loaded texture sidecar bindings from cache.")
+    return raw_path_rows, basename_rows
+
+
+def load_archive_texture_sidecar_cache(
+    package_root: Path,
+    cache_root: Path,
+    entries: Sequence[ArchiveEntry],
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    stop_event: Optional[threading.Event] = None,
+    timings: Optional[Dict[str, float]] = None,
+) -> Optional[Tuple[Dict[str, List[ArchiveEntry]], Dict[str, List[ArchiveEntry]]]]:
+    cached_rows = load_archive_texture_sidecar_cache_rows(
+        package_root,
+        cache_root,
+        entries,
+        on_log=on_log,
+        on_progress=on_progress,
+        stop_event=stop_event,
+        timings=timings,
+    )
+    if cached_rows is None:
+        return None
+    path_rows, basename_rows = cached_rows
+    return (
+        _deserialize_archive_sidecar_entry_rows(path_rows, entries),
+        _deserialize_archive_sidecar_entry_rows(basename_rows, entries),
+    )
+
+
+def build_archive_texture_sidecar_entry_index_cached(
+    package_root: Path,
+    cache_root: Path,
+    entries: Sequence[ArchiveEntry],
+    *,
+    stop_event: Optional[threading.Event] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+) -> Tuple[Dict[str, List[ArchiveEntry]], Dict[str, List[ArchiveEntry]], str, Optional[Path]]:
+    cache_path = resolve_archive_sidecar_cache_path(package_root, cache_root)
+    cached = load_archive_texture_sidecar_cache(
+        package_root,
+        cache_root,
+        entries,
+        on_log=on_log,
+        on_progress=on_progress,
+        stop_event=stop_event,
+    )
+    if cached is not None:
+        entries_by_texture_path, entries_by_texture_basename = cached
+        return entries_by_texture_path, entries_by_texture_basename, "cache", cache_path
+
+    if on_log is not None:
+        on_log("Indexing texture sidecar bindings for related-file discovery...")
+    path_rows = build_archive_texture_sidecar_path_rows(
+        entries,
+        stop_event=stop_event,
+        on_progress=on_progress,
+    )
+    basename_rows = _build_archive_sidecar_basename_rows_from_path_rows(path_rows)
+    entries_by_texture_path = _deserialize_archive_sidecar_entry_rows(path_rows, entries) if path_rows else {}
+    entries_by_texture_basename = (
+        _deserialize_archive_sidecar_entry_rows(basename_rows, entries) if basename_rows else {}
+    )
+    try:
+        cache_path = save_archive_texture_sidecar_cache(
+            package_root,
+            cache_root,
+            entries,
+            path_rows=path_rows,
+            basename_rows=basename_rows if int(_ARCHIVE_SIDECAR_CACHE_VERSION) <= 1 else None,
+            entries_by_texture_path=entries_by_texture_path,
+            entries_by_texture_basename=entries_by_texture_basename,
+            on_log=on_log,
+            on_progress=on_progress,
+            stop_event=stop_event,
+        )
+    except Exception as exc:
+        if on_log is not None:
+            on_log(f"Warning: texture sidecar cache could not be written: {exc}")
+        cache_path = None
+    return entries_by_texture_path, entries_by_texture_basename, "scan", cache_path
+
+
 def build_archive_structure_children_map(entries: Sequence[ArchiveEntry]) -> Dict[str, List[Tuple[str, int]]]:
     child_counts: Dict[str, Dict[str, int]] = defaultdict(dict)
     folder_counts: Dict[Tuple[str, ...], int] = defaultdict(int)
@@ -1553,10 +2734,12 @@ def build_archive_tree_index(
     Dict[Tuple[str, ...], List[Tuple[str, Tuple[str, ...]]]],
     Dict[Tuple[str, ...], List[int]],
     Dict[Tuple[str, ...], List[int]],
+    Dict[Tuple[str, ...], Tuple[int, int, int]],
 ]:
     child_folder_sets: Dict[Tuple[str, ...], Dict[Tuple[str, ...], str]] = defaultdict(dict)
     direct_files: Dict[Tuple[str, ...], List[Tuple[str, int]]] = defaultdict(list)
     folder_entry_indexes: Dict[Tuple[str, ...], List[int]] = defaultdict(list)
+    folder_preview_stats: Dict[Tuple[str, ...], List[int]] = defaultdict(lambda: [0, 0, 0])
     folder_key_cache: Dict[str, Tuple[str, ...]] = {"": ()}
     folder_hierarchy_cache: Dict[Tuple[str, ...], Tuple[Tuple[Tuple[str, ...], Tuple[str, ...], str], ...]] = {(): ()}
     total_entries = len(entries)
@@ -1587,6 +2770,10 @@ def build_archive_tree_index(
 
         direct_files[folder_key].append((basename.lower(), index))
         folder_entry_indexes[()].append(index)
+        root_stats = folder_preview_stats[()]
+        root_stats[0] += 1
+        root_stats[1] += int(entry.orig_size)
+        root_stats[2] += int(entry.comp_size)
         hierarchy = folder_hierarchy_cache.get(folder_key)
         if hierarchy is None:
             parent_key: Tuple[str, ...] = ()
@@ -1602,6 +2789,10 @@ def build_archive_tree_index(
         for parent_key, child_key, part in hierarchy:
             child_folder_sets[parent_key][child_key] = part
             folder_entry_indexes[child_key].append(index)
+            folder_stats = folder_preview_stats[child_key]
+            folder_stats[0] += 1
+            folder_stats[1] += int(entry.orig_size)
+            folder_stats[2] += int(entry.comp_size)
 
         if on_progress and (current == 1 or current % update_every == 0 or current == total_entries):
             on_progress(current, progress_total, f"Indexing archive browser tree... {current:,} / {total_entries:,} entries")
@@ -1630,7 +2821,11 @@ def build_archive_tree_index(
         folder_key: [index for _basename, index in sorted_items]
         for folder_key, sorted_items in direct_files_by_folder.items()
     }
-    return child_folders, direct_file_indexes, dict(folder_entry_indexes)
+    normalized_folder_preview_stats = {
+        folder_key: (int(stats[0]), int(stats[1]), int(stats[2]))
+        for folder_key, stats in folder_preview_stats.items()
+    }
+    return child_folders, direct_file_indexes, dict(folder_entry_indexes), normalized_folder_preview_stats
 
 
 def prepare_archive_browser_state(
@@ -1682,12 +2877,13 @@ def prepare_archive_browser_state(
     tree_child_folders: Dict[Tuple[str, ...], List[Tuple[str, Tuple[str, ...]]]] = {}
     tree_direct_files: Dict[Tuple[str, ...], List[int]] = {}
     folder_entry_indexes: Dict[Tuple[str, ...], List[int]] = {}
+    folder_preview_stats: Dict[Tuple[str, ...], Tuple[int, int, int]] = {}
     if build_tree_index:
         raise_if_cancelled(stop_event)
         current_step += 1
         if on_progress:
             on_progress(current_step, total_steps, "Indexing archive browser tree...")
-        tree_child_folders, tree_direct_files, folder_entry_indexes = build_archive_tree_index(
+        tree_child_folders, tree_direct_files, folder_entry_indexes, folder_preview_stats = build_archive_tree_index(
             filtered_entries,
             on_progress=on_progress,
             stop_event=stop_event,
@@ -1700,16 +2896,19 @@ def prepare_archive_browser_state(
         "tree_child_folders": tree_child_folders,
         "tree_direct_files": tree_direct_files,
         "tree_folder_entry_indexes": folder_entry_indexes,
+        "tree_folder_preview_stats": folder_preview_stats,
         "tree_index_ready": build_tree_index,
         "dds_count": dds_count,
     }
 
 
 class PathcCollection:
-    def __init__(self, path: Path) -> None:
-        raw = path.read_bytes()
+    def __init__(self, path: Path, raw_data: Optional[bytes] = None) -> None:
+        raw = path.read_bytes() if raw_data is None else bytes(raw_data)
         if len(raw) < 32:
             raise ValueError(f"{path} is too small to be a valid .pathc file.")
+        self.path = path
+        self.raw_size = len(raw)
         (
             _reserved0,
             header_size,
@@ -1718,8 +2917,13 @@ class PathcCollection:
             collision_entry_count,
             filenames_length,
         ) = struct.unpack_from("<QIIIII", raw, 0)
+        self.reserved0 = _reserved0
         offset = struct.calcsize("<QIIIII")
         self.header_size = header_size
+        self.header_count = header_count
+        self.entry_count = entry_count
+        self.collision_entry_count = collision_entry_count
+        self.filenames_length = filenames_length
         self.headers: List[bytes] = []
         for _ in range(header_count):
             header = raw[offset : offset + header_size]
@@ -1733,8 +2937,9 @@ class PathcCollection:
                 raise ValueError(f"{path.name} checksum table is truncated.")
             checksums.append(struct.unpack_from("<I", raw, offset)[0])
             offset += 4
+        self.checksums = tuple(checksums)
         entries: List[PathcEntry] = []
-        for _ in range(entry_count):
+        for entry_index in range(entry_count):
             if offset + 20 > len(raw):
                 raise ValueError(f"{path.name} entry table is truncated.")
             texture_header_index, collision_start_index, collision_end_index, compressed_block_infos = struct.unpack_from(
@@ -1742,16 +2947,19 @@ class PathcCollection:
                 raw,
                 offset,
             )
+            checksum = checksums[entry_index] if entry_index < len(checksums) else 0
             entries.append(
                 PathcEntry(
                     texture_header_index=texture_header_index,
                     collision_start_index=collision_start_index,
                     collision_end_index=collision_end_index,
                     compressed_block_infos=compressed_block_infos,
+                    checksum=checksum,
                 )
             )
             offset += 20
         self.entries = {checksum: entry for checksum, entry in zip(checksums, entries)}
+        self.entry_rows = tuple(entries)
         collision_entries: List[PathcCollisionEntry] = []
         for _ in range(collision_entry_count):
             if offset + 24 > len(raw):
@@ -1773,32 +2981,109 @@ class PathcCollection:
         filenames = raw[offset : offset + filenames_length]
         if len(filenames) != filenames_length:
             raise ValueError(f"{path.name} filename table is truncated.")
+        self.filename_blob = filenames
         self.hash_collision_entries: Dict[str, PathcCollisionEntry] = {}
         for entry in collision_entries:
             end = filenames.find(b"\x00", entry.filename_offset)
             if end < 0:
                 end = len(filenames)
             name = filenames[entry.filename_offset:end].decode("utf-8", errors="replace")
+            entry.path = name
             self.hash_collision_entries[name] = entry
+        self.collision_entries = tuple(collision_entries)
+        self.direct_mapping_count = 0
+        self.collision_mapping_count = 0
+        self.invalid_mapping_count = 0
+        self.unknown_mapping_count = 0
+        for entry in self.entry_rows:
+            if entry.texture_header_index != 0xFFFF:
+                if 0 <= int(entry.texture_header_index) < len(self.headers):
+                    self.direct_mapping_count += 1
+                else:
+                    self.invalid_mapping_count += 1
+                continue
+            if int(entry.collision_start_index) < int(entry.collision_end_index):
+                self.collision_mapping_count += 1
+            else:
+                self.unknown_mapping_count += 1
 
     def get_file_header(self, path: str) -> bytes:
-        normalized = path.replace("\\", "/").lstrip("/")
-        checksum = calculate_pa_checksum(f"/{normalized}")
-        entry = self.entries.get(checksum)
-        if entry is None:
-            raise KeyError(normalized)
-        if entry.texture_header_index != 0xFFFF:
-            header = self.headers[entry.texture_header_index]
-            compressed_block_infos = entry.compressed_block_infos
-        else:
-            collision_entry = self.hash_collision_entries.get(normalized)
-            if collision_entry is None:
-                raise KeyError(normalized)
-            header = self.headers[collision_entry.texture_header_index]
-            compressed_block_infos = collision_entry.compressed_block_infos
+        lookup = self.lookup_file(path)
+        if lookup.mapping_mode not in {"direct", "collision"} or lookup.texture_header_index < 0:
+            raise KeyError(lookup.normalized_path)
+        header = self.headers[lookup.texture_header_index]
+        compressed_block_infos = lookup.compressed_block_infos
         if self.header_size == 0x94:
             return header[:0x20] + compressed_block_infos + header[0x30:]
         return header
+
+    def lookup_file(self, path: str) -> PathcLookupResult:
+        normalized = str(path or "").replace("\\", "/").lstrip("/")
+        checksum = calculate_pa_checksum(f"/{normalized}")
+        entry = self.entries.get(checksum)
+        if entry is None:
+            return PathcLookupResult(
+                normalized_path=normalized,
+                checksum=checksum,
+                mapping_mode="missing",
+                message="No PATHC hash entry matched this path.",
+            )
+        if entry.texture_header_index != 0xFFFF:
+            header_index = int(entry.texture_header_index)
+            if 0 <= header_index < len(self.headers):
+                return PathcLookupResult(
+                    normalized_path=normalized,
+                    checksum=checksum,
+                    mapping_mode="direct",
+                    texture_header_index=header_index,
+                    header_size=self.header_size,
+                    compressed_block_infos=entry.compressed_block_infos,
+                )
+            return PathcLookupResult(
+                normalized_path=normalized,
+                checksum=checksum,
+                mapping_mode="invalid",
+                texture_header_index=header_index,
+                header_size=self.header_size,
+                compressed_block_infos=entry.compressed_block_infos,
+                message="Direct PATHC header index is outside the header table.",
+            )
+
+        collision_entry = self.hash_collision_entries.get(normalized)
+        if collision_entry is None:
+            return PathcLookupResult(
+                normalized_path=normalized,
+                checksum=checksum,
+                mapping_mode="missing",
+                texture_header_index=-1,
+                header_size=self.header_size,
+                compressed_block_infos=entry.compressed_block_infos,
+                message="PATHC hash entry uses collision mapping, but no collision path matched this file.",
+            )
+        header_index = int(collision_entry.texture_header_index)
+        if not (0 <= header_index < len(self.headers)):
+            return PathcLookupResult(
+                normalized_path=normalized,
+                checksum=checksum,
+                mapping_mode="invalid",
+                texture_header_index=header_index,
+                header_size=self.header_size,
+                compressed_block_infos=collision_entry.compressed_block_infos,
+                collision_path=collision_entry.path,
+                message="Collision PATHC header index is outside the header table.",
+            )
+        return PathcLookupResult(
+            normalized_path=normalized,
+            checksum=checksum,
+            mapping_mode="collision",
+            texture_header_index=header_index,
+            header_size=self.header_size,
+            compressed_block_infos=collision_entry.compressed_block_infos,
+            collision_path=collision_entry.path,
+        )
+
+    def iter_collision_samples(self, limit: int = 16) -> Tuple[PathcCollisionEntry, ...]:
+        return tuple(self.collision_entries[: max(0, int(limit))])
 
 
 def load_pathc_collection(path: Path) -> PathcCollection:
@@ -1841,6 +3126,89 @@ def get_archive_partial_dds_header(entry: ArchiveEntry) -> bytes:
         except KeyError:
             continue
     raise ValueError(f"Partial DDS header not found in {pathc_path} for {entry.path}")
+
+
+def _format_pathc_block_infos(block_infos: bytes) -> str:
+    if len(block_infos) < 16:
+        return block_infos.hex(" ").upper() if block_infos else "none"
+    values = struct.unpack_from("<4I", block_infos, 0)
+    return ", ".join(f"mip{i}={value:,}" for i, value in enumerate(values))
+
+
+def _format_pathc_lookup_detail(lookup: PathcLookupResult) -> str:
+    lines = [
+        "PATHC Lookup:",
+        f"- Path: {lookup.normalized_path or '-'}",
+        f"- Hash/checksum: 0x{lookup.checksum:08X}",
+        f"- Mapping: {lookup.mapping_mode}",
+    ]
+    if lookup.texture_header_index >= 0:
+        lines.append(f"- Texture header index: {lookup.texture_header_index:,}")
+    if lookup.header_size:
+        lines.append(f"- Header record size: {lookup.header_size:,} bytes")
+    if lookup.compressed_block_infos:
+        lines.append(f"- First-four-mip / block metadata: {_format_pathc_block_infos(lookup.compressed_block_infos)}")
+    if lookup.collision_path:
+        lines.append(f"- Collision path: {lookup.collision_path}")
+    if lookup.message:
+        lines.append(f"- Note: {lookup.message}")
+    return "\n".join(lines)
+
+
+def build_archive_pathc_preview(data: bytes, virtual_path: str) -> _StructuredBinaryPreviewBundle:
+    collection = PathcCollection(Path(PurePosixPath(virtual_path.replace("\\", "/")).name or "0.pathc"), raw_data=data)
+    lines = [
+        f"PATHC texture path index preview for {virtual_path}",
+        "",
+        "Summary:",
+        f"- Header record size: {collection.header_size:,} bytes",
+        f"- DDS template/header records: {collection.header_count:,}",
+        f"- Path hash entries: {collection.entry_count:,}",
+        f"- Collision path entries: {collection.collision_entry_count:,}",
+        f"- Filename table size: {collection.filenames_length:,} bytes",
+        f"- Direct mappings: {collection.direct_mapping_count:,}",
+        f"- Collision mappings: {collection.collision_mapping_count:,}",
+        f"- Unknown mappings: {collection.unknown_mapping_count:,}",
+        f"- Invalid mappings: {collection.invalid_mapping_count:,}",
+    ]
+    collision_samples = collection.iter_collision_samples(limit=16)
+    if collision_samples:
+        lines.extend(["", "Collision path samples:"])
+        for index, collision_entry in enumerate(collision_samples, start=1):
+            block_info_text = _format_pathc_block_infos(collision_entry.compressed_block_infos)
+            lines.append(
+                f"- [{index:02d}] header={collision_entry.texture_header_index} "
+                f"offset={collision_entry.filename_offset} path={collision_entry.path or '<empty>'} "
+                f"blocks=({block_info_text})"
+            )
+        if len(collection.collision_entries) > len(collision_samples):
+            lines.append(f"... {len(collection.collision_entries) - len(collision_samples):,} more collision path(s)")
+    else:
+        lines.extend(["", "Collision path samples:", "- None"])
+
+    detail_lines = (
+        f"PATHC contains {collection.header_count:,} DDS template/header record(s).",
+        f"PATHC contains {collection.entry_count:,} path hash entry/entries.",
+        f"Mapping types: direct={collection.direct_mapping_count:,}, collision={collection.collision_mapping_count:,}, "
+        f"unknown={collection.unknown_mapping_count:,}, invalid={collection.invalid_mapping_count:,}.",
+        "This inspector is read-only and does not change DDS reconstruction or mod packaging.",
+    )
+    return _StructuredBinaryPreviewBundle(
+        preview_text="\n".join(lines),
+        detail_lines=detail_lines,
+        metadata_label="PATHC Texture Index",
+    )
+
+
+def build_archive_pathc_lookup_detail_for_entry(entry: ArchiveEntry) -> str:
+    try:
+        pathc_path = resolve_archive_pathc_path(entry)
+        if not pathc_path.is_file():
+            return ""
+        collection = load_pathc_collection(pathc_path)
+        return _format_pathc_lookup_detail(collection.lookup_file(entry.path))
+    except Exception as exc:
+        return f"PATHC Lookup:\n- Unavailable: {exc}"
 
 
 def _dds_bytes_per_block(dxgi_format: int, four_cc: bytes) -> Optional[int]:
@@ -2011,6 +3379,20 @@ def find_available_output_path(target_path: Path, reserved_paths: Optional[set[s
         counter += 1
 
 
+def _read_archive_entry_raw_data_from_handle(
+    handle: BinaryIO,
+    entry: ArchiveEntry,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> bytes:
+    raise_if_cancelled(stop_event)
+    read_size = entry.comp_size if entry.compressed else entry.orig_size
+    handle.seek(entry.offset)
+    data = handle.read(read_size)
+    raise_if_cancelled(stop_event)
+    return data
+
+
 def read_archive_entry_raw_data(
     entry: ArchiveEntry,
     stop_event: Optional[threading.Event] = None,
@@ -2019,12 +3401,8 @@ def read_archive_entry_raw_data(
     if not entry.paz_file.exists():
         raise ValueError(f"Missing PAZ file: {entry.paz_file}")
 
-    read_size = entry.comp_size if entry.compressed else entry.orig_size
     with entry.paz_file.open("rb") as handle:
-        handle.seek(entry.offset)
-        data = handle.read(read_size)
-    raise_if_cancelled(stop_event)
-    return data
+        return _read_archive_entry_raw_data_from_handle(handle, entry, stop_event=stop_event)
 
 
 def maybe_reconstruct_sparse_dds(entry: ArchiveEntry, data: bytes) -> Optional[Tuple[bytes, str]]:
@@ -2106,12 +3484,12 @@ def _maybe_decompress_partial_par_container(
     return bytes(rebuilt), "PartialPAR"
 
 
-def read_archive_entry_data(
+def _decode_archive_entry_data(
     entry: ArchiveEntry,
+    data: bytes,
+    *,
     stop_event: Optional[threading.Event] = None,
 ) -> Tuple[bytes, bool, str]:
-    data = read_archive_entry_raw_data(entry, stop_event=stop_event)
-
     decompressed = False
     note = ""
     if entry.encrypted:
@@ -2159,6 +3537,24 @@ def read_archive_entry_data(
         raise_if_cancelled(stop_event)
 
     return data, decompressed, note
+
+
+def read_archive_entry_data(
+    entry: ArchiveEntry,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[bytes, bool, str]:
+    data = read_archive_entry_raw_data(entry, stop_event=stop_event)
+    return _decode_archive_entry_data(entry, data, stop_event=stop_event)
+
+
+def _read_archive_entry_data_from_handle(
+    handle: BinaryIO,
+    entry: ArchiveEntry,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[bytes, bool, str]:
+    data = _read_archive_entry_raw_data_from_handle(handle, entry, stop_event=stop_event)
+    return _decode_archive_entry_data(entry, data, stop_event=stop_event)
 
 
 def extract_archive_entry(
@@ -2680,7 +4076,13 @@ def ensure_archive_preview_source(
 
 
 def _normalize_model_texture_reference(value: str) -> str:
-    return PurePosixPath(str(value or "").replace("\\", "/")).as_posix().strip().lower()
+    raw_text = str(value or "").replace("\\", "/").strip().lower()
+    if not raw_text or raw_text == ".":
+        return ""
+    normalized = PurePosixPath(raw_text).as_posix().strip().lower()
+    if normalized == ".":
+        return ""
+    return normalized
 
 
 def _normalize_model_submesh_reference(value: str) -> str:
@@ -2774,6 +4176,193 @@ def _model_texture_hint_priority(semantic_hint: str) -> Optional[Tuple[int, int]
     return None
 
 
+def _normalize_model_visible_texture_mode(visible_texture_mode: str) -> str:
+    normalized_mode = str(visible_texture_mode or "").strip().lower()
+    if normalized_mode not in MODEL_PREVIEW_VISIBLE_TEXTURE_MODES:
+        return ModelPreviewRenderSettings().visible_texture_mode
+    return normalized_mode
+
+
+def _classify_model_sidecar_visible_binding(semantic_hint: str, texture_path: str) -> str:
+    normalized_hint = str(semantic_hint or "").strip().lower().replace("_", "")
+    texture_basename = PurePosixPath(str(texture_path or "").replace("\\", "/")).stem.lower()
+
+    technical_tokens = (
+        "normal",
+        "height",
+        "displacement",
+        "material",
+        "roughness",
+        "metallic",
+        "ambientocclusion",
+        "occlusion",
+        "opacity",
+        "specular",
+        "orm",
+        "rma",
+        "mra",
+        "arm",
+        "ao",
+    )
+    technical_suffixes = (
+        "_n",
+        "_normal",
+        "_normalmap",
+        "_disp",
+        "_displacement",
+        "_height",
+        "_hgt",
+        "_dmap",
+        "_parallax",
+        "_pom",
+        "_ssdm",
+        "_mask",
+        "_ma",
+        "_mg",
+        "_sp",
+        "_orm",
+        "_rma",
+        "_mra",
+        "_arm",
+        "_ao",
+        "_spec",
+        "_specular",
+        "_roughness",
+        "_metallic",
+    )
+    if any(token in normalized_hint for token in technical_tokens):
+        return "technical"
+    if normalized_hint in {"colorblendingmasktexture", "detailmasktexture"}:
+        return "technical"
+    if "mask" in normalized_hint and not any(
+        token in normalized_hint for token in ("diffuse", "albedo", "color", "colour", "overlay", "emissive")
+    ):
+        return "technical"
+    if texture_basename.endswith(technical_suffixes):
+        return "technical"
+
+    layer_tokens = (
+        "grime",
+        "detail",
+        "layer",
+        "blend",
+        "decal",
+    )
+    if any(token in normalized_hint for token in layer_tokens):
+        return "layer_visible"
+
+    primary_tokens = (
+        "basecolor",
+        "basecolour",
+        "albedo",
+        "diffuse",
+        "colortexture",
+        "overlaycolor",
+        "base",
+    )
+    if any(token in normalized_hint for token in primary_tokens):
+        return "primary_visible"
+
+    generic_tokens = (
+        "color",
+        "colour",
+        "overlay",
+        "tint",
+        "emissive",
+    )
+    if any(token in normalized_hint for token in generic_tokens):
+        return "visible_generic"
+
+    if not normalized_hint:
+        return "visible_generic"
+    return "visible_generic"
+
+
+def _allowed_model_sidecar_visible_classes(visible_texture_mode: str) -> Tuple[str, ...]:
+    normalized_mode = _normalize_model_visible_texture_mode(visible_texture_mode)
+    if normalized_mode == "mesh_base_first":
+        return ("primary_visible",)
+    if normalized_mode == "layer_aware_visible":
+        return ("primary_visible", "layer_visible")
+    return ("primary_visible", "visible_generic", "layer_visible")
+
+
+def _model_sidecar_visible_class_priority(binding_class: str) -> int:
+    if binding_class == "primary_visible":
+        return 3
+    if binding_class == "visible_generic":
+        return 2
+    if binding_class == "layer_visible":
+        return 1
+    return 0
+
+
+def _model_texture_slot_hint_priority(preview_slot: str, semantic_hint: str) -> Optional[Tuple[int, int]]:
+    normalized_slot = str(preview_slot or "").strip().lower()
+    normalized_hint = str(semantic_hint or "").strip().lower().replace("_", "")
+    if not normalized_slot or not normalized_hint:
+        return None
+
+    if normalized_slot == "base":
+        if "basecolor" in normalized_hint:
+            return (9, 4)
+        if any(token in normalized_hint for token in ("grimediffuse", "detaildiffuse", "detailalbedo", "detailcolor")):
+            return (5, 1)
+        if any(
+            token in normalized_hint
+            for token in (
+                "overlaycolor",
+                "colortexture",
+                "diffuse",
+                "albedo",
+                "emissive",
+            )
+        ):
+            return (8, 3)
+        if "tintcolor" in normalized_hint:
+            return (6, 1)
+        if "color" in normalized_hint or "overlay" in normalized_hint or "tint" in normalized_hint:
+            return (5, 0)
+        return None
+
+    if normalized_slot == "normal":
+        if normalized_hint in {"normaltexture", "basenormaltexture"}:
+            return (9, 4)
+        if "detailnormal" in normalized_hint or "grimenormal" in normalized_hint:
+            return (5, 1)
+        if normalized_hint.startswith("normal") or normalized_hint.endswith("normaltexture"):
+            return (8, 3)
+        if "normal" in normalized_hint:
+            return (6, 0)
+        return None
+
+    if normalized_slot == "material":
+        if normalized_hint in {"materialtexture", "basematerialtexture"}:
+            return (9, 4)
+        if "detailmaterial" in normalized_hint or "grimematerial" in normalized_hint:
+            return (5, 1)
+        if normalized_hint.startswith("material") or normalized_hint.endswith("materialtexture"):
+            return (8, 3)
+        if any(token in normalized_hint for token in ("masktexture", "detailmask", "material", "roughness", "metallic", "occlusion")):
+            return (6, 0)
+        return None
+
+    if normalized_slot == "height":
+        if normalized_hint in {"heighttexture", "displacementtexture"}:
+            return (9, 4)
+        if "detailheight" in normalized_hint or "detaildisplacement" in normalized_hint:
+            return (5, 1)
+        if normalized_hint.startswith("height") or normalized_hint.endswith("heighttexture"):
+            return (8, 3)
+        if normalized_hint.startswith("displacement") or normalized_hint.endswith("displacementtexture"):
+            return (8, 2)
+        if any(token in normalized_hint for token in ("height", "displacement", "parallax", "pom", "ssdm", "bump")):
+            return (6, 0)
+        return None
+
+    return None
+
+
 def _score_model_sidecar_entry_candidate(source_entry: ArchiveEntry, candidate: ArchiveEntry) -> Tuple[int, int, int]:
     normalized_candidate = _normalize_model_texture_reference(candidate.path)
     source_path = _normalize_model_texture_reference(source_entry.path)
@@ -2789,9 +4378,13 @@ def _score_model_sidecar_entry_candidate(source_entry: ArchiveEntry, candidate: 
     if candidate_root and source_root and candidate_root == source_root:
         score_value += 4
     source_extension = str(source_entry.extension or "").strip().lower()
+    candidate_extension = str(candidate.extension or "").strip().lower()
+    candidate_basename = PurePosixPath(candidate.path.replace("\\", "/")).name.lower()
     if source_extension in {".pam", ".pamlod"} and normalized_candidate.endswith(".pami"):
         extension_priority = 2
-    elif normalized_candidate.endswith(".xml"):
+    elif _is_material_sidecar_extension(candidate_extension, candidate_basename):
+        extension_priority = 2
+    elif normalized_candidate.endswith(".xml") or candidate_extension in _ARCHIVE_METADATA_XML_EXTENSIONS:
         extension_priority = 1
     else:
         extension_priority = 0
@@ -2816,9 +4409,9 @@ def _score_model_related_entry_candidate(source_entry: ArchiveEntry, candidate: 
     if source_extension == ".pam":
         if candidate_extension == ".pamlod":
             extension_priority = 6
-        elif candidate_extension == ".pami":
+        elif candidate_extension in {".pami", ".pam_xml"}:
             extension_priority = 5
-        elif candidate_extension == ".xml":
+        elif candidate_extension in {".xml", ".pamlod_xml"}:
             extension_priority = 4
         elif candidate_extension == ".meshinfo":
             extension_priority = 3
@@ -2827,7 +4420,7 @@ def _score_model_related_entry_candidate(source_entry: ArchiveEntry, candidate: 
     elif source_extension == ".pamlod":
         if candidate_extension == ".pam":
             extension_priority = 6
-        elif candidate_extension == ".pami":
+        elif candidate_extension in {".pami", ".pamlod_xml", ".pam_xml"}:
             extension_priority = 5
         elif candidate_extension == ".xml":
             extension_priority = 4
@@ -2838,18 +4431,20 @@ def _score_model_related_entry_candidate(source_entry: ArchiveEntry, candidate: 
     elif source_extension == ".pac":
         if candidate_extension == ".pab":
             extension_priority = 7
-        elif candidate_extension == ".xml":
+        elif candidate_extension == ".pac_xml":
             extension_priority = 6
-        elif candidate_extension == ".meshinfo":
+        elif candidate_extension in {".xml", ".prefabdata_xml"}:
             extension_priority = 5
-        elif candidate_extension == ".hkx":
+        elif candidate_extension == ".meshinfo":
             extension_priority = 4
+        elif candidate_extension == ".hkx":
+            extension_priority = 3
     elif source_extension == ".meshinfo":
         if candidate_extension in {".pam", ".pamlod", ".pac"}:
             extension_priority = 7
         elif candidate_extension == ".hkx":
             extension_priority = 6
-        elif candidate_extension == ".xml":
+        elif candidate_extension in _ARCHIVE_XML_LIKE_EXTENSIONS:
             extension_priority = 5
         elif candidate_extension == ".pami":
             extension_priority = 4
@@ -2860,16 +4455,262 @@ def _score_model_related_entry_candidate(source_entry: ArchiveEntry, candidate: 
             extension_priority = 6
         elif candidate_extension == ".meshinfo":
             extension_priority = 5
-        elif candidate_extension == ".xml":
+        elif candidate_extension in _ARCHIVE_XML_LIKE_EXTENSIONS:
             extension_priority = 4
     elif source_extension in {".paa", ".pae", ".paem", ".paseq", ".paschedule", ".paschedulepath", ".pastage"}:
         if candidate_extension in {".hkx", ".paa", ".pae", ".paem", ".paseq", ".paschedule", ".paschedulepath", ".pastage"}:
             extension_priority = 6
-        elif candidate_extension == ".xml":
+        elif candidate_extension in _ARCHIVE_XML_LIKE_EXTENSIONS:
             extension_priority = 5
-    elif candidate_extension in {".xml", ".pami", ".meshinfo", ".hkx"}:
+    elif source_extension in _ARCHIVE_XML_LIKE_EXTENSIONS:
+        source_stem_lower = PurePosixPath(source_entry.path.replace("\\", "/")).stem.lower()
+        if source_stem_lower.endswith(".pac"):
+            if candidate_extension == ".pac":
+                extension_priority = 7
+            elif candidate_extension == ".pab":
+                extension_priority = 6
+            elif candidate_extension == ".meshinfo":
+                extension_priority = 5
+            elif candidate_extension == ".hkx":
+                extension_priority = 4
+        elif source_stem_lower.endswith(".pam"):
+            if candidate_extension == ".pam":
+                extension_priority = 7
+            elif candidate_extension == ".pamlod":
+                extension_priority = 6
+            elif candidate_extension == ".pami":
+                extension_priority = 5
+            elif candidate_extension == ".meshinfo":
+                extension_priority = 4
+            elif candidate_extension == ".hkx":
+                extension_priority = 3
+        elif source_stem_lower.endswith(".pamlod"):
+            if candidate_extension == ".pamlod":
+                extension_priority = 7
+            elif candidate_extension == ".pam":
+                extension_priority = 6
+            elif candidate_extension == ".pami":
+                extension_priority = 5
+            elif candidate_extension == ".meshinfo":
+                extension_priority = 4
+            elif candidate_extension == ".hkx":
+                extension_priority = 3
+        elif source_stem_lower.endswith(".pab"):
+            if candidate_extension == ".pab":
+                extension_priority = 7
+            elif candidate_extension == ".pac":
+                extension_priority = 6
+            elif candidate_extension == ".hkx":
+                extension_priority = 5
+            elif candidate_extension == ".meshinfo":
+                extension_priority = 4
+        elif candidate_extension in {".pam", ".pamlod", ".pac", ".pab", ".pami", ".meshinfo", ".hkx"}:
+            extension_priority = 3
+    elif source_extension == ".pami":
+        if candidate_extension in {".pam", ".pamlod"}:
+            extension_priority = 7
+        elif candidate_extension == ".meshinfo":
+            extension_priority = 6
+        elif candidate_extension == ".hkx":
+            extension_priority = 5
+        elif candidate_extension in _ARCHIVE_XML_LIKE_EXTENSIONS:
+            extension_priority = 4
+    elif source_extension == ".hkx":
+        if candidate_extension in {".pam", ".pamlod", ".pac"}:
+            extension_priority = 7
+        elif candidate_extension == ".pab":
+            extension_priority = 6
+        elif candidate_extension == ".meshinfo":
+            extension_priority = 5
+        elif candidate_extension in _ARCHIVE_XML_LIKE_EXTENSIONS:
+            extension_priority = 4
+    elif candidate_extension in _ARCHIVE_XML_LIKE_EXTENSIONS | {".meshinfo", ".hkx"}:
         extension_priority = 2
     return score_value, -len(candidate.path), extension_priority
+
+
+def _extend_archive_related_target_basenames(
+    add_target: Callable[[str], None],
+    *,
+    stem: str,
+    source_extension: str,
+) -> None:
+    if not stem:
+        return
+    add_target(f"{stem}.xml")
+    add_target(f"{stem}.hkx")
+    add_target(f"{stem}.meshinfo")
+    if source_extension in {".pam", ".pamlod"}:
+        add_target(f"{stem}.pami")
+        add_target(f"{stem}.pam_xml")
+        add_target(f"{stem}.pamlod_xml")
+    if source_extension == ".pam":
+        add_target(f"{stem}.pamlod")
+        if stem.endswith("_breakable"):
+            add_target(f"{stem[:-10]}.pamlod")
+    elif source_extension == ".pamlod":
+        add_target(f"{stem}.pam")
+    elif source_extension == ".pac":
+        add_target(f"{stem}.pab")
+        add_target(f"{stem}.prefabdata.xml")
+        add_target(f"{stem}.pac_xml")
+        add_target(f"{stem}.prefabdata_xml")
+    elif source_extension == ".meshinfo":
+        add_target(f"{stem}.pam")
+        add_target(f"{stem}.pamlod")
+        add_target(f"{stem}.pac")
+        add_target(f"{stem}.pami")
+    elif source_extension == ".pab":
+        add_target(f"{stem}.pac")
+    elif source_extension == ".pami":
+        add_target(f"{stem}.pam")
+        add_target(f"{stem}.pamlod")
+    elif source_extension in {".pac_xml", ".pam_xml", ".pamlod_xml", ".prefabdata_xml"}:
+        if source_extension == ".pac_xml":
+            add_target(f"{stem}.pac")
+            add_target(f"{stem}.pab")
+            add_target(f"{stem}.hkx")
+            add_target(f"{stem}.meshinfo")
+        elif source_extension == ".pam_xml":
+            add_target(f"{stem}.pam")
+            add_target(f"{stem}.pamlod")
+            add_target(f"{stem}.pami")
+            add_target(f"{stem}.meshinfo")
+            add_target(f"{stem}.hkx")
+        elif source_extension == ".pamlod_xml":
+            add_target(f"{stem}.pamlod")
+            add_target(f"{stem}.pam")
+            add_target(f"{stem}.pami")
+            add_target(f"{stem}.meshinfo")
+            add_target(f"{stem}.hkx")
+    elif source_extension in {".paa", ".pae", ".paem", ".paseq", ".paschedule", ".paschedulepath", ".pastage"}:
+        for related_extension in (".paa", ".pae", ".paem", ".paseq", ".paschedule", ".paschedulepath", ".pastage"):
+            add_target(f"{stem}{related_extension}")
+    elif source_extension == ".hkx":
+        add_target(f"{stem}.pam")
+        add_target(f"{stem}.pamlod")
+        add_target(f"{stem}.pac")
+        add_target(f"{stem}.pab")
+        add_target(f"{stem}.pami")
+
+
+def _collect_same_stem_related_target_basenames(source_entry: ArchiveEntry) -> set[str]:
+    normalized_path = source_entry.path.replace("\\", "/").strip()
+    basename = PurePosixPath(normalized_path).name.strip().lower()
+    stem = PurePosixPath(normalized_path).stem.strip()
+    source_extension = str(source_entry.extension or "").strip().lower()
+    targets: set[str] = set()
+
+    def add_target(raw_value: str) -> None:
+        candidate = str(raw_value or "").strip().lower()
+        if candidate:
+            targets.add(candidate)
+
+    if basename:
+        add_target(f"{basename}.xml")
+        add_target(f"{basename}.hkx")
+        add_target(f"{basename}.meshinfo")
+    if stem:
+        _extend_archive_related_target_basenames(
+            add_target,
+            stem=stem,
+            source_extension=source_extension,
+        )
+        if source_extension in _ARCHIVE_XML_LIKE_EXTENSIONS:
+            nested_basename = stem.strip().lower()
+            nested_extension = PurePosixPath(nested_basename).suffix.strip().lower()
+            nested_stem = PurePosixPath(nested_basename).stem.strip()
+            if nested_extension:
+                add_target(nested_basename)
+                _extend_archive_related_target_basenames(
+                    add_target,
+                    stem=nested_stem,
+                    source_extension=nested_extension,
+                )
+    return targets
+
+
+def _collect_family_heuristic_target_basenames(source_entry: ArchiveEntry) -> set[str]:
+    normalized_path = source_entry.path.replace("\\", "/").strip().lower()
+    source_extension = str(source_entry.extension or "").strip().lower()
+    if source_extension not in {".pac", ".pab", ".hkx", ".meshinfo", ".xml", ".pac_xml", ".prefabdata_xml"}:
+        return set()
+    targets: set[str] = set()
+    for pab_basename in iter_pab_candidate_basenames(normalized_path):
+        normalized_pab = str(pab_basename or "").strip().lower()
+        if not normalized_pab:
+            continue
+        targets.add(normalized_pab)
+        family_stem = PurePosixPath(normalized_pab).stem
+        if not family_stem:
+            continue
+        for extension in (".pac", ".pab", ".hkx", ".meshinfo", ".prefabdata.xml", ".pac_xml", ".prefabdata_xml"):
+            targets.add(f"{family_stem}{extension}")
+    return targets
+
+
+def _relation_group_for_kind(relation_kind: str) -> str:
+    normalized_kind = str(relation_kind or "").strip().lower()
+    if normalized_kind == RelationKind.TEXTURE.value:
+        return "Textures"
+    if normalized_kind == RelationKind.MATERIAL_SIDECAR.value:
+        return "Material Sidecars"
+    if normalized_kind in {RelationKind.MESH.value, RelationKind.LOD.value}:
+        return "Mesh / Model"
+    if normalized_kind == RelationKind.SKELETON.value:
+        return "Skeleton / Rig"
+    if normalized_kind == RelationKind.ANIMATION.value:
+        return "Animation / Motion"
+    return "Metadata / Other"
+
+
+def _relation_kind_for_entry(candidate_entry: Optional[ArchiveEntry], reference_name: str = "") -> str:
+    reference_path = str(getattr(candidate_entry, "path", "") or reference_name).replace("\\", "/")
+    reference_basename = PurePosixPath(reference_path).name.lower()
+    extension = str(getattr(candidate_entry, "extension", "") or PurePosixPath(reference_path).suffix).strip().lower()
+    if extension == ".dds":
+        return RelationKind.TEXTURE.value
+    if _is_material_sidecar_extension(extension, reference_basename):
+        return RelationKind.MATERIAL_SIDECAR.value
+    if extension == ".xml":
+        return RelationKind.METADATA.value
+    if extension == ".prefabdata_xml":
+        return RelationKind.METADATA.value
+    if extension in {".pab", ".pabc"}:
+        return RelationKind.SKELETON.value
+    if extension in {".pac", ".pam"}:
+        return RelationKind.MESH.value
+    if extension == ".pamlod":
+        return RelationKind.LOD.value
+    if extension in {".hkx", ".motionblending", ".papr", ".paa", ".pae", ".paem", ".paseq", ".paschedule", ".paschedulepath", ".pastage"}:
+        return RelationKind.ANIMATION.value
+    return RelationKind.METADATA.value
+
+
+def _build_archive_relation_metadata(
+    source_entry: ArchiveEntry,
+    *,
+    reference_name: str = "",
+    resolved_entry: Optional[ArchiveEntry] = None,
+    authoritative: bool = False,
+    authoritative_reason: str = "",
+) -> Tuple[str, str, str, str]:
+    relation_kind = _relation_kind_for_entry(resolved_entry, reference_name=reference_name)
+    normalized_basename = PurePosixPath(
+        str(getattr(resolved_entry, "path", "") or reference_name).replace("\\", "/")
+    ).name.strip().lower()
+    same_stem_targets = _collect_same_stem_related_target_basenames(source_entry)
+    family_targets = _collect_family_heuristic_target_basenames(source_entry)
+    if authoritative:
+        confidence = RelationConfidence.AUTHORITATIVE.value
+        reason = authoritative_reason or "Explicit path or sidecar binding"
+    elif normalized_basename and normalized_basename in family_targets and normalized_basename not in same_stem_targets:
+        confidence = RelationConfidence.DERIVED_FAMILY_HEURISTIC.value
+        reason = "Family-token heuristic"
+    else:
+        confidence = RelationConfidence.DERIVED_SAME_STEM.value
+        reason = "Same-stem heuristic"
+    return relation_kind, _relation_group_for_kind(relation_kind), confidence, reason
 
 
 def _find_archive_model_related_entries(
@@ -2887,66 +4728,144 @@ def _find_archive_model_related_entries(
 
     source_extension = str(source_entry.extension or "").strip().lower()
     target_basenames: set[str] = set()
+    must_keep_basenames: set[str] = set()
 
-    def add_target(raw_value: str) -> None:
+    def add_target(raw_value: str, *, must_keep: bool = False) -> None:
         candidate = str(raw_value or "").strip().lower()
         if candidate:
             target_basenames.add(candidate)
+            if must_keep:
+                must_keep_basenames.add(candidate)
 
-    add_target(f"{basename}.xml")
+    add_target(f"{basename}.xml", must_keep=True)
     if source_stem:
-        add_target(f"{source_stem}.xml")
-        add_target(f"{source_stem}.hkx")
-        add_target(f"{source_stem}.meshinfo")
-        if source_extension in {".pam", ".pamlod"}:
-            add_target(f"{source_stem}.pami")
-        if source_extension == ".pam":
-            add_target(f"{source_stem}.pamlod")
-            if source_stem.endswith("_breakable"):
-                add_target(f"{source_stem[:-10]}.pamlod")
+        _extend_archive_related_target_basenames(
+            add_target,
+            stem=source_stem,
+            source_extension=source_extension,
+        )
+        if source_extension == ".pac":
+            add_target(f"{source_stem}.pab", must_keep=True)
+            add_target(f"{source_stem}.prefabdata.xml", must_keep=True)
+            add_target(f"{source_stem}.pac_xml", must_keep=True)
+            add_target(f"{source_stem}.prefabdata_xml", must_keep=True)
+        elif source_extension == ".pam":
+            add_target(f"{source_stem}.pami", must_keep=True)
+            add_target(f"{source_stem}.pam_xml", must_keep=True)
+            add_target(f"{source_stem}.pamlod", must_keep=True)
         elif source_extension == ".pamlod":
-            add_target(f"{source_stem}.pam")
-        elif source_extension == ".pac":
-            add_target(f"{source_stem}.pab")
-        elif source_extension == ".meshinfo":
-            add_target(f"{source_stem}.pam")
-            add_target(f"{source_stem}.pamlod")
-            add_target(f"{source_stem}.pac")
-            add_target(f"{source_stem}.pami")
-        elif source_extension == ".pab":
-            add_target(f"{source_stem}.pac")
-        elif source_extension in {".paa", ".pae", ".paem", ".paseq", ".paschedule", ".paschedulepath", ".pastage"}:
-            for related_extension in (".paa", ".pae", ".paem", ".paseq", ".paschedule", ".paschedulepath", ".pastage", ".xml", ".hkx"):
-                add_target(f"{source_stem}{related_extension}")
-    add_target(f"{basename}.hkx")
-    add_target(f"{basename}.meshinfo")
+            add_target(f"{source_stem}.pami", must_keep=True)
+            add_target(f"{source_stem}.pamlod_xml", must_keep=True)
+            add_target(f"{source_stem}.pam_xml", must_keep=True)
+            add_target(f"{source_stem}.pam", must_keep=True)
+        if source_extension in _ARCHIVE_XML_LIKE_EXTENSIONS:
+            nested_basename = source_stem.strip()
+            nested_extension = PurePosixPath(nested_basename).suffix.strip().lower()
+            nested_stem = PurePosixPath(nested_basename).stem.strip()
+            if nested_extension:
+                add_target(nested_basename, must_keep=True)
+                _extend_archive_related_target_basenames(
+                    add_target,
+                    stem=nested_stem,
+                    source_extension=nested_extension,
+                )
+    for family_target in _collect_family_heuristic_target_basenames(source_entry):
+        add_target(family_target)
+    add_target(f"{basename}.hkx", must_keep=True)
+    add_target(f"{basename}.meshinfo", must_keep=True)
 
     candidates: List[ArchiveEntry] = []
+    must_keep_candidates: List[ArchiveEntry] = []
     for target_basename in target_basenames:
         for candidate in archive_entries_by_basename.get(target_basename, ()):
             if candidate.path == source_entry.path:
                 continue
             if candidate not in candidates:
                 candidates.append(candidate)
+            if target_basename in must_keep_basenames and candidate not in must_keep_candidates:
+                must_keep_candidates.append(candidate)
     if not candidates:
         return ()
     candidates.sort(key=lambda candidate: _score_model_related_entry_candidate(source_entry, candidate), reverse=True)
-    return tuple(candidates[:12])
+    ordered: List[ArchiveEntry] = []
+    for candidate in must_keep_candidates:
+        if candidate not in ordered:
+            ordered.append(candidate)
+    for candidate in candidates:
+        if candidate not in ordered:
+            ordered.append(candidate)
+    return tuple(ordered[:64])
 
 
 def _find_archive_model_sidecar_entries(
     source_entry: ArchiveEntry,
     archive_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]],
 ) -> Tuple[ArchiveEntry, ...]:
-    candidates = [
-        candidate
-        for candidate in _find_archive_model_related_entries(source_entry, archive_entries_by_basename)
-        if candidate.extension in {".xml", ".pami"}
-    ]
+    if archive_entries_by_basename is None:
+        return ()
+
+    normalized_path = source_entry.path.replace("\\", "/").strip()
+    basename = PurePosixPath(normalized_path).name.strip()
+    source_stem = PurePosixPath(normalized_path).stem.strip()
+    source_extension = str(source_entry.extension or "").strip().lower()
+    target_basenames: set[str] = set()
+
+    def add_target(raw_value: str) -> None:
+        candidate = str(raw_value or "").strip().lower()
+        if candidate:
+            target_basenames.add(candidate)
+
+    if basename:
+        add_target(f"{basename}.xml")
+    if source_stem:
+        add_target(f"{source_stem}.xml")
+        if source_extension == ".pac":
+            add_target(f"{source_stem}.pac_xml")
+        elif source_extension == ".pam":
+            add_target(f"{source_stem}.pam_xml")
+        elif source_extension == ".pamlod":
+            add_target(f"{source_stem}.pamlod_xml")
+        if source_extension in {".pam", ".pamlod"}:
+            add_target(f"{source_stem}.pami")
+        elif source_extension in _ARCHIVE_XML_LIKE_EXTENSIONS:
+            nested_basename = source_stem.strip()
+            nested_extension = PurePosixPath(nested_basename).suffix.strip().lower()
+            nested_stem = PurePosixPath(nested_basename).stem.strip()
+            if nested_extension:
+                add_target(f"{nested_basename}.xml")
+                add_target(f"{nested_stem}.xml")
+                if nested_extension == ".pac":
+                    add_target(f"{nested_stem}.pac_xml")
+                elif nested_extension == ".pam":
+                    add_target(f"{nested_stem}.pam_xml")
+                elif nested_extension == ".pamlod":
+                    add_target(f"{nested_stem}.pamlod_xml")
+                if nested_extension in {".pam", ".pamlod"}:
+                    add_target(f"{nested_stem}.pami")
+
+    candidates: List[ArchiveEntry] = []
+    for target_basename in target_basenames:
+        for candidate in archive_entries_by_basename.get(target_basename, ()):
+            if candidate.path == source_entry.path:
+                continue
+            candidate_basename = PurePosixPath(candidate.path.replace("\\", "/")).name.lower()
+            if not _is_material_sidecar_extension(candidate.extension, candidate_basename):
+                continue
+            if candidate not in candidates:
+                candidates.append(candidate)
+    if not candidates:
+        candidates = [
+            candidate
+            for candidate in _find_archive_model_related_entries(source_entry, archive_entries_by_basename)
+            if _is_material_sidecar_extension(
+                str(candidate.extension or "").strip().lower(),
+                PurePosixPath(candidate.path.replace("\\", "/")).name.lower(),
+            )
+        ]
     if not candidates:
         return ()
     candidates.sort(key=lambda candidate: _score_model_sidecar_entry_candidate(source_entry, candidate), reverse=True)
-    return tuple(candidates[:4])
+    return tuple(candidates[:8])
 
 
 def _parse_archive_model_sidecar_texture_bindings(
@@ -3086,6 +5005,49 @@ def _iter_model_texture_family_reference_candidates(group_key: str) -> Tuple[str
     return tuple(ordered_candidates)
 
 
+def _iter_model_texture_slot_family_reference_candidates(
+    group_key: str,
+    preview_slot: str,
+) -> Tuple[str, ...]:
+    normalized_slot = str(preview_slot or "").strip().lower()
+    if not normalized_slot or normalized_slot == "base":
+        return _iter_model_texture_family_reference_candidates(group_key)
+
+    suffixes = _MODEL_TEXTURE_SUPPORT_FAMILY_SUFFIXES.get(normalized_slot, ())
+    if not suffixes:
+        return ()
+
+    normalized_group_key = _normalize_model_texture_reference(group_key)
+    if not normalized_group_key:
+        return ()
+
+    ordered_candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(raw_value: str) -> None:
+        normalized = _normalize_model_texture_reference(raw_value)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        ordered_candidates.append(normalized)
+
+    if "/" in normalized_group_key:
+        folder, _, family_name = normalized_group_key.rpartition("/")
+    else:
+        folder, family_name = "", normalized_group_key
+    family_name = family_name.strip()
+    if not family_name:
+        return ()
+
+    for suffix in suffixes:
+        basename = f"{family_name}{suffix}.dds"
+        add_candidate(basename)
+        if folder:
+            add_candidate(f"{folder}/{basename}")
+
+    return tuple(ordered_candidates)
+
+
 def _iter_model_texture_reference_candidates(
     texture_name: str,
     material_name: str = "",
@@ -3120,6 +5082,24 @@ def _iter_model_texture_reference_candidates(
                 add_candidate(f"{stem}.dds")
 
     return tuple(ordered_candidates)
+
+
+def _match_model_texture_slot_family_suffix(
+    texture_path: str,
+    preview_slot: str,
+) -> int:
+    normalized_slot = str(preview_slot or "").strip().lower()
+    suffixes = _MODEL_TEXTURE_SUPPORT_FAMILY_SUFFIXES.get(normalized_slot, ())
+    if not suffixes:
+        return -1
+    basename = PurePosixPath(_normalize_model_texture_reference(texture_path)).name
+    if not basename.endswith(".dds"):
+        return -1
+    stem = basename[:-4]
+    for index, suffix in enumerate(suffixes):
+        if stem.endswith(suffix):
+            return index
+    return -1
 
 
 def _looks_like_technical_model_texture(texture_path: str) -> bool:
@@ -3166,6 +5146,287 @@ def _resolve_model_texture_semantics(
     return texture_type, semantic_subtype, confidence
 
 
+def _resolve_model_texture_semantic_details(
+    texture_path: str,
+    *,
+    family_members: Sequence[str] = (),
+    sidecar_texts: Sequence[str] = (),
+) -> Tuple[str, str, int, Tuple[str, ...]]:
+    semantic = infer_texture_semantics(
+        texture_path,
+        family_members=family_members,
+        sidecar_texts=sidecar_texts,
+    )
+    texture_type = str(getattr(semantic, "texture_type", "") or "").strip().lower() or "unknown"
+    semantic_subtype = str(getattr(semantic, "semantic_subtype", "") or "").strip().lower() or texture_type
+    confidence = int(getattr(semantic, "confidence", 0) or 0)
+    packed_channels = tuple(
+        str(item or "").strip().lower()
+        for item in getattr(semantic, "packed_channels", ())
+        if str(item or "").strip()
+    )
+    if texture_type == "unknown":
+        normalized = _normalize_model_texture_reference(texture_path)
+        if normalized.endswith(".dds") and not _looks_like_technical_model_texture(normalized):
+            return "color", "albedo", max(confidence, 64), ()
+    return texture_type, semantic_subtype, confidence, packed_channels
+
+
+def _refine_model_texture_semantic_from_hint(
+    texture_type: str,
+    semantic_subtype: str,
+    semantic_hint: str,
+) -> Tuple[str, str]:
+    normalized_hint = re.sub(r"[^a-z0-9]+", "", str(semantic_hint or "").strip().lower())
+    normalized_type = str(texture_type or "").strip().lower()
+    normalized_subtype = str(semantic_subtype or "").strip().lower()
+    if not normalized_hint:
+        return normalized_type, normalized_subtype
+
+    if any(token in normalized_hint for token in ("orm", "occlusionroughnessmetallic")):
+        return "mask", "orm"
+    if any(token in normalized_hint for token in ("rma", "roughnessmetallicao")):
+        return "mask", "rma"
+    if any(token in normalized_hint for token in ("mra", "metallicroughnessao")):
+        return "mask", "mra"
+    if any(token in normalized_hint for token in ("arm", "aoroughnessmetallic")):
+        return "mask", "arm"
+    if "roughness" in normalized_hint:
+        return "roughness", "roughness"
+    if any(token in normalized_hint for token in ("specular", "gloss", "smoothness")):
+        return "mask", "specular"
+    if any(token in normalized_hint for token in ("metallic", "metalness")):
+        return "mask", "metallic"
+    if any(token in normalized_hint for token in ("ao", "occlusion")):
+        return "mask", "ao"
+    if "opacity" in normalized_hint or "alpha" in normalized_hint:
+        return "mask", "opacity_mask"
+    if "material" in normalized_hint and normalized_subtype in {"unknown", "mask"}:
+        return "mask", "material_mask"
+    return normalized_type, normalized_subtype
+
+
+def _infer_model_preview_texture_slot(
+    texture_path: str,
+    *,
+    semantic_hint: str = "",
+    sidecar_texts: Sequence[str] = (),
+) -> str:
+    normalized_hint = re.sub(r"[^a-z0-9]+", "", str(semantic_hint or "").strip().lower())
+    if normalized_hint:
+        if "normal" in normalized_hint:
+            return "normal"
+        if any(token in normalized_hint for token in ("height", "displacement", "parallax", "pom", "ssdm", "bump")):
+            return "height"
+        if any(token in normalized_hint for token in ("material", "roughness", "metallic", "metalness", "specular", "ao", "occlusion", "mask")):
+            return "material"
+        if any(token in normalized_hint for token in ("basecolor", "overlaycolor", "diffuse", "albedo", "colortexture", "emissive")):
+            return "base"
+    texture_type, semantic_subtype, _confidence = _resolve_model_texture_semantics(
+        texture_path,
+        sidecar_texts=sidecar_texts,
+    )
+    normalized_type = str(texture_type or "").strip().lower()
+    normalized_subtype = str(semantic_subtype or "").strip().lower()
+    if normalized_type == "normal":
+        return "normal"
+    if normalized_type == "height" or normalized_subtype in {"displacement", "parallax_height", "height", "bump"}:
+        return "height"
+    if normalized_type in {"mask", "roughness", "vector"}:
+        return "material"
+    return "base"
+
+
+def _model_texture_candidate_slot_priority(
+    preview_slot: str,
+    texture_path: str,
+    *,
+    sidecar_texts: Sequence[str] = (),
+) -> Optional[Tuple[int, int]]:
+    normalized_slot = str(preview_slot or "").strip().lower()
+    if normalized_slot not in {"normal", "material", "height"}:
+        return None
+
+    texture_type, semantic_subtype, _confidence = _resolve_model_texture_semantics(
+        texture_path,
+        sidecar_texts=sidecar_texts,
+    )
+    normalized_type = str(texture_type or "").strip().lower()
+    normalized_subtype = str(semantic_subtype or "").strip().lower()
+    suffix_index = _match_model_texture_slot_family_suffix(texture_path, normalized_slot)
+    suffix_priority = (
+        len(_MODEL_TEXTURE_SUPPORT_FAMILY_SUFFIXES.get(normalized_slot, ())) - suffix_index
+        if suffix_index >= 0
+        else 0
+    )
+
+    if normalized_slot == "normal":
+        if normalized_type == "normal":
+            return (12, 3)
+        if suffix_index >= 0:
+            return (10, suffix_priority)
+        return None
+
+    if normalized_slot == "height":
+        if normalized_type == "height" or normalized_subtype in {"displacement", "parallax_height", "height", "bump"}:
+            return (12, 3)
+        if suffix_index >= 0:
+            return (10, suffix_priority)
+        return None
+
+    if normalized_slot == "material":
+        if normalized_type in {"mask", "roughness", "vector"}:
+            return (12, 3)
+        if normalized_subtype in {"packed_mask", "specular", "metallic", "ao", "mask", "opacity_mask"}:
+            return (11, 2)
+        if suffix_index >= 0:
+            return (10, suffix_priority)
+        return None
+
+    return None
+
+
+def _infer_model_preview_normal_strength(
+    *,
+    base_texture_path: str = "",
+    normal_texture_path: str = "",
+    material_name: str = "",
+    semantic_hint: str = "",
+    prefer_stronger: bool = False,
+) -> float:
+    normalized_hint = str(semantic_hint or "").strip().lower().replace("_", "")
+    combined = " ".join(
+        part
+        for part in (
+            _normalize_model_texture_reference(base_texture_path),
+            _normalize_model_texture_reference(normal_texture_path),
+            str(material_name or "").strip().lower(),
+            normalized_hint,
+        )
+        if part
+    )
+
+    strength = 0.36
+    if prefer_stronger:
+        strength += 0.08
+    if normalized_hint in {"normaltexture", "basenormaltexture"}:
+        strength += 0.06
+    elif "detailnormal" in normalized_hint or "grimenormal" in normalized_hint:
+        strength -= 0.05
+
+    soft_tokens = (
+        "wood",
+        "plank",
+        "timber",
+        "fabric",
+        "cloth",
+        "rope",
+        "leather",
+        "skin",
+        "paper",
+        "parchment",
+        "banner",
+        "canvas",
+        "fur",
+        "hair",
+    )
+    hard_tokens = (
+        "stone",
+        "rock",
+        "brick",
+        "concrete",
+        "cliff",
+        "marble",
+        "granite",
+        "dungeon",
+        "ancient",
+        "wall",
+        "masonry",
+        "ruin",
+    )
+    medium_tokens = (
+        "metal",
+        "rust",
+        "iron",
+        "steel",
+        "armor",
+        "shield",
+        "weapon",
+    )
+
+    if any(token in combined for token in soft_tokens):
+        strength -= 0.04
+    if any(token in combined for token in hard_tokens):
+        strength += 0.14
+    if any(token in combined for token in medium_tokens):
+        strength += 0.08
+
+    return max(0.22, min(0.72, strength))
+
+
+def _set_model_preview_texture_slot(
+    mesh: ModelPreviewMesh,
+    *,
+    slot: str,
+    preview_path: str,
+    texture_path: str,
+    normal_strength: Optional[float] = None,
+    semantic_type: str = "",
+    semantic_subtype: str = "",
+    packed_channels: Sequence[str] = (),
+    flip_vertical: Optional[bool] = None,
+) -> bool:
+    normalized_slot = str(slot or "").strip().lower()
+    preview_path_text = str(preview_path or "").strip()
+    texture_path_text = str(texture_path or "").strip()
+    if not preview_path_text:
+        return False
+
+    if normalized_slot == "normal":
+        if not str(getattr(mesh, "preview_normal_texture_path", "") or "").strip():
+            mesh.preview_normal_texture_path = preview_path_text
+            mesh.preview_normal_texture_name = texture_path_text
+            if normal_strength is not None:
+                mesh.preview_normal_texture_strength = float(normal_strength)
+            if texture_path_text and not str(getattr(mesh, "texture_name", "") or "").strip():
+                mesh.texture_name = texture_path_text
+            return True
+        return False
+    if normalized_slot == "material":
+        if not str(getattr(mesh, "preview_material_texture_path", "") or "").strip():
+            mesh.preview_material_texture_path = preview_path_text
+            mesh.preview_material_texture_name = texture_path_text
+            mesh.preview_material_texture_type = str(semantic_type or "").strip().lower()
+            mesh.preview_material_texture_subtype = str(semantic_subtype or "").strip().lower()
+            mesh.preview_material_texture_packed_channels = tuple(
+                str(channel or "").strip().lower()
+                for channel in packed_channels
+                if str(channel or "").strip()
+            )
+            return True
+        return False
+    if normalized_slot == "height":
+        if not str(getattr(mesh, "preview_height_texture_path", "") or "").strip():
+            mesh.preview_height_texture_path = preview_path_text
+            mesh.preview_height_texture_name = texture_path_text
+            return True
+        return False
+
+    changed = False
+    if not str(getattr(mesh, "preview_texture_path", "") or "").strip():
+        mesh.preview_texture_path = preview_path_text
+        changed = True
+    if texture_path_text:
+        current_texture_name = str(getattr(mesh, "texture_name", "") or "").strip()
+        if not current_texture_name or not current_texture_name.lower().endswith(".dds"):
+            mesh.texture_name = texture_path_text
+            changed = True
+    if flip_vertical is not None:
+        mesh.preview_texture_flip_vertical = bool(flip_vertical)
+        changed = True
+    return changed
+
+
 def _score_model_texture_archive_candidate(
     source_entry: ArchiveEntry,
     candidate: ArchiveEntry,
@@ -3201,6 +5462,7 @@ def _collect_model_texture_archive_entry_candidates(
     texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]],
     *,
     expand_family_candidates: bool = True,
+    preferred_slot: str = "",
 ) -> List[Tuple[ArchiveEntry, Tuple[int, int]]]:
     reference_candidates = _iter_model_texture_reference_candidates(texture_name, material_name)
     if not reference_candidates:
@@ -3211,7 +5473,7 @@ def _collect_model_texture_archive_entry_candidates(
         seen_expanded = set(expanded_reference_candidates)
         for normalized_reference in reference_candidates:
             group_key = derive_texture_group_key(normalized_reference)
-            for family_reference in _iter_model_texture_family_reference_candidates(group_key):
+            for family_reference in _iter_model_texture_slot_family_reference_candidates(group_key, preferred_slot):
                 if family_reference in seen_expanded:
                     continue
                 seen_expanded.add(family_reference)
@@ -3274,11 +5536,16 @@ def _resolve_model_texture_archive_entry(
     semantic_hint: str = "",
     expand_family_candidates: Optional[bool] = None,
     allow_technical_match: bool = False,
+    preferred_slot: str = "",
     sidecar_texts_by_normalized_path: Optional[Dict[str, Tuple[str, ...]]] = None,
     sidecar_texts_by_basename: Optional[Dict[str, Tuple[str, ...]]] = None,
 ) -> Tuple[Optional[ArchiveEntry], str]:
+    normalized_preferred_slot = str(preferred_slot or "").strip().lower()
     if expand_family_candidates is None:
-        expand_family_candidates = not _has_explicit_model_texture_reference(texture_name, material_name)
+        if normalized_preferred_slot in {"normal", "material", "height"}:
+            expand_family_candidates = True
+        else:
+            expand_family_candidates = not _has_explicit_model_texture_reference(texture_name, material_name)
     scored_candidates = _collect_model_texture_archive_entry_candidates(
         source_entry,
         texture_name,
@@ -3286,6 +5553,7 @@ def _resolve_model_texture_archive_entry(
         texture_entries_by_normalized_path,
         texture_entries_by_basename,
         expand_family_candidates=expand_family_candidates,
+        preferred_slot=normalized_preferred_slot,
     )
     if not scored_candidates:
         return None, "missing"
@@ -3301,6 +5569,7 @@ def _resolve_model_texture_archive_entry(
     best_candidate_key: Optional[Tuple[int, int, int, Tuple[int, int]]] = None
     best_candidate_priority = (0, 0)
     hint_priority = _model_texture_hint_priority(semantic_hint)
+    slot_filtered_out = False
     for candidate, direct_score in scored_candidates:
         group_key = derive_texture_group_key(candidate.path)
         candidate_normalized_path = normalize_texture_reference_for_sidecar_lookup(candidate.path)
@@ -3316,12 +5585,22 @@ def _resolve_model_texture_archive_entry(
             family_members=family_members_by_group.get(group_key, (candidate.path,)),
             sidecar_texts=sidecar_texts,
         )
-        semantic_priority = _model_texture_semantic_priority(
-            texture_type,
-            semantic_subtype,
-        )
-        if hint_priority is not None and hint_priority > semantic_priority:
-            semantic_priority = hint_priority
+        if normalized_preferred_slot in {"normal", "material", "height"}:
+            semantic_priority = _model_texture_candidate_slot_priority(
+                normalized_preferred_slot,
+                candidate.path,
+                sidecar_texts=sidecar_texts,
+            )
+            if semantic_priority is None:
+                slot_filtered_out = True
+                continue
+        else:
+            semantic_priority = _model_texture_semantic_priority(
+                texture_type,
+                semantic_subtype,
+            )
+            if hint_priority is not None and hint_priority > semantic_priority:
+                semantic_priority = hint_priority
         sort_key = (
             semantic_priority[0],
             semantic_priority[1],
@@ -3334,6 +5613,8 @@ def _resolve_model_texture_archive_entry(
             best_candidate_priority = semantic_priority
 
     if best_candidate is None:
+        if normalized_preferred_slot in {"normal", "material", "height"} and slot_filtered_out:
+            return None, "technical_only"
         return None, "missing"
     if allow_technical_match and best_candidate_priority[0] <= 0:
         return best_candidate, "resolved"
@@ -3374,10 +5655,12 @@ def _attach_model_sidecar_texture_preview_paths(
     *,
     parsed_mesh: Optional[object],
     sidecar_texture_bindings: Sequence[_ArchiveModelSidecarTextureBinding],
+    visible_texture_mode: str = "mesh_base_first",
     texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
     texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
     sidecar_texts_by_normalized_path: Optional[Dict[str, Tuple[str, ...]]] = None,
     sidecar_texts_by_basename: Optional[Dict[str, Tuple[str, ...]]] = None,
+    fallback_only: bool = False,
     stop_event: Optional[threading.Event] = None,
 ) -> List[str]:
     if texconv_path is None or model_preview is None or not model_preview.meshes or not sidecar_texture_bindings:
@@ -3385,9 +5668,11 @@ def _attach_model_sidecar_texture_preview_paths(
 
     parsed_submeshes = _iter_parsed_model_submeshes(parsed_mesh)
     resolved_texconv_path = texconv_path.expanduser().resolve()
-    resolved_by_submesh: Dict[str, Tuple[Tuple[int, int, int, int], ArchiveEntry, str, str]] = {}
+    normalized_visible_texture_mode = _normalize_model_visible_texture_mode(visible_texture_mode)
+    allowed_visible_classes = set(_allowed_model_sidecar_visible_classes(normalized_visible_texture_mode))
+    resolved_by_submesh: Dict[str, Tuple[Tuple[int, int, int, int, int], ArchiveEntry, str, str]] = {}
     global_visible_bindings: List[Tuple[ArchiveEntry, str, str]] = []
-    fallback_visible_bindings: List[Tuple[Tuple[int, int, int, int], ArchiveEntry, str, str]] = []
+    fallback_visible_bindings: List[Tuple[Tuple[int, int, int, int, int], ArchiveEntry, str, str]] = []
     seen_fallback_binding_keys: set[Tuple[str, str, str]] = set()
     seen_global_binding_keys: set[Tuple[str, str]] = set()
     sidecar_paths: List[str] = []
@@ -3427,11 +5712,20 @@ def _attach_model_sidecar_texture_preview_paths(
             )
         if not _is_visible_model_texture_type(texture_type):
             continue
+        binding_class = _classify_model_sidecar_visible_binding(binding.parameter_name, texture_entry.path)
+        if binding_class not in allowed_visible_classes:
+            continue
         priority = _model_texture_hint_priority(binding.parameter_name) or _model_texture_semantic_priority(
             texture_type,
             semantic_subtype,
         )
-        candidate_key = (priority[0], priority[1], confidence, -len(texture_entry.path))
+        candidate_key = (
+            _model_sidecar_visible_class_priority(binding_class),
+            priority[0],
+            priority[1],
+            confidence,
+            -len(texture_entry.path),
+        )
         fallback_binding_key = (
             _normalize_model_texture_reference(texture_entry.path),
             str(binding.parameter_name or "").strip().lower(),
@@ -3482,7 +5776,7 @@ def _attach_model_sidecar_texture_preview_paths(
             str(getattr(mesh, "material_name", "") or ""),
             str(getattr(mesh, "texture_name", "") or ""),
         )
-        best_match: Optional[Tuple[Tuple[int, int, int, int], ArchiveEntry, str, str]] = None
+        best_match: Optional[Tuple[Tuple[int, int, int, int, int], ArchiveEntry, str, str]] = None
         for candidate_key_text in candidate_keys:
             resolved = resolved_by_submesh.get(candidate_key_text)
             if resolved is None:
@@ -3593,7 +5887,11 @@ def _attach_model_sidecar_texture_preview_paths(
     if len(sidecar_paths) > 2:
         sidecar_suffix += " ..."
     info_lines = [
-        f"Applied {assigned_count:,} textured preview binding(s) from companion material sidecar data{sidecar_suffix}."
+        (
+            f"Applied {assigned_count:,} textured preview fallback binding(s) from companion material sidecar data{sidecar_suffix}."
+            if fallback_only
+            else f"Applied {assigned_count:,} textured preview binding(s) from companion material sidecar data{sidecar_suffix}."
+        )
     ]
     if promoted_anonymous_fallback:
         info_lines.append(
@@ -3716,6 +6014,343 @@ def _attach_model_texture_preview_paths(
     return info_lines
 
 
+def _attach_model_support_texture_preview_paths(
+    texconv_path: Optional[Path],
+    source_entry: ArchiveEntry,
+    model_preview: Optional[ModelPreviewData],
+    *,
+    parsed_mesh: Optional[object] = None,
+    sidecar_texture_bindings: Sequence[_ArchiveModelSidecarTextureBinding] = (),
+    texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    sidecar_texts_by_normalized_path: Optional[Dict[str, Tuple[str, ...]]] = None,
+    sidecar_texts_by_basename: Optional[Dict[str, Tuple[str, ...]]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> List[str]:
+    if texconv_path is None or model_preview is None or not model_preview.meshes:
+        return []
+
+    parsed_submeshes = _iter_parsed_model_submeshes(parsed_mesh)
+    resolved_texconv_path = texconv_path.expanduser().resolve()
+    preview_cache: Dict[str, str] = {}
+    support_slots = ("normal", "material", "height")
+    slot_labels = {
+        "normal": "normal-map",
+        "material": "material-mask",
+        "height": "height/displacement",
+    }
+    exact_assigned_by_slot: Dict[str, int] = {slot: 0 for slot in support_slots}
+    fallback_assigned_by_slot: Dict[str, int] = {slot: 0 for slot in support_slots}
+    exact_examples: Dict[str, List[str]] = {slot: [] for slot in support_slots}
+    fallback_examples: Dict[str, List[str]] = {slot: [] for slot in support_slots}
+    exact_sidecar_paths: List[str] = []
+    force_unflipped_preview = str(getattr(source_entry, "extension", "") or "").lower() == ".pac"
+    slot_hints = (
+        ("normal", "normal"),
+        ("material", "material"),
+        ("height", "height"),
+    )
+
+    def _lookup_sidecar_texts(texture_path: str) -> Tuple[str, ...]:
+        normalized_path = normalize_texture_reference_for_sidecar_lookup(texture_path)
+        if sidecar_texts_by_normalized_path is not None and normalized_path:
+            sidecar_texts = tuple(sidecar_texts_by_normalized_path.get(normalized_path, ()))
+            if sidecar_texts:
+                return sidecar_texts
+        if sidecar_texts_by_basename is not None:
+            basename = PurePosixPath(texture_path.replace("\\", "/")).name.lower()
+            if basename:
+                return tuple(sidecar_texts_by_basename.get(basename, ()))
+        return ()
+
+    def _preview_path_for_entry(texture_entry: ArchiveEntry) -> str:
+        cache_key = _normalize_model_texture_reference(texture_entry.path)
+        preview_path_text = preview_cache.get(cache_key, "")
+        if preview_path_text:
+            return preview_path_text
+        preview_path_text = _ensure_archive_model_texture_preview_path(
+            resolved_texconv_path,
+            texture_entry,
+            stop_event=stop_event,
+        )
+        preview_cache[cache_key] = preview_path_text
+        return preview_path_text
+
+    def _record_slot_example(target: Dict[str, List[str]], slot_name: str, texture_path: str) -> None:
+        examples = target[slot_name]
+        basename = PurePosixPath(texture_path.replace("\\", "/")).name
+        if basename and basename not in examples and len(examples) < 3:
+            examples.append(basename)
+
+    def _assign_support_slot(
+        mesh: ModelPreviewMesh,
+        slot_name: str,
+        texture_entry: ArchiveEntry,
+        *,
+        semantic_hint: str,
+    ) -> bool:
+        preview_path_text = _preview_path_for_entry(texture_entry)
+        semantic_type = ""
+        semantic_subtype = ""
+        packed_channels: Tuple[str, ...] = ()
+        if slot_name == "material":
+            sidecar_texts = _lookup_sidecar_texts(texture_entry.path)
+            semantic_type, semantic_subtype, _confidence, packed_channels = _resolve_model_texture_semantic_details(
+                texture_entry.path,
+                sidecar_texts=sidecar_texts,
+            )
+            semantic_type, semantic_subtype = _refine_model_texture_semantic_from_hint(
+                semantic_type,
+                semantic_subtype,
+                semantic_hint,
+            )
+        changed = _set_model_preview_texture_slot(
+            mesh,
+            slot=slot_name,
+            preview_path=preview_path_text,
+            texture_path=texture_entry.path,
+            normal_strength=(
+                _infer_model_preview_normal_strength(
+                    base_texture_path=str(getattr(mesh, "texture_name", "") or "").strip(),
+                    normal_texture_path=texture_entry.path,
+                    material_name=str(getattr(mesh, "material_name", "") or "").strip(),
+                    semantic_hint=semantic_hint,
+                    prefer_stronger=False,
+                )
+                if slot_name == "normal"
+                else None
+            ),
+            semantic_type=semantic_type,
+            semantic_subtype=semantic_subtype,
+            packed_channels=packed_channels,
+        )
+        if changed and force_unflipped_preview:
+            mesh.preview_texture_flip_vertical = False
+        return changed
+
+    exact_resolved_by_submesh: Dict[Tuple[str, str], Tuple[Tuple[int, int, int, int], ArchiveEntry, str, str]] = {}
+    exact_global_bindings: Dict[str, List[Tuple[Tuple[int, int, int, int], ArchiveEntry, str, str]]] = defaultdict(list)
+    seen_exact_global_keys: set[Tuple[str, str, str]] = set()
+
+    for binding in sidecar_texture_bindings:
+        raise_if_cancelled(stop_event)
+        parameter_name = str(binding.parameter_name or "").strip()
+        slot_name = _infer_model_preview_texture_slot("", semantic_hint=parameter_name)
+        if slot_name not in support_slots:
+            continue
+        submesh_keys = _iter_model_submesh_reference_candidates(binding.submesh_name)
+        texture_entry, resolution_status = _resolve_model_texture_archive_entry(
+            source_entry,
+            binding.texture_path,
+            binding.submesh_name,
+            texture_entries_by_normalized_path,
+            texture_entries_by_basename,
+            semantic_hint=parameter_name,
+            expand_family_candidates=False,
+            allow_technical_match=True,
+            preferred_slot=slot_name,
+            sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+            sidecar_texts_by_basename=sidecar_texts_by_basename,
+        )
+        if texture_entry is None or resolution_status != "resolved":
+            continue
+        sidecar_texts = _lookup_sidecar_texts(texture_entry.path)
+        texture_type, semantic_subtype, confidence = _resolve_model_texture_semantics(
+            texture_entry.path,
+            sidecar_texts=sidecar_texts,
+        )
+        slot_priority = (
+            _model_texture_slot_hint_priority(slot_name, parameter_name)
+            or _model_texture_candidate_slot_priority(slot_name, texture_entry.path, sidecar_texts=sidecar_texts)
+        )
+        if slot_priority is None:
+            continue
+        candidate_key = (
+            slot_priority[0],
+            slot_priority[1],
+            confidence,
+            -len(texture_entry.path),
+        )
+        if submesh_keys:
+            for submesh_key in submesh_keys:
+                resolved_key = (slot_name, submesh_key)
+                existing = exact_resolved_by_submesh.get(resolved_key)
+                if existing is None or candidate_key > existing[0]:
+                    exact_resolved_by_submesh[resolved_key] = (
+                        candidate_key,
+                        texture_entry,
+                        parameter_name,
+                        binding.submesh_name,
+                    )
+        else:
+            global_key = (
+                slot_name,
+                _normalize_model_texture_reference(texture_entry.path),
+                parameter_name.lower(),
+            )
+            if global_key not in seen_exact_global_keys:
+                seen_exact_global_keys.add(global_key)
+                exact_global_bindings[slot_name].append(
+                    (
+                        candidate_key,
+                        texture_entry,
+                        parameter_name,
+                        binding.submesh_name,
+                    )
+                )
+        if binding.sidecar_path and binding.sidecar_path not in exact_sidecar_paths:
+            exact_sidecar_paths.append(binding.sidecar_path)
+
+    for mesh_index, mesh in enumerate(model_preview.meshes):
+        raise_if_cancelled(stop_event)
+        parsed_submesh = parsed_submeshes[mesh_index] if mesh_index < len(parsed_submeshes) else None
+        candidate_keys = _iter_model_submesh_reference_candidates(
+            str(getattr(parsed_submesh, "name", "") or ""),
+            str(getattr(parsed_submesh, "material", "") or ""),
+            str(getattr(parsed_submesh, "texture", "") or ""),
+            str(getattr(mesh, "material_name", "") or ""),
+            str(getattr(mesh, "texture_name", "") or ""),
+        )
+        for slot_name in support_slots:
+            existing_preview_path = str(getattr(mesh, f"preview_{slot_name}_texture_path", "") or "").strip()
+            if existing_preview_path:
+                continue
+            best_match: Optional[Tuple[Tuple[int, int, int, int], ArchiveEntry, str, str]] = None
+            for candidate_key_text in candidate_keys:
+                resolved = exact_resolved_by_submesh.get((slot_name, candidate_key_text))
+                if resolved is None:
+                    continue
+                if best_match is None or resolved[0] > best_match[0]:
+                    best_match = resolved
+            if best_match is None:
+                continue
+            _candidate_key, texture_entry, parameter_name, _submesh_name = best_match
+            try:
+                if _assign_support_slot(mesh, slot_name, texture_entry, semantic_hint=parameter_name):
+                    exact_assigned_by_slot[slot_name] += 1
+                    _record_slot_example(exact_examples, slot_name, texture_entry.path)
+            except RunCancelled:
+                raise
+            except Exception:
+                continue
+
+    for slot_name in support_slots:
+        global_bindings = exact_global_bindings.get(slot_name, [])
+        if not global_bindings:
+            continue
+        global_bindings.sort(key=lambda item: item[0], reverse=True)
+        unresolved_meshes = [
+            mesh
+            for mesh in model_preview.meshes
+            if not str(getattr(mesh, f"preview_{slot_name}_texture_path", "") or "").strip()
+        ]
+        if not unresolved_meshes:
+            continue
+        if len(global_bindings) == 1:
+            _candidate_key, texture_entry, parameter_name, _submesh_name = global_bindings[0]
+            for mesh in unresolved_meshes:
+                raise_if_cancelled(stop_event)
+                try:
+                    if _assign_support_slot(mesh, slot_name, texture_entry, semantic_hint=parameter_name):
+                        exact_assigned_by_slot[slot_name] += 1
+                        _record_slot_example(exact_examples, slot_name, texture_entry.path)
+                except RunCancelled:
+                    raise
+                except Exception:
+                    continue
+        else:
+            binding_index = 0
+            for mesh in unresolved_meshes:
+                raise_if_cancelled(stop_event)
+                if binding_index >= len(global_bindings):
+                    break
+                _candidate_key, texture_entry, parameter_name, _submesh_name = global_bindings[binding_index]
+                binding_index += 1
+                try:
+                    if _assign_support_slot(mesh, slot_name, texture_entry, semantic_hint=parameter_name):
+                        exact_assigned_by_slot[slot_name] += 1
+                        _record_slot_example(exact_examples, slot_name, texture_entry.path)
+                except RunCancelled:
+                    raise
+                except Exception:
+                    continue
+
+    for mesh in model_preview.meshes:
+        raise_if_cancelled(stop_event)
+        reference_texture_name = str(getattr(mesh, "texture_name", "") or "").strip()
+        reference_material_name = str(getattr(mesh, "material_name", "") or "").strip()
+        if not reference_texture_name and not reference_material_name:
+            continue
+        for slot_name, semantic_hint in slot_hints:
+            existing_preview_path = str(getattr(mesh, f"preview_{slot_name}_texture_path", "") or "").strip()
+            if existing_preview_path:
+                continue
+            texture_entry, resolution_status = _resolve_model_texture_archive_entry(
+                source_entry,
+                reference_texture_name,
+                reference_material_name,
+                texture_entries_by_normalized_path,
+                texture_entries_by_basename,
+                semantic_hint=semantic_hint,
+                allow_technical_match=True,
+                preferred_slot=slot_name,
+                sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                sidecar_texts_by_basename=sidecar_texts_by_basename,
+            )
+            if texture_entry is None or resolution_status != "resolved":
+                continue
+            try:
+                if _assign_support_slot(mesh, slot_name, texture_entry, semantic_hint=semantic_hint):
+                    fallback_assigned_by_slot[slot_name] += 1
+                    _record_slot_example(fallback_examples, slot_name, texture_entry.path)
+            except RunCancelled:
+                raise
+            except Exception:
+                continue
+
+    info_lines: List[str] = []
+    exact_total = sum(exact_assigned_by_slot.values())
+    fallback_total = sum(fallback_assigned_by_slot.values())
+    if exact_total > 0:
+        sidecar_suffix = f" from {', '.join(exact_sidecar_paths[:2])}" if exact_sidecar_paths else ""
+        if len(exact_sidecar_paths) > 2:
+            sidecar_suffix += " ..."
+        info_lines.append(
+            f"Applied {exact_total:,} exact high-quality support-map binding(s) from companion material sidecar data{sidecar_suffix}."
+        )
+        for slot_name in support_slots:
+            count = exact_assigned_by_slot[slot_name]
+            if count <= 0:
+                continue
+            suffix = f" Examples: {', '.join(exact_examples[slot_name])}." if exact_examples[slot_name] else ""
+            info_lines.append(
+                f"Exact sidecar {slot_labels[slot_name]} bindings: {count:,}.{suffix}"
+            )
+    if fallback_total > 0:
+        info_lines.append(
+            f"Applied {fallback_total:,} semantic sibling high-quality support-map binding(s) using slot-correct family fallback."
+        )
+        for slot_name in support_slots:
+            count = fallback_assigned_by_slot[slot_name]
+            if count <= 0:
+                continue
+            suffix = f" Examples: {', '.join(fallback_examples[slot_name])}." if fallback_examples[slot_name] else ""
+            info_lines.append(
+                f"Semantic sibling {slot_labels[slot_name]} bindings: {count:,}.{suffix}"
+            )
+    if exact_total <= 0 and fallback_total <= 0:
+        has_textured_mesh = any(
+            str(getattr(mesh, "texture_name", "") or "").strip()
+            or str(getattr(mesh, "preview_texture_path", "") or "").strip()
+            for mesh in model_preview.meshes
+        )
+        if has_textured_mesh:
+            info_lines.append(
+                "No usable high-quality support maps were resolved from exact sidecar bindings or semantic sibling fallback. The preview remains base-texture only."
+            )
+    return info_lines
+
+
 def _describe_model_texture_semantic_label(
     texture_path: str,
     *,
@@ -3743,6 +6378,7 @@ def _describe_model_texture_semantic_label(
 
 def _describe_model_related_file_label(entry: ArchiveEntry) -> str:
     extension = str(entry.extension or "").strip().lower()
+    basename = PurePosixPath(entry.path.replace("\\", "/")).name.lower()
     if extension == ".pam":
         return "Companion PAM"
     if extension == ".pamlod":
@@ -3751,10 +6387,16 @@ def _describe_model_related_file_label(entry: ArchiveEntry) -> str:
         return "Companion PAC"
     if extension == ".pab":
         return "Companion PAB"
+    if extension == ".pabc":
+        return "Skeleton Variation"
+    if extension == ".papr":
+        return "Animation Constraint"
+    if "prefabdata" in basename or extension == ".prefabdata_xml":
+        return "Prefab Metadata"
+    if _is_material_sidecar_extension(extension, basename):
+        return "Material Sidecar"
     if extension == ".xml":
         return "Companion XML"
-    if extension == ".pami":
-        return "Companion PAMI"
     if extension == ".hkx":
         return "Companion HKX"
     if extension == ".meshinfo":
@@ -3836,6 +6478,10 @@ def build_archive_model_texture_references(
         related_key = ("sidecar", _normalize_model_texture_reference(related_entry.path))
         if related_key in references:
             continue
+        relation_kind, relation_group, relation_confidence, relation_reason = _build_archive_relation_metadata(
+            source_entry,
+            resolved_entry=related_entry,
+        )
         references[related_key] = ArchiveModelTextureReference(
             reference_name=PurePosixPath(related_entry.path.replace("\\", "/")).name,
             semantic_label=_describe_model_related_file_label(related_entry),
@@ -3844,7 +6490,10 @@ def build_archive_model_texture_references(
             resolved_package_label=related_entry.package_label,
             resolved_entry=related_entry,
             usage_count=1,
-            reference_kind="sidecar",
+            reference_kind=relation_kind,
+            relation_group=relation_group,
+            relation_reason=relation_reason,
+            relation_confidence=relation_confidence,
         )
         ordered_keys.append(related_key)
 
@@ -3945,6 +6594,7 @@ def build_archive_model_texture_references(
                 material_name=material_name,
                 semantic_label=semantic_label,
                 semantic_hint=semantic_hint,
+                sidecar_parameter_name=semantic_hint,
                 sidecar_texts=sidecar_texts,
                 resolution_status=resolution_status,
                 resolved_archive_path=resolved_archive_path,
@@ -3953,6 +6603,17 @@ def build_archive_model_texture_references(
                 preview_texture_path=preview_texture_path,
                 usage_count=1,
                 reference_kind="texture",
+                relation_group="Textures",
+                relation_reason=(
+                    "Sidecar texture binding"
+                    if semantic_hint
+                    else "Resolved texture family"
+                ),
+                relation_confidence=(
+                    RelationConfidence.AUTHORITATIVE.value
+                    if semantic_hint
+                    else RelationConfidence.DERIVED_SAME_STEM.value
+                ),
             )
             ordered_keys.append(key)
             continue
@@ -3985,6 +6646,8 @@ def build_archive_model_texture_references(
                 for part in [existing.semantic_hint.strip(), semantic_hint.strip()]
                 if part
             )
+            if not existing.sidecar_parameter_name:
+                existing.sidecar_parameter_name = semantic_hint
         if sidecar_texts:
             merged_sidecar_texts = list(existing.sidecar_texts)
             for text in sidecar_texts:
@@ -4533,6 +7196,27 @@ def _looks_like_structured_field_name(value: str) -> bool:
     return any(character.isalpha() for character in text)
 
 
+def _looks_like_structured_asset_reference(value: str) -> bool:
+    raw_text = str(value or "").strip().strip("\x00")
+    if len(raw_text) < 3 or len(raw_text) > 255:
+        return False
+    normalized_text = raw_text.replace("\\", "/")
+    if normalized_text.startswith("/") or normalized_text.endswith("/"):
+        return False
+    if "//" in normalized_text:
+        return False
+    suffix = PurePosixPath(normalized_text).suffix.lower()
+    if suffix not in _STRUCTURED_BINARY_ASSET_REFERENCE_EXTENSIONS:
+        return False
+    segments = normalized_text.split("/")
+    if not segments:
+        return False
+    for segment in segments:
+        if not segment or not _STRUCTURED_BINARY_ASSET_SEGMENT_RE.fullmatch(segment):
+            return False
+    return any(character.isalpha() for character in normalized_text)
+
+
 def _extract_binary_asset_references(
     data: bytes,
     *,
@@ -4542,10 +7226,11 @@ def _extract_binary_asset_references(
     references: List[str] = []
     seen: set[str] = set()
     for text in extract_binary_strings(data, sample_limit=sample_limit, max_strings=max(max_references * 6, 96)):
-        for match in _STRUCTURED_BINARY_ASSET_REFERENCE_RE.finditer(text):
-            raw_text = str(match.group(0) or "").strip().strip("\x00").replace("\\", "/")
-            if not raw_text or not any(character.isalpha() for character in raw_text):
+        for match in _STRUCTURED_BINARY_ASSET_TOKEN_RE.finditer(text):
+            raw_text = str(match.group(0) or "").strip().strip("\x00")
+            if not _looks_like_structured_asset_reference(raw_text):
                 continue
+            raw_text = raw_text.replace("\\", "/")
             normalized = _normalize_model_texture_reference(raw_text)
             if not normalized or normalized in seen:
                 continue
@@ -4553,6 +7238,37 @@ def _extract_binary_asset_references(
             references.append(raw_text)
             if len(references) >= max_references:
                 return references
+    return references
+
+
+def _extract_text_asset_references(
+    text: str,
+    *,
+    sidecar_path: str = "",
+    max_references: int = 96,
+) -> List[str]:
+    references: List[str] = []
+    seen: set[str] = set()
+
+    def add_reference(raw_value: str) -> None:
+        raw_text = str(raw_value or "").strip().strip("\x00").replace("\\", "/")
+        if not _looks_like_structured_asset_reference(raw_text):
+            return
+        normalized = _normalize_model_texture_reference(raw_text)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        references.append(raw_text)
+
+    for binding in parse_texture_sidecar_bindings(text, sidecar_path=sidecar_path):
+        add_reference(binding.texture_path)
+        if len(references) >= max_references:
+            return references
+
+    for match in _STRUCTURED_BINARY_ASSET_TOKEN_RE.finditer(text):
+        add_reference(str(match.group(0) or ""))
+        if len(references) >= max_references:
+            return references
     return references
 
 
@@ -4720,20 +7436,29 @@ def _resolve_related_archive_entry(
 
 
 def _describe_generic_related_reference_label(reference_name: str, resolved_entry: Optional[ArchiveEntry] = None) -> str:
+    reference_basename = PurePosixPath(
+        str(getattr(resolved_entry, "path", "") or reference_name).replace("\\", "/")
+    ).name.lower()
     extension = str(getattr(resolved_entry, "extension", "") or PurePosixPath(reference_name.replace("\\", "/")).suffix).strip().lower()
     if extension == ".dds":
         semantic_label = _describe_model_texture_semantic_label(reference_name)
         return semantic_label or "Texture / DDS"
+    if "prefabdata" in reference_basename or extension == ".prefabdata_xml":
+        return "Prefab Metadata"
+    if _is_material_sidecar_extension(extension, reference_basename):
+        return "Material Sidecar"
     if extension == ".xml":
         return "Related XML"
-    if extension == ".pami":
-        return "Related PAMI"
     if extension == ".meshinfo":
         return "Related MeshInfo"
     if extension == ".hkx":
         return "Related HKX"
     if extension == ".pab":
         return "Related PAB"
+    if extension == ".pabc":
+        return "Skeleton Variation"
+    if extension == ".papr":
+        return "Animation Constraint"
     if extension == ".pac":
         return "Related PAC"
     if extension == ".pam":
@@ -4767,6 +7492,18 @@ def build_archive_related_file_references(
         key = ("file", normalized_path)
         if key in references:
             continue
+        relation_kind, relation_group, relation_confidence, relation_reason = _build_archive_relation_metadata(
+            source_entry,
+            resolved_entry=companion_entry,
+            authoritative=(
+                str(source_entry.extension or "").strip().lower() == ".dds"
+                and _is_material_sidecar_extension(
+                    str(companion_entry.extension or "").strip().lower(),
+                    PurePosixPath(companion_entry.path.replace("\\", "/")).name.lower(),
+                )
+            ),
+            authoritative_reason="Sidecar binding reference",
+        )
         references[key] = ArchiveModelTextureReference(
             reference_name=PurePosixPath(companion_entry.path.replace("\\", "/")).name,
             semantic_label=_describe_model_related_file_label(companion_entry),
@@ -4775,7 +7512,10 @@ def build_archive_related_file_references(
             resolved_package_label=companion_entry.package_label,
             resolved_entry=companion_entry,
             usage_count=1,
-            reference_kind="sidecar",
+            reference_kind=relation_kind,
+            relation_group=relation_group,
+            relation_reason=relation_reason,
+            relation_confidence=relation_confidence,
         )
         ordered_keys.append(key)
 
@@ -4796,6 +7536,14 @@ def build_archive_related_file_references(
             continue
         key = ("file", normalized_key_value)
         if key not in references:
+            authoritative = bool(isinstance(resolved_entry, ArchiveEntry) or "/" in reference_name or "." in PurePosixPath(reference_name).name)
+            relation_kind, relation_group, relation_confidence, relation_reason = _build_archive_relation_metadata(
+                source_entry,
+                reference_name=reference_name,
+                resolved_entry=resolved_entry if isinstance(resolved_entry, ArchiveEntry) else None,
+                authoritative=authoritative,
+                authoritative_reason="Explicit path reference",
+            )
             references[key] = ArchiveModelTextureReference(
                 reference_name=reference_name,
                 semantic_label=_describe_generic_related_reference_label(reference_name, resolved_entry),
@@ -4804,7 +7552,10 @@ def build_archive_related_file_references(
                 resolved_package_label=resolved_entry.package_label if isinstance(resolved_entry, ArchiveEntry) else "",
                 resolved_entry=resolved_entry if isinstance(resolved_entry, ArchiveEntry) else None,
                 usage_count=1,
-                reference_kind="file",
+                reference_kind=relation_kind,
+                relation_group=relation_group,
+                relation_reason=relation_reason,
+                relation_confidence=relation_confidence,
             )
             ordered_keys.append(key)
             continue
@@ -4818,6 +7569,222 @@ def build_archive_related_file_references(
             references[key].resolution_status = "resolved"
 
     return tuple(references[key] for key in ordered_keys)
+
+
+def build_archive_asset_family_graph(
+    source_entry: ArchiveEntry,
+    references: Sequence[ArchiveModelTextureReference],
+) -> AssetFamilyGraph:
+    grouped_paths: Dict[str, List[str]] = defaultdict(list)
+    relations: List[AssetRelation] = []
+    member_paths: List[str] = []
+    seen_members: set[str] = set()
+
+    def add_member(raw_value: str) -> None:
+        normalized = str(raw_value or "").strip().replace("\\", "/")
+        if not normalized or normalized in seen_members:
+            return
+        seen_members.add(normalized)
+        member_paths.append(normalized)
+
+    add_member(source_entry.path)
+    for reference in references:
+        relation_group = str(getattr(reference, "relation_group", "") or "").strip() or "Metadata / Other"
+        target_path = str(getattr(reference, "resolved_archive_path", "") or "").strip()
+        if not target_path:
+            target_path = str(getattr(reference, "reference_name", "") or "").strip().replace("\\", "/")
+        if not target_path:
+            continue
+        add_member(target_path)
+        if target_path not in grouped_paths[relation_group]:
+            grouped_paths[relation_group].append(target_path)
+        relations.append(
+            AssetRelation(
+                source_path=source_entry.path,
+                target_path=target_path,
+                relation_kind=str(getattr(reference, "reference_kind", "") or _relation_kind_for_entry(getattr(reference, "resolved_entry", None))),
+                confidence=str(getattr(reference, "relation_confidence", "") or RelationConfidence.DERIVED_SAME_STEM.value),
+                role_label=str(getattr(reference, "semantic_label", "") or "").strip(),
+                reason=str(getattr(reference, "relation_reason", "") or "").strip(),
+                source_entry=source_entry,
+                target_entry=getattr(reference, "resolved_entry", None),
+                semantic_label=str(getattr(reference, "semantic_label", "") or "").strip(),
+                semantic_hint=str(getattr(reference, "semantic_hint", "") or "").strip(),
+                sidecar_parameter_name=str(getattr(reference, "sidecar_parameter_name", "") or "").strip(),
+                material_name=str(getattr(reference, "material_name", "") or "").strip(),
+                package_label=str(getattr(reference, "resolved_package_label", "") or "").strip(),
+            )
+        )
+    return AssetFamilyGraph(
+        root_path=source_entry.path,
+        family_key=PurePosixPath(source_entry.path.replace("\\", "/")).stem,
+        members=tuple(member_paths),
+        relations=tuple(relations),
+        grouped_paths={key: tuple(value) for key, value in grouped_paths.items()},
+    )
+
+
+def _find_archive_texture_family_entries(
+    source_entry: ArchiveEntry,
+    archive_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]],
+) -> Tuple[ArchiveEntry, ...]:
+    if archive_entries_by_normalized_path is None:
+        return ()
+    extension = str(source_entry.extension or "").strip().lower()
+    normalized_path = normalize_texture_reference_for_sidecar_lookup(source_entry.path)
+    if extension != ".dds" or not normalized_path:
+        return ()
+
+    group_key = derive_texture_group_key(normalized_path)
+    if not group_key:
+        return ()
+    if "/" in group_key:
+        folder, family = group_key.rsplit("/", 1)
+    else:
+        folder, family = "", group_key
+    if not family:
+        return ()
+
+    candidates: List[ArchiveEntry] = []
+    seen_paths: set[str] = set()
+    source_normalized = _normalize_model_texture_reference(source_entry.path)
+    for suffix in _ARCHIVE_TEXTURE_FAMILY_SUFFIXES:
+        candidate_path = f"{folder}/{family}{suffix}.dds" if folder else f"{family}{suffix}.dds"
+        normalized_candidate_path = _normalize_model_texture_reference(candidate_path)
+        for candidate in archive_entries_by_normalized_path.get(normalized_candidate_path, ()):
+            normalized_candidate = _normalize_model_texture_reference(candidate.path)
+            if normalized_candidate in seen_paths or normalized_candidate == source_normalized:
+                continue
+            seen_paths.add(normalized_candidate)
+            candidates.append(candidate)
+
+    if not candidates:
+        return ()
+    candidates.sort(key=lambda candidate: _score_model_related_entry_candidate(source_entry, candidate), reverse=True)
+    return tuple(candidates[:16])
+
+
+def _find_archive_texture_referencing_sidecar_entries(
+    source_entry: ArchiveEntry,
+    *,
+    sidecar_entries_by_texture_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    sidecar_entries_by_texture_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+) -> Tuple[ArchiveEntry, ...]:
+    normalized_path = normalize_texture_reference_for_sidecar_lookup(source_entry.path)
+    if not normalized_path:
+        return ()
+    basename = PurePosixPath(normalized_path).name
+    candidates: List[ArchiveEntry] = []
+    seen_paths: set[str] = set()
+
+    def add_candidate(entry: ArchiveEntry) -> None:
+        normalized_candidate = _normalize_model_texture_reference(entry.path)
+        if not normalized_candidate or normalized_candidate == _normalize_model_texture_reference(source_entry.path):
+            return
+        if normalized_candidate in seen_paths:
+            return
+        seen_paths.add(normalized_candidate)
+        candidates.append(entry)
+
+    if sidecar_entries_by_texture_path is not None:
+        for candidate in sidecar_entries_by_texture_path.get(normalized_path, ()):
+            add_candidate(candidate)
+    if sidecar_entries_by_texture_basename is not None and basename:
+        for candidate in sidecar_entries_by_texture_basename.get(basename, ()):
+            add_candidate(candidate)
+    return tuple(candidates)
+
+
+def _collect_archive_texture_sidecar_texts_from_entries(
+    sidecar_entries: Sequence[ArchiveEntry],
+    *,
+    limit: int = 6,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[str, ...]:
+    texts: List[str] = []
+    seen_texts: set[str] = set()
+    for sidecar_entry in sidecar_entries:
+        raise_if_cancelled(stop_event)
+        try:
+            raw_data, _decompressed, _note = read_archive_entry_data(sidecar_entry, stop_event=stop_event)
+        except Exception:
+            continue
+        text = str(try_decode_text_like_archive_data(raw_data) or "").strip()
+        if not text or text in seen_texts:
+            continue
+        seen_texts.add(text)
+        texts.append(text)
+        if len(texts) >= limit:
+            break
+    return tuple(texts)
+
+
+def build_archive_entry_related_references(
+    source_entry: ArchiveEntry,
+    *,
+    text: str = "",
+    binary_data: bytes = b"",
+    explicit_reference_names: Sequence[str] = (),
+    companion_entries: Sequence[ArchiveEntry] = (),
+    archive_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    archive_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    sidecar_entries_by_texture_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    sidecar_entries_by_texture_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+) -> Tuple[ArchiveModelTextureReference, ...]:
+    combined_reference_names: List[str] = []
+    seen_reference_names: set[str] = set()
+
+    def add_reference_name(raw_value: str) -> None:
+        normalized = _normalize_model_texture_reference(raw_value)
+        if not normalized or normalized in seen_reference_names:
+            return
+        seen_reference_names.add(normalized)
+        combined_reference_names.append(str(raw_value or "").strip().replace("\\", "/"))
+
+    for reference_name in explicit_reference_names:
+        add_reference_name(reference_name)
+    if text:
+        for reference_name in _extract_text_asset_references(text, sidecar_path=source_entry.path):
+            add_reference_name(reference_name)
+    elif binary_data:
+        for reference_name in _extract_binary_asset_references(binary_data, sample_limit=262_144, max_references=64):
+            add_reference_name(reference_name)
+
+    combined_companion_entries: List[ArchiveEntry] = []
+    seen_companion_paths: set[str] = set()
+
+    def add_companion_entry(candidate: ArchiveEntry) -> None:
+        normalized_candidate = _normalize_model_texture_reference(candidate.path)
+        if not normalized_candidate or normalized_candidate == _normalize_model_texture_reference(source_entry.path):
+            return
+        if normalized_candidate in seen_companion_paths:
+            return
+        seen_companion_paths.add(normalized_candidate)
+        combined_companion_entries.append(candidate)
+
+    for candidate in companion_entries:
+        add_companion_entry(candidate)
+    for candidate in _find_archive_model_related_entries(source_entry, archive_entries_by_basename):
+        add_companion_entry(candidate)
+    for candidate in _find_archive_texture_family_entries(source_entry, archive_entries_by_normalized_path):
+        add_companion_entry(candidate)
+    if str(source_entry.extension or "").strip().lower() == ".dds":
+        for candidate in _find_archive_texture_referencing_sidecar_entries(
+            source_entry,
+            sidecar_entries_by_texture_path=sidecar_entries_by_texture_path,
+            sidecar_entries_by_texture_basename=sidecar_entries_by_texture_basename,
+        ):
+            add_companion_entry(candidate)
+            for related_candidate in _find_archive_model_related_entries(candidate, archive_entries_by_basename):
+                add_companion_entry(related_candidate)
+
+    return build_archive_related_file_references(
+        source_entry,
+        explicit_reference_names=combined_reference_names,
+        companion_entries=combined_companion_entries,
+        archive_entries_by_normalized_path=archive_entries_by_normalized_path,
+        archive_entries_by_basename=archive_entries_by_basename,
+    )
 
 
 def build_meshinfo_preview(
@@ -4895,6 +7862,8 @@ def build_par_structured_preview(
     strings = extract_binary_strings(data, sample_limit=262_144, max_strings=224)
     field_names = sorted({text for text in strings if _looks_like_structured_field_name(text)}, key=str.casefold)
     asset_references = _extract_binary_asset_references(data, sample_limit=262_144, max_references=64)
+    strings_preview = build_binary_strings_preview(data, sample_limit=65_536, max_strings=32)
+    header_preview = format_binary_header_preview(data)
     markers = [
         marker
         for marker in ("AnimationMetaData", "ParameterizedMotionSpace", "Sequencer", "SceneObject", "EmitterData")
@@ -4925,12 +7894,16 @@ def build_par_structured_preview(
     elif normalized_extension in {".pae", ".paem"}:
         title = "PAE effect inspector"
         metadata_label = "Effect"
+    elif normalized_extension == ".motionblending":
+        title = "Motion blending inspector"
+        metadata_label = "Motion Blending"
     else:
         title = f"{normalized_extension.lstrip('.').upper()} structured inspector"
         metadata_label = "Structured Binary"
 
     lines = [f"{title} for {virtual_path}", "", "Summary:"]
     lines.append(f"- Field-like entries: {len(field_names):,}")
+    lines.append(f"- Readable strings: {len(strings):,}")
     if markers:
         lines.append(f"- Detected markers: {', '.join(markers)}")
     if asset_references:
@@ -4950,18 +7923,27 @@ def build_par_structured_preview(
         lines.extend(f"  - {reference}" for reference in asset_references[:24])
         if len(asset_references) > 24:
             lines.append(f"  ... {len(asset_references) - 24} more")
+    if strings_preview:
+        lines.extend(["", strings_preview])
+    else:
+        lines.extend(["", "Readable strings:", "  None detected in the preview sample."])
+    lines.extend(["", "Binary header preview:", header_preview])
 
     detail_lines = [
         f"Detected {len(field_names):,} field-like identifier(s) from the preview sample.",
     ]
     if markers:
         detail_lines.append(f"Detected structured marker(s): {', '.join(markers)}.")
+    if not field_names and not markers and not strings:
+        detail_lines.append("No readable strings or structured markers were detected, so the preview falls back to raw header bytes.")
     if asset_references:
         detail_lines.append(f"Detected {len(asset_references):,} related asset reference(s).")
     if normalized_extension == ".paa":
         detail_lines.append("This inspector summarizes animation-side metadata and readable markers. Real animation playback is not implemented yet.")
     elif normalized_extension in {".pae", ".paem"}:
         detail_lines.append("This inspector summarizes effect/emitter-side metadata and readable markers. Real particle or timeline playback is not implemented yet.")
+    elif normalized_extension == ".motionblending":
+        detail_lines.append("This inspector summarizes motion/blend references and readable markers. Playback or editing is not implemented yet.")
 
     return _StructuredBinaryPreviewBundle(
         preview_text="\n".join(lines),
@@ -5295,8 +8277,11 @@ def build_archive_preview_result(
     companion_entry: Optional[ArchiveEntry] = None,
     texture_entries_by_normalized_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
     texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    sidecar_entries_by_texture_path: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+    sidecar_entries_by_texture_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
     include_loose_preview_assets: bool = True,
     semantic_sidecar_texts: Sequence[str] = (),
+    visible_texture_mode: str = "mesh_base_first",
     stop_event: Optional[threading.Event] = None,
 ) -> ArchivePreviewResult:
     if entry is None:
@@ -5310,6 +8295,7 @@ def build_archive_preview_result(
 
     metadata_summary = build_archive_entry_metadata_summary(entry)
     extension = entry.extension
+    normalized_visible_texture_mode = _normalize_model_visible_texture_mode(visible_texture_mode)
     loose_file_path = ""
     loose_preview_image_path = ""
     loose_preview_media_path = ""
@@ -5426,6 +8412,30 @@ def build_archive_preview_result(
         if extension == ".dds":
             source_path, note = ensure_archive_preview_source(entry, stop_event=stop_event)
             note_flags = parse_archive_note_flags(note)
+            referencing_sidecar_entries = _find_archive_texture_referencing_sidecar_entries(
+                entry,
+                sidecar_entries_by_texture_path=sidecar_entries_by_texture_path,
+                sidecar_entries_by_texture_basename=sidecar_entries_by_texture_basename,
+            )
+            combined_semantic_sidecar_texts: List[str] = [
+                str(text or "").strip()
+                for text in semantic_sidecar_texts
+                if str(text or "").strip()
+            ]
+            for sidecar_text in _collect_archive_texture_sidecar_texts_from_entries(
+                referencing_sidecar_entries,
+                stop_event=stop_event,
+            ):
+                if sidecar_text not in combined_semantic_sidecar_texts:
+                    combined_semantic_sidecar_texts.append(sidecar_text)
+            related_references = build_archive_entry_related_references(
+                entry,
+                archive_entries_by_normalized_path=texture_entries_by_normalized_path,
+                archive_entries_by_basename=texture_entries_by_basename,
+                sidecar_entries_by_texture_path=sidecar_entries_by_texture_path,
+                sidecar_entries_by_texture_basename=sidecar_entries_by_texture_basename,
+                companion_entries=referencing_sidecar_entries,
+            )
             warning_badge = ""
             warning_text = ""
             extra_detail_parts: List[str] = []
@@ -5441,7 +8451,7 @@ def build_archive_preview_result(
                         source_path,
                         dds_info,
                         logical_path=entry.path,
-                        sidecar_texts=semantic_sidecar_texts,
+                        sidecar_texts=tuple(combined_semantic_sidecar_texts),
                     )
                 )
             except Exception as exc:
@@ -5461,6 +8471,9 @@ def build_archive_preview_result(
                     extra_detail_parts.append(f"Loose file candidate found: {loose_file_path}")
             if "ChaCha20" in note_flags:
                 extra_detail_parts.append("Archive payload decrypted via deterministic ChaCha20 filename derivation.")
+            pathc_lookup_detail = build_archive_pathc_lookup_detail_for_entry(entry)
+            if pathc_lookup_detail:
+                extra_detail_parts.append(pathc_lookup_detail)
             if texconv_path is None:
                 return ArchivePreviewResult(
                     status="missing",
@@ -5471,7 +8484,7 @@ def build_archive_preview_result(
                         "\n".join(
                             part
                             for part in [
-                                "Set texconv.exe in the Workflow tab to enable DDS image previews.",
+                                "Set texconv.exe under Settings > Paths to enable DDS image previews.",
                                 *extra_detail_parts,
                             ]
                             if part
@@ -5480,6 +8493,8 @@ def build_archive_preview_result(
                     preferred_view="info",
                     warning_badge=warning_badge,
                     warning_text=warning_text,
+                    model_texture_references=related_references,
+                    asset_family_graph=build_archive_asset_family_graph(entry, related_references),
                     loose_file_path=loose_file_path,
                     loose_preview_image_path=loose_preview_image_path,
                     loose_preview_media_path=loose_preview_media_path,
@@ -5503,6 +8518,8 @@ def build_archive_preview_result(
                 preferred_view="image",
                 warning_badge=warning_badge,
                 warning_text=warning_text,
+                model_texture_references=related_references,
+                asset_family_graph=build_archive_asset_family_graph(entry, related_references),
                 loose_file_path=loose_file_path,
                 loose_preview_image_path=loose_preview_image_path,
                 loose_preview_media_path=loose_preview_media_path,
@@ -5514,6 +8531,11 @@ def build_archive_preview_result(
 
         if extension in ARCHIVE_IMAGE_EXTENSIONS:
             source_path, note = ensure_archive_preview_source(entry, stop_event=stop_event)
+            related_references = build_archive_entry_related_references(
+                entry,
+                archive_entries_by_normalized_path=texture_entries_by_normalized_path,
+                archive_entries_by_basename=texture_entries_by_basename,
+            )
             return ArchivePreviewResult(
                 status="ok",
                 title=entry.basename,
@@ -5526,6 +8548,7 @@ def build_archive_preview_result(
                 ),
                 preview_image_path=str(source_path),
                 preferred_view="image",
+                model_texture_references=related_references,
                 loose_file_path=loose_file_path,
                 loose_preview_image_path=loose_preview_image_path,
                 loose_preview_media_path=loose_preview_media_path,
@@ -5569,6 +8592,33 @@ def build_archive_preview_result(
                 loose_preview_detail_text=loose_preview_detail_text,
             )
 
+        if extension == ".pathc":
+            pathc_preview = build_archive_pathc_preview(data, entry.path)
+            detail_extra = "\n\n".join(
+                part
+                for part in [
+                    ("Archive entry uses non-DDS Partial storage; preview is based on raw stored bytes." if "PartialRaw" in note_flags else ""),
+                    ("Decrypted via deterministic ChaCha20 filename derivation." if "ChaCha20" in note_flags else ""),
+                    "\n".join(pathc_preview.detail_lines),
+                ]
+                if part
+            )
+            return ArchivePreviewResult(
+                status="ok",
+                title=entry.basename,
+                metadata_summary=f"{metadata_summary} | {pathc_preview.metadata_label}",
+                detail_text=build_archive_entry_detail_text(entry, detail_extra),
+                preview_text=pathc_preview.preview_text,
+                preferred_view="text",
+                loose_file_path=loose_file_path,
+                loose_preview_image_path=loose_preview_image_path,
+                loose_preview_media_path=loose_preview_media_path,
+                loose_preview_media_kind=loose_preview_media_kind,
+                loose_preview_title=loose_preview_title,
+                loose_preview_metadata_summary=loose_preview_metadata_summary,
+                loose_preview_detail_text=loose_preview_detail_text,
+            )
+
         if extension == ".pab":
             skeleton_preview = build_pab_preview(data, entry.path)
             related_references = build_archive_related_file_references(
@@ -5599,6 +8649,7 @@ def build_archive_preview_result(
                 detail_text=build_archive_entry_detail_text(entry, detail_extra),
                 preview_text=skeleton_preview.preview_text,
                 model_texture_references=related_references,
+                asset_family_graph=build_archive_asset_family_graph(entry, related_references),
                 preferred_view="text",
                 loose_file_path=loose_file_path,
                 loose_preview_image_path=loose_preview_image_path,
@@ -5634,6 +8685,7 @@ def build_archive_preview_result(
                 detail_text=build_archive_entry_detail_text(entry, detail_extra),
                 preview_text=meshinfo_preview.preview_text,
                 model_texture_references=meshinfo_preview.related_references,
+                asset_family_graph=build_archive_asset_family_graph(entry, meshinfo_preview.related_references),
                 preferred_view="text",
                 loose_file_path=loose_file_path,
                 loose_preview_image_path=loose_preview_image_path,
@@ -5644,7 +8696,7 @@ def build_archive_preview_result(
                 loose_preview_detail_text=loose_preview_detail_text,
             )
 
-        if extension in {".paa", ".pae", ".paem"}:
+        if extension in {".paa", ".pae", ".paem", ".motionblending"}:
             structured_preview = build_par_structured_preview(
                 data,
                 entry.path,
@@ -5670,6 +8722,7 @@ def build_archive_preview_result(
                 detail_text=build_archive_entry_detail_text(entry, detail_extra),
                 preview_text=structured_preview.preview_text,
                 model_texture_references=structured_preview.related_references,
+                asset_family_graph=build_archive_asset_family_graph(entry, structured_preview.related_references),
                 preferred_view="text",
                 loose_file_path=loose_file_path,
                 loose_preview_image_path=loose_preview_image_path,
@@ -5682,12 +8735,19 @@ def build_archive_preview_result(
 
         if extension == ".hkx":
             hkx_preview = build_hkx_preview(data, entry.path)
+            related_references = build_archive_entry_related_references(
+                entry,
+                binary_data=data,
+                archive_entries_by_normalized_path=texture_entries_by_normalized_path,
+                archive_entries_by_basename=texture_entries_by_basename,
+            )
             detail_extra = "\n\n".join(
                 part
                 for part in [
                     ("Archive entry uses non-DDS Partial storage; preview is based on raw stored bytes." if "PartialRaw" in note_flags else ""),
                     ("Decrypted via deterministic ChaCha20 filename derivation." if "ChaCha20" in note_flags else ""),
                     "\n".join(hkx_preview.detail_lines),
+                    ("Companion and related files are listed below." if related_references else ""),
                 ]
                 if part
             )
@@ -5697,6 +8757,8 @@ def build_archive_preview_result(
                 metadata_summary=f"{metadata_summary} | Havok",
                 detail_text=build_archive_entry_detail_text(entry, detail_extra),
                 preview_text=hkx_preview.preview_text,
+                model_texture_references=related_references,
+                asset_family_graph=build_archive_asset_family_graph(entry, related_references),
                 preferred_view="text",
                 loose_file_path=loose_file_path,
                 loose_preview_image_path=loose_preview_image_path,
@@ -5710,6 +8772,12 @@ def build_archive_preview_result(
         if extension in ARCHIVE_TEXT_EXTENSIONS:
             preview_bytes = data[:ARCHIVE_TEXT_PREVIEW_LIMIT]
             text = try_decode_text_like_archive_data(data) or preview_bytes.decode("utf-8", errors="replace")
+            related_references = build_archive_entry_related_references(
+                entry,
+                text=text,
+                archive_entries_by_normalized_path=texture_entries_by_normalized_path,
+                archive_entries_by_basename=texture_entries_by_basename,
+            )
             extra_note = ""
             if len(data) > ARCHIVE_TEXT_PREVIEW_LIMIT:
                 extra_note = f"\n\nPreview truncated to {format_byte_size(ARCHIVE_TEXT_PREVIEW_LIMIT)}."
@@ -5729,6 +8797,10 @@ def build_archive_preview_result(
             if extension == ".obj":
                 summary_text = summarize_obj_text(text)
                 extra_note = "\n\n".join(part for part in [summary_text, extra_note.strip()] if part)
+            if related_references:
+                extra_note = "\n\n".join(
+                    part for part in [extra_note.strip(), "Companion and related files are listed below."] if part
+                )
             return ArchivePreviewResult(
                 status="ok",
                 title=entry.basename,
@@ -5745,6 +8817,8 @@ def build_archive_preview_result(
                     ),
                 ),
                 preview_text=text,
+                model_texture_references=related_references,
+                asset_family_graph=build_archive_asset_family_graph(entry, related_references),
                 preferred_view="text",
                 loose_file_path=loose_file_path,
                 loose_preview_image_path=loose_preview_image_path,
@@ -5954,7 +9028,7 @@ def build_archive_preview_result(
                     for mesh in model_preview.meshes
                 ):
                     info_extra_parts.append(
-                        "Set texconv.exe in the Workflow tab to enable textured model shading and PNG-backed model export."
+                        "Set texconv.exe under Settings > Paths to enable textured model shading and PNG-backed model export."
                     )
             else:
                 if sidecar_texture_references:
@@ -5965,6 +9039,7 @@ def build_archive_preview_result(
                             model_preview,
                             parsed_mesh=parsed_mesh_for_references,
                             sidecar_texture_bindings=sidecar_texture_references,
+                            visible_texture_mode=normalized_visible_texture_mode,
                             texture_entries_by_normalized_path=texture_entries_by_normalized_path,
                             texture_entries_by_basename=texture_entries_by_basename,
                             sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
@@ -5977,6 +9052,37 @@ def build_archive_preview_result(
                         texconv_path,
                         entry,
                         model_preview,
+                        texture_entries_by_normalized_path=texture_entries_by_normalized_path,
+                        texture_entries_by_basename=texture_entries_by_basename,
+                        sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                        sidecar_texts_by_basename=sidecar_texts_by_basename,
+                        stop_event=stop_event,
+                    )
+                )
+                if sidecar_texture_references and normalized_visible_texture_mode == "mesh_base_first":
+                    info_extra_parts.extend(
+                        _attach_model_sidecar_texture_preview_paths(
+                            texconv_path,
+                            entry,
+                            model_preview,
+                            parsed_mesh=parsed_mesh_for_references,
+                            sidecar_texture_bindings=sidecar_texture_references,
+                            visible_texture_mode="layer_aware_visible",
+                            texture_entries_by_normalized_path=texture_entries_by_normalized_path,
+                            texture_entries_by_basename=texture_entries_by_basename,
+                            sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                            sidecar_texts_by_basename=sidecar_texts_by_basename,
+                            fallback_only=True,
+                            stop_event=stop_event,
+                        )
+                    )
+                info_extra_parts.extend(
+                    _attach_model_support_texture_preview_paths(
+                        texconv_path,
+                        entry,
+                        model_preview,
+                        parsed_mesh=parsed_mesh_for_references,
+                        sidecar_texture_bindings=sidecar_texture_references,
                         texture_entries_by_normalized_path=texture_entries_by_normalized_path,
                         texture_entries_by_basename=texture_entries_by_basename,
                         sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
@@ -6025,6 +9131,7 @@ def build_archive_preview_result(
             preview_text=preview_text,
             preview_model=model_preview,
             model_texture_references=model_texture_references,
+            asset_family_graph=build_archive_asset_family_graph(entry, model_texture_references),
             preferred_view="model" if model_preview is not None else preferred_view,
             warning_badge="Model preview fallback" if model_preview is None and model_preview_error else "",
             warning_text=model_preview_error if model_preview is None and model_preview_error else "",

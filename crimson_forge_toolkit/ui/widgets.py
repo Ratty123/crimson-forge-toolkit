@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
+import math
+from pathlib import PurePosixPath
 import re
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QDesktopServices,
     QFont,
     QImage,
@@ -15,8 +18,10 @@ from PySide6.QtGui import (
     QMatrix4x4,
     QOpenGLFunctions,
     QPainter,
+    QPen,
     QPixmap,
     QVector3D,
+    QVector4D,
     QSyntaxHighlighter,
     QTextCharFormat,
     QTextCursor,
@@ -61,6 +66,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from crimson_forge_toolkit.models import (
+    MODEL_PREVIEW_VISIBLE_TEXTURE_MODE_LABELS,
+    ModelPreviewData,
+    ModelPreviewMesh,
+    ModelPreviewRenderSettings,
+    PreparedModelPreviewBatch,
+    PreparedModelPreviewData,
+    clamp_model_preview_render_settings,
+)
 from crimson_forge_toolkit.ui.themes import get_theme
 
 _GL_COLOR_BUFFER_BIT = 0x00004000
@@ -77,6 +91,15 @@ class _ModelPreviewDrawBatch:
     first_vertex: int
     vertex_count: int
     texture_key: str = ""
+    normal_texture_key: str = ""
+    normal_texture_strength: float = 0.0
+    material_texture_key: str = ""
+    material_texture_type: str = ""
+    material_texture_subtype: str = ""
+    material_texture_packed_channels: Tuple[str, ...] = ()
+    material_decode_mode: int = 0
+    height_texture_key: str = ""
+    support_maps_disabled: bool = False
     has_texture_coordinates: bool = False
     texture_wrap_repeat: bool = False
     texture_flip_vertical: bool = True
@@ -663,10 +686,12 @@ class PreviewLabel(QLabel):
 
 class ModelPreviewWidget(QOpenGLWidget):
     view_state_changed = Signal(float, bool)
+    debug_details_changed = Signal(str)
 
     _DEFAULT_YAW = -35.0
     _DEFAULT_PITCH = 20.0
     _FIT_DISTANCE = 3.25
+    _VERTICAL_FOV_DEGREES = 45.0
     _ZOOM_STEPS = (0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0)
     _PALETTE = (
         (201 / 255.0, 111 / 255.0, 81 / 255.0),
@@ -675,6 +700,19 @@ class ModelPreviewWidget(QOpenGLWidget):
         (198 / 255.0, 176 / 255.0, 92 / 255.0),
         (147 / 255.0, 112 / 255.0, 166 / 255.0),
     )
+    _MATERIAL_DECODE_GENERIC = 0
+    _MATERIAL_DECODE_SPECULAR = 1
+    _MATERIAL_DECODE_AO = 2
+    _MATERIAL_DECODE_ROUGHNESS = 3
+    _MATERIAL_DECODE_METALLIC = 4
+    _MATERIAL_DECODE_MATERIAL_MASK = 5
+    _MATERIAL_DECODE_MATERIAL_RESPONSE = 6
+    _MATERIAL_DECODE_PACKED_MASK = 7
+    _MATERIAL_DECODE_ORM = 8
+    _MATERIAL_DECODE_RMA = 9
+    _MATERIAL_DECODE_MRA = 10
+    _MATERIAL_DECODE_ARM = 11
+    _MATERIAL_DECODE_OPACITY_MASK = 12
 
     def __init__(self, title: str, *, theme_key: str):
         super().__init__()
@@ -684,6 +722,8 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._theme_key = theme_key
         self._background_color = QColor(get_theme(theme_key)["preview_bg"])
         self._overlay_text_color = QColor(get_theme(theme_key)["text_muted"])
+        self._debug_overlay_lines: Tuple[str, ...] = ()
+        self._debug_detail_lines: Tuple[str, ...] = ()
         self._model_summary = ""
         self._vertex_blob = b""
         self._vertex_count = 0
@@ -694,21 +734,56 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._vertex_array = QOpenGLVertexArrayObject(self)
         self._mvp_uniform_location = -1
         self._model_uniform_location = -1
+        self._camera_uniform_location = -1
         self._light_uniform_location = -1
         self._ambient_uniform_location = -1
         self._texture_sampler_uniform_location = -1
+        self._normal_texture_sampler_uniform_location = -1
+        self._material_texture_sampler_uniform_location = -1
+        self._height_texture_sampler_uniform_location = -1
         self._use_texture_uniform_location = -1
+        self._use_high_quality_uniform_location = -1
+        self._use_normal_texture_uniform_location = -1
+        self._normal_texture_strength_uniform_location = -1
+        self._use_material_texture_uniform_location = -1
+        self._material_decode_mode_uniform_location = -1
+        self._use_height_texture_uniform_location = -1
+        self._diffuse_wrap_bias_uniform_location = -1
+        self._diffuse_light_scale_uniform_location = -1
+        self._normal_strength_cap_uniform_location = -1
+        self._normal_strength_floor_uniform_location = -1
+        self._height_effect_max_uniform_location = -1
+        self._cavity_clamp_min_uniform_location = -1
+        self._cavity_clamp_max_uniform_location = -1
+        self._specular_base_uniform_location = -1
+        self._specular_min_uniform_location = -1
+        self._specular_max_uniform_location = -1
+        self._shininess_base_uniform_location = -1
+        self._shininess_min_uniform_location = -1
+        self._shininess_max_uniform_location = -1
+        self._height_shininess_boost_uniform_location = -1
         self._fit_to_view = True
         self._zoom_factor = 1.0
         self._distance = self._FIT_DISTANCE
         self._yaw = self._DEFAULT_YAW
         self._pitch = self._DEFAULT_PITCH
         self._drag_active = False
-        self._last_mouse_pos = QPoint()
+        self._pan_drag_active = False
+        self._pan_drag_button = Qt.NoButton
+        self._last_mouse_pos = QPointF()
+        self._last_global_mouse_pos = QPoint()
+        self._pan_offset = QVector3D(0.0, 0.0, 0.0)
         self._current_model = None
         self._mesh_batches: List[_ModelPreviewDrawBatch] = []
         self._texture_objects: Dict[Tuple[str, bool, bool], QOpenGLTexture] = {}
         self._use_textures = False
+        self._high_quality_textures = True
+        self._show_grid_overlay = True
+        self._show_origin_overlay = True
+        self._render_settings = clamp_model_preview_render_settings()
+        self._pan_poll_timer = QTimer(self)
+        self._pan_poll_timer.setInterval(16)
+        self._pan_poll_timer.timeout.connect(self._poll_pan_drag)
 
     def set_theme(self, theme_key: str) -> None:
         self._theme_key = theme_key
@@ -717,38 +792,761 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._overlay_text_color = QColor(theme["text_muted"])
         self.update()
 
-    def clear_model(self, message: str) -> None:
+    def set_alignment_guides_visible(self, visible: bool) -> None:
+        self._show_grid_overlay = bool(visible)
+        self._show_origin_overlay = bool(visible)
+        self.update()
+
+    def _reset_model_state(self, message: str) -> bool:
+        had_renderable_state = bool(
+            self._current_model is not None
+            or self._vertex_count > 0
+            or self._mesh_batches
+            or self._texture_objects
+        )
         self._message = message
+        self._debug_overlay_lines = ()
+        self._debug_detail_lines = ()
+        self.debug_details_changed.emit("")
         self._model_summary = ""
         self._vertex_blob = b""
         self._vertex_count = 0
         self._current_model = None
         self._mesh_batches = []
         self._drag_active = False
+        self._pan_drag_active = False
+        self._pan_drag_button = Qt.NoButton
+        self._pan_poll_timer.stop()
+        self._pan_offset = QVector3D(0.0, 0.0, 0.0)
         self.unsetCursor()
-        self._upload_geometry()
+        return had_renderable_state
+
+    def clear_model(self, message: str, *, release_gl: bool = False) -> None:
+        had_renderable_state = self._reset_model_state(message)
+        if release_gl and had_renderable_state and self._gl_ready and self.context() is not None:
+            self._upload_geometry()
         self.update()
 
     def set_model(self, model) -> None:
-        self._current_model = model
-        self._model_summary = getattr(model, "summary", "") or ""
+        cloned_model, prepared_preview = self.prepare_model_preview(model)
+        self.set_prepared_model(cloned_model, prepared_preview)
+
+    def set_prepared_model(
+        self,
+        model,
+        prepared_preview: Optional[PreparedModelPreviewData],
+    ) -> None:
+        cloned_model = self._clone_model_preview(model)
+        self._initialize_preview_slot_defaults(cloned_model)
+        if isinstance(prepared_preview, PreparedModelPreviewData):
+            vertex_blob = b"".join(batch.vertex_blob for batch in prepared_preview.batches)
+            vertex_count = sum(int(batch.index_count) for batch in prepared_preview.batches)
+            mesh_batches: List[_ModelPreviewDrawBatch] = []
+            first_vertex = 0
+            for batch in prepared_preview.batches:
+                material_texture_channels = tuple(batch.preview_material_texture_packed_channels or ())
+                mesh_batches.append(
+                    _ModelPreviewDrawBatch(
+                        first_vertex=first_vertex,
+                        vertex_count=int(batch.index_count),
+                        texture_key=batch.preview_texture_path,
+                        normal_texture_key=batch.preview_normal_texture_path,
+                        normal_texture_strength=float(batch.preview_normal_texture_strength or 0.0),
+                        material_texture_key=batch.preview_material_texture_path,
+                        material_texture_type=batch.preview_material_texture_type,
+                        material_texture_subtype=batch.preview_material_texture_subtype,
+                        material_texture_packed_channels=material_texture_channels,
+                        material_decode_mode=self._material_decode_mode_for_semantics(
+                            batch.preview_material_texture_type,
+                            batch.preview_material_texture_subtype,
+                            material_texture_channels,
+                        ),
+                        height_texture_key=batch.preview_height_texture_path,
+                        support_maps_disabled=bool(batch.preview_debug_disable_support_maps),
+                        has_texture_coordinates=bool(batch.has_texture_coordinates),
+                        texture_wrap_repeat=bool(batch.texture_wrap_repeat),
+                        texture_flip_vertical=(
+                            True
+                            if batch.preview_texture_flip_vertical is None
+                            else bool(batch.preview_texture_flip_vertical)
+                        ),
+                    )
+                )
+                first_vertex += int(batch.index_count)
+        else:
+            vertex_blob, vertex_count, mesh_batches = self._build_vertex_blob(cloned_model)
+        self._current_model = cloned_model
+        self._model_summary = getattr(cloned_model, "summary", "") or ""
         self._message = self._model_summary or "Model preview ready."
-        self._vertex_blob, self._vertex_count, self._mesh_batches = self._build_vertex_blob(model)
+        self._vertex_blob = vertex_blob
+        self._vertex_count = vertex_count
+        self._mesh_batches = mesh_batches
         self._yaw = self._DEFAULT_YAW
         self._pitch = self._DEFAULT_PITCH
         self._fit_to_view = True
         self._zoom_factor = 1.0
         self._distance = self._FIT_DISTANCE
+        self._pan_drag_button = Qt.NoButton
+        self._pan_poll_timer.stop()
+        self._pan_offset = QVector3D(0.0, 0.0, 0.0)
+        self._refresh_debug_overlay_lines()
         self._upload_geometry()
         self.view_state_changed.emit(self._zoom_factor, self._fit_to_view)
         self.update()
+
+    @classmethod
+    def prepare_model_preview(
+        cls,
+        model,
+    ) -> Tuple[object, Optional[PreparedModelPreviewData]]:
+        cloned_model = cls._clone_model_preview(model)
+        if not isinstance(cloned_model, ModelPreviewData):
+            return cloned_model, None
+        for mesh in getattr(cloned_model, "meshes", None) or []:
+            if isinstance(mesh, ModelPreviewMesh):
+                cls._initialize_mesh_preview_slot_defaults(mesh)
+        vertex_blob, vertex_count, mesh_batches = cls._build_vertex_blob(cloned_model)
+        prepared_batches: List[PreparedModelPreviewBatch] = []
+        floats_per_vertex = 17
+        bytes_per_vertex = floats_per_vertex * 4
+        for mesh, batch in zip(getattr(cloned_model, "meshes", ()) or (), mesh_batches):
+            start = int(batch.first_vertex) * bytes_per_vertex
+            end = start + (int(batch.vertex_count) * bytes_per_vertex)
+            prepared_batches.append(
+                PreparedModelPreviewBatch(
+                    material_name=str(getattr(mesh, "material_name", "") or "").strip(),
+                    texture_name=str(getattr(mesh, "texture_name", "") or "").strip(),
+                    vertex_blob=vertex_blob[start:end],
+                    index_count=int(batch.vertex_count),
+                    preview_texture_path=batch.texture_key,
+                    preview_normal_texture_path=batch.normal_texture_key,
+                    preview_material_texture_path=batch.material_texture_key,
+                    preview_height_texture_path=batch.height_texture_key,
+                    preview_texture_flip_vertical=batch.texture_flip_vertical,
+                    preview_normal_texture_strength=float(batch.normal_texture_strength or 0.0),
+                    preview_material_texture_type=batch.material_texture_type,
+                    preview_material_texture_subtype=batch.material_texture_subtype,
+                    preview_material_texture_packed_channels=tuple(batch.material_texture_packed_channels or ()),
+                    has_texture_coordinates=bool(batch.has_texture_coordinates),
+                    texture_wrap_repeat=bool(batch.texture_wrap_repeat),
+                    preview_debug_flip_base_v=False,
+                    preview_debug_disable_support_maps=bool(batch.support_maps_disabled),
+                )
+            )
+        return cloned_model, PreparedModelPreviewData(
+            source_path=str(getattr(cloned_model, "path", "") or "").strip(),
+            format=str(getattr(cloned_model, "format", "") or "").strip(),
+            summary=str(getattr(cloned_model, "summary", "") or "").strip(),
+            mesh_count=int(getattr(cloned_model, "mesh_count", 0) or 0),
+            vertex_count=int(getattr(cloned_model, "vertex_count", vertex_count) or vertex_count),
+            face_count=int(getattr(cloned_model, "face_count", 0) or 0),
+            lod_index=int(getattr(cloned_model, "lod_index", -1) or -1),
+            lod_count=int(getattr(cloned_model, "lod_count", 0) or 0),
+            normalization_center=tuple(getattr(cloned_model, "normalization_center", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)),
+            normalization_scale=float(getattr(cloned_model, "normalization_scale", 1.0) or 1.0),
+            batches=tuple(prepared_batches),
+        )
+
+    @staticmethod
+    def _clone_model_preview(model) -> Optional[ModelPreviewData]:
+        if not isinstance(model, ModelPreviewData):
+            return model
+        cloned_meshes = []
+        for mesh in getattr(model, "meshes", []) or []:
+            if isinstance(mesh, ModelPreviewMesh):
+                cloned_meshes.append(
+                    ModelPreviewMesh(
+                        **{field_info.name: getattr(mesh, field_info.name) for field_info in dataclass_fields(ModelPreviewMesh)}
+                    )
+                )
+            else:
+                cloned_meshes.append(mesh)
+        return ModelPreviewData(
+            **{
+                field_info.name: (
+                    cloned_meshes
+                    if field_info.name == "meshes"
+                    else getattr(model, field_info.name)
+                )
+                for field_info in dataclass_fields(ModelPreviewData)
+            }
+        )
+
+    @staticmethod
+    def _normalize_override_target(value: object) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+    @staticmethod
+    def _initialize_mesh_preview_slot_defaults(mesh: ModelPreviewMesh) -> None:
+        if (
+            not str(getattr(mesh, "preview_base_texture_default_path", "") or "").strip()
+            and not str(getattr(mesh, "preview_base_texture_default_name", "") or "").strip()
+        ):
+            mesh.preview_base_texture_default_path = str(getattr(mesh, "preview_texture_path", "") or "").strip()
+            mesh.preview_base_texture_default_name = str(getattr(mesh, "texture_name", "") or "").strip()
+        if (
+            not str(getattr(mesh, "preview_normal_texture_default_path", "") or "").strip()
+            and not str(getattr(mesh, "preview_normal_texture_default_name", "") or "").strip()
+        ):
+            mesh.preview_normal_texture_default_path = str(getattr(mesh, "preview_normal_texture_path", "") or "").strip()
+            mesh.preview_normal_texture_default_name = str(getattr(mesh, "preview_normal_texture_name", "") or "").strip()
+            mesh.preview_normal_texture_default_strength = float(
+                getattr(mesh, "preview_normal_texture_strength", 0.0) or 0.0
+            )
+        if (
+            not str(getattr(mesh, "preview_material_texture_default_path", "") or "").strip()
+            and not str(getattr(mesh, "preview_material_texture_default_name", "") or "").strip()
+        ):
+            mesh.preview_material_texture_default_path = str(getattr(mesh, "preview_material_texture_path", "") or "").strip()
+            mesh.preview_material_texture_default_name = str(getattr(mesh, "preview_material_texture_name", "") or "").strip()
+            mesh.preview_material_texture_default_type = str(getattr(mesh, "preview_material_texture_type", "") or "").strip()
+            mesh.preview_material_texture_default_subtype = str(
+                getattr(mesh, "preview_material_texture_subtype", "") or ""
+            ).strip()
+            mesh.preview_material_texture_default_packed_channels = tuple(
+                str(channel or "").strip().lower()
+                for channel in (getattr(mesh, "preview_material_texture_packed_channels", ()) or ())
+                if str(channel or "").strip()
+            )
+        if (
+            not str(getattr(mesh, "preview_height_texture_default_path", "") or "").strip()
+            and not str(getattr(mesh, "preview_height_texture_default_name", "") or "").strip()
+        ):
+            mesh.preview_height_texture_default_path = str(getattr(mesh, "preview_height_texture_path", "") or "").strip()
+            mesh.preview_height_texture_default_name = str(getattr(mesh, "preview_height_texture_name", "") or "").strip()
+
+    def _initialize_preview_slot_defaults(self, model: Optional[ModelPreviewData]) -> None:
+        meshes = getattr(model, "meshes", None) or []
+        for mesh in meshes:
+            if isinstance(mesh, ModelPreviewMesh):
+                self._initialize_mesh_preview_slot_defaults(mesh)
 
     def set_use_textures(self, use_textures: bool) -> None:
         self._use_textures = bool(use_textures)
         self.update()
 
+    def support_maps_available(self) -> bool:
+        return any(
+            batch.normal_texture_key or batch.material_texture_key or batch.height_texture_key
+            for batch in self._mesh_batches
+        )
+
+    def base_flip_override_enabled(self) -> bool:
+        meshes = getattr(self._current_model, "meshes", None) or []
+        return any(bool(getattr(mesh, "preview_debug_flip_base_v", False)) for mesh in meshes)
+
+    def support_maps_disabled(self) -> bool:
+        meshes = getattr(self._current_model, "meshes", None) or []
+        return any(bool(getattr(mesh, "preview_debug_disable_support_maps", False)) for mesh in meshes)
+
+    def _slot_override_active(self, mesh: ModelPreviewMesh, slot: str) -> bool:
+        normalized_slot = str(slot or "").strip().lower()
+        if normalized_slot == "base":
+            return (
+                str(getattr(mesh, "preview_texture_path", "") or "").strip()
+                != str(getattr(mesh, "preview_base_texture_default_path", "") or "").strip()
+                or str(getattr(mesh, "texture_name", "") or "").strip()
+                != str(getattr(mesh, "preview_base_texture_default_name", "") or "").strip()
+            )
+        if normalized_slot == "normal":
+            return (
+                str(getattr(mesh, "preview_normal_texture_path", "") or "").strip()
+                != str(getattr(mesh, "preview_normal_texture_default_path", "") or "").strip()
+                or str(getattr(mesh, "preview_normal_texture_name", "") or "").strip()
+                != str(getattr(mesh, "preview_normal_texture_default_name", "") or "").strip()
+                or abs(
+                    float(getattr(mesh, "preview_normal_texture_strength", 0.0) or 0.0)
+                    - float(getattr(mesh, "preview_normal_texture_default_strength", 0.0) or 0.0)
+                ) > 1e-6
+            )
+        if normalized_slot == "material":
+            return (
+                str(getattr(mesh, "preview_material_texture_path", "") or "").strip()
+                != str(getattr(mesh, "preview_material_texture_default_path", "") or "").strip()
+                or str(getattr(mesh, "preview_material_texture_name", "") or "").strip()
+                != str(getattr(mesh, "preview_material_texture_default_name", "") or "").strip()
+                or str(getattr(mesh, "preview_material_texture_type", "") or "").strip().lower()
+                != str(getattr(mesh, "preview_material_texture_default_type", "") or "").strip().lower()
+                or str(getattr(mesh, "preview_material_texture_subtype", "") or "").strip().lower()
+                != str(getattr(mesh, "preview_material_texture_default_subtype", "") or "").strip().lower()
+                or tuple(
+                    str(channel or "").strip().lower()
+                    for channel in (getattr(mesh, "preview_material_texture_packed_channels", ()) or ())
+                    if str(channel or "").strip()
+                )
+                != tuple(
+                    str(channel or "").strip().lower()
+                    for channel in (getattr(mesh, "preview_material_texture_default_packed_channels", ()) or ())
+                    if str(channel or "").strip()
+                )
+            )
+        if normalized_slot == "height":
+            return (
+                str(getattr(mesh, "preview_height_texture_path", "") or "").strip()
+                != str(getattr(mesh, "preview_height_texture_default_path", "") or "").strip()
+                or str(getattr(mesh, "preview_height_texture_name", "") or "").strip()
+                != str(getattr(mesh, "preview_height_texture_default_name", "") or "").strip()
+            )
+        return False
+
+    def texture_slot_overrides_active(self) -> bool:
+        meshes = getattr(self._current_model, "meshes", None) or []
+        return any(
+            self._slot_override_active(mesh, slot)
+            for mesh in meshes
+            for slot in ("base", "normal", "material", "height")
+        )
+
+    def debug_overrides_active(self) -> bool:
+        return self.base_flip_override_enabled() or self.support_maps_disabled() or self.texture_slot_overrides_active()
+
+    def set_base_texture_flip_override_enabled(self, enabled: bool) -> None:
+        self._set_mesh_debug_override("preview_debug_flip_base_v", bool(enabled))
+
+    def set_support_maps_disabled(self, enabled: bool) -> None:
+        self._set_mesh_debug_override("preview_debug_disable_support_maps", bool(enabled))
+
+    def _iter_override_target_meshes(self, material_name: object) -> List[ModelPreviewMesh]:
+        meshes = [
+            mesh
+            for mesh in (getattr(self._current_model, "meshes", None) or [])
+            if isinstance(mesh, ModelPreviewMesh)
+        ]
+        if not meshes:
+            return []
+        normalized_material_name = self._normalize_override_target(material_name)
+        if not normalized_material_name:
+            return meshes
+        matched_meshes = [
+            mesh
+            for mesh in meshes
+            if self._normalize_override_target(getattr(mesh, "material_name", "")) == normalized_material_name
+        ]
+        return matched_meshes or meshes
+
+    def set_texture_slot_override(
+        self,
+        slot: str,
+        *,
+        preview_path: str,
+        texture_name: str,
+        material_name: str = "",
+        normal_strength: float = 0.0,
+        material_texture_type: str = "",
+        material_texture_subtype: str = "",
+        material_texture_packed_channels: Sequence[str] = (),
+    ) -> bool:
+        meshes = self._iter_override_target_meshes(material_name)
+        if not meshes:
+            return False
+        normalized_slot = str(slot or "").strip().lower()
+        preview_path_text = str(preview_path or "").strip()
+        texture_name_text = str(texture_name or "").strip()
+        if normalized_slot not in {"base", "normal", "material", "height"} or not preview_path_text:
+            return False
+
+        changed = False
+        for mesh in meshes:
+            self._initialize_mesh_preview_slot_defaults(mesh)
+            if normalized_slot == "base":
+                if str(getattr(mesh, "preview_texture_path", "") or "").strip() != preview_path_text:
+                    mesh.preview_texture_path = preview_path_text
+                    mesh.preview_texture_image = None
+                    changed = True
+                if str(getattr(mesh, "texture_name", "") or "").strip() != texture_name_text:
+                    mesh.texture_name = texture_name_text
+                    changed = True
+                continue
+            if normalized_slot == "normal":
+                if str(getattr(mesh, "preview_normal_texture_path", "") or "").strip() != preview_path_text:
+                    mesh.preview_normal_texture_path = preview_path_text
+                    mesh.preview_normal_texture_image = None
+                    changed = True
+                if str(getattr(mesh, "preview_normal_texture_name", "") or "").strip() != texture_name_text:
+                    mesh.preview_normal_texture_name = texture_name_text
+                    changed = True
+                if abs(float(getattr(mesh, "preview_normal_texture_strength", 0.0) or 0.0) - float(normal_strength)) > 1e-6:
+                    mesh.preview_normal_texture_strength = float(normal_strength)
+                    changed = True
+                continue
+            if normalized_slot == "material":
+                packed_channels = tuple(
+                    str(channel or "").strip().lower()
+                    for channel in material_texture_packed_channels
+                    if str(channel or "").strip()
+                )
+                if str(getattr(mesh, "preview_material_texture_path", "") or "").strip() != preview_path_text:
+                    mesh.preview_material_texture_path = preview_path_text
+                    mesh.preview_material_texture_image = None
+                    changed = True
+                if str(getattr(mesh, "preview_material_texture_name", "") or "").strip() != texture_name_text:
+                    mesh.preview_material_texture_name = texture_name_text
+                    changed = True
+                if str(getattr(mesh, "preview_material_texture_type", "") or "").strip().lower() != str(material_texture_type or "").strip().lower():
+                    mesh.preview_material_texture_type = str(material_texture_type or "").strip().lower()
+                    changed = True
+                if str(getattr(mesh, "preview_material_texture_subtype", "") or "").strip().lower() != str(material_texture_subtype or "").strip().lower():
+                    mesh.preview_material_texture_subtype = str(material_texture_subtype or "").strip().lower()
+                    changed = True
+                if tuple(
+                    str(channel or "").strip().lower()
+                    for channel in (getattr(mesh, "preview_material_texture_packed_channels", ()) or ())
+                    if str(channel or "").strip()
+                ) != packed_channels:
+                    mesh.preview_material_texture_packed_channels = packed_channels
+                    changed = True
+                continue
+            if str(getattr(mesh, "preview_height_texture_path", "") or "").strip() != preview_path_text:
+                mesh.preview_height_texture_path = preview_path_text
+                mesh.preview_height_texture_image = None
+                changed = True
+            if str(getattr(mesh, "preview_height_texture_name", "") or "").strip() != texture_name_text:
+                mesh.preview_height_texture_name = texture_name_text
+                changed = True
+        if changed:
+            self._rebuild_preview_batches()
+        return changed
+
+    def reset_preview_overrides(self) -> None:
+        meshes = getattr(self._current_model, "meshes", None) or []
+        if not meshes:
+            return
+        changed = False
+        for mesh in meshes:
+            if isinstance(mesh, ModelPreviewMesh):
+                self._initialize_mesh_preview_slot_defaults(mesh)
+            if bool(getattr(mesh, "preview_debug_flip_base_v", False)):
+                mesh.preview_debug_flip_base_v = False
+                changed = True
+            if bool(getattr(mesh, "preview_debug_disable_support_maps", False)):
+                mesh.preview_debug_disable_support_maps = False
+                changed = True
+            if isinstance(mesh, ModelPreviewMesh):
+                if self._slot_override_active(mesh, "base"):
+                    mesh.preview_texture_path = str(getattr(mesh, "preview_base_texture_default_path", "") or "").strip()
+                    mesh.texture_name = str(getattr(mesh, "preview_base_texture_default_name", "") or "").strip()
+                    mesh.preview_texture_image = None
+                    changed = True
+                if self._slot_override_active(mesh, "normal"):
+                    mesh.preview_normal_texture_path = str(getattr(mesh, "preview_normal_texture_default_path", "") or "").strip()
+                    mesh.preview_normal_texture_name = str(getattr(mesh, "preview_normal_texture_default_name", "") or "").strip()
+                    mesh.preview_normal_texture_strength = float(
+                        getattr(mesh, "preview_normal_texture_default_strength", 0.0) or 0.0
+                    )
+                    mesh.preview_normal_texture_image = None
+                    changed = True
+                if self._slot_override_active(mesh, "material"):
+                    mesh.preview_material_texture_path = str(
+                        getattr(mesh, "preview_material_texture_default_path", "") or ""
+                    ).strip()
+                    mesh.preview_material_texture_name = str(
+                        getattr(mesh, "preview_material_texture_default_name", "") or ""
+                    ).strip()
+                    mesh.preview_material_texture_type = str(
+                        getattr(mesh, "preview_material_texture_default_type", "") or ""
+                    ).strip().lower()
+                    mesh.preview_material_texture_subtype = str(
+                        getattr(mesh, "preview_material_texture_default_subtype", "") or ""
+                    ).strip().lower()
+                    mesh.preview_material_texture_packed_channels = tuple(
+                        str(channel or "").strip().lower()
+                        for channel in (getattr(mesh, "preview_material_texture_default_packed_channels", ()) or ())
+                        if str(channel or "").strip()
+                    )
+                    mesh.preview_material_texture_image = None
+                    changed = True
+                if self._slot_override_active(mesh, "height"):
+                    mesh.preview_height_texture_path = str(getattr(mesh, "preview_height_texture_default_path", "") or "").strip()
+                    mesh.preview_height_texture_name = str(getattr(mesh, "preview_height_texture_default_name", "") or "").strip()
+                    mesh.preview_height_texture_image = None
+                    changed = True
+        if changed:
+            self._rebuild_preview_batches()
+
+    def current_model_preview(self) -> Optional[ModelPreviewData]:
+        return self._clone_model_preview(self._current_model)
+
+    def _set_mesh_debug_override(
+        self,
+        field_name: str,
+        enabled: bool,
+    ) -> None:
+        meshes = getattr(self._current_model, "meshes", None) or []
+        if not meshes:
+            return
+        changed = False
+        for mesh in meshes:
+            current = bool(getattr(mesh, field_name, False))
+            if current == enabled:
+                continue
+            setattr(mesh, field_name, bool(enabled))
+            changed = True
+        if not changed:
+            return
+        self._rebuild_preview_batches()
+
+    def _rebuild_preview_batches(self) -> None:
+        self._vertex_blob, self._vertex_count, self._mesh_batches = self._build_vertex_blob(self._current_model)
+        self._refresh_debug_overlay_lines()
+        if self._gl_ready and self.context() is not None:
+            self._upload_geometry()
+        self.update()
+
+    @staticmethod
+    def _texture_display_name(explicit_name: object, texture_path: object) -> str:
+        explicit_text = str(explicit_name or "").strip()
+        if explicit_text:
+            return PurePosixPath(explicit_text).name or explicit_text
+        texture_path_text = str(texture_path or "").strip()
+        if not texture_path_text:
+            return ""
+        return PurePosixPath(texture_path_text).name or texture_path_text
+
+    @staticmethod
+    def _summarize_overlay_values(values: Sequence[str]) -> str:
+        unique_values: List[str] = []
+        for value in values:
+            normalized = str(value or "").strip()
+            if not normalized or normalized in unique_values:
+                continue
+            unique_values.append(normalized)
+        if not unique_values:
+            return "None"
+        if len(unique_values) <= 2:
+            return ", ".join(unique_values)
+        return f"{', '.join(unique_values[:2])} (+{len(unique_values) - 2} more)"
+
+    @staticmethod
+    def _format_material_channel_name(channel_name: str) -> str:
+        normalized = str(channel_name or "").strip().lower()
+        if not normalized:
+            return "Unknown"
+        replacements = {
+            "ao": "AO",
+            "orm": "ORM",
+            "rma": "RMA",
+            "mra": "MRA",
+            "arm": "ARM",
+            "alpha": "Alpha",
+        }
+        if normalized in replacements:
+            return replacements[normalized]
+        return normalized.replace("_", " ").title()
+
+    @classmethod
+    def _material_decode_mode_for_semantics(
+        cls,
+        texture_type: object,
+        semantic_subtype: object,
+        packed_channels: Sequence[str],
+    ) -> int:
+        normalized_type = str(texture_type or "").strip().lower()
+        normalized_subtype = str(semantic_subtype or "").strip().lower()
+        normalized_channels = tuple(
+            str(channel or "").strip().lower()
+            for channel in packed_channels
+            if str(channel or "").strip()
+        )
+        if normalized_subtype == "specular" or normalized_type == "specular":
+            return cls._MATERIAL_DECODE_SPECULAR
+        if normalized_subtype == "ao":
+            return cls._MATERIAL_DECODE_AO
+        if normalized_subtype in {"roughness", "gloss_or_smoothness"} or normalized_type == "roughness":
+            return cls._MATERIAL_DECODE_ROUGHNESS
+        if normalized_subtype == "metallic" or normalized_type == "metallic":
+            return cls._MATERIAL_DECODE_METALLIC
+        if normalized_subtype == "material_mask":
+            return cls._MATERIAL_DECODE_MATERIAL_MASK
+        if normalized_subtype == "material_response":
+            return cls._MATERIAL_DECODE_MATERIAL_RESPONSE
+        if normalized_subtype == "packed_mask":
+            return cls._MATERIAL_DECODE_PACKED_MASK
+        if normalized_subtype == "orm":
+            return cls._MATERIAL_DECODE_ORM
+        if normalized_subtype == "rma":
+            return cls._MATERIAL_DECODE_RMA
+        if normalized_subtype == "mra":
+            return cls._MATERIAL_DECODE_MRA
+        if normalized_subtype == "arm":
+            return cls._MATERIAL_DECODE_ARM
+        if normalized_subtype == "opacity_mask":
+            return cls._MATERIAL_DECODE_OPACITY_MASK
+        if normalized_channels[:3] == ("ao", "roughness", "metallic"):
+            return cls._MATERIAL_DECODE_ORM
+        if normalized_channels[:3] == ("roughness", "metallic", "ao"):
+            return cls._MATERIAL_DECODE_RMA
+        if normalized_channels[:3] == ("metallic", "roughness", "ao"):
+            return cls._MATERIAL_DECODE_MRA
+        if normalized_channels:
+            return cls._MATERIAL_DECODE_PACKED_MASK
+        return cls._MATERIAL_DECODE_GENERIC
+
+    @classmethod
+    def _describe_material_interpretation(
+        cls,
+        texture_type: object,
+        semantic_subtype: object,
+        packed_channels: Sequence[str],
+    ) -> str:
+        normalized_type = str(texture_type or "").strip().lower()
+        normalized_subtype = str(semantic_subtype or "").strip().lower()
+        normalized_channels = tuple(
+            str(channel or "").strip().lower()
+            for channel in packed_channels
+            if str(channel or "").strip()
+        )
+        label_lookup = {
+            "specular": "Specular Response",
+            "ao": "Ambient Occlusion",
+            "roughness": "Roughness",
+            "gloss_or_smoothness": "Gloss or Smoothness",
+            "metallic": "Metallic",
+            "material_mask": "Material Mask",
+            "material_response": "Material Response",
+            "packed_mask": "Packed Mask",
+            "opacity_mask": "Opacity Mask",
+            "orm": "ORM",
+            "rma": "RMA",
+            "mra": "MRA",
+            "arm": "ARM",
+        }
+        label = label_lookup.get(normalized_subtype)
+        if label is None and normalized_subtype:
+            label = cls._format_material_channel_name(normalized_subtype)
+        if label is None and normalized_type:
+            label = cls._format_material_channel_name(normalized_type)
+        if not label:
+            label = "Generic Heuristic"
+        if normalized_channels:
+            channel_text = " / ".join(cls._format_material_channel_name(channel) for channel in normalized_channels)
+            return f"{label} ({channel_text})"
+        return label
+
+    def _refresh_debug_overlay_lines(self) -> None:
+        meshes = getattr(self._current_model, "meshes", None) or []
+        if not meshes:
+            self._debug_overlay_lines = ()
+            self._debug_detail_lines = ()
+            self.debug_details_changed.emit("")
+            return
+        base_names: List[str] = []
+        normal_names: List[str] = []
+        material_names: List[str] = []
+        material_interpretations: List[str] = []
+        height_names: List[str] = []
+        for mesh in meshes:
+            base_names.append(
+                self._texture_display_name(
+                    getattr(mesh, "texture_name", ""),
+                    getattr(mesh, "preview_texture_path", ""),
+                )
+            )
+            normal_names.append(
+                self._texture_display_name(
+                    getattr(mesh, "preview_normal_texture_name", ""),
+                    getattr(mesh, "preview_normal_texture_path", ""),
+                )
+            )
+            material_names.append(
+                self._texture_display_name(
+                    getattr(mesh, "preview_material_texture_name", ""),
+                    getattr(mesh, "preview_material_texture_path", ""),
+                )
+            )
+            height_names.append(
+                self._texture_display_name(
+                    getattr(mesh, "preview_height_texture_name", ""),
+                    getattr(mesh, "preview_height_texture_path", ""),
+                )
+            )
+            if str(getattr(mesh, "preview_material_texture_path", "") or "").strip() or getattr(
+                mesh,
+                "preview_material_texture_image",
+                None,
+            ) is not None:
+                material_interpretations.append(
+                    self._describe_material_interpretation(
+                        getattr(mesh, "preview_material_texture_type", ""),
+                        getattr(mesh, "preview_material_texture_subtype", ""),
+                        getattr(mesh, "preview_material_texture_packed_channels", ()) or (),
+                    )
+                )
+        override_labels: List[str] = []
+        if any(self._slot_override_active(mesh, "base") for mesh in meshes if isinstance(mesh, ModelPreviewMesh)):
+            override_labels.append("Base Override")
+        if any(self._slot_override_active(mesh, "normal") for mesh in meshes if isinstance(mesh, ModelPreviewMesh)):
+            override_labels.append("Normal Override")
+        if any(self._slot_override_active(mesh, "material") for mesh in meshes if isinstance(mesh, ModelPreviewMesh)):
+            override_labels.append("Material Override")
+        if any(self._slot_override_active(mesh, "height") for mesh in meshes if isinstance(mesh, ModelPreviewMesh)):
+            override_labels.append("Height Override")
+        if self.base_flip_override_enabled():
+            override_labels.append("Flip Base V")
+        if self.support_maps_disabled():
+            override_labels.append("Support Maps Off")
+        self._debug_overlay_lines = (
+            f"Visible Mode: {self._visible_texture_mode_label()}",
+        )
+        self._debug_detail_lines = (
+            self._debug_overlay_lines[0],
+            f"Base: {self._summarize_overlay_values(base_names)}",
+            f"Normal: {self._summarize_overlay_values(normal_names)}",
+            f"Material: {self._summarize_overlay_values(material_names)}",
+            f"Material Decode: {self._summarize_overlay_values(material_interpretations)}",
+            f"Height: {self._summarize_overlay_values(height_names)}",
+            f"Overrides: {', '.join(override_labels) if override_labels else 'None'}",
+        )
+        self.debug_details_changed.emit("\n".join(self._debug_detail_lines))
+
+    def _visible_texture_mode_label(self) -> str:
+        settings = self.render_settings()
+        mode = str(getattr(settings, "visible_texture_mode", "") or "").strip().lower()
+        return MODEL_PREVIEW_VISIBLE_TEXTURE_MODE_LABELS.get(mode, mode.replace("_", " ").title() or "Mesh Base First")
+
+    def render_settings(self) -> ModelPreviewRenderSettings:
+        return clamp_model_preview_render_settings(self._render_settings)
+
+    def debug_details_text(self) -> str:
+        return "\n".join(self._debug_detail_lines)
+
+    def set_render_settings(self, settings: Optional[ModelPreviewRenderSettings]) -> None:
+        clamped = clamp_model_preview_render_settings(settings)
+        previous = self._render_settings
+        self._render_settings = clamped
+        textures_changed = (
+            previous.preview_texture_max_dimension != clamped.preview_texture_max_dimension
+            or previous.low_quality_texture_max_dimension != clamped.low_quality_texture_max_dimension
+            or previous.max_anisotropy != clamped.max_anisotropy
+        )
+        if previous.visible_texture_mode != clamped.visible_texture_mode:
+            self._refresh_debug_overlay_lines()
+        if textures_changed and self._gl_ready and self.context() is not None:
+            self.makeCurrent()
+            self._clear_gl_textures()
+            self._rebuild_gl_textures()
+            self.doneCurrent()
+        self.update()
+
+    def set_high_quality_textures(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._high_quality_textures == enabled:
+            return
+        self._high_quality_textures = enabled
+        if self._gl_ready and self.context() is not None:
+            self.makeCurrent()
+            self._clear_gl_textures()
+            self._rebuild_gl_textures()
+            self.doneCurrent()
+        self.update()
+
     def textures_available(self) -> bool:
         return any(batch.texture_key and batch.has_texture_coordinates for batch in self._mesh_batches)
+
+    def textures_enabled(self) -> bool:
+        return bool(self._use_textures)
+
+    def high_quality_textures_enabled(self) -> bool:
+        return bool(self._high_quality_textures)
 
     def set_zoom_factor(self, zoom_factor: float) -> None:
         self._zoom_factor = min(max(float(zoom_factor), 0.1), 16.0)
@@ -766,6 +1564,74 @@ class ModelPreviewWidget(QOpenGLWidget):
     def current_display_scale(self) -> float:
         return max(0.1, self._FIT_DISTANCE / max(self._distance, 0.01))
 
+    def _world_units_per_pixel(self) -> float:
+        viewport_height = max(1, self.height())
+        visible_height = 2.0 * max(self._distance, 0.1) * math.tan(math.radians(self._VERTICAL_FOV_DEGREES) * 0.5)
+        return visible_height / float(viewport_height)
+
+    def _camera_orbit_basis(self) -> Tuple[QVector3D, QVector3D, QVector3D]:
+        yaw_radians = math.radians(float(self._yaw))
+        pitch_radians = math.radians(float(self._pitch))
+        cos_yaw = math.cos(yaw_radians)
+        sin_yaw = math.sin(yaw_radians)
+        cos_pitch = math.cos(pitch_radians)
+        sin_pitch = math.sin(pitch_radians)
+
+        # Build a simple orbit camera basis without relying on PySide's
+        # matrix/vector operator overloads, which are brittle at runtime.
+        forward = QVector3D(
+            sin_yaw * cos_pitch,
+            sin_pitch,
+            cos_yaw * cos_pitch,
+        ).normalized()
+        right = QVector3D.crossProduct(forward, QVector3D(0.0, 1.0, 0.0))
+        if right.lengthSquared() <= 1e-8:
+            right = QVector3D(1.0, 0.0, 0.0)
+        else:
+            right.normalize()
+        up = QVector3D.crossProduct(right, forward)
+        if up.lengthSquared() <= 1e-8:
+            up = QVector3D(0.0, 1.0, 0.0)
+        else:
+            up.normalize()
+        orbit_offset = QVector3D(
+            forward.x() * float(self._distance),
+            forward.y() * float(self._distance),
+            forward.z() * float(self._distance),
+        )
+        return orbit_offset, right, up
+
+    def _apply_pan_delta(self, delta_x: float, delta_y: float) -> None:
+        if abs(delta_x) <= 1e-6 and abs(delta_y) <= 1e-6:
+            return
+        units_per_pixel = self._world_units_per_pixel()
+        settings = self.render_settings()
+        pan_scale = float(settings.pan_sensitivity)
+        horizontal_sign = -1.0 if settings.invert_pan_x else 1.0
+        vertical_sign = 1.0 if settings.invert_pan_y else -1.0
+        horizontal_scale = float(delta_x) * units_per_pixel * pan_scale * horizontal_sign
+        vertical_scale = float(delta_y) * units_per_pixel * pan_scale * vertical_sign
+        self._pan_offset = self._pan_offset + QVector3D(horizontal_scale, vertical_scale, 0.0)
+        self.update()
+
+    def _poll_pan_drag(self) -> None:
+        if not self._pan_drag_active:
+            self._pan_poll_timer.stop()
+            return
+        if self._pan_drag_button != Qt.NoButton and not bool(QApplication.mouseButtons() & self._pan_drag_button):
+            self._pan_drag_active = False
+            self._pan_drag_button = Qt.NoButton
+            self._pan_poll_timer.stop()
+            self.releaseMouse()
+            self.unsetCursor()
+            return
+        current_global_pos = QCursor.pos()
+        delta = current_global_pos - self._last_global_mouse_pos
+        if delta.x() or delta.y():
+            self._last_global_mouse_pos = current_global_pos
+            self._apply_pan_delta(delta.x(), delta.y())
+            
+
     def initializeGL(self) -> None:  # type: ignore[override]
         self._functions = self.context().functions() if self.context() is not None else None
         if self._functions is None:
@@ -782,13 +1648,21 @@ class ModelPreviewWidget(QOpenGLWidget):
             attribute vec3 normal;
             attribute vec3 color;
             attribute vec2 texcoord;
+            attribute vec3 tangent;
+            attribute vec3 bitangent;
             uniform mat4 mvp_matrix;
             uniform mat4 model_matrix;
+            varying vec3 frag_position;
             varying vec3 frag_normal;
             varying vec3 frag_color;
             varying vec2 frag_texcoord;
+            varying vec3 frag_tangent;
+            varying vec3 frag_bitangent;
             void main() {
+                frag_position = (model_matrix * vec4(position, 1.0)).xyz;
                 frag_normal = normalize((model_matrix * vec4(normal, 0.0)).xyz);
+                frag_tangent = normalize((model_matrix * vec4(tangent, 0.0)).xyz);
+                frag_bitangent = normalize((model_matrix * vec4(bitangent, 0.0)).xyz);
                 frag_color = color;
                 frag_texcoord = texcoord;
                 gl_Position = mvp_matrix * vec4(position, 1.0);
@@ -800,25 +1674,272 @@ class ModelPreviewWidget(QOpenGLWidget):
             QOpenGLShader.Fragment,
             """
             #version 120
+            varying vec3 frag_position;
             varying vec3 frag_normal;
             varying vec3 frag_color;
             varying vec2 frag_texcoord;
+            varying vec3 frag_tangent;
+            varying vec3 frag_bitangent;
+            uniform vec3 camera_position;
             uniform vec3 light_direction;
             uniform float ambient_strength;
             uniform int use_texture;
+            uniform int use_high_quality;
+            uniform int use_normal_texture;
+            uniform float normal_texture_strength;
+            uniform int use_material_texture;
+            uniform int use_height_texture;
+            uniform float diffuse_wrap_bias;
+            uniform float diffuse_light_scale;
+            uniform float normal_strength_cap;
+            uniform float normal_strength_floor;
+            uniform float height_effect_max;
+            uniform float cavity_clamp_min;
+            uniform float cavity_clamp_max;
+            uniform float specular_base;
+            uniform float specular_min;
+            uniform float specular_max;
+            uniform float shininess_base;
+            uniform float shininess_min;
+            uniform float shininess_max;
+            uniform float height_shininess_boost;
+            uniform int material_decode_mode;
             uniform sampler2D diffuse_texture;
+            uniform sampler2D normal_texture;
+            uniform sampler2D material_texture;
+            uniform sampler2D height_texture;
+            float wrapped_lambert(vec3 surface_normal, vec3 light_vector, float wrap_bias) {
+                return clamp((dot(surface_normal, light_vector) + wrap_bias) / (1.0 + wrap_bias), 0.0, 1.0);
+            }
+            void decode_material_sample(
+                vec4 sample_value,
+                int decode_mode,
+                out float ao_value,
+                out float roughness_value,
+                out float metallic_value,
+                out float specular_value,
+                out float cavity_value,
+                out float opacity_value
+            ) {
+                vec4 sample = clamp(sample_value, 0.0, 1.0);
+                float average = dot(sample.rgb, vec3(0.3333, 0.3333, 0.3334));
+                float peak = max(max(sample.r, sample.g), max(sample.b, sample.a));
+                float minimum = min(min(sample.r, sample.g), min(sample.b, sample.a));
+                float variance = max(peak - minimum, 0.0);
+                ao_value = 1.0;
+                roughness_value = 0.58;
+                metallic_value = 0.0;
+                specular_value = clamp(0.12 + (variance * 0.24), 0.05, 0.42);
+                cavity_value = clamp(1.0 - (variance * 0.14), 0.78, 1.0);
+                opacity_value = 1.0;
+                if (decode_mode == 1) {
+                    specular_value = clamp(max(max(sample.r, sample.g), sample.b), 0.06, 1.0);
+                    roughness_value = clamp(1.0 - max(sample.g, average), 0.08, 0.92);
+                    cavity_value = clamp(1.0 - (specular_value * 0.12), 0.84, 1.0);
+                } else if (decode_mode == 2) {
+                    ao_value = clamp(sample.r, 0.35, 1.0);
+                    roughness_value = 0.74;
+                    metallic_value = 0.0;
+                    specular_value = 0.08;
+                    cavity_value = ao_value;
+                } else if (decode_mode == 3) {
+                    float rough_source = max(sample.g, average);
+                    roughness_value = clamp(rough_source, 0.06, 0.98);
+                    specular_value = clamp(0.42 - (roughness_value * 0.28), 0.04, 0.30);
+                    cavity_value = clamp(1.0 - (roughness_value * 0.08), 0.88, 1.0);
+                } else if (decode_mode == 4) {
+                    metallic_value = clamp(max(sample.r, average), 0.0, 1.0);
+                    roughness_value = clamp(0.18 + ((1.0 - max(sample.g, average)) * 0.62), 0.08, 0.92);
+                    specular_value = clamp(0.16 + (metallic_value * 0.48), 0.06, 0.72);
+                    cavity_value = clamp(1.0 - (metallic_value * 0.05), 0.90, 1.0);
+                } else if (decode_mode == 5) {
+                    ao_value = clamp(1.0 - (sample.r * 0.30), 0.60, 1.0);
+                    roughness_value = clamp(0.28 + (sample.g * 0.56), 0.10, 0.96);
+                    specular_value = clamp(0.10 + (sample.b * 0.34) + (sample.a * 0.10), 0.05, 0.46);
+                    metallic_value = clamp(sample.b * 0.28, 0.0, 0.55);
+                    cavity_value = clamp(min(ao_value, 1.0 - (sample.a * 0.08)), 0.58, 1.0);
+                } else if (decode_mode == 6) {
+                    ao_value = clamp(1.0 - (sample.r * 0.20), 0.68, 1.0);
+                    roughness_value = clamp(0.16 + ((1.0 - sample.g) * 0.72), 0.08, 0.96);
+                    specular_value = clamp(0.12 + (max(sample.b, sample.a) * 0.42), 0.05, 0.62);
+                    metallic_value = clamp((sample.b * 0.24) + (sample.a * 0.16), 0.0, 0.58);
+                    cavity_value = clamp(min(ao_value, 1.0 - (variance * 0.20)), 0.64, 1.0);
+                } else if (decode_mode == 7) {
+                    ao_value = clamp(1.0 - (sample.r * 0.18), 0.74, 1.0);
+                    roughness_value = clamp(0.24 + (sample.g * 0.56), 0.10, 0.96);
+                    specular_value = clamp(0.10 + (sample.b * 0.26) + (sample.a * 0.12), 0.04, 0.44);
+                    metallic_value = clamp(sample.b * 0.35, 0.0, 0.60);
+                    cavity_value = clamp(min(ao_value, 1.0 - (variance * 0.10)), 0.70, 1.0);
+                } else if (decode_mode == 8 || decode_mode == 11) {
+                    ao_value = clamp(sample.r, 0.20, 1.0);
+                    roughness_value = clamp(sample.g, 0.05, 0.98);
+                    metallic_value = clamp(sample.b, 0.0, 1.0);
+                    specular_value = clamp((0.10 + (metallic_value * 0.54)) * (1.0 - (roughness_value * 0.38)), 0.05, 0.72);
+                    cavity_value = ao_value;
+                } else if (decode_mode == 9) {
+                    roughness_value = clamp(sample.r, 0.05, 0.98);
+                    metallic_value = clamp(sample.g, 0.0, 1.0);
+                    ao_value = clamp(sample.b, 0.20, 1.0);
+                    specular_value = clamp((0.10 + (metallic_value * 0.54)) * (1.0 - (roughness_value * 0.38)), 0.05, 0.72);
+                    cavity_value = ao_value;
+                } else if (decode_mode == 10) {
+                    metallic_value = clamp(sample.r, 0.0, 1.0);
+                    roughness_value = clamp(sample.g, 0.05, 0.98);
+                    ao_value = clamp(sample.b, 0.20, 1.0);
+                    specular_value = clamp((0.10 + (metallic_value * 0.54)) * (1.0 - (roughness_value * 0.38)), 0.05, 0.72);
+                    cavity_value = ao_value;
+                } else if (decode_mode == 12) {
+                    opacity_value = clamp(sample.a > 0.01 ? sample.a : average, 0.0, 1.0);
+                    roughness_value = 0.60;
+                    metallic_value = 0.0;
+                    specular_value = 0.10;
+                    cavity_value = 1.0;
+                } else {
+                    ao_value = clamp(1.0 - (sample.r * 0.16), 0.78, 1.0);
+                    roughness_value = clamp(0.22 + (sample.g * 0.54), 0.10, 0.96);
+                    metallic_value = clamp(max(0.0, sample.b - (sample.r * 0.30)) * 0.55, 0.0, 0.72);
+                    specular_value = clamp(0.10 + (sample.b * 0.22) + (sample.a * 0.18) + (variance * 0.12), 0.04, 0.55);
+                    cavity_value = clamp(min(ao_value, 1.0 - (variance * 0.16)), 0.74, 1.0);
+                }
+                ao_value = clamp(ao_value, 0.0, 1.0);
+                roughness_value = clamp(roughness_value, 0.04, 1.0);
+                metallic_value = clamp(metallic_value, 0.0, 1.0);
+                specular_value = clamp(specular_value, 0.0, 1.0);
+                cavity_value = clamp(cavity_value, 0.0, 1.0);
+                opacity_value = clamp(opacity_value, 0.0, 1.0);
+            }
             void main() {
-                vec3 normal = normalize(frag_normal);
-                float diffuse = abs(dot(normal, normalize(light_direction)));
-                float lighting = max(ambient_strength, diffuse);
-                vec4 base_color = vec4(frag_color, 1.0);
+                vec3 fallback_vertex_color = max(frag_color, vec3(0.0));
+                float fallback_luma = dot(fallback_vertex_color, vec3(0.2126, 0.7152, 0.0722));
+                if (fallback_luma <= 0.045) {
+                    fallback_vertex_color = vec3(0.74, 0.76, 0.80);
+                }
+                vec4 base_color = vec4(fallback_vertex_color, 1.0);
                 if (use_texture != 0) {
                     base_color = texture2D(diffuse_texture, frag_texcoord);
                     if (base_color.a <= 0.01) {
                         discard;
                     }
                 }
-                gl_FragColor = vec4(base_color.rgb * lighting, base_color.a);
+
+                vec3 surface_normal = normalize(frag_normal);
+                vec4 material_sample = vec4(0.5, 0.5, 0.5, 1.0);
+                if (use_material_texture != 0) {
+                    material_sample = texture2D(material_texture, frag_texcoord);
+                }
+                float material_ao = 1.0;
+                float material_roughness = 0.58;
+                float material_metallic = 0.0;
+                float material_specular = 0.12;
+                float material_cavity = 1.0;
+                float material_opacity = 1.0;
+                if (use_material_texture != 0) {
+                    decode_material_sample(
+                        material_sample,
+                        material_decode_mode,
+                        material_ao,
+                        material_roughness,
+                        material_metallic,
+                        material_specular,
+                        material_cavity,
+                        material_opacity
+                    );
+                    if (material_decode_mode == 12) {
+                        base_color.a *= material_opacity;
+                        if (base_color.a <= 0.01) {
+                            discard;
+                        }
+                    }
+                }
+
+                float height_value = 0.5;
+                if (use_height_texture != 0) {
+                    height_value = texture2D(height_texture, frag_texcoord).r;
+                }
+                float relief = clamp((height_value - 0.5) * 2.0, -1.0, 1.0);
+                float height_effect = clamp(abs(relief) * height_effect_max, 0.0, height_effect_max);
+
+                if (use_high_quality != 0 && use_normal_texture != 0) {
+                    vec3 tangent = normalize(frag_tangent);
+                    vec3 bitangent = normalize(frag_bitangent);
+                    vec3 sampled_normal = texture2D(normal_texture, frag_texcoord).xyz * 2.0 - 1.0;
+                    sampled_normal.y = -sampled_normal.y;
+                    float mapped_strength = clamp(
+                        max(normal_texture_strength, normal_strength_floor),
+                        0.0,
+                        normal_strength_cap
+                    );
+                    float strength_ratio = clamp(mapped_strength / max(normal_strength_cap, 0.001), 0.0, 1.0);
+                    sampled_normal.xy *= mix(0.90, 1.35, strength_ratio);
+                    sampled_normal.xy *= mapped_strength;
+                    sampled_normal = normalize(sampled_normal);
+                    mat3 tbn = mat3(tangent, bitangent, surface_normal);
+                    vec3 mapped_normal = normalize(tbn * sampled_normal);
+                    surface_normal = normalize(mix(surface_normal, mapped_normal, clamp(mapped_strength * 1.08, 0.0, 1.0)));
+                }
+
+                vec3 main_light = normalize(light_direction);
+                vec3 fill_light = normalize(vec3(-main_light.x * 0.35, 0.45, -main_light.z * 0.35));
+                vec3 rim_light = normalize(vec3(-0.10, 0.32, -1.0));
+                float wrap_bias = max(0.0, diffuse_wrap_bias);
+                float primary_diffuse = wrapped_lambert(surface_normal, main_light, wrap_bias);
+                float fill_diffuse = wrapped_lambert(surface_normal, fill_light, wrap_bias * 0.65);
+                float back_diffuse = wrapped_lambert(surface_normal, -main_light, wrap_bias * 0.20);
+                float rim_diffuse = wrapped_lambert(surface_normal, rim_light, wrap_bias * 0.20);
+                float lighting = max(ambient_strength, 0.62);
+                lighting += primary_diffuse * diffuse_light_scale;
+                lighting += fill_diffuse * (use_high_quality != 0 ? 0.28 : 0.16);
+                lighting += back_diffuse * (use_high_quality != 0 ? 0.10 : 0.04);
+                lighting += rim_diffuse * (use_high_quality != 0 ? 0.12 : 0.06);
+
+                if (use_high_quality != 0) {
+                    float occlusion_drive = clamp(
+                        mix(material_ao, min(material_ao, material_cavity), 0.45) - (abs(relief) * 0.10),
+                        0.0,
+                        1.0
+                    );
+                    float cavity_scale = clamp(
+                        mix(cavity_clamp_min, cavity_clamp_max, occlusion_drive),
+                        cavity_clamp_min,
+                        cavity_clamp_max
+                    );
+                    lighting *= mix(1.0, cavity_scale, (use_material_texture != 0 || use_height_texture != 0) ? 0.40 : 0.12);
+                    lighting += height_effect * 0.32;
+                }
+
+                vec3 view_dir = normalize(camera_position - frag_position);
+                vec3 half_dir = normalize(main_light + view_dir);
+                float view_facing = clamp(dot(surface_normal, view_dir), 0.0, 1.0);
+                float specular = 0.0;
+                float rim_specular = 0.0;
+                vec3 specular_color = vec3(1.0);
+                if (use_high_quality != 0) {
+                    float specular_mask = clamp(
+                        mix(specular_base, specular_max, material_specular),
+                        specular_min,
+                        specular_max
+                    );
+                    float shininess = clamp(
+                        mix(shininess_max, shininess_min, material_roughness) + (height_effect * height_shininess_boost),
+                        shininess_min,
+                        shininess_max
+                    );
+                    float fresnel = pow(1.0 - view_facing, 4.0);
+                    float rim_response = pow(1.0 - view_facing, 2.4);
+                    specular_color = mix(
+                        vec3(1.0),
+                        clamp((base_color.rgb * 1.15) + vec3(0.08), 0.0, 1.0),
+                        material_metallic * 0.68
+                    );
+                    specular = pow(max(dot(surface_normal, half_dir), 0.0), shininess) * specular_mask;
+                    specular += fresnel * (0.03 + (material_specular * 0.18) + (material_metallic * 0.12));
+                    rim_specular = rim_response * (0.02 + (material_specular * 0.07));
+                }
+
+                vec3 final_rgb = base_color.rgb * clamp(lighting, 0.60, 1.62);
+                final_rgb += specular_color * specular;
+                final_rgb += specular_color * rim_specular;
+                gl_FragColor = vec4(final_rgb, base_color.a);
             }
             """,
         ):
@@ -827,16 +1948,42 @@ class ModelPreviewWidget(QOpenGLWidget):
         program.bindAttributeLocation("normal", 1)
         program.bindAttributeLocation("color", 2)
         program.bindAttributeLocation("texcoord", 3)
+        program.bindAttributeLocation("tangent", 4)
+        program.bindAttributeLocation("bitangent", 5)
         if not program.link():
             raise RuntimeError(f"Model preview shader link failed: {program.log()}")
 
         self._program = program
         self._mvp_uniform_location = program.uniformLocation("mvp_matrix")
         self._model_uniform_location = program.uniformLocation("model_matrix")
+        self._camera_uniform_location = program.uniformLocation("camera_position")
         self._light_uniform_location = program.uniformLocation("light_direction")
         self._ambient_uniform_location = program.uniformLocation("ambient_strength")
         self._texture_sampler_uniform_location = program.uniformLocation("diffuse_texture")
+        self._normal_texture_sampler_uniform_location = program.uniformLocation("normal_texture")
+        self._material_texture_sampler_uniform_location = program.uniformLocation("material_texture")
+        self._height_texture_sampler_uniform_location = program.uniformLocation("height_texture")
         self._use_texture_uniform_location = program.uniformLocation("use_texture")
+        self._use_high_quality_uniform_location = program.uniformLocation("use_high_quality")
+        self._use_normal_texture_uniform_location = program.uniformLocation("use_normal_texture")
+        self._normal_texture_strength_uniform_location = program.uniformLocation("normal_texture_strength")
+        self._use_material_texture_uniform_location = program.uniformLocation("use_material_texture")
+        self._material_decode_mode_uniform_location = program.uniformLocation("material_decode_mode")
+        self._use_height_texture_uniform_location = program.uniformLocation("use_height_texture")
+        self._diffuse_wrap_bias_uniform_location = program.uniformLocation("diffuse_wrap_bias")
+        self._diffuse_light_scale_uniform_location = program.uniformLocation("diffuse_light_scale")
+        self._normal_strength_cap_uniform_location = program.uniformLocation("normal_strength_cap")
+        self._normal_strength_floor_uniform_location = program.uniformLocation("normal_strength_floor")
+        self._height_effect_max_uniform_location = program.uniformLocation("height_effect_max")
+        self._cavity_clamp_min_uniform_location = program.uniformLocation("cavity_clamp_min")
+        self._cavity_clamp_max_uniform_location = program.uniformLocation("cavity_clamp_max")
+        self._specular_base_uniform_location = program.uniformLocation("specular_base")
+        self._specular_min_uniform_location = program.uniformLocation("specular_min")
+        self._specular_max_uniform_location = program.uniformLocation("specular_max")
+        self._shininess_base_uniform_location = program.uniformLocation("shininess_base")
+        self._shininess_min_uniform_location = program.uniformLocation("shininess_min")
+        self._shininess_max_uniform_location = program.uniformLocation("shininess_max")
+        self._height_shininess_boost_uniform_location = program.uniformLocation("height_shininess_boost")
         self._vertex_array.create()
         self._vertex_buffer.create()
         self._vertex_buffer.setUsagePattern(QOpenGLBuffer.StaticDraw)
@@ -860,46 +2007,211 @@ class ModelPreviewWidget(QOpenGLWidget):
         width = max(1, self.width())
         height = max(1, self.height())
         projection = QMatrix4x4()
-        projection.perspective(45.0, width / float(height), 0.1, 100.0)
+        projection.perspective(self._VERTICAL_FOV_DEGREES, width / float(height), 0.1, 100.0)
         view = QMatrix4x4()
         view.translate(0.0, 0.0, -self._distance)
         model = QMatrix4x4()
+        model.translate(self._pan_offset)
         model.rotate(self._pitch, 1.0, 0.0, 0.0)
         model.rotate(self._yaw, 0.0, 1.0, 0.0)
         mvp = projection * view * model
 
+        settings = self.render_settings()
         self._program.bind()
         self._program.setUniformValue(self._mvp_uniform_location, mvp)
         self._program.setUniformValue(self._model_uniform_location, model)
-        self._program.setUniformValue(self._light_uniform_location, QVector3D(0.45, 0.65, 1.0))
-        self._program.setUniformValue(self._ambient_uniform_location, 0.28)
+        self._program.setUniformValue(self._camera_uniform_location, QVector3D(0.0, 0.0, self._distance))
+        self._program.setUniformValue(self._light_uniform_location, QVector3D(0.20, 0.45, 1.0))
+        self._program.setUniformValue(self._ambient_uniform_location, max(0.62, float(settings.ambient_strength)))
         self._program.setUniformValue(self._texture_sampler_uniform_location, 0)
+        self._program.setUniformValue(self._normal_texture_sampler_uniform_location, 1)
+        self._program.setUniformValue(self._material_texture_sampler_uniform_location, 2)
+        self._program.setUniformValue(self._height_texture_sampler_uniform_location, 3)
         self._vertex_array.bind()
         for batch in self._mesh_batches:
-            texture = self._texture_objects.get(
+            diffuse_texture = self._texture_objects.get(
                 (batch.texture_key, batch.texture_wrap_repeat, batch.texture_flip_vertical)
+            )
+            normal_texture = self._texture_objects.get(
+                (batch.normal_texture_key, batch.texture_wrap_repeat, batch.texture_flip_vertical)
+            )
+            material_texture = self._texture_objects.get(
+                (batch.material_texture_key, batch.texture_wrap_repeat, batch.texture_flip_vertical)
+            )
+            height_texture = self._texture_objects.get(
+                (batch.height_texture_key, batch.texture_wrap_repeat, batch.texture_flip_vertical)
             )
             use_texture = int(
                 bool(
                     self._use_textures
                     and batch.has_texture_coordinates
                     and bool(batch.texture_key)
-                    and texture is not None
+                    and diffuse_texture is not None
                 )
             )
+            use_high_quality_maps = bool(
+                use_texture
+                and self._high_quality_textures
+                and batch.has_texture_coordinates
+            )
+            support_maps_enabled = bool(use_high_quality_maps and not batch.support_maps_disabled)
+            use_normal_texture = int(
+                bool(
+                    support_maps_enabled
+                    and batch.normal_texture_key
+                    and normal_texture is not None
+                    and float(batch.normal_texture_strength) > 0.0
+                )
+            )
+            use_material_texture = int(
+                bool(support_maps_enabled and batch.material_texture_key and material_texture is not None)
+            )
+            use_height_texture = int(
+                bool(support_maps_enabled and batch.height_texture_key and height_texture is not None)
+            )
+            use_high_quality_shading = int(bool(use_texture and self._high_quality_textures))
             self._program.setUniformValue(self._use_texture_uniform_location, use_texture)
-            if use_texture and texture is not None:
-                texture.bind(0)
+            self._program.setUniformValue(self._use_high_quality_uniform_location, use_high_quality_shading)
+            self._program.setUniformValue(self._use_normal_texture_uniform_location, use_normal_texture)
+            self._program.setUniformValue(
+                self._normal_texture_strength_uniform_location,
+                float(batch.normal_texture_strength if use_normal_texture else 0.0),
+            )
+            self._program.setUniformValue(self._use_material_texture_uniform_location, use_material_texture)
+            self._program.setUniformValue(
+                self._material_decode_mode_uniform_location,
+                int(batch.material_decode_mode if use_material_texture else self._MATERIAL_DECODE_GENERIC),
+            )
+            self._program.setUniformValue(self._use_height_texture_uniform_location, use_height_texture)
+            self._program.setUniformValue(self._diffuse_wrap_bias_uniform_location, float(settings.diffuse_wrap_bias))
+            self._program.setUniformValue(self._diffuse_light_scale_uniform_location, float(settings.diffuse_light_scale))
+            self._program.setUniformValue(self._normal_strength_cap_uniform_location, float(settings.normal_strength_cap))
+            self._program.setUniformValue(self._normal_strength_floor_uniform_location, float(settings.normal_strength_floor))
+            self._program.setUniformValue(self._height_effect_max_uniform_location, float(settings.height_effect_max))
+            self._program.setUniformValue(self._cavity_clamp_min_uniform_location, float(settings.cavity_clamp_min))
+            self._program.setUniformValue(self._cavity_clamp_max_uniform_location, float(settings.cavity_clamp_max))
+            self._program.setUniformValue(self._specular_base_uniform_location, float(settings.specular_base))
+            self._program.setUniformValue(self._specular_min_uniform_location, float(settings.specular_min))
+            self._program.setUniformValue(self._specular_max_uniform_location, float(settings.specular_max))
+            self._program.setUniformValue(self._shininess_base_uniform_location, float(settings.shininess_base))
+            self._program.setUniformValue(self._shininess_min_uniform_location, float(settings.shininess_min))
+            self._program.setUniformValue(self._shininess_max_uniform_location, float(settings.shininess_max))
+            self._program.setUniformValue(self._height_shininess_boost_uniform_location, float(settings.height_shininess_boost))
+            if use_texture and diffuse_texture is not None:
+                diffuse_texture.bind(0)
+            if use_normal_texture and normal_texture is not None:
+                normal_texture.bind(1)
+            if use_material_texture and material_texture is not None:
+                material_texture.bind(2)
+            if use_height_texture and height_texture is not None:
+                height_texture.bind(3)
             self._functions.glDrawArrays(_GL_TRIANGLES, batch.first_vertex, batch.vertex_count)
-            if use_texture and texture is not None:
-                texture.release()
+            if use_texture and diffuse_texture is not None:
+                diffuse_texture.release()
+            if use_normal_texture and normal_texture is not None:
+                normal_texture.release()
+            if use_material_texture and material_texture is not None:
+                material_texture.release()
+            if use_height_texture and height_texture is not None:
+                height_texture.release()
         self._vertex_array.release()
         self._program.release()
+
+    def _preview_mvp_matrix(self) -> QMatrix4x4:
+        width = max(1, self.width())
+        height = max(1, self.height())
+        projection = QMatrix4x4()
+        projection.perspective(self._VERTICAL_FOV_DEGREES, width / float(height), 0.1, 100.0)
+        view = QMatrix4x4()
+        view.translate(0.0, 0.0, -self._distance)
+        model = QMatrix4x4()
+        model.translate(self._pan_offset)
+        model.rotate(self._pitch, 1.0, 0.0, 0.0)
+        model.rotate(self._yaw, 0.0, 1.0, 0.0)
+        return projection * view * model
+
+    def _project_preview_point(
+        self,
+        mvp: QMatrix4x4,
+        point: tuple[float, float, float],
+    ) -> Optional[QPointF]:
+        clip = mvp * QVector4D(float(point[0]), float(point[1]), float(point[2]), 1.0)
+        w = float(clip.w())
+        if abs(w) < 1e-8:
+            return None
+        ndc_x = float(clip.x()) / w
+        ndc_y = float(clip.y()) / w
+        if ndc_x < -4.0 or ndc_x > 4.0 or ndc_y < -4.0 or ndc_y > 4.0:
+            return None
+        return QPointF(
+            (ndc_x * 0.5 + 0.5) * float(max(1, self.width())),
+            (1.0 - (ndc_y * 0.5 + 0.5)) * float(max(1, self.height())),
+        )
+
+    def _draw_preview_line(
+        self,
+        painter: QPainter,
+        mvp: QMatrix4x4,
+        start: tuple[float, float, float],
+        end: tuple[float, float, float],
+        color: QColor,
+        *,
+        width: float = 1.0,
+    ) -> None:
+        start_point = self._project_preview_point(mvp, start)
+        end_point = self._project_preview_point(mvp, end)
+        if start_point is None or end_point is None:
+            return
+        painter.setPen(QPen(color, width))
+        painter.drawLine(start_point, end_point)
+
+    def _draw_alignment_guides(self, painter: QPainter) -> None:
+        if self._vertex_count <= 0 or not (self._show_grid_overlay or self._show_origin_overlay):
+            return
+        mvp = self._preview_mvp_matrix()
+        grid_color = QColor(148, 163, 184, 54)
+        major_grid_color = QColor(148, 163, 184, 86)
+        extent = 2.0
+        step = 0.25
+        if self._show_grid_overlay:
+            line_count = int(round((extent * 2.0) / step))
+            for index in range(line_count + 1):
+                value = -extent + index * step
+                major = abs(value) < 1e-6 or abs(value - round(value)) < 1e-6
+                color = major_grid_color if major else grid_color
+                self._draw_preview_line(painter, mvp, (value, 0.0, -extent), (value, 0.0, extent), color)
+                self._draw_preview_line(painter, mvp, (-extent, 0.0, value), (extent, 0.0, value), color)
+
+        axis_extent = 2.25
+        self._draw_preview_line(painter, mvp, (-axis_extent, 0.0, 0.0), (axis_extent, 0.0, 0.0), QColor(239, 68, 68, 170), width=1.6)
+        self._draw_preview_line(painter, mvp, (0.0, -axis_extent, 0.0), (0.0, axis_extent, 0.0), QColor(59, 130, 246, 170), width=1.6)
+        self._draw_preview_line(painter, mvp, (0.0, 0.0, -axis_extent), (0.0, 0.0, axis_extent), QColor(34, 197, 94, 170), width=1.6)
+        for label, point, color in (
+            ("X", (axis_extent, 0.0, 0.0), QColor(239, 68, 68, 210)),
+            ("Y", (0.0, axis_extent, 0.0), QColor(59, 130, 246, 210)),
+            ("Z", (0.0, 0.0, axis_extent), QColor(34, 197, 94, 210)),
+        ):
+            label_point = self._project_preview_point(mvp, point)
+            if label_point is not None:
+                painter.setPen(color)
+                painter.drawText(QRect(int(label_point.x()) + 4, int(label_point.y()) + 4, 18, 18), Qt.AlignLeft, label)
+
+        if self._show_origin_overlay:
+            origin = self._project_preview_point(mvp, (0.0, 0.0, 0.0))
+            if origin is not None:
+                painter.setPen(QPen(QColor(226, 232, 240, 210), 1.2))
+                radius = 7.0
+                painter.drawEllipse(origin, radius, radius)
+                painter.drawLine(QPointF(origin.x() - 10.0, origin.y()), QPointF(origin.x() + 10.0, origin.y()))
+                painter.drawLine(QPointF(origin.x(), origin.y() - 10.0), QPointF(origin.x(), origin.y() + 10.0))
+                painter.setPen(QColor(226, 232, 240, 170))
+                painter.drawText(QRect(int(origin.x()) + 10, int(origin.y()) + 8, 80, 18), Qt.AlignLeft, "origin")
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
+        self._draw_alignment_guides(painter)
         painter.setPen(self._overlay_text_color)
         if self._vertex_count <= 0:
             painter.drawText(self.rect().adjusted(24, 24, -24, -24), Qt.AlignCenter | Qt.TextWordWrap, self._message)
@@ -907,27 +2219,71 @@ class ModelPreviewWidget(QOpenGLWidget):
             painter.drawText(
                 QRect(12, 10, max(120, self.width() - 24), 22),
                 Qt.AlignLeft | Qt.AlignVCenter,
-                "Drag: orbit | Wheel: zoom | Double-click: reset",
+                "Drag: orbit | Middle/Right-drag or Shift+Drag: pan | Wheel: zoom | Double-click: reset",
             )
+            if self._debug_overlay_lines:
+                metrics = painter.fontMetrics()
+                painter.setPen(self._overlay_text_color)
+                overlay_text = metrics.elidedText(
+                    self._debug_overlay_lines[0],
+                    Qt.ElideRight,
+                    max(120, self.width() - 24),
+                )
+                painter.drawText(
+                    QRect(12, 34, max(120, self.width() - 24), 20),
+                    Qt.AlignLeft | Qt.AlignVCenter,
+                    overlay_text,
+                )
         painter.end()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        pan_requested = (
+            event.button() == Qt.MiddleButton
+            or event.button() == Qt.RightButton
+            or (event.button() == Qt.LeftButton and bool(event.modifiers() & Qt.ShiftModifier))
+        )
+        if self._vertex_count > 0 and pan_requested:
+            self._pan_drag_active = True
+            self._pan_drag_button = event.button()
+            self._last_mouse_pos = event.position()
+            self._last_global_mouse_pos = event.globalPosition().toPoint()
+            self.setCursor(Qt.SizeAllCursor)
+            self.grabMouse()
+            self._pan_poll_timer.start()
+            event.accept()
+            return
         if self._vertex_count > 0 and event.button() == Qt.LeftButton:
             self._drag_active = True
-            self._last_mouse_pos = event.position().toPoint()
+            self._last_mouse_pos = event.position()
+            self._last_global_mouse_pos = event.globalPosition().toPoint()
             self.setCursor(Qt.ClosedHandCursor)
+            self.grabMouse()
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         if self._drag_active:
-            current_pos = event.position().toPoint()
+            current_pos = event.position()
             delta = current_pos - self._last_mouse_pos
             self._last_mouse_pos = current_pos
-            self._yaw += delta.x() * 0.6
-            self._pitch = min(max(self._pitch + delta.y() * 0.6, -89.0), 89.0)
+            # Orbit should feel like dragging the model rather than steering a
+            # camera rig, so both axes follow the more common DCC-style signs.
+            settings = self.render_settings()
+            orbit_sign_x = -1.0 if settings.invert_orbit_x else 1.0
+            orbit_sign_y = -1.0 if settings.invert_orbit_y else 1.0
+            orbit_scale = float(settings.orbit_sensitivity)
+            self._yaw += delta.x() * orbit_scale * orbit_sign_x
+            self._pitch = min(max(self._pitch + delta.y() * orbit_scale * orbit_sign_y, -89.0), 89.0)
             self.update()
+            event.accept()
+            return
+        if self._pan_drag_active:
+            current_pos = event.position()
+            delta = current_pos - self._last_mouse_pos
+            self._last_mouse_pos = current_pos
+            self._last_global_mouse_pos = event.globalPosition().toPoint()
+            self._apply_pan_delta(delta.x(), delta.y())
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -935,6 +2291,15 @@ class ModelPreviewWidget(QOpenGLWidget):
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if self._drag_active and event.button() == Qt.LeftButton:
             self._drag_active = False
+            self.releaseMouse()
+            self.unsetCursor()
+            event.accept()
+            return
+        if self._pan_drag_active and event.button() == self._pan_drag_button:
+            self._pan_drag_active = False
+            self._pan_drag_button = Qt.NoButton
+            self._pan_poll_timer.stop()
+            self.releaseMouse()
             self.unsetCursor()
             event.accept()
             return
@@ -947,6 +2312,9 @@ class ModelPreviewWidget(QOpenGLWidget):
             self._fit_to_view = True
             self._zoom_factor = 1.0
             self._distance = self._FIT_DISTANCE
+            self._pan_drag_button = Qt.NoButton
+            self._pan_poll_timer.stop()
+            self._pan_offset = QVector3D(0.0, 0.0, 0.0)
             self.view_state_changed.emit(self._zoom_factor, self._fit_to_view)
             self.update()
             event.accept()
@@ -980,7 +2348,7 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._vertex_array.bind()
         self._vertex_buffer.bind()
         self._vertex_buffer.allocate(self._vertex_blob, len(self._vertex_blob))
-        stride = 11 * 4
+        stride = 17 * 4
         self._program.enableAttributeArray(0)
         self._program.setAttributeBuffer(0, _GL_FLOAT, 0, 3, stride)
         self._program.enableAttributeArray(1)
@@ -989,13 +2357,145 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._program.setAttributeBuffer(2, _GL_FLOAT, 6 * 4, 3, stride)
         self._program.enableAttributeArray(3)
         self._program.setAttributeBuffer(3, _GL_FLOAT, 9 * 4, 2, stride)
+        self._program.enableAttributeArray(4)
+        self._program.setAttributeBuffer(4, _GL_FLOAT, 11 * 4, 3, stride)
+        self._program.enableAttributeArray(5)
+        self._program.setAttributeBuffer(5, _GL_FLOAT, 14 * 4, 3, stride)
         self._vertex_buffer.release()
         self._vertex_array.release()
         self._program.release()
         self._rebuild_gl_textures()
         self.doneCurrent()
 
-    def _build_vertex_blob(self, model) -> Tuple[bytes, int, List[_ModelPreviewDrawBatch]]:
+    @staticmethod
+    def _orthogonal_tangent_frame(normal: Tuple[float, float, float]) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+        nx, ny, nz = normal
+        if abs(nz) < 0.999:
+            tangent = (0.0, 0.0, 1.0)
+        else:
+            tangent = (1.0, 0.0, 0.0)
+        tx = tangent[1] * nz - tangent[2] * ny
+        ty = tangent[2] * nx - tangent[0] * nz
+        tz = tangent[0] * ny - tangent[1] * nx
+        tangent_length = max((tx * tx + ty * ty + tz * tz) ** 0.5, 1e-6)
+        tx /= tangent_length
+        ty /= tangent_length
+        tz /= tangent_length
+        bx = ny * tz - nz * ty
+        by = nz * tx - nx * tz
+        bz = nx * ty - ny * tx
+        bitangent_length = max((bx * bx + by * by + bz * bz) ** 0.5, 1e-6)
+        bx /= bitangent_length
+        by /= bitangent_length
+        bz /= bitangent_length
+        return (tx, ty, tz), (bx, by, bz)
+
+    @classmethod
+    def _build_tangent_frames(
+        cls,
+        positions: Sequence[Tuple[float, float, float]],
+        texture_coordinates: Sequence[Tuple[float, float]],
+        normals: Sequence[Tuple[float, float, float]],
+        indices: Sequence[int],
+    ) -> Tuple[List[Tuple[float, float, float]], List[Tuple[float, float, float]]]:
+        vertex_count = len(positions)
+        if (
+            vertex_count <= 0
+            or len(texture_coordinates) != vertex_count
+            or len(normals) != vertex_count
+        ):
+            tangents: List[Tuple[float, float, float]] = []
+            bitangents: List[Tuple[float, float, float]] = []
+            for normal in normals or [(0.0, 0.0, 1.0)] * max(vertex_count, 1):
+                tangent, bitangent = cls._orthogonal_tangent_frame(normal)
+                tangents.append(tangent)
+                bitangents.append(bitangent)
+            return tangents[:vertex_count], bitangents[:vertex_count]
+
+        tangent_accum = [[0.0, 0.0, 0.0] for _ in range(vertex_count)]
+        bitangent_accum = [[0.0, 0.0, 0.0] for _ in range(vertex_count)]
+        for triangle_index in range(0, len(indices) - 2, 3):
+            a = indices[triangle_index]
+            b = indices[triangle_index + 1]
+            c = indices[triangle_index + 2]
+            if (
+                a < 0
+                or b < 0
+                or c < 0
+                or a >= vertex_count
+                or b >= vertex_count
+                or c >= vertex_count
+            ):
+                continue
+            p0 = positions[a]
+            p1 = positions[b]
+            p2 = positions[c]
+            uv0 = texture_coordinates[a]
+            uv1 = texture_coordinates[b]
+            uv2 = texture_coordinates[c]
+            edge1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+            edge2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+            delta_uv1 = (uv1[0] - uv0[0], uv1[1] - uv0[1])
+            delta_uv2 = (uv2[0] - uv0[0], uv2[1] - uv0[1])
+            determinant = (delta_uv1[0] * delta_uv2[1]) - (delta_uv1[1] * delta_uv2[0])
+            if abs(determinant) <= 1e-8:
+                continue
+            reciprocal = 1.0 / determinant
+            tangent = (
+                reciprocal * ((delta_uv2[1] * edge1[0]) - (delta_uv1[1] * edge2[0])),
+                reciprocal * ((delta_uv2[1] * edge1[1]) - (delta_uv1[1] * edge2[1])),
+                reciprocal * ((delta_uv2[1] * edge1[2]) - (delta_uv1[1] * edge2[2])),
+            )
+            bitangent = (
+                reciprocal * ((-delta_uv2[0] * edge1[0]) + (delta_uv1[0] * edge2[0])),
+                reciprocal * ((-delta_uv2[0] * edge1[1]) + (delta_uv1[0] * edge2[1])),
+                reciprocal * ((-delta_uv2[0] * edge1[2]) + (delta_uv1[0] * edge2[2])),
+            )
+            for vertex_index in (a, b, c):
+                tangent_accum[vertex_index][0] += tangent[0]
+                tangent_accum[vertex_index][1] += tangent[1]
+                tangent_accum[vertex_index][2] += tangent[2]
+                bitangent_accum[vertex_index][0] += bitangent[0]
+                bitangent_accum[vertex_index][1] += bitangent[1]
+                bitangent_accum[vertex_index][2] += bitangent[2]
+
+        tangents = []
+        bitangents = []
+        for vertex_index in range(vertex_count):
+            nx, ny, nz = normals[vertex_index]
+            tx, ty, tz = tangent_accum[vertex_index]
+            tangent_length = (tx * tx + ty * ty + tz * tz) ** 0.5
+            if tangent_length <= 1e-6:
+                tangent, bitangent = cls._orthogonal_tangent_frame(normals[vertex_index])
+                tangents.append(tangent)
+                bitangents.append(bitangent)
+                continue
+            tx /= tangent_length
+            ty /= tangent_length
+            tz /= tangent_length
+            normal_dot_tangent = (nx * tx) + (ny * ty) + (nz * tz)
+            tx -= nx * normal_dot_tangent
+            ty -= ny * normal_dot_tangent
+            tz -= nz * normal_dot_tangent
+            tangent_length = max((tx * tx + ty * ty + tz * tz) ** 0.5, 1e-6)
+            tx /= tangent_length
+            ty /= tangent_length
+            tz /= tangent_length
+            bx, by, bz = bitangent_accum[vertex_index]
+            if (bx * bx + by * by + bz * bz) <= 1e-6:
+                bx = (ny * tz) - (nz * ty)
+                by = (nz * tx) - (nx * tz)
+                bz = (nx * ty) - (ny * tx)
+            bitangent_length = max((bx * bx + by * by + bz * bz) ** 0.5, 1e-6)
+            bx /= bitangent_length
+            by /= bitangent_length
+            bz /= bitangent_length
+            tangents.append((tx, ty, tz))
+            bitangents.append((bx, by, bz))
+        return tangents, bitangents
+
+    @classmethod
+    def _build_vertex_blob(cls, model) -> Tuple[bytes, int, List[_ModelPreviewDrawBatch]]:
         meshes = getattr(model, "meshes", None)
         if not meshes:
             return b"", 0, []
@@ -1012,6 +2512,12 @@ class ModelPreviewWidget(QOpenGLWidget):
                 normals = [(0.0, 0.0, 1.0)] * len(positions)
             texture_coordinates = list(getattr(mesh, "texture_coordinates", []) or [])
             has_texture_coordinates = len(texture_coordinates) == len(positions)
+            tangents, bitangents = cls._build_tangent_frames(
+                positions,
+                texture_coordinates,
+                normals,
+                indices,
+            )
             texture_wrap_repeat = False
             if has_texture_coordinates:
                 us = [uv[0] for uv in texture_coordinates]
@@ -1022,7 +2528,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                     or min(vs) < -0.05
                     or max(vs) > 1.05
                 )
-            color = self._PALETTE[mesh_index % len(self._PALETTE)]
+            color = cls._PALETTE[mesh_index % len(cls._PALETTE)]
             batch_first_vertex = vertex_count
             for triangle_index in range(0, len(indices) - 2, 3):
                 a = indices[triangle_index]
@@ -1044,7 +2550,29 @@ class ModelPreviewWidget(QOpenGLWidget):
                         tu, tv = texture_coordinates[vertex_index]
                     else:
                         tu, tv = 0.0, 0.0
-                    vertex_data.extend((px, py, pz, nx, ny, nz, color[0], color[1], color[2], tu, tv))
+                    tx, ty, tz = tangents[vertex_index] if vertex_index < len(tangents) else (1.0, 0.0, 0.0)
+                    bx, by, bz = bitangents[vertex_index] if vertex_index < len(bitangents) else (0.0, 1.0, 0.0)
+                    vertex_data.extend(
+                        (
+                            px,
+                            py,
+                            pz,
+                            nx,
+                            ny,
+                            nz,
+                            color[0],
+                            color[1],
+                            color[2],
+                            tu,
+                            tv,
+                            tx,
+                            ty,
+                            tz,
+                            bx,
+                            by,
+                            bz,
+                        )
+                    )
                 vertex_count += 3
             batch_vertex_count = vertex_count - batch_first_vertex
             if batch_vertex_count <= 0:
@@ -1052,12 +2580,43 @@ class ModelPreviewWidget(QOpenGLWidget):
             texture_key = str(getattr(mesh, "preview_texture_path", "") or "").strip()
             if not texture_key and getattr(mesh, "preview_texture_image", None) is not None:
                 texture_key = f"in_memory:{mesh_index}"
-            texture_flip_vertical = self._should_flip_texture_vertically(mesh)
+            normal_texture_key = str(getattr(mesh, "preview_normal_texture_path", "") or "").strip()
+            if not normal_texture_key and getattr(mesh, "preview_normal_texture_image", None) is not None:
+                normal_texture_key = f"in_memory_normal:{mesh_index}"
+            material_texture_key = str(getattr(mesh, "preview_material_texture_path", "") or "").strip()
+            if not material_texture_key and getattr(mesh, "preview_material_texture_image", None) is not None:
+                material_texture_key = f"in_memory_material:{mesh_index}"
+            height_texture_key = str(getattr(mesh, "preview_height_texture_path", "") or "").strip()
+            if not height_texture_key and getattr(mesh, "preview_height_texture_image", None) is not None:
+                height_texture_key = f"in_memory_height:{mesh_index}"
+            texture_flip_vertical = cls._should_flip_texture_vertically(mesh)
+            if bool(getattr(mesh, "preview_debug_flip_base_v", False)):
+                texture_flip_vertical = not texture_flip_vertical
+            material_texture_type = str(getattr(mesh, "preview_material_texture_type", "") or "").strip().lower()
+            material_texture_subtype = str(getattr(mesh, "preview_material_texture_subtype", "") or "").strip().lower()
+            material_texture_packed_channels = tuple(
+                str(channel or "").strip().lower()
+                for channel in (getattr(mesh, "preview_material_texture_packed_channels", ()) or ())
+                if str(channel or "").strip()
+            )
             batches.append(
                 _ModelPreviewDrawBatch(
                     first_vertex=batch_first_vertex,
                     vertex_count=batch_vertex_count,
                     texture_key=texture_key,
+                    normal_texture_key=normal_texture_key,
+                    normal_texture_strength=float(getattr(mesh, "preview_normal_texture_strength", 0.0) or 0.0),
+                    material_texture_key=material_texture_key,
+                    material_texture_type=material_texture_type,
+                    material_texture_subtype=material_texture_subtype,
+                    material_texture_packed_channels=material_texture_packed_channels,
+                    material_decode_mode=cls._material_decode_mode_for_semantics(
+                        material_texture_type,
+                        material_texture_subtype,
+                        material_texture_packed_channels,
+                    ),
+                    height_texture_key=height_texture_key,
+                    support_maps_disabled=bool(getattr(mesh, "preview_debug_disable_support_maps", False)),
                     has_texture_coordinates=has_texture_coordinates,
                     texture_wrap_repeat=texture_wrap_repeat,
                     texture_flip_vertical=texture_flip_vertical,
@@ -1111,23 +2670,26 @@ class ModelPreviewWidget(QOpenGLWidget):
             colored += 1
         return opaque_black, transparent, colored, total
 
-    def _should_flip_texture_vertically(self, mesh) -> bool:
+    @classmethod
+    def _should_flip_texture_vertically(cls, mesh) -> bool:
         flip_override = getattr(mesh, "preview_texture_flip_vertical", None)
         if flip_override is not None:
             return bool(flip_override)
         texture_image = getattr(mesh, "preview_texture_image", None)
+        if not isinstance(texture_image, QImage) or texture_image.isNull():
+            texture_image = cls._load_gl_texture_image(str(getattr(mesh, "preview_texture_path", "") or "").strip())
         if not isinstance(texture_image, QImage) or texture_image.isNull():
             return True
         texture_coordinates = list(getattr(mesh, "texture_coordinates", []) or [])
         positions = list(getattr(mesh, "positions", []) or [])
         if not texture_coordinates or len(texture_coordinates) != len(positions):
             return True
-        flipped_black, flipped_transparent, flipped_colored, flipped_total = self._sample_texture_orientation_metrics(
+        flipped_black, flipped_transparent, flipped_colored, flipped_total = cls._sample_texture_orientation_metrics(
             texture_image,
             texture_coordinates,
             flip_vertical=True,
         )
-        unflipped_black, unflipped_transparent, unflipped_colored, unflipped_total = self._sample_texture_orientation_metrics(
+        unflipped_black, unflipped_transparent, unflipped_colored, unflipped_total = cls._sample_texture_orientation_metrics(
             texture_image,
             texture_coordinates,
             flip_vertical=False,
@@ -1157,6 +2719,42 @@ class ModelPreviewWidget(QOpenGLWidget):
                 continue
         self._texture_objects.clear()
 
+    def _prepare_gl_texture_image(self, texture_image: QImage) -> QImage:
+        prepared = texture_image.convertToFormat(QImage.Format_RGBA8888)
+        if prepared.isNull():
+            return prepared
+        longest_edge = max(prepared.width(), prepared.height())
+        settings = self.render_settings()
+        if self._high_quality_textures:
+            max_dimension = int(settings.preview_texture_max_dimension)
+            if longest_edge <= 0 or max_dimension <= 0 or longest_edge <= max_dimension:
+                return prepared
+            target_longest_edge = max_dimension
+        else:
+            max_dimension = int(settings.low_quality_texture_max_dimension)
+            if longest_edge <= 0 or max_dimension <= 0:
+                return prepared
+            target_longest_edge = min(max_dimension, max(256, longest_edge // 2))
+        if longest_edge <= 0 or max_dimension <= 0:
+            return prepared
+        if target_longest_edge >= longest_edge:
+            return prepared
+        target_size = prepared.size().scaled(target_longest_edge, target_longest_edge, Qt.KeepAspectRatio)
+        if target_size.width() <= 0 or target_size.height() <= 0:
+            return prepared
+        return prepared.scaled(target_size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+    @staticmethod
+    def _load_gl_texture_image(texture_key: str) -> Optional[QImage]:
+        normalized_key = str(texture_key or "").strip()
+        if not normalized_key or normalized_key.lower().startswith("in_memory"):
+            return None
+        reader = QImageReader(normalized_key)
+        image = reader.read()
+        if image.isNull():
+            return None
+        return image
+
     def _rebuild_gl_textures(self) -> None:
         if not self._gl_ready:
             return
@@ -1164,34 +2762,63 @@ class ModelPreviewWidget(QOpenGLWidget):
         current_meshes = getattr(getattr(self, "_current_model", None), "meshes", None)
         if current_meshes:
             for mesh_index, mesh in enumerate(current_meshes):
-                texture_key = str(getattr(mesh, "preview_texture_path", "") or "").strip()
-                if not texture_key and getattr(mesh, "preview_texture_image", None) is not None:
-                    texture_key = f"in_memory:{mesh_index}"
-                texture_image = getattr(mesh, "preview_texture_image", None)
-                if not texture_key or texture_key in source_images or texture_image is None:
-                    continue
-                if not isinstance(texture_image, QImage) or texture_image.isNull():
-                    continue
-                source_images[texture_key] = texture_image
+                texture_slots = (
+                    ("preview_texture_path", "preview_texture_image", f"in_memory:{mesh_index}"),
+                    ("preview_normal_texture_path", "preview_normal_texture_image", f"in_memory_normal:{mesh_index}"),
+                    ("preview_material_texture_path", "preview_material_texture_image", f"in_memory_material:{mesh_index}"),
+                    ("preview_height_texture_path", "preview_height_texture_image", f"in_memory_height:{mesh_index}"),
+                )
+                for path_attr, image_attr, fallback_key in texture_slots:
+                    texture_key = str(getattr(mesh, path_attr, "") or "").strip()
+                    texture_image = getattr(mesh, image_attr, None)
+                    if not texture_key and texture_image is not None:
+                        texture_key = fallback_key
+                    if not texture_key or texture_key in source_images or texture_image is None:
+                        continue
+                    if not isinstance(texture_image, QImage) or texture_image.isNull():
+                        continue
+                    source_images[texture_key] = texture_image
         for batch in self._mesh_batches:
-            if not batch.texture_key:
-                continue
-            texture_image = source_images.get(batch.texture_key)
-            if texture_image is None:
-                continue
-            cache_key = (batch.texture_key, bool(batch.texture_wrap_repeat), bool(batch.texture_flip_vertical))
-            if cache_key in self._texture_objects:
-                continue
-            image = texture_image
-            texture_image = image.convertToFormat(QImage.Format_RGBA8888)
-            if batch.texture_flip_vertical:
-                texture_image = texture_image.mirrored(False, True)
-            if texture_image.isNull():
-                continue
-            texture = QOpenGLTexture(texture_image)
-            texture.setMinMagFilters(QOpenGLTexture.LinearMipMapLinear, QOpenGLTexture.Linear)
-            texture.setWrapMode(QOpenGLTexture.Repeat if batch.texture_wrap_repeat else QOpenGLTexture.ClampToEdge)
-            self._texture_objects[cache_key] = texture
+            batch_texture_keys = (
+                batch.texture_key,
+                batch.normal_texture_key,
+                batch.material_texture_key,
+                batch.height_texture_key,
+            )
+            for texture_key in batch_texture_keys:
+                if not texture_key:
+                    continue
+                texture_image = source_images.get(texture_key)
+                if texture_image is None:
+                    texture_image = self._load_gl_texture_image(texture_key)
+                    if texture_image is not None:
+                        source_images[texture_key] = texture_image
+                if texture_image is None:
+                    continue
+                cache_key = (texture_key, bool(batch.texture_wrap_repeat), bool(batch.texture_flip_vertical))
+                if cache_key in self._texture_objects:
+                    continue
+                prepared_image = self._prepare_gl_texture_image(texture_image)
+                if batch.texture_flip_vertical:
+                    prepared_image = prepared_image.mirrored(False, True)
+                if prepared_image.isNull():
+                    continue
+                texture = QOpenGLTexture(prepared_image)
+                if self._high_quality_textures:
+                    try:
+                        texture.generateMipMaps()
+                    except Exception:
+                        pass
+                    texture.setMinMagFilters(QOpenGLTexture.LinearMipMapLinear, QOpenGLTexture.Linear)
+                    if hasattr(texture, "setMaximumAnisotropy"):
+                        try:
+                            texture.setMaximumAnisotropy(float(self.render_settings().max_anisotropy))
+                        except Exception:
+                            pass
+                else:
+                    texture.setMinMagFilters(QOpenGLTexture.Linear, QOpenGLTexture.Linear)
+                texture.setWrapMode(QOpenGLTexture.Repeat if batch.texture_wrap_repeat else QOpenGLTexture.ClampToEdge)
+                self._texture_objects[cache_key] = texture
 
 
 class PreviewScrollArea(QScrollArea):
@@ -1923,6 +3550,108 @@ class LogHighlighter(QSyntaxHighlighter):
             self.setFormat(match.start(), match.end() - match.start(), self.success_format)
 
 
+class ArchiveDetailsHighlighter(QSyntaxHighlighter):
+    _section_re = re.compile(
+        r"^(Entry Metadata|Import Summary|Preview / Texture Notes|Preview Diagnostics|Readable Strings|Binary Header Preview)\s*$"
+    )
+    _label_re = re.compile(r"^([A-Za-z][A-Za-z0-9 /()_-]+:)")
+    _warning_re = re.compile(r"\b(warning|failed|missing|truncated|unsupported|fallback|skipped|unavailable|error)\b", re.IGNORECASE)
+    _windows_path_re = re.compile(r"[A-Za-z]:\\[^\r\n<>|\"*?]+")
+    _relative_path_re = re.compile(r"(?<![\w.-])(?:[\w.-]+[\\/]){2,}[\w./\\-]+")
+    _number_re = re.compile(r"(?<![\w./\\-])\d[\d,]*(?:\.\d+)?\b")
+    _hex_offset_re = re.compile(r"^\s*([0-9A-F]{4})(?=\s)")
+    _hex_byte_re = re.compile(r"\b[0-9A-F]{2}\b")
+
+    def __init__(self, document, theme_key: str):
+        super().__init__(document)
+        self.current_theme_key = theme_key
+        self.section_format = QTextCharFormat()
+        self.label_format = QTextCharFormat()
+        self.path_format = QTextCharFormat()
+        self.number_format = QTextCharFormat()
+        self.warning_format = QTextCharFormat()
+        self.hex_offset_format = QTextCharFormat()
+        self.hex_byte_format = QTextCharFormat()
+        self.muted_format = QTextCharFormat()
+        self.set_theme(theme_key)
+
+    def set_theme(self, theme_key: str) -> None:
+        self.current_theme_key = theme_key
+        theme = get_theme(theme_key)
+        light = _theme_is_light(theme_key)
+
+        def make_format(
+            color: str,
+            *,
+            bold: bool = False,
+            italic: bool = False,
+        ) -> QTextCharFormat:
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(color))
+            if bold:
+                fmt.setFontWeight(QFont.Bold)
+            fmt.setFontItalic(italic)
+            return fmt
+
+        self.section_format = make_format(theme["accent"], bold=True)
+        self.label_format = make_format("#795e26" if light else "#d7ba7d", bold=True)
+        self.path_format = make_format(theme["text_strong"], bold=True)
+        self.number_format = make_format("#098658" if light else "#b5cea8")
+        self.warning_format = make_format(theme["warning_text"], bold=True)
+        self.hex_offset_format = make_format("#0451a5" if light else "#569cd6", bold=True)
+        self.hex_byte_format = make_format("#ce9178" if light else "#d7ba7d")
+        self.muted_format = make_format(theme["text_muted"], italic=True)
+        self.rehighlight()
+
+    def highlightBlock(self, text: str) -> None:  # type: ignore[override]
+        if not text.strip():
+            return
+
+        section_match = self._section_re.match(text.strip())
+        if section_match:
+            self.setFormat(0, len(text), self.section_format)
+            return
+
+        if text.lstrip().startswith("String scan truncated") or text.lstrip().startswith("No details available."):
+            self.setFormat(0, len(text), self.muted_format)
+            return
+
+        hex_offset_match = self._hex_offset_re.match(text)
+        if hex_offset_match:
+            offset_start, offset_end = hex_offset_match.span(1)
+            self.setFormat(offset_start, offset_end - offset_start, self.hex_offset_format)
+            remainder = text[offset_end:]
+            ascii_separator = remainder.find("  ")
+            hex_region_end = len(text) if ascii_separator < 0 else offset_end + ascii_separator
+            for match in self._hex_byte_re.finditer(text[offset_end:hex_region_end]):
+                start = offset_end + match.start()
+                self.setFormat(start, match.end() - match.start(), self.hex_byte_format)
+
+        label_match = self._label_re.match(text)
+        if label_match:
+            start, end = label_match.span(1)
+            self.setFormat(start, end - start, self.label_format)
+
+        for match in self._windows_path_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.path_format)
+        for match in self._relative_path_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.path_format)
+        for match in self._number_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.number_format)
+        for match in self._warning_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.warning_format)
+
+
+class ArchiveDetailsEditor(CodePreviewEditor):
+    def __init__(self, *, theme_key: str, parent: Optional[QWidget] = None):
+        super().__init__(theme_key=theme_key, parent=parent)
+        self.syntax_highlighter = ArchiveDetailsHighlighter(self.document(), theme_key)
+        self.set_theme(theme_key)
+
+    def set_language_for_extension(self, extension: str) -> None:
+        _ = extension
+
+
 class CollapsibleSection(QWidget):
     toggled = Signal(bool)
 
@@ -1962,11 +3691,103 @@ class CollapsibleSection(QWidget):
         self.toggled.emit(expanded)
 
 
+_QUICK_START_HTML_ES = """
+<h3>Que cubre esta app</h3>
+<p><b>Crimson Forge Toolkit</b> es una herramienta de archivos y archivos sueltos para Crimson Desert. Cubre extraccion, investigacion, edicion, reconstruccion DDS, escalado opcional, comparacion y exportacion suelta lista para mods.</p>
+<ul>
+  <li><b>Explorador de archivos</b>: escanear .pamt/.paz, previsualizar recursos compatibles, filtrar, clasificar y extraer a carpetas sueltas.</li>
+  <li><b>Flujo de texturas</b>: escanear DDS sueltos, convertir DDS a PNG si hace falta, escalar opcionalmente, reconstruir DDS, comparar resultados y exportar salida mod-ready.</li>
+  <li><b>Editor de texturas</b>: abrir imagenes para edicion visible por capas y enviar la salida plana al flujo de reconstruccion.</li>
+  <li><b>Asistente de reemplazo</b>: tomar PNG/DDS editados, asociarlos con el DDS original del juego, reconstruir la salida corregida y preparar carpetas mod-ready.</li>
+  <li><b>Investigacion</b>: inspeccionar familias de texturas, clasificaciones desconocidas, referencias, analisis DDS, informes y notas locales.</li>
+  <li><b>Busqueda de texto</b>: buscar archivos de texto de archivo o sueltos, como .xml, .json, .cfg y .lua.</li>
+  <li><b>Configuracion</b>: guardar tema, densidad, cache, estado de layout, confirmaciones y preferencias de inicio.</li>
+</ul>
+<h3>Configuracion inicial recomendada</h3>
+<ol>
+  <li>Abre <b>Configuracion</b>. <b>Configuracion inicial</b> esta a la izquierda y <b>Rutas</b> a la derecha.</li>
+  <li>Haz clic en <b>Inicializar espacio</b>.</li>
+  <li>Configura <b>texconv.exe</b>. Las vistas DDS, conversion DDS-a-PNG, comparacion y reconstruccion DDS dependen de el.</li>
+  <li>Define <b>Raiz DDS original</b>, <b>Raiz PNG</b> y <b>Raiz de salida</b>. Activa staging DDS solo si quieres una carpeta PNG previa al escalado.</li>
+  <li>Elige un backend de escalado: desactivado, <b>Real-ESRGAN NCNN</b> directo o <b>chaiNNer</b>.</li>
+  <li>Empieza con una politica de texturas segura y deja las reglas automaticas activadas para preservar mapas tecnicos riesgosos.</li>
+  <li>Revisa perfiles, reglas y coincidencias antes de ejecutar un lote.</li>
+  <li>Usa <b>Vista de politica</b> antes de <b>Iniciar</b> para revisar la accion planeada por textura.</li>
+  <li>Ejecuta un subconjunto pequeno primero y revisa el resultado en <b>Comparar</b>.</li>
+  <li>Si ya editaste una textura fuera de la app, usa <b>Asistente de reemplazo</b>.</li>
+</ol>
+<h3>Areas principales</h3>
+<ul>
+  <li><b>Configuracion / Setup</b>: creacion de workspace, herramientas externas, enlaces de ayuda e importadores.</li>
+  <li><b>Configuracion / Rutas</b>: origen, staging, PNG, salida y raices de exportacion mod-ready.</li>
+  <li><b>Salida DDS</b>: formato, tamano, mips y staging globales.</li>
+  <li><b>Perfiles, reglas y coincidencias</b>: planificacion reutilizable por archivo.</li>
+  <li><b>Escalado</b>: backend, politica, controles NCNN y notas.</li>
+  <li><b>Comparar</b>: revision lado a lado antes de lotes grandes.</li>
+</ul>
+<h3>Advertencia sobre texturas tecnicas</h3>
+<p>Las texturas visibles de color no son iguales que mapas tecnicos. Altura, desplazamiento, normales, mascaras, vectores y otros DDS sensibles son mas riesgosos al pasar por PNG.</p>
+<ul>
+  <li>Empieza con un preajuste seguro.</li>
+  <li>Manten las reglas automaticas activadas.</li>
+  <li>Revisa perfiles y rutas del planificador antes de forzar mapas tecnicos por la ruta PNG visible.</li>
+</ul>
+<h3>Documentacion</h3>
+<p>El menu <b>Documentacion</b> abre un navegador de documentacion con busqueda y temas de flujo, perfiles y rutas del planificador.</p>
+"""
+
+
+_QUICK_START_HTML_DE = """
+<h3>Was diese App abdeckt</h3>
+<p><b>Crimson Forge Toolkit</b> ist ein Archiv- und Loose-File-Werkzeug fuer Crimson Desert. Es deckt Extraktion, Research, Bearbeitung, DDS-Neuaufbau, optionales Upscaling, Vergleich und mod-fertigen Loose-Export ab.</p>
+<ul>
+  <li><b>Archiv-Browser</b>: .pamt/.paz scannen, unterstuetzte Assets anzeigen, filtern, klassifizieren und in lose Ordner extrahieren.</li>
+  <li><b>Textur-Workflow</b>: lose DDS scannen, DDS bei Bedarf zu PNG konvertieren, optional hochskalieren, DDS neu erstellen, Ergebnisse vergleichen und mod-fertige Ausgabe exportieren.</li>
+  <li><b>Textur-Editor</b>: Bilder fuer sichtbare Ebenenbearbeitung oeffnen und die flache Ausgabe zurueck in den Neuaufbau senden.</li>
+  <li><b>Ersetzungsassistent</b>: bearbeitete PNG/DDS mit dem Original-DDS abgleichen, korrigierte Ausgabe neu erstellen und mod-fertige Ordner vorbereiten.</li>
+  <li><b>Recherche</b>: Texturfamilien, unbekannte Klassifizierungen, Referenzen, DDS-Analyse, Berichte und lokale Notizen pruefen.</li>
+  <li><b>Textsuche</b>: Archiv- oder lose Textdateien wie .xml, .json, .cfg und .lua durchsuchen.</li>
+  <li><b>Einstellungen</b>: Theme, Dichte, Cache, Layoutstatus, Bestaetigungen und Startpraeferenzen speichern.</li>
+</ul>
+<h3>Empfohlene Starteinrichtung</h3>
+<ol>
+  <li>Oeffne <b>Einstellungen</b>. <b>Einrichtung</b> ist links und <b>Pfade</b> rechts.</li>
+  <li>Klicke auf <b>Arbeitsbereich einrichten</b>.</li>
+  <li>Konfiguriere <b>texconv.exe</b>. DDS-Vorschau, DDS-zu-PNG, Vergleich und DDS-Neuaufbau haengen davon ab.</li>
+  <li>Setze <b>Original-DDS-Stamm</b>, <b>PNG-Stamm</b> und <b>Ausgabe-Stamm</b>. Aktiviere DDS-Staging nur fuer einen separaten PNG-Staging-Ordner.</li>
+  <li>Waehle ein Upscaling-Backend: deaktiviert, direktes <b>Real-ESRGAN NCNN</b> oder <b>chaiNNer</b>.</li>
+  <li>Starte mit einer sicheren Textur-Richtlinie und lasse automatische Regeln aktiv, damit riskante technische Maps erhalten bleiben.</li>
+  <li>Pruefe Profile, Regeln und Treffer, bevor du einen Stapellauf startest.</li>
+  <li>Nutze <b>Richtlinienvorschau</b> vor <b>Start</b>, um die geplante Aktion pro Textur zu pruefen.</li>
+  <li>Fuehre zuerst eine kleine Auswahl aus und pruefe das Ergebnis in <b>Vergleichen</b>.</li>
+  <li>Wenn du eine Textur bereits extern bearbeitet hast, nutze den <b>Ersetzungsassistent</b>.</li>
+</ol>
+<h3>Hauptbereiche</h3>
+<ul>
+  <li><b>Einstellungen / Einrichtung</b>: Workspace-Erstellung, externe Tools, Hilfelinks und Importhelfer.</li>
+  <li><b>Einstellungen / Pfade</b>: Quelle, Staging, PNG, Ausgabe und mod-fertige Exportstaemme.</li>
+  <li><b>DDS-Ausgabe</b>: globale Format-, Groessen-, Mip- und Staging-Regeln.</li>
+  <li><b>Profile, Regeln und Treffer</b>: wiederverwendbare Planung pro Datei.</li>
+  <li><b>Upscaling</b>: Backend, Richtlinie, NCNN-Steuerung und Notizen.</li>
+  <li><b>Vergleichen</b>: Seit-an-Seit-Pruefung vor groesseren Laeufen.</li>
+</ul>
+<h3>Warnung zu technischen Texturen</h3>
+<p>Sichtbare Farbtexturen sind nicht dasselbe wie technische Maps. Hoehe, Displacement, Normalen, Masken, Vektoren und andere empfindliche DDS-Dateien sind riskanter, wenn sie ueber PNG laufen.</p>
+<ul>
+  <li>Starte mit einem sicheren Preset.</li>
+  <li>Lasse automatische Regeln aktiv.</li>
+  <li>Pruefe Planerprofile und Planerpfade, bevor technische Maps in den sichtbaren PNG-Pfad gezwungen werden.</li>
+</ul>
+<h3>Dokumentation</h3>
+<p>Das Menue <b>Dokumentation</b> oeffnet einen durchsuchbaren Dokumentationsbrowser mit Workflow-Themen, Profilen und Planerpfaden.</p>
+"""
+
+
 class QuickStartDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.parent_window = parent
-        self.setWindowTitle("Quick Start")
+        self.setWindowTitle("Startup Setup")
         self.setMinimumSize(560, 460)
         self.resize(720, 560)
 
@@ -1974,14 +3795,14 @@ class QuickStartDialog(QDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        title_label = QLabel("First-run guide")
+        title_label = QLabel("Startup setup guide")
         title_font = QFont(self.font())
         title_font.setBold(True)
         title_label.setFont(title_font)
         layout.addWidget(title_label)
 
         intro_label = QLabel(
-            "This app is a workspace manager for archive extraction, texture workflows, guided replacement builds, research, text search, and visible-texture editing."
+            "Before running archive previews or texture workflows, configure Setup and Paths under Settings. The same controls are used by Texture Workflow, Archive Browser previews, Replace Assistant, and Texture Editor handoffs."
         )
         intro_label.setObjectName("HintLabel")
         intro_label.setWordWrap(True)
@@ -1990,7 +3811,7 @@ class QuickStartDialog(QDialog):
         self.browser = QTextBrowser()
         self.browser.setOpenExternalLinks(False)
         self.browser.setReadOnly(True)
-        self.browser.setHtml(
+        quick_start_html = (
             """
             <h3>What This App Covers</h3>
             <p><b>Crimson Forge Toolkit</b> is a read-only archive and loose-file workflow tool for Crimson Desert. It is built around extraction, research, editing, DDS rebuild, optional upscaling, comparison, and mod-ready loose export.</p>
@@ -2003,9 +3824,10 @@ class QuickStartDialog(QDialog):
               <li><b>Text Search</b>: search archive or loose text-like files such as <b>.xml</b>, <b>.json</b>, <b>.cfg</b>, and <b>.lua</b>.</li>
               <li><b>Settings</b>: store theme, density, cache behavior, remembered layout state, confirmations, and startup preferences beside the EXE.</li>
             </ul>
-            <h3>Recommended First Run</h3>
+            <h3>Recommended Startup Setup</h3>
             <ol>
-              <li>Open <b>Setup</b> and click <b>Init Workspace</b>.</li>
+              <li>Open <b>Settings</b>. <b>Setup</b> is on the left and <b>Paths</b> is on the right.</li>
+              <li>Click <b>Init Workspace</b>.</li>
               <li>Configure <b>texconv.exe</b>. DDS preview, DDS-to-PNG conversion, compare previews, and DDS rebuild all depend on it.</li>
               <li>Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>. Enable DDS staging only if you want a separate pre-upscale PNG staging folder.</li>
               <li>Choose an upscaling backend in <b>Upscaling</b>: disabled, direct <b>Real-ESRGAN NCNN</b>, or <b>chaiNNer</b>.</li>
@@ -2019,8 +3841,8 @@ class QuickStartDialog(QDialog):
             </ol>
             <h3>Main Workflow Areas</h3>
             <ul>
-              <li><b>Setup</b>: workspace creation, external tools, app links, and optional downloads/import helpers.</li>
-              <li><b>Paths</b>: source, staging, PNG, output, and mod-ready export roots.</li>
+              <li><b>Settings / Setup</b>: workspace creation, external tools, app links, and optional downloads/import helpers.</li>
+              <li><b>Settings / Paths</b>: source, staging, PNG, output, and mod-ready export roots.</li>
               <li><b>DDS Output</b>: global format, size, mip, and staging behavior used unless a workflow profile overrides them.</li>
               <li><b>Profiles, Rules &amp; Matches</b>: reusable per-file workflow profiles, ordered matching rules, and a live matched DDS table.</li>
               <li><b>Upscaling</b>: backend choice, policy preset, direct NCNN controls, and backend-specific notes.</li>
@@ -2079,11 +3901,17 @@ class QuickStartDialog(QDialog):
             <p>The app auto-saves its settings beside the EXE and also stores archive scan cache beside it.</p>
             """
         )
+        self.browser.setFont(self.font())
+        self.browser.document().setDefaultFont(self.font())
+        self.browser.setProperty("_i18n_source_html", quick_start_html)
+        self.browser.setProperty("_i18n_html_es", _QUICK_START_HTML_ES)
+        self.browser.setProperty("_i18n_html_de", _QUICK_START_HTML_DE)
+        self.browser.setHtml(quick_start_html)
         layout.addWidget(self.browser, stretch=1)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(8)
-        self.open_setup_button = QPushButton("Open Setup")
+        self.open_setup_button = QPushButton("Open Setup && Paths")
         self.open_chainner_button = QPushButton("Open chaiNNer Setup")
         self.open_docs_button = QPushButton("Open Documentation")
         self.close_button = QPushButton("Close")
@@ -2108,8 +3936,10 @@ class QuickStartDialog(QDialog):
         self.accept()
 
     def _open_docs(self) -> None:
+        parent_window = self.parent_window
         self.accept()
-        self.parent_window.show_about_dialog(topic_id="workflow_overview")
+        if parent_window is not None and hasattr(parent_window, "show_about_dialog"):
+            QTimer.singleShot(0, lambda: parent_window.show_about_dialog(topic_id="overview"))
 
 
 class AboutDialog(QDialog):
@@ -2166,6 +3996,7 @@ class AboutDialog(QDialog):
         topic_layout.addWidget(topic_hint)
         self.topic_list = QListWidget()
         self.topic_list.setAlternatingRowColors(True)
+        self.topic_list.setProperty("_i18n_translate_items", True)
         topic_layout.addWidget(self.topic_list, stretch=1)
         splitter.addWidget(topic_panel)
 
@@ -2173,7 +4004,11 @@ class AboutDialog(QDialog):
         self.browser.setReadOnly(True)
         self.browser.setOpenLinks(False)
         self.browser.setOpenExternalLinks(False)
-        self.browser.setHtml(self._build_document_html(title, intro_html))
+        document_html = self._build_document_html(title, intro_html)
+        self.browser.setFont(self.font())
+        self.browser.document().setDefaultFont(self.font())
+        self.browser.setProperty("_i18n_source_html", document_html)
+        self.browser.setHtml(document_html)
         splitter.addWidget(self.browser)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -2239,7 +4074,7 @@ class AboutDialog(QDialog):
                 item.setToolTip(summary)
             self.topic_list.addItem(item)
         self.topic_list.blockSignals(False)
-        self.topic_count_label.setText(f"{len(self._filtered_sections)} topic(s)")
+        self.topic_count_label.setText(self._format_topic_count(len(self._filtered_sections)))
         if not self._filtered_sections:
             return
         if current_section_id:
@@ -2249,6 +4084,19 @@ class AboutDialog(QDialog):
                     self.topic_list.setCurrentItem(item)
                     return
         self.topic_list.setCurrentRow(0)
+
+    def _current_language_code(self) -> str:
+        parent = self.parent()
+        localizer = getattr(parent, "ui_localizer", None)
+        return str(getattr(localizer, "language_code", "en") or "en").strip().lower()
+
+    def _format_topic_count(self, count: int) -> str:
+        language_code = self._current_language_code()
+        if language_code == "es":
+            return f"{count} tema" if count == 1 else f"{count} temas"
+        if language_code == "de":
+            return f"{count} Thema" if count == 1 else f"{count} Themen"
+        return f"{count} topic" if count == 1 else f"{count} topics"
 
     def current_section_id(self) -> str:
         item = self.topic_list.currentItem()

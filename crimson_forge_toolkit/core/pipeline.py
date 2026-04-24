@@ -26,7 +26,7 @@ from crimson_forge_toolkit.constants import *
 from crimson_forge_toolkit.models import *
 from crimson_forge_toolkit.core.common import *
 from crimson_forge_toolkit.core.chainner import *
-from crimson_forge_toolkit.core.mod_package import resolve_mod_package_root, write_mod_package_info
+from crimson_forge_toolkit.core.mod_package import resolve_mod_package_root, write_mod_package_manifest
 from crimson_forge_toolkit.core.realesrgan_ncnn import *
 from crimson_forge_toolkit.core.upscale_postprocess import (
     build_source_match_plan_for_decision,
@@ -5159,12 +5159,6 @@ def rebuild_dds_files(
         final_package_root = resolve_mod_package_root(normalized.mod_ready_export_root, normalized.mod_ready_package_info)
         emit_phase("Mod Package", "Writing ready mod package from final DDS output...", False)
         emit_log(f"Creating ready mod package under: {final_package_root}")
-        if not normalized.dry_run:
-            write_mod_package_info(
-                final_package_root,
-                normalized.mod_ready_package_info,
-                create_no_encrypt_file=normalized.mod_ready_create_no_encrypt_file,
-            )
         export_result = copy_mod_ready_loose_tree(
             normalized.output_root,
             final_package_root,
@@ -5172,6 +5166,14 @@ def rebuild_dds_files(
             dry_run=normalized.dry_run,
             on_log=None,
         )
+        if not normalized.dry_run:
+            write_mod_package_manifest(
+                final_package_root,
+                normalized.mod_ready_package_info,
+                kind="dds_loose_mod",
+                extra_fields={"file_count": export_result.copied_files},
+                create_no_encrypt_file=normalized.mod_ready_create_no_encrypt_file,
+            )
         emit_log(
             "Ready mod package export complete: "
             f"copied={export_result.copied_files}, skipped={export_result.skipped_files}, failed={export_result.failed_files}"
