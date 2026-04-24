@@ -79,7 +79,7 @@ from crimson_forge_toolkit.core.upscale_profiles import get_texture_preset_defin
 
 def run_gui() -> int:
     try:
-        from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, QObject, Signal, Slot
+        from PySide6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, QUrl, QObject, Signal, Slot
         from PySide6.QtGui import (
             QDesktopServices,
             QFont,
@@ -12052,22 +12052,33 @@ def run_gui() -> int:
         ) -> Optional[StaticMeshReplacementOptions]:
             dialog = QDialog(self)
             dialog.setWindowTitle("Static Mesh Alignment")
-            dialog.setMinimumSize(1280, 760)
-            dialog.resize(1640, 920)
+            dialog.setMinimumSize(1180, 720)
+            dialog.resize(1720, 900)
             dialog.setSizeGripEnabled(True)
             root_layout = QVBoxLayout(dialog)
             main_splitter = QSplitter(Qt.Horizontal, dialog)
             content_scroll = QScrollArea(dialog)
             content_scroll.setWidgetResizable(True)
-            content_scroll.setMinimumWidth(560)
+            content_scroll.setMinimumWidth(430)
+            content_scroll.setMaximumWidth(640)
             content_container = QWidget()
             layout = QVBoxLayout(content_container)
             content_scroll.setWidget(content_container)
             main_splitter.addWidget(content_scroll)
             preview_panel = QWidget(dialog)
-            preview_panel.setMinimumWidth(560)
+            preview_panel.setMinimumWidth(620)
             preview_panel_layout = QVBoxLayout(preview_panel)
-            preview_panel_layout.addWidget(QLabel("Live Alignment Preview"))
+            preview_header = QHBoxLayout()
+            preview_header.addWidget(QLabel("Live Alignment Preview"))
+            preview_header.addStretch(1)
+            preview_mode_combo = QComboBox()
+            preview_mode_combo.addItem("Side by side", "side_by_side")
+            preview_mode_combo.addItem("Overlay", "overlay")
+            preview_mode_combo.addItem("Replacement only", "replacement_only")
+            preview_mode_combo.setToolTip("Side by side compares original and replacement. Overlay draws both in one view. Replacement only gives more room to inspect the imported asset.")
+            preview_header.addWidget(QLabel("Preview mode"))
+            preview_header.addWidget(preview_mode_combo)
+            preview_panel_layout.addLayout(preview_header)
             preview_render_settings = self._current_model_preview_render_settings()
             preview_splitter = QSplitter(Qt.Horizontal, preview_panel)
             original_preview_container = QWidget(preview_splitter)
@@ -12079,6 +12090,7 @@ def run_gui() -> int:
             original_dialog_preview.set_render_settings(preview_render_settings)
             original_dialog_preview.set_use_textures(True)
             original_dialog_preview.set_high_quality_textures(True)
+            original_dialog_preview.set_alignment_guides_visible(True)
             original_preview_layout.addWidget(original_dialog_preview, 1)
             replacement_preview_container = QWidget(preview_splitter)
             replacement_preview_layout = QVBoxLayout(replacement_preview_container)
@@ -12089,6 +12101,7 @@ def run_gui() -> int:
             static_dialog_preview.set_render_settings(preview_render_settings)
             static_dialog_preview.set_use_textures(True)
             static_dialog_preview.set_high_quality_textures(True)
+            static_dialog_preview.set_alignment_guides_visible(True)
             replacement_preview_layout.addWidget(static_dialog_preview, 1)
             preview_splitter.addWidget(original_preview_container)
             preview_splitter.addWidget(replacement_preview_container)
@@ -12097,10 +12110,25 @@ def run_gui() -> int:
             preview_splitter.setStretchFactor(0, 1)
             preview_splitter.setStretchFactor(1, 2)
             preview_splitter.setSizes([420, 620])
-            preview_panel_layout.addWidget(preview_splitter, 1)
+            overlay_dialog_preview = ModelPreviewWidget("Overlay preview.", theme_key=self.current_theme_key)
+            overlay_dialog_preview.setMinimumSize(620, 420)
+            overlay_dialog_preview.set_render_settings(preview_render_settings)
+            overlay_dialog_preview.set_use_textures(True)
+            overlay_dialog_preview.set_high_quality_textures(True)
+            overlay_dialog_preview.set_alignment_guides_visible(True)
+            replacement_only_preview = ModelPreviewWidget("Replacement preview.", theme_key=self.current_theme_key)
+            replacement_only_preview.setMinimumSize(620, 420)
+            replacement_only_preview.set_render_settings(preview_render_settings)
+            replacement_only_preview.set_use_textures(True)
+            replacement_only_preview.set_high_quality_textures(True)
+            replacement_only_preview.set_alignment_guides_visible(True)
+            preview_stack = QStackedWidget(preview_panel)
+            preview_stack.addWidget(preview_splitter)
+            preview_stack.addWidget(overlay_dialog_preview)
+            preview_stack.addWidget(replacement_only_preview)
+            preview_panel_layout.addWidget(preview_stack, 1)
             preview_help = QLabel(
-                "The left view is the original asset reference. The right view rebuilds the replacement using the current "
-                "mapping, scale, rotation, offset, and selected texture slots before the package is built."
+                "The preview rebuilds the replacement using the current mapping, transform, and selected texture slots before the package is built."
             )
             preview_help.setWordWrap(True)
             preview_help.setObjectName("HintLabel")
@@ -12110,7 +12138,7 @@ def run_gui() -> int:
             main_splitter.setCollapsible(1, False)
             main_splitter.setStretchFactor(0, 2)
             main_splitter.setStretchFactor(1, 3)
-            main_splitter.setSizes([680, 940])
+            main_splitter.setSizes([540, 1180])
             root_layout.addWidget(main_splitter, 1)
             intro = QLabel(
                 "Auto anchor aligns the replacement to the original asset. Scaling can be disabled so the replacement keeps its own imported size."
@@ -12136,6 +12164,76 @@ def run_gui() -> int:
             original_mesh_for_mapping = None
             replacement_preview_model = None
             preview_controls_ready = {"ready": False}
+            highlighted_source_indices: set[int] = set()
+            hover_filters: List[QObject] = []
+            texture_preview_cache: Dict[tuple[str, int, int], str] = {}
+            static_preview_refresh_timer = QTimer(dialog)
+            static_preview_refresh_timer.setSingleShot(True)
+            static_preview_refresh_timer.setInterval(90)
+
+            def _clone_preview_model(model: object):
+                if not isinstance(model, ModelPreviewData):
+                    return model
+                return dataclasses.replace(
+                    model,
+                    meshes=[
+                        dataclasses.replace(mesh)
+                        for mesh in getattr(model, "meshes", ()) or ()
+                    ],
+                )
+
+            def _tint_preview_model(model: object, color: tuple[float, float, float], *, clear_textures: bool = False):
+                cloned = _clone_preview_model(model)
+                for mesh in getattr(cloned, "meshes", ()) or ():
+                    if hasattr(mesh, "preview_color"):
+                        mesh.preview_color = color
+                    if clear_textures:
+                        mesh.preview_texture_path = ""
+                        mesh.preview_normal_texture_path = ""
+                        mesh.preview_material_texture_path = ""
+                        mesh.preview_height_texture_path = ""
+                return cloned
+
+            def _combine_preview_models(*models: object):
+                valid_models = [model for model in models if isinstance(model, ModelPreviewData)]
+                if not valid_models:
+                    return None
+                base = valid_models[-1]
+                meshes = []
+                for model in valid_models:
+                    meshes.extend([dataclasses.replace(mesh) for mesh in getattr(model, "meshes", ()) or ()])
+                return dataclasses.replace(
+                    base,
+                    summary="Overlay alignment preview",
+                    mesh_count=len(meshes),
+                    meshes=meshes,
+                )
+
+            def _queue_static_preview_refresh(*_args: object) -> None:
+                static_preview_refresh_timer.start()
+
+            def _set_preview_mode() -> None:
+                mode = str(preview_mode_combo.currentData() or "side_by_side")
+                preview_stack.setCurrentIndex({"side_by_side": 0, "overlay": 1, "replacement_only": 2}.get(mode, 0))
+                _queue_static_preview_refresh()
+
+            preview_mode_combo.currentIndexChanged.connect(_set_preview_mode)
+
+            class _StaticMappingHoverFilter(QObject):
+                def __init__(self, source_indices: Sequence[int], refresh: Callable[[], None]) -> None:
+                    super().__init__(dialog)
+                    self.source_indices = set(source_indices)
+                    self.refresh = refresh
+
+                def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+                    if event.type() == QEvent.Type.Enter:
+                        highlighted_source_indices.clear()
+                        highlighted_source_indices.update(self.source_indices)
+                        self.refresh()
+                    elif event.type() == QEvent.Type.Leave:
+                        highlighted_source_indices.clear()
+                        self.refresh()
+                    return False
 
             def _is_marker_source(submesh: object) -> bool:
                 label = f"{getattr(submesh, 'name', '')} {getattr(submesh, 'material', '')}".lower()
@@ -12291,21 +12389,35 @@ def run_gui() -> int:
                     selected_label.setStyleSheet(
                         "color: #cbd5e1;" if selected_ok else "color: #fca5a5; font-weight: 600;"
                     )
+                    initial_hover_indices = tuple(mapping.source_submesh_indices if mapping is not None else ())
+                    hover_filter = _StaticMappingHoverFilter(initial_hover_indices, _queue_static_preview_refresh)
+                    for hover_widget in (target_label, edit, selected_label):
+                        hover_widget.setMouseTracking(True)
+                        hover_widget.installEventFilter(hover_filter)
+                    hover_filters.append(hover_filter)
 
                     def _update_selected_source_label(
                         text: str,
                         *,
                         label: QLabel = selected_label,
+                        hover_filter: _StaticMappingHoverFilter = hover_filter,
                     ) -> None:
                         summary, ok = _selected_source_summary(text)
                         label.setText(summary)
                         label.setStyleSheet(
                             "color: #cbd5e1;" if ok else "color: #fca5a5; font-weight: 600;"
                         )
-                        try:
-                            _refresh_static_dialog_preview()
-                        except NameError:
-                            pass
+                        updated_indices: List[int] = []
+                        for raw_part in re.split(r"[,;\s]+", text.strip()):
+                            part = raw_part.strip()
+                            if not part:
+                                continue
+                            try:
+                                updated_indices.append(int(part))
+                            except ValueError:
+                                pass
+                        hover_filter.source_indices = set(updated_indices)
+                        _queue_static_preview_refresh()
 
                     edit.textChanged.connect(_update_selected_source_label)
                     edit.setPlaceholderText("blank, 0, or 0, 1")
@@ -12489,7 +12601,12 @@ def run_gui() -> int:
                                             float(rotate_y_spin.value()),
                                             float(rotate_z_spin.value()),
                                         ),
-                                        scale=float(uniform_scale_spin.value()),
+                                        scale=float(scale_x_spin.value()),
+                                        scale_xyz=(
+                                            float(scale_x_spin.value()),
+                                            float(scale_y_spin.value()),
+                                            float(scale_z_spin.value()),
+                                        ),
                                         offset_xyz=(
                                             float(offset_x_spin.value()),
                                             float(offset_y_spin.value()),
@@ -12508,23 +12625,41 @@ def run_gui() -> int:
                             source_model = replacement_preview_model
                     else:
                         source_model = replacement_preview_model
-                    preview_model = dataclasses.replace(
-                        source_model,
-                        meshes=[
-                            dataclasses.replace(mesh)
-                            for mesh in getattr(source_model, "meshes", ()) or ()
-                        ],
-                    )
+                    preview_model = _clone_preview_model(source_model)
+                    if highlighted_source_indices:
+                        highlighted_target_indices: set[int] = set()
+                        if mapped_preview:
+                            for mapping in current_mappings:
+                                if any(source_index in highlighted_source_indices for source_index in mapping.source_submesh_indices):
+                                    highlighted_target_indices.add(mapping.target_submesh_index)
+                        else:
+                            highlighted_target_indices.update(highlighted_source_indices)
+                        for mesh_index, mesh in enumerate(getattr(preview_model, "meshes", ()) or ()):
+                            if mesh_index in highlighted_target_indices:
+                                mesh.preview_color = (1.0, 0.78, 0.22)
+                            else:
+                                mesh.preview_color = (0.18, 0.22, 0.26)
                     def _source_preview_path(source_path_text: str) -> str:
                         source = Path(source_path_text).expanduser()
                         if source.suffix.lower() != ".dds":
                             return str(source)
+                        try:
+                            stat = source.stat()
+                            cache_key = (str(source.resolve()).lower(), int(stat.st_mtime_ns), int(stat.st_size))
+                            cached = texture_preview_cache.get(cache_key)
+                            if cached:
+                                return cached
+                        except Exception:
+                            cache_key = None
                         texconv_text = self.texconv_path_edit.text().strip()
                         if not texconv_text:
                             return str(source)
                         try:
                             dds_info = parse_dds(source)
-                            return ensure_dds_display_preview_png(Path(texconv_text).expanduser(), source, dds_info=dds_info)
+                            preview_path = ensure_dds_display_preview_png(Path(texconv_text).expanduser(), source, dds_info=dds_info)
+                            if cache_key is not None:
+                                texture_preview_cache[cache_key] = preview_path
+                            return preview_path
                         except Exception:
                             return str(source)
 
@@ -12565,11 +12700,53 @@ def run_gui() -> int:
                                 mesh.preview_material_texture_type = semantic_type
                                 mesh.preview_material_texture_subtype = semantic_subtype
                                 mesh.preview_material_texture_packed_channels = tuple(packed_channels)
-                    previous_view_state = static_dialog_preview.view_state_snapshot()
+                    static_view_state = static_dialog_preview.view_state_snapshot()
+                    replacement_only_view_state = replacement_only_preview.view_state_snapshot()
+                    overlay_view_state = overlay_dialog_preview.view_state_snapshot()
                     static_dialog_preview.set_model(preview_model)
-                    static_dialog_preview.restore_view_state(previous_view_state)
+                    static_dialog_preview.restore_view_state(static_view_state)
                     static_dialog_preview.set_use_textures(True)
                     static_dialog_preview.set_high_quality_textures(True)
+                    replacement_only_preview.set_model(preview_model)
+                    replacement_only_preview.restore_view_state(replacement_only_view_state)
+                    replacement_only_preview.set_use_textures(True)
+                    replacement_only_preview.set_high_quality_textures(True)
+                    if original_reference_preview_model is not None:
+                        overlay_model = _combine_preview_models(
+                            _tint_preview_model(original_reference_preview_model, (0.30, 0.42, 0.54)),
+                            preview_model,
+                        )
+                        if overlay_model is not None:
+                            overlay_dialog_preview.set_model(overlay_model)
+                            overlay_dialog_preview.restore_view_state(overlay_view_state)
+                            overlay_dialog_preview.set_use_textures(True)
+                            overlay_dialog_preview.set_high_quality_textures(True)
+
+                static_preview_refresh_timer.timeout.connect(_refresh_static_dialog_preview)
+
+                sidecar_bindings = ()
+                try:
+                    sidecar_bindings, _sidecar_paths, _texts_by_path, _texts_by_name = _extract_archive_model_sidecar_texture_references(
+                        entry,
+                        archive_entries_by_basename=dict(self.archive_entries_by_basename),
+                    )
+                    texconv_text = self.texconv_path_edit.text().strip()
+                    if texconv_text and original_reference_preview_model is not None:
+                        _attach_model_sidecar_texture_preview_paths(
+                            Path(texconv_text).expanduser(),
+                            entry,
+                            original_reference_preview_model,
+                            parsed_mesh=original_mesh_for_mapping,
+                            sidecar_texture_bindings=sidecar_bindings,
+                            visible_texture_mode=str(self._current_model_preview_render_settings().visible_texture_mode),
+                            texture_entries_by_normalized_path=dict(self.archive_entries_by_normalized_path),
+                            texture_entries_by_basename=dict(self.archive_entries_by_basename),
+                        )
+                        original_dialog_preview.set_model(original_reference_preview_model)
+                        original_dialog_preview.set_use_textures(True)
+                        original_dialog_preview.set_high_quality_textures(True)
+                except Exception:
+                    sidecar_bindings = ()
 
                 if texture_files_for_mapping:
                     texture_group = QGroupBox("Texture Slot Mapping")
@@ -12582,28 +12759,6 @@ def run_gui() -> int:
                     texture_hint.setWordWrap(True)
                     texture_hint.setObjectName("HintLabel")
                     texture_layout.addWidget(texture_hint)
-                    try:
-                        sidecar_bindings, _sidecar_paths, _texts_by_path, _texts_by_name = _extract_archive_model_sidecar_texture_references(
-                            entry,
-                            archive_entries_by_basename=dict(self.archive_entries_by_basename),
-                        )
-                        texconv_text = self.texconv_path_edit.text().strip()
-                        if texconv_text and original_reference_preview_model is not None:
-                            _attach_model_sidecar_texture_preview_paths(
-                                Path(texconv_text).expanduser(),
-                                entry,
-                                original_reference_preview_model,
-                                parsed_mesh=original_mesh_for_mapping,
-                                sidecar_texture_bindings=sidecar_bindings,
-                                visible_texture_mode=str(self._current_model_preview_render_settings().visible_texture_mode),
-                                texture_entries_by_normalized_path=dict(self.archive_entries_by_normalized_path),
-                                texture_entries_by_basename=dict(self.archive_entries_by_basename),
-                            )
-                            original_dialog_preview.set_model(original_reference_preview_model)
-                            original_dialog_preview.set_use_textures(True)
-                            original_dialog_preview.set_high_quality_textures(True)
-                    except Exception:
-                        sidecar_bindings = ()
                     texture_sets = group_replacement_texture_sets(texture_files_for_mapping, obj_mesh=replacement_mesh_for_mapping)
                     texture_scroll = QScrollArea()
                     texture_scroll.setWidgetResizable(True)
@@ -12656,10 +12811,10 @@ def run_gui() -> int:
                             ) -> None:
                                 if str(combo.currentData() or "").strip():
                                     checkbox.setChecked(True)
-                                _refresh_static_dialog_preview()
+                                _queue_static_preview_refresh()
 
                             combo.currentIndexChanged.connect(_texture_combo_changed)
-                            checkbox.toggled.connect(lambda _checked: _refresh_static_dialog_preview())
+                            checkbox.toggled.connect(_queue_static_preview_refresh)
                             texture_grid.addWidget(checkbox, row_index, 0)
                             texture_grid.addWidget(QLabel(mapping.target_submesh_name), row_index, 1)
                             texture_grid.addWidget(QLabel(parameter_name or slot_kind), row_index, 2)
@@ -12749,69 +12904,99 @@ def run_gui() -> int:
                     spin.setSuffix(suffix)
                 return spin
 
-            uniform_scale_spin = _double_spin(value=1.0, minimum=0.001, maximum=100.0, decimals=4, step=0.05)
-            form.addWidget(QLabel("Manual uniform scale"), 5, 0)
-            form.addWidget(uniform_scale_spin, 5, 1)
-            scale_hint = QLabel(
-                "Start at 1.0000. Increase if the replacement is too small; decrease if it is too large. "
-                "This is applied in addition to Auto length scale when that checkbox is enabled."
-            )
-            scale_hint.setWordWrap(True)
-            scale_hint.setObjectName("HintLabel")
-            form.addWidget(scale_hint, 6, 0, 1, 2)
+            def _mesh_center_for_ui(mesh: object) -> tuple[float, float, float]:
+                vertices: List[tuple[float, float, float]] = []
+                for submesh in getattr(mesh, "submeshes", ()) or ():
+                    vertices.extend(list(getattr(submesh, "vertices", ()) or ()))
+                if not vertices:
+                    return (0.0, 0.0, 0.0)
+                xs, ys, zs = zip(*vertices)
+                return (
+                    (min(xs) + max(xs)) * 0.5,
+                    (min(ys) + max(ys)) * 0.5,
+                    (min(zs) + max(zs)) * 0.5,
+                )
 
-            offset_group = QGroupBox("Manual Anchor Offset")
-            offset_layout = QGridLayout(offset_group)
+            original_center = _mesh_center_for_ui(original_mesh_for_mapping)
+            transform_group = QGroupBox("Transform")
+            transform_layout = QGridLayout(transform_group)
+            transform_layout.addWidget(QLabel("Property"), 0, 0)
+            transform_layout.addWidget(QLabel("Original reference"), 0, 1)
+            transform_layout.addWidget(QLabel("Replacement export value"), 0, 2)
+            transform_layout.addWidget(QLabel("Location X"), 1, 0)
+            transform_layout.addWidget(QLabel(f"{original_center[0]:.5f}"), 1, 1)
             offset_x_spin = _double_spin(value=0.0, minimum=-10.0, maximum=10.0, decimals=5, step=0.005)
             offset_y_spin = _double_spin(value=0.0, minimum=-10.0, maximum=10.0, decimals=5, step=0.005)
             offset_z_spin = _double_spin(value=0.0, minimum=-10.0, maximum=10.0, decimals=5, step=0.005)
-            offset_layout.addWidget(QLabel("X"), 0, 0)
-            offset_layout.addWidget(offset_x_spin, 0, 1)
-            offset_layout.addWidget(QLabel("Y"), 1, 0)
-            offset_layout.addWidget(offset_y_spin, 1, 1)
-            offset_layout.addWidget(QLabel("Z"), 2, 0)
-            offset_layout.addWidget(offset_z_spin, 2, 1)
-            offset_hint = QLabel(
-                "Use small values first, for example 0.005 or -0.005. "
-                "X/Y/Z are in the original asset coordinate space shown above."
-            )
-            offset_hint.setWordWrap(True)
-            offset_hint.setObjectName("HintLabel")
-            offset_layout.addWidget(offset_hint, 3, 0, 1, 2)
-            layout.addWidget(offset_group)
-
-            rotation_group = QGroupBox("Manual Rotation")
-            rotation_layout = QGridLayout(rotation_group)
+            transform_layout.addWidget(offset_x_spin, 1, 2)
+            transform_layout.addWidget(QLabel("Location Y"), 2, 0)
+            transform_layout.addWidget(QLabel(f"{original_center[1]:.5f}"), 2, 1)
+            transform_layout.addWidget(offset_y_spin, 2, 2)
+            transform_layout.addWidget(QLabel("Location Z"), 3, 0)
+            transform_layout.addWidget(QLabel(f"{original_center[2]:.5f}"), 3, 1)
+            transform_layout.addWidget(offset_z_spin, 3, 2)
             rotate_x_spin = _double_spin(value=0.0, minimum=-360.0, maximum=360.0, decimals=2, step=5.0, suffix=" deg")
             rotate_y_spin = _double_spin(value=0.0, minimum=-360.0, maximum=360.0, decimals=2, step=5.0, suffix=" deg")
             rotate_z_spin = _double_spin(value=0.0, minimum=-360.0, maximum=360.0, decimals=2, step=5.0, suffix=" deg")
-            rotation_layout.addWidget(QLabel("X"), 0, 0)
-            rotation_layout.addWidget(rotate_x_spin, 0, 1)
-            rotation_layout.addWidget(QLabel("Y"), 1, 0)
-            rotation_layout.addWidget(rotate_y_spin, 1, 1)
-            rotation_layout.addWidget(QLabel("Z"), 2, 0)
-            rotation_layout.addWidget(rotate_z_spin, 2, 1)
-            rotation_hint = QLabel(
-                "Use Flip Direction 180 for a fully backwards asset. Use manual rotation for smaller tilt/roll corrections."
+            transform_layout.addWidget(QLabel("Rotation X"), 4, 0)
+            transform_layout.addWidget(QLabel("0.00 deg"), 4, 1)
+            transform_layout.addWidget(rotate_x_spin, 4, 2)
+            transform_layout.addWidget(QLabel("Rotation Y"), 5, 0)
+            transform_layout.addWidget(QLabel("0.00 deg"), 5, 1)
+            transform_layout.addWidget(rotate_y_spin, 5, 2)
+            transform_layout.addWidget(QLabel("Rotation Z"), 6, 0)
+            transform_layout.addWidget(QLabel("0.00 deg"), 6, 1)
+            transform_layout.addWidget(rotate_z_spin, 6, 2)
+            scale_x_spin = _double_spin(value=1.0, minimum=0.001, maximum=100.0, decimals=4, step=0.05)
+            scale_y_spin = _double_spin(value=1.0, minimum=0.001, maximum=100.0, decimals=4, step=0.05)
+            scale_z_spin = _double_spin(value=1.0, minimum=0.001, maximum=100.0, decimals=4, step=0.05)
+            transform_layout.addWidget(QLabel("Scale X"), 7, 0)
+            transform_layout.addWidget(QLabel("1.0000"), 7, 1)
+            transform_layout.addWidget(scale_x_spin, 7, 2)
+            transform_layout.addWidget(QLabel("Scale Y"), 8, 0)
+            transform_layout.addWidget(QLabel("1.0000"), 8, 1)
+            transform_layout.addWidget(scale_y_spin, 8, 2)
+            transform_layout.addWidget(QLabel("Scale Z"), 9, 0)
+            transform_layout.addWidget(QLabel("1.0000"), 9, 1)
+            transform_layout.addWidget(scale_z_spin, 9, 2)
+            scale_link_checkbox = QCheckBox("Link scale axes")
+            scale_link_checkbox.setChecked(True)
+            transform_layout.addWidget(scale_link_checkbox, 10, 2)
+            transform_hint = QLabel(
+                "These are the manual Delta Transform values exported into the rebuilt PAC. "
+                "Location uses original asset units; rotation uses XYZ Euler degrees; scale is applied after auto length scaling when enabled."
             )
-            rotation_hint.setWordWrap(True)
-            rotation_hint.setObjectName("HintLabel")
-            rotation_layout.addWidget(rotation_hint, 3, 0, 1, 2)
-            layout.addWidget(rotation_group)
+            transform_hint.setWordWrap(True)
+            transform_hint.setObjectName("HintLabel")
+            transform_layout.addWidget(transform_hint, 11, 0, 1, 3)
+            layout.addWidget(transform_group)
 
-            def _queue_static_preview_refresh(*_args: object) -> None:
-                _refresh_static_dialog_preview()
+            scale_syncing = {"active": False}
+
+            def _sync_linked_scale(value: float) -> None:
+                if scale_syncing["active"] or not scale_link_checkbox.isChecked():
+                    return
+                scale_syncing["active"] = True
+                sender = dialog.sender()
+                for scale_spin in (scale_x_spin, scale_y_spin, scale_z_spin):
+                    if scale_spin is not sender:
+                        scale_spin.setValue(float(value))
+                scale_syncing["active"] = False
 
             for spin in (
-                uniform_scale_spin,
                 offset_x_spin,
                 offset_y_spin,
                 offset_z_spin,
                 rotate_x_spin,
                 rotate_y_spin,
                 rotate_z_spin,
+                scale_x_spin,
+                scale_y_spin,
+                scale_z_spin,
             ):
                 spin.valueChanged.connect(_queue_static_preview_refresh)
+            for spin in (scale_x_spin, scale_y_spin, scale_z_spin):
+                spin.valueChanged.connect(_sync_linked_scale)
             alignment_mode_combo.currentIndexChanged.connect(_queue_static_preview_refresh)
             scale_to_length_checkbox.toggled.connect(_queue_static_preview_refresh)
             flip_direction_checkbox.toggled.connect(_queue_static_preview_refresh)
@@ -12902,7 +13087,12 @@ def run_gui() -> int:
                         float(rotate_y_spin.value()),
                         float(rotate_z_spin.value()),
                     ),
-                    scale=float(uniform_scale_spin.value()),
+                    scale=float(scale_x_spin.value()),
+                    scale_xyz=(
+                        float(scale_x_spin.value()),
+                        float(scale_y_spin.value()),
+                        float(scale_z_spin.value()),
+                    ),
                     offset_xyz=(
                         float(offset_x_spin.value()),
                         float(offset_y_spin.value()),

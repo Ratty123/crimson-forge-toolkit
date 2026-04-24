@@ -778,8 +778,8 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._texture_objects: Dict[Tuple[str, bool, bool], QOpenGLTexture] = {}
         self._use_textures = False
         self._high_quality_textures = True
-        self._show_grid_overlay = True
-        self._show_origin_overlay = True
+        self._show_grid_overlay = False
+        self._show_origin_overlay = False
         self._render_settings = clamp_model_preview_render_settings()
         self._pan_poll_timer = QTimer(self)
         self._pan_poll_timer.setInterval(16)
@@ -2198,10 +2198,10 @@ class ModelPreviewWidget(QOpenGLWidget):
         if self._vertex_count <= 0 or not (self._show_grid_overlay or self._show_origin_overlay):
             return
         mvp = self._preview_mvp_matrix()
-        grid_color = QColor(148, 163, 184, 125)
-        major_grid_color = QColor(203, 213, 225, 175)
-        extent = 3.0
-        step = 0.25
+        grid_color = QColor(148, 163, 184, 42)
+        major_grid_color = QColor(203, 213, 225, 72)
+        extent = 2.5
+        step = 0.5
         if self._show_grid_overlay:
             line_count = int(round((extent * 2.0) / step))
             for index in range(line_count + 1):
@@ -2211,14 +2211,14 @@ class ModelPreviewWidget(QOpenGLWidget):
                 self._draw_preview_line(painter, mvp, (value, 0.0, -extent), (value, 0.0, extent), color)
                 self._draw_preview_line(painter, mvp, (-extent, 0.0, value), (extent, 0.0, value), color)
 
-        axis_extent = 3.25
-        self._draw_preview_line(painter, mvp, (-axis_extent, 0.0, 0.0), (axis_extent, 0.0, 0.0), QColor(239, 68, 68, 235), width=2.4)
-        self._draw_preview_line(painter, mvp, (0.0, -axis_extent, 0.0), (0.0, axis_extent, 0.0), QColor(59, 130, 246, 235), width=2.4)
-        self._draw_preview_line(painter, mvp, (0.0, 0.0, -axis_extent), (0.0, 0.0, axis_extent), QColor(34, 197, 94, 235), width=2.4)
+        axis_extent = 2.85
+        self._draw_preview_line(painter, mvp, (-axis_extent, 0.0, 0.0), (axis_extent, 0.0, 0.0), QColor(239, 68, 68, 145), width=1.35)
+        self._draw_preview_line(painter, mvp, (0.0, -axis_extent, 0.0), (0.0, axis_extent, 0.0), QColor(59, 130, 246, 145), width=1.35)
+        self._draw_preview_line(painter, mvp, (0.0, 0.0, -axis_extent), (0.0, 0.0, axis_extent), QColor(34, 197, 94, 145), width=1.35)
         for label, point, color in (
-            ("X", (axis_extent, 0.0, 0.0), QColor(239, 68, 68, 210)),
-            ("Y", (0.0, axis_extent, 0.0), QColor(59, 130, 246, 210)),
-            ("Z", (0.0, 0.0, axis_extent), QColor(34, 197, 94, 210)),
+            ("X", (axis_extent, 0.0, 0.0), QColor(239, 68, 68, 150)),
+            ("Y", (0.0, axis_extent, 0.0), QColor(59, 130, 246, 150)),
+            ("Z", (0.0, 0.0, axis_extent), QColor(34, 197, 94, 150)),
         ):
             label_point = self._project_preview_point(mvp, point)
             if label_point is not None:
@@ -2228,19 +2228,19 @@ class ModelPreviewWidget(QOpenGLWidget):
         if self._show_origin_overlay:
             origin = self._project_preview_point(mvp, (0.0, 0.0, 0.0))
             if origin is not None:
-                painter.setPen(QPen(QColor(255, 255, 255, 245), 1.8))
-                radius = 8.0
+                painter.setPen(QPen(QColor(255, 255, 255, 170), 1.2))
+                radius = 6.0
                 painter.drawEllipse(origin, radius, radius)
-                painter.drawLine(QPointF(origin.x() - 10.0, origin.y()), QPointF(origin.x() + 10.0, origin.y()))
-                painter.drawLine(QPointF(origin.x(), origin.y() - 10.0), QPointF(origin.x(), origin.y() + 10.0))
-                painter.setPen(QColor(226, 232, 240, 170))
+                painter.drawLine(QPointF(origin.x() - 8.0, origin.y()), QPointF(origin.x() + 8.0, origin.y()))
+                painter.drawLine(QPointF(origin.x(), origin.y() - 8.0), QPointF(origin.x(), origin.y() + 8.0))
+                painter.setPen(QColor(226, 232, 240, 120))
                 painter.drawText(QRect(int(origin.x()) + 10, int(origin.y()) + 8, 80, 18), Qt.AlignLeft, "origin")
             center = QPointF(float(self.width()) * 0.5, float(self.height()) * 0.5)
-            painter.setPen(QPen(QColor(255, 255, 255, 95), 1.0))
-            painter.drawLine(QPointF(center.x() - 18.0, center.y()), QPointF(center.x() + 18.0, center.y()))
-            painter.drawLine(QPointF(center.x(), center.y() - 18.0), QPointF(center.x(), center.y() + 18.0))
-            painter.setPen(QPen(QColor(255, 255, 255, 170), 1.3))
-            painter.drawEllipse(center, 3.0, 3.0)
+            painter.setPen(QPen(QColor(255, 255, 255, 55), 0.8))
+            painter.drawLine(QPointF(center.x() - 12.0, center.y()), QPointF(center.x() + 12.0, center.y()))
+            painter.drawLine(QPointF(center.x(), center.y() - 12.0), QPointF(center.x(), center.y() + 12.0))
+            painter.setPen(QPen(QColor(255, 255, 255, 105), 1.0))
+            painter.drawEllipse(center, 2.0, 2.0)
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         super().paintEvent(event)
@@ -2563,7 +2563,15 @@ class ModelPreviewWidget(QOpenGLWidget):
                     or min(vs) < -0.05
                     or max(vs) > 1.05
                 )
-            color = cls._PALETTE[mesh_index % len(cls._PALETTE)]
+            preview_color = tuple(getattr(mesh, "preview_color", ()) or ())
+            if len(preview_color) >= 3:
+                color = (
+                    max(0.0, min(1.0, float(preview_color[0]))),
+                    max(0.0, min(1.0, float(preview_color[1]))),
+                    max(0.0, min(1.0, float(preview_color[2]))),
+                )
+            else:
+                color = cls._PALETTE[mesh_index % len(cls._PALETTE)]
             batch_first_vertex = vertex_count
             for triangle_index in range(0, len(indices) - 2, 3):
                 a = indices[triangle_index]

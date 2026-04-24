@@ -786,6 +786,7 @@ class ArchivePreviewResult:
 class ModelPreviewMesh:
     material_name: str = ""
     texture_name: str = ""
+    preview_color: Tuple[float, float, float] = ()
     positions: List[Tuple[float, float, float]] = field(default_factory=list)
     texture_coordinates: List[Tuple[float, float]] = field(default_factory=list)
     normals: List[Tuple[float, float, float]] = field(default_factory=list)

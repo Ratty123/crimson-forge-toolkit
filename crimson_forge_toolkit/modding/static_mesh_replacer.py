@@ -34,6 +34,7 @@ class StaticSubmeshMapping:
 class StaticReplacementTransform:
     rotate_xyz_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
     scale: float = 1.0
+    scale_xyz: tuple[float, float, float] | None = None
     offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     fit_to_original_bbox: bool = False
     preserve_aspect_ratio: bool = True
@@ -990,9 +991,10 @@ def _apply_transform(
         vertex[2] - source_anchor[2],
     )
     x, y, z = _apply_alignment_roll(_rotate_between(centered, source_axis, target_axis), alignment)
-    x *= transform.scale * align_scale * fit_scale_xyz[0]
-    y *= transform.scale * align_scale * fit_scale_xyz[1]
-    z *= transform.scale * align_scale * fit_scale_xyz[2]
+    manual_scale = transform.scale_xyz or (transform.scale, transform.scale, transform.scale)
+    x *= manual_scale[0] * align_scale * fit_scale_xyz[0]
+    y *= manual_scale[1] * align_scale * fit_scale_xyz[1]
+    z *= manual_scale[2] * align_scale * fit_scale_xyz[2]
     x, y, z = _rotate_xyz((x, y, z), transform.rotate_xyz_degrees)
     return (
         x + target_anchor[0] + fit_offset[0] + transform.offset_xyz[0] + transform.manual_adjustment[0],
