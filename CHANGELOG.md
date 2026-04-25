@@ -9,6 +9,22 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## Unreleased
+
+### Added
+- Added an Archive Browser material-sidecar editor for recognized `.pac_xml`, `.pam_xml`, `.pamlod_xml`, and `.pami` color/float/texture-path values, with reviewed related-file inclusion and mod-ready package export.
+- Added an approximate model preview panel to the material-sidecar editor for associated `.pac`, `.pam`, and `.pamlod` meshes, including live color/scalar refresh and cloak dye-color approximations.
+- Added `new_paths` metadata to generated mesh loose-mod manifests when included supplemental files are brand-new archive paths instead of replacements.
+- Added a central mod-package finalizer for mod-ready exports, with shared metadata output for `manifest.json`, `mod.json`, `modinfo.json`, `info.json`, optional `files/` wrapping, and optional ready `.zip` creation.
+- Added mod-manager export profile choices to the Archive Browser mesh loose-export dialog for universal, JSON Mod Manager, CDUMM, Definitive Mod Manager, and Crimson Sharp / Crimson Browser targets.
+- Added the same mod-package structure, metadata, and zip export choices to Texture Workflow and Replace Assistant mod-ready package output.
+- Added shared generated-file descriptions and wrapped `?` help buttons for mod-package export options.
+
+### Changed
+- Changed archive package root detection to also recognize PAZ/PAMT layouts nested under a `game_files/` subfolder.
+- Clarified mod-package output cleanup versus manager conflict metadata, and moved `.no_encrypt` into the generated-artifacts controls.
+- Updated generated mod-package README files to list the actual metadata artifacts written for the selected export options.
+
 ## [0.7.0-beta.4] - 2026-04-21
 
 ### Added

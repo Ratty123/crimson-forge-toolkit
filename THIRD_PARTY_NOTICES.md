@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Crimson Forge Toolkit uses or interoperates with several third-party projects and tools.
+Crimson Desert Mod Workbench uses or interoperates with several third-party projects and tools.
 
 This file is a practical notice list for repository and release packaging. For authoritative license text, copyright ownership, and redistribution terms, always refer to the upstream project itself.
 
@@ -37,7 +37,7 @@ This file is a practical notice list for repository and release packaging. For a
 - Purpose: DDS preview conversion, DDS staging, and final DDS rebuild
 - Upstream: https://github.com/microsoft/DirectXTex
 - Release assets: https://github.com/microsoft/DirectXTex/releases
-- Notes: Crimson Forge Toolkit links to the official `texconv.exe` release page, but the tool remains a separate upstream project
+- Notes: Crimson Desert Mod Workbench links to the official `texconv.exe` release page, but the tool remains a separate upstream project
 
 ### chaiNNer
 
@@ -45,7 +45,7 @@ This file is a practical notice list for repository and release packaging. For a
 - Upstream: https://chainner.app/
 - Download page: https://chainner.app/download/
 - CLI documentation: https://github.com/chaiNNer-org/chaiNNer/wiki/05--CLI
-- Notes: Crimson Forge Toolkit can open the official chaiNNer download page, launch chaiNNer, inspect `.chn` chains, and pass override JSON, but chaiNNer remains a separate upstream application with its own dependencies and licenses
+- Notes: Crimson Desert Mod Workbench can open the official chaiNNer download page, launch chaiNNer, inspect `.chn` chains, and pass override JSON, but chaiNNer remains a separate upstream application with its own dependencies and licenses
 
 ### vgmstream
 
@@ -71,10 +71,10 @@ This file is a practical notice list for repository and release packaging. For a
 - Purpose: selectively adapted mesh parsing/export/import and archive-modding reference code
 - Upstream: https://github.com/hzeemr/crimsonforge
 - License: MIT
-- Notes: selected components are vendored under `crimson_forge_toolkit/modding/` with the upstream MIT license text included in `CrimsonForge_MIT_LICENSE.txt`
+- Notes: selected components are vendored under `cdmw/modding/` with the upstream MIT license text included in `CrimsonForge_MIT_LICENSE.txt`
 
 ## Redistribution Notes
  
-- Crimson Forge Toolkit now includes explicit, confirm-before-write archive patch workflows for selected mesh and audio replacement paths.
+- Crimson Desert Mod Workbench now includes explicit, confirm-before-write archive patch workflows for selected mesh and audio replacement paths.
 - External tools such as `texconv.exe` and `chaiNNer.exe` remain separate projects and should be distributed in accordance with their upstream terms.
 - If you publish releases of this app, review the upstream licenses of any bundled or redistributed third-party components before shipping them.

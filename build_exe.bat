@@ -22,7 +22,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Building Crimson Forge Toolkit in %MODE% mode...
+echo Building Crimson Desert Mod Workbench in %MODE% mode...
 echo.
 
 powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_pyside6_app.ps1" -Mode %MODE%

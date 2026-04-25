@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve Crimson Forge Toolkit.
+Thanks for helping improve Crimson Desert Mod Workbench.
 
 ## Before You Open An Issue
 
@@ -49,7 +49,7 @@ Please try to:
 
 ## Project Scope
 
-Crimson Forge Toolkit is intentionally centered on:
+Crimson Desert Mod Workbench is intentionally centered on:
 
 - archive browsing, preview, extraction, and supported patch workflows
 - explicit confirm-before-write archive mutation for supported paths only

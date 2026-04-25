@@ -1,1 +1,0 @@
-"""Crimson Forge Toolkit package."""

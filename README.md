@@ -1,4 +1,4 @@
-# Crimson Forge Toolkit
+# Crimson Desert Mod Workbench
 
 Windows desktop tool for **Crimson Desert texture workflows**, **archive browsing and patching**, **3D mesh preview/modding**, **media preview**, **texture research**, and **text search**.
 
@@ -15,7 +15,7 @@ Project guidelines:
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [SECURITY.md](SECURITY.md)
 
-Crimson Forge Toolkit is built for modders who want one place to:
+Crimson Desert Mod Workbench is built for modders who want one place to:
 
 - browse, preview, extract, and selectively patch files from `.pamt` / `.paz` archives
 - scan loose DDS files and rebuild controlled DDS output with `texconv`
@@ -72,7 +72,7 @@ The app still keeps archive mutation explicit and separate from normal browsing.
 
 If you want the safest starting point, use this path first:
 
-1. Run `CrimsonForgeToolkit-<version>-windows-portable.exe`.
+1. Run `CrimsonDesertModWorkbench-<version>-windows-portable.exe`.
 2. In `Texture Workflow > Setup`, click `Init Workspace`.
 3. Configure `texconv.exe` or open its official download page from `Setup`.
 4. Set `Original DDS root`, `PNG root`, and `Output root`.
@@ -136,7 +136,7 @@ Use this when you already have:
 Important:
 
 - `chaiNNer` remains the source of truth for its own chain behavior
-- direct NCNN controls in Crimson Forge Toolkit do **not** override the chain
+- direct NCNN controls in Crimson Desert Mod Workbench do **not** override the chain
 
 ## Texture Policy And Safety
 
@@ -271,6 +271,7 @@ Use the archive browser to:
 - preview supported assets
 - extract selected files or filtered sets to normal folders
 - inspect referenced textures for supported mesh previews and open/export/replace resolved DDS entries
+- edit recognized material-sidecar values from `.pac_xml`, `.pam_xml`, `.pamlod_xml`, and `.pami` files, preview approximate changes on associated `.pac` / `.pam` / `.pamlod` models, then export the edited sidecar plus reviewed related files as a mod-ready package
 - export supported meshes as `OBJ` / `FBX`
 - import `OBJ` for preview or patch supported archive meshes, with backup/restore support for archive writes
 - export `WAV` from supported audio entries and patch supported `.wem` entries from `WAV`
@@ -365,7 +366,7 @@ The app stores its portable local state beside the EXE.
 
 Main local files and folders include:
 
-- `CrimsonForgeToolkit.cfg`
+- `CrimsonDesertModWorkbench.cfg`
 - `archive_cache`
 - research notes / related local support files
 
@@ -376,7 +377,7 @@ The app also supports:
 
 ## Privacy And Network Behavior
 
-Crimson Forge Toolkit does **not** include built-in telemetry, analytics, auto-update checks, background network calls for normal offline use, or in-app file downloads for external tools/models.
+Crimson Desert Mod Workbench does **not** include built-in telemetry, analytics, auto-update checks, background network calls for normal offline use, or in-app file downloads for external tools/models.
 
 It only opens external pages in your browser when you explicitly trigger actions such as:
 
@@ -389,35 +390,35 @@ It only opens external pages in your browser when you explicitly trigger actions
 
 ### Texture Workflow
 
-![Texture Workflow](<docs/screenshots/cft-texture-workflow.png>)
+![Texture Workflow](<docs/screenshots/cdmw-texture-workflow.png>)
 
 ### Archive Browser
 
-![Archive Browser](<docs/screenshots/cft-archive-browser.png>)
+![Archive Browser](<docs/screenshots/cdmw-archive-browser.png>)
 
 ### Texture Editor
 
-![Texture Editor](<docs/screenshots/cft-texture-editor.png>)
+![Texture Editor](<docs/screenshots/cdmw-texture-editor.png>)
 
 ### Replace Assistant
 
-![Replace Assistant](<docs/screenshots/cft-replace-assistant.png>)
+![Replace Assistant](<docs/screenshots/cdmw-replace-assistant.png>)
 
 ### Research: References
 
-![Research References](<docs/screenshots/cft-research-references.png>)
+![Research References](<docs/screenshots/cdmw-research-references.png>)
 
 ### Research: Classification Review
 
-![Research Classification Review](<docs/screenshots/cft-research-classification-review.png>)
+![Research Classification Review](<docs/screenshots/cdmw-research-classification-review.png>)
 
 ### Text Search
 
-![Text Search](<docs/screenshots/cft-text-search.png>)
+![Text Search](<docs/screenshots/cdmw-text-search.png>)
 
 ### Settings
 
-![Settings](<docs/screenshots/cft-settings.png>)
+![Settings](<docs/screenshots/cdmw-settings.png>)
 
 ## Dependencies
 
