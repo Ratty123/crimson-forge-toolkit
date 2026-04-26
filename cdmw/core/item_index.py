@@ -28,6 +28,7 @@ class ArchiveItemSearchIndex:
     items: List[ArchiveItemRecord]
     pac_to_items: Dict[str, List[ArchiveItemRecord]]
     model_base_aliases: Dict[str, str]
+    model_base_display_names: Dict[str, str]
 
 
 @dataclass(slots=True)
@@ -367,6 +368,7 @@ def build_archive_item_search_index(
 
     pac_to_items: Dict[str, List[ArchiveItemRecord]] = {}
     model_base_aliases: Dict[str, str] = {}
+    model_base_display_names: Dict[str, str] = {}
     items_with_models: List[ArchiveItemRecord] = []
 
     for item in items:
@@ -398,6 +400,13 @@ def build_archive_item_search_index(
                 continue
             existing = model_base_aliases.get(base, "")
             model_base_aliases[base] = f"{existing} {terms}".strip() if existing else terms
+            display_name = item.display_name.strip() or item.internal_name.strip()
+            if display_name:
+                existing_display = model_base_display_names.get(base, "")
+                if not existing_display:
+                    model_base_display_names[base] = display_name
+                elif display_name not in existing_display.split(" / "):
+                    model_base_display_names[base] = f"{existing_display} / {display_name}"
         if item.display_name and item.pac_files:
             items_with_models.append(item)
 
@@ -408,4 +417,5 @@ def build_archive_item_search_index(
         items=items_with_models,
         pac_to_items=pac_to_items,
         model_base_aliases=model_base_aliases,
+        model_base_display_names=model_base_display_names,
     )

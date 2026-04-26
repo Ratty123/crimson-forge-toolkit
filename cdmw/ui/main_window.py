@@ -524,8 +524,23 @@ def run_gui() -> int:
         allowed = {key for key, _label in UI_LOG_TEXT_STYLE_OPTIONS}
         return value if value in allowed else DEFAULT_UI_LOG_TEXT_STYLE
 
+    def read_text_color_scheme(settings: QSettings, key: str, default: str) -> str:
+        value = str(settings.value(key, default) or default).strip().lower()
+        allowed = {scheme_key for scheme_key, _label in UI_TEXT_COLOR_SCHEME_OPTIONS}
+        return value if value in allowed else default
+
     def apply_window_text_highlight_style(window: "MainWindow") -> None:
         style = read_log_text_style(window.settings)
+        log_scheme = read_text_color_scheme(
+            window.settings,
+            "appearance/log_color_scheme",
+            DEFAULT_UI_LOG_COLOR_SCHEME,
+        )
+        preview_scheme = read_text_color_scheme(
+            window.settings,
+            "appearance/preview_color_scheme",
+            DEFAULT_UI_PREVIEW_COLOR_SCHEME,
+        )
         for highlighter in (
             window.log_highlighter,
             window.archive_log_highlighter,
@@ -533,6 +548,8 @@ def run_gui() -> int:
         ):
             if hasattr(highlighter, "set_highlight_style"):
                 highlighter.set_highlight_style(style)
+            if hasattr(highlighter, "set_color_scheme"):
+                highlighter.set_color_scheme(log_scheme)
         for editor in (
             window.archive_preview_text_edit,
             window.archive_preview_details_edit,
@@ -540,6 +557,8 @@ def run_gui() -> int:
         ):
             if hasattr(editor, "set_highlight_style"):
                 editor.set_highlight_style(style)
+            if hasattr(editor, "set_color_scheme"):
+                editor.set_color_scheme(preview_scheme)
 
     def apply_window_data_fonts(window: "MainWindow") -> None:
         log_font = build_monospace_font(window.settings)
@@ -654,6 +673,7 @@ def run_gui() -> int:
                 )
                 item_index_started_at = time.perf_counter()
                 item_search_aliases: Dict[str, str] = {}
+                item_display_names: Dict[str, str] = {}
                 try:
                     item_index = build_archive_item_search_index(
                         entries,
@@ -661,6 +681,7 @@ def run_gui() -> int:
                         stop_event=self.stop_event,
                     )
                     item_search_aliases = dict(item_index.model_base_aliases)
+                    item_display_names = dict(getattr(item_index, "model_base_display_names", {}) or {})
                 except RunCancelled:
                     raise
                 except Exception as exc:
@@ -723,6 +744,7 @@ def run_gui() -> int:
                         "basename_index": basename_index,
                         "extension_index": extension_index,
                         "item_search_aliases": item_search_aliases,
+                        "item_display_names": item_display_names,
                         "timings": timings,
                         "timing_summary": timing_summary,
                     }
@@ -1355,6 +1377,21 @@ def run_gui() -> int:
                 return None
             return image
 
+    class DetachedToolWindow(QMainWindow):
+        def __init__(self, owner: "MainWindow", tool_key: str, title: str) -> None:
+            super().__init__(owner, Qt.Window)
+            self.owner = owner
+            self.tool_key = tool_key
+            self.setWindowTitle(title)
+            self.setAttribute(Qt.WA_DeleteOnClose, False)
+
+        def closeEvent(self, event) -> None:  # type: ignore[override]
+            if getattr(self.owner, "_shutting_down", False):
+                event.accept()
+                return
+            event.ignore()
+            self.owner._attach_detached_tool(self.tool_key, select_after=False)
+
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
             super().__init__()
@@ -1372,7 +1409,10 @@ def run_gui() -> int:
             )
             self._settings_ready = False
             self.current_theme_key = str(self.settings.value("appearance/theme", DEFAULT_UI_THEME))
-            self.show_quick_start_on_launch = not self.settings.contains("ui/startup_setup_shown")
+            self.show_quick_start_on_launch = (
+                not self.settings.contains("ui/startup_setup_shown")
+                or not str(self.settings.value("archive/package_root", "") or "").strip()
+            )
             self._model_preview_render_settings = clamp_model_preview_render_settings()
             self.model_preview_settings_dialog: Optional[ModelPreviewSettingsDialog] = None
             self._archive_performance_settings = clamp_archive_performance_settings()
@@ -1444,6 +1484,7 @@ def run_gui() -> int:
             self.archive_entries_by_basename: Dict[str, List[ArchiveEntry]] = {}
             self.archive_entries_by_extension: Dict[str, List[ArchiveEntry]] = {}
             self.archive_item_search_aliases: Dict[str, str] = {}
+            self.archive_item_display_names: Dict[str, str] = {}
             self.archive_sidecar_entries_by_texture_path: Dict[str, List[ArchiveEntry]] = {}
             self.archive_sidecar_entries_by_texture_basename: Dict[str, List[ArchiveEntry]] = {}
             self.archive_sidecar_generation = 0
@@ -1520,6 +1561,13 @@ def run_gui() -> int:
             self.archive_tree_clear_timer.setInterval(0)
             self.archive_tree_clear_timer.timeout.connect(self._continue_archive_tree_clear)
             self._last_build_unknown_review_result: Optional[Dict[str, object]] = None
+            self._detachable_tool_order: List[str] = []
+            self._tool_widgets_by_key: Dict[str, QWidget] = {}
+            self._tool_titles_by_key: Dict[str, str] = {}
+            self._tool_placeholders_by_key: Dict[str, QWidget] = {}
+            self._tool_keys_by_placeholder: Dict[QWidget, str] = {}
+            self._detached_tool_windows: Dict[str, DetachedToolWindow] = {}
+            self._tool_window_actions: Dict[str, object] = {}
 
             icon_path = resolve_app_icon_path()
             if icon_path is not None:
@@ -1531,6 +1579,11 @@ def run_gui() -> int:
             self.import_profile_action = self.profile_menu.addAction("Import Profile...")
             self.quick_start_menu_action = menu_bar.addAction("Quick Start")
             self.open_documentation_action = menu_bar.addAction("Documentation")
+            self.window_menu = menu_bar.addMenu("Window")
+            self.detach_current_tab_action = self.window_menu.addAction("Detach Current Tab")
+            self.attach_current_tool_action = self.window_menu.addAction("Attach Current Tool")
+            self.attach_all_tools_action = self.window_menu.addAction("Attach All Tools")
+            self.window_menu.addSeparator()
             self.help_menu = menu_bar.addMenu("Help")
             self.support_menu_action = self.help_menu.addAction("Support Me...")
             self.export_diagnostics_action = self.help_menu.addAction("Export Diagnostics...")
@@ -1634,7 +1687,6 @@ def run_gui() -> int:
             setup_overview_layout.setVerticalSpacing(8)
 
             setup_workspace_group = QGroupBox("Workspace")
-            setup_workspace_group.setMaximumWidth(520)
             setup_workspace_layout = QGridLayout(setup_workspace_group)
             setup_workspace_layout.setContentsMargins(10, 10, 10, 10)
             setup_workspace_layout.setHorizontalSpacing(8)
@@ -1643,11 +1695,11 @@ def run_gui() -> int:
             self.create_folders_button = QPushButton("Create Folders")
             self.open_texture_editor_button = QPushButton("Open File In Texture Editor")
             setup_workspace_layout.addWidget(self.init_workspace_button, 0, 0)
-            setup_workspace_layout.addWidget(self.create_folders_button, 0, 1)
-            setup_workspace_layout.addWidget(self.open_texture_editor_button, 1, 0, 1, 2)
+            setup_workspace_layout.addWidget(self.create_folders_button, 1, 0)
+            setup_workspace_layout.addWidget(self.open_texture_editor_button, 2, 0)
+            setup_workspace_layout.setColumnStretch(0, 1)
 
             setup_tools_group = QGroupBox("External Tools")
-            setup_tools_group.setMaximumWidth(620)
             setup_tools_layout = QGridLayout(setup_tools_group)
             setup_tools_layout.setContentsMargins(10, 10, 10, 10)
             setup_tools_layout.setHorizontalSpacing(8)
@@ -1662,10 +1714,11 @@ def run_gui() -> int:
             self.import_ncnn_models_button.setToolTip(
                 "Import NCNN models from a folder, zip, or files that contain matching .param + .bin pairs."
             )
-            setup_tools_layout.addWidget(self.download_chainner_button, 0, 0)
-            setup_tools_layout.addWidget(self.download_texconv_button, 0, 1)
-            setup_tools_layout.addWidget(self.download_ncnn_button, 1, 0, 1, 2)
-            setup_tools_layout.addWidget(self.import_ncnn_models_button, 2, 0, 1, 2)
+            setup_tools_layout.addWidget(self.download_texconv_button, 0, 0)
+            setup_tools_layout.addWidget(self.download_chainner_button, 1, 0)
+            setup_tools_layout.addWidget(self.download_ncnn_button, 2, 0)
+            setup_tools_layout.addWidget(self.import_ncnn_models_button, 3, 0)
+            setup_tools_layout.setColumnStretch(0, 1)
             for button in (
                 self.init_workspace_button,
                 self.create_folders_button,
@@ -1683,9 +1736,10 @@ def run_gui() -> int:
             setup_note_layout.setContentsMargins(10, 10, 10, 10)
             setup_note_layout.setSpacing(8)
             setup_hint = QLabel(
-                "Direct backends can be prepared here. The setup buttons open official external download or install pages "
-                "in your browser instead of downloading files inside the app. NCNN models can still be imported "
-                "from files you already downloaded locally."
+                "Recommended first run: put the portable EXE in its own folder, set the game/package path under "
+                "Archive Locations, click Init Workspace, then download texconv and place texconv.exe under the "
+                "workspace tools folder. Direct backends can be prepared here; download buttons open official pages "
+                "in your browser instead of downloading files inside the app."
             )
             setup_hint.setObjectName("HintLabel")
             setup_hint.setWordWrap(True)
@@ -1693,11 +1747,9 @@ def run_gui() -> int:
             setup_note_layout.addStretch(1)
 
             setup_overview_layout.addWidget(setup_workspace_group, 0, 0)
-            setup_overview_layout.addWidget(setup_tools_group, 0, 1)
-            setup_overview_layout.addWidget(setup_note_group, 0, 2)
-            setup_overview_layout.setColumnStretch(0, 0)
-            setup_overview_layout.setColumnStretch(1, 0)
-            setup_overview_layout.setColumnStretch(2, 1)
+            setup_overview_layout.addWidget(setup_tools_group, 1, 0)
+            setup_overview_layout.addWidget(setup_note_group, 2, 0)
+            setup_overview_layout.setColumnStretch(0, 1)
             setup_layout.addLayout(setup_overview_layout)
 
             self.setup_section.body_layout.addWidget(setup_group)
@@ -2849,8 +2901,8 @@ def run_gui() -> int:
             archive_tab_layout.addWidget(self.archive_splitter, stretch=1)
 
             archive_controls_group = FlatSectionPanel("Archive Controls")
-            archive_controls_group.setMinimumWidth(300)
-            archive_controls_group.setMaximumWidth(420)
+            archive_controls_group.setMinimumWidth(260)
+            archive_controls_group.setMaximumWidth(390)
             archive_controls_layout = archive_controls_group.body_layout
             archive_controls_layout.setContentsMargins(10, 10, 10, 10)
             archive_controls_layout.setSpacing(8)
@@ -2862,14 +2914,17 @@ def run_gui() -> int:
             archive_hint.setWordWrap(True)
             archive_controls_layout.addWidget(archive_hint)
 
-            archive_locations_group = QGroupBox("Locations")
+            self.archive_locations_section = CollapsibleSection("Archive Locations", expanded=False)
+            archive_locations_group = QGroupBox("Game And Extraction Paths")
             archive_paths_layout = QGridLayout(archive_locations_group)
             archive_paths_layout.setContentsMargins(8, 8, 8, 8)
             archive_paths_layout.setHorizontalSpacing(8)
             archive_paths_layout.setVerticalSpacing(6)
             self.archive_package_root_edit = QLineEdit()
             self.archive_extract_root_edit = QLineEdit()
-            package_root_label = QLabel("Package")
+            self.archive_package_root_edit.setPlaceholderText("Crimson Desert folder or package root containing game files")
+            self.archive_extract_root_edit.setPlaceholderText("Folder where extracted archive files should be written")
+            package_root_label = QLabel("Game / Package")
             package_root_label.setObjectName("HintLabel")
             self.archive_package_root_browse_button = QPushButton("Browse")
             self.archive_package_root_browse_button.setMinimumWidth(80)
@@ -2879,18 +2934,31 @@ def run_gui() -> int:
             archive_paths_layout.addWidget(package_root_label, 0, 0)
             archive_paths_layout.addWidget(self.archive_package_root_edit, 0, 1)
             archive_paths_layout.addWidget(self.archive_package_root_browse_button, 0, 2)
-            archive_paths_layout.addWidget(self.archive_package_root_detect_button, 0, 3)
+            archive_paths_layout.addWidget(self.archive_package_root_detect_button, 1, 2)
 
             extract_root_label = QLabel("Extract")
             extract_root_label.setObjectName("HintLabel")
             self.archive_extract_root_browse_button = QPushButton("Browse")
             self.archive_extract_root_browse_button.setMinimumWidth(80)
             self.archive_extract_root_browse_button.clicked.connect(self._browse_archive_extract_root)
-            archive_paths_layout.addWidget(extract_root_label, 1, 0)
-            archive_paths_layout.addWidget(self.archive_extract_root_edit, 1, 1)
-            archive_paths_layout.addWidget(self.archive_extract_root_browse_button, 1, 2, 1, 2)
+            archive_paths_layout.addWidget(extract_root_label, 2, 0)
+            archive_paths_layout.addWidget(self.archive_extract_root_edit, 2, 1)
+            archive_paths_layout.addWidget(self.archive_extract_root_browse_button, 2, 2)
             archive_paths_layout.setColumnStretch(1, 1)
-            archive_controls_layout.addWidget(archive_locations_group)
+            archive_locations_hint = QLabel(
+                "Set the game/package path before scanning. Sidecar cache building can take a long time on first use; "
+                "let it finish when you enable it, and configure it under Archive Browser Performance."
+            )
+            archive_locations_hint.setObjectName("HintLabel")
+            archive_locations_hint.setWordWrap(True)
+            self.archive_locations_section.body_layout.addWidget(archive_locations_hint)
+            self.archive_locations_section.body_layout.addWidget(archive_locations_group)
+            archive_locations_pointer = QLabel(
+                "Set game/package and extraction paths in Settings > Archive Locations."
+            )
+            archive_locations_pointer.setObjectName("HintLabel")
+            archive_locations_pointer.setWordWrap(True)
+            archive_controls_layout.addWidget(archive_locations_pointer)
 
             archive_search_group = QGroupBox("Search")
             archive_search_layout = QVBoxLayout(archive_search_group)
@@ -3160,14 +3228,14 @@ def run_gui() -> int:
             self.archive_splitter.addWidget(self.archive_controls_scroll)
 
             archive_files_group = FlatSectionPanel("Archive Files")
-            archive_files_group.setMinimumWidth(320)
+            archive_files_group.setMinimumWidth(280)
             archive_files_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self.archive_files_group = archive_files_group
             archive_files_layout = archive_files_group.body_layout
             archive_files_layout.setSpacing(0)
 
             self.archive_tree = QTreeWidget()
-            self.archive_tree.setHeaderLabels(["Name", "Type", "Size", "Comp", "Package"])
+            self.archive_tree.setHeaderLabels(["Name", "In-game Name", "Type", "Size", "Comp", "Package", "Path"])
             self.archive_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
             self.archive_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
             self.archive_tree.setAlternatingRowColors(False)
@@ -3176,6 +3244,9 @@ def run_gui() -> int:
             self.archive_tree.setContextMenuPolicy(Qt.CustomContextMenu)
             archive_header = self.archive_tree.header()
             archive_header.setStretchLastSection(False)
+            archive_header.setSectionResizeMode(0, QHeaderView.Interactive)
+            archive_header.setSectionResizeMode(1, QHeaderView.Interactive)
+            archive_header.setSectionResizeMode(6, QHeaderView.Stretch)
             archive_header.setSectionsMovable(True)
             archive_header.setToolTip("Drag columns to reorder. Right-click the header to show, hide, or reset columns.")
             archive_header.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -3183,7 +3254,10 @@ def run_gui() -> int:
             archive_header.sectionMoved.connect(lambda *_args: self.schedule_settings_save())
             archive_header.sectionResized.connect(lambda *_args: self.schedule_settings_save())
             for section in range(self.archive_tree.columnCount()):
-                archive_header.setSectionResizeMode(section, QHeaderView.Interactive)
+                if section == 6:
+                    archive_header.setSectionResizeMode(section, QHeaderView.Stretch)
+                else:
+                    archive_header.setSectionResizeMode(section, QHeaderView.Interactive)
             archive_header.resizeSection(0, 480)
             archive_header.resizeSection(1, 78)
             archive_header.resizeSection(2, 145)
@@ -3198,7 +3272,7 @@ def run_gui() -> int:
             archive_preview_container_layout = archive_preview_group.body_layout
             archive_preview_container_layout.setSpacing(6)
             archive_preview_main_widget = QWidget()
-            archive_preview_main_widget.setMinimumWidth(420)
+            archive_preview_main_widget.setMinimumWidth(300)
             archive_preview_main_layout = QVBoxLayout(archive_preview_main_widget)
             archive_preview_main_layout.setContentsMargins(0, 0, 0, 0)
             archive_preview_main_layout.setSpacing(6)
@@ -3326,11 +3400,11 @@ def run_gui() -> int:
             archive_view_layout.addWidget(self.archive_preview_zoom_100_button, 0, 2)
             archive_view_layout.addWidget(self.archive_preview_zoom_in_button, 0, 3)
             archive_view_layout.addWidget(self.archive_preview_zoom_value, 0, 4)
-            archive_view_layout.addWidget(self.archive_model_preview_darkmode_button, 0, 5)
-            archive_view_layout.addWidget(self.archive_model_preview_flip_v_checkbox, 1, 0, 1, 2)
-            archive_view_layout.addWidget(self.archive_model_preview_disable_support_checkbox, 1, 2, 1, 3)
-            archive_view_layout.addWidget(self.archive_model_preview_reset_overrides_button, 1, 5)
-            archive_view_layout.setColumnStretch(6, 1)
+            archive_view_layout.addWidget(self.archive_model_preview_darkmode_button, 1, 0, 1, 2)
+            archive_view_layout.addWidget(self.archive_model_preview_reset_overrides_button, 1, 2, 1, 3)
+            archive_view_layout.addWidget(self.archive_model_preview_flip_v_checkbox, 2, 0, 1, 2)
+            archive_view_layout.addWidget(self.archive_model_preview_disable_support_checkbox, 2, 2, 1, 3)
+            archive_view_layout.setColumnStretch(4, 1)
             for button in (
                 self.archive_model_export_obj_button,
                 self.archive_model_export_fbx_button,
@@ -3373,9 +3447,8 @@ def run_gui() -> int:
             for column_index in range(2):
                 archive_model_actions_layout.setColumnStretch(column_index, 1)
             archive_preview_toolbar_row.addWidget(archive_view_group, 0, 0)
-            archive_preview_toolbar_row.addWidget(archive_model_actions_group, 0, 1)
-            archive_preview_toolbar_row.setColumnStretch(0, 0)
-            archive_preview_toolbar_row.setColumnStretch(1, 1)
+            archive_preview_toolbar_row.addWidget(archive_model_actions_group, 1, 0)
+            archive_preview_toolbar_row.setColumnStretch(0, 1)
             archive_preview_header.addLayout(archive_preview_title_row)
             archive_preview_header.addLayout(archive_preview_toolbar_row)
             archive_preview_main_layout.addLayout(archive_preview_header)
@@ -3391,7 +3464,7 @@ def run_gui() -> int:
             archive_preview_main_layout.addWidget(self.archive_preview_warning_label)
             self.archive_texture_refs_group = QGroupBox("Referenced Files")
             self.archive_texture_refs_group.setVisible(False)
-            self.archive_texture_refs_group.setMinimumWidth(360)
+            self.archive_texture_refs_group.setMinimumWidth(260)
             self.archive_texture_refs_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             archive_texture_refs_layout = QVBoxLayout(self.archive_texture_refs_group)
             archive_texture_refs_layout.setContentsMargins(10, 10, 10, 10)
@@ -3422,8 +3495,9 @@ def run_gui() -> int:
             archive_texture_refs_layout.addWidget(self.archive_texture_refs_tree)
             archive_texture_actions_layout = QVBoxLayout()
             archive_texture_actions_layout.setSpacing(6)
-            archive_texture_actions_row = QHBoxLayout()
-            archive_texture_actions_row.setSpacing(8)
+            archive_texture_actions_grid = QGridLayout()
+            archive_texture_actions_grid.setHorizontalSpacing(8)
+            archive_texture_actions_grid.setVerticalSpacing(6)
             self.archive_texture_open_button = QPushButton("Open")
             self.archive_texture_export_button = QPushButton("Export Selected...")
             self.archive_texture_export_all_button = QPushButton("Export All...")
@@ -3432,12 +3506,21 @@ def run_gui() -> int:
             self.archive_texture_export_button.setEnabled(False)
             self.archive_texture_export_all_button.setEnabled(False)
             self.archive_texture_edit_material_button.setEnabled(False)
-            archive_texture_actions_row.addWidget(self.archive_texture_open_button)
-            archive_texture_actions_row.addWidget(self.archive_texture_export_button)
-            archive_texture_actions_row.addWidget(self.archive_texture_export_all_button)
-            archive_texture_actions_row.addWidget(self.archive_texture_edit_material_button)
-            archive_texture_actions_row.addStretch(1)
-            archive_texture_actions_layout.addLayout(archive_texture_actions_row)
+            for button in (
+                self.archive_texture_open_button,
+                self.archive_texture_export_button,
+                self.archive_texture_export_all_button,
+                self.archive_texture_edit_material_button,
+            ):
+                button.setMinimumWidth(0)
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            archive_texture_actions_grid.addWidget(self.archive_texture_open_button, 0, 0)
+            archive_texture_actions_grid.addWidget(self.archive_texture_export_button, 0, 1)
+            archive_texture_actions_grid.addWidget(self.archive_texture_export_all_button, 1, 0)
+            archive_texture_actions_grid.addWidget(self.archive_texture_edit_material_button, 1, 1)
+            archive_texture_actions_grid.setColumnStretch(0, 1)
+            archive_texture_actions_grid.setColumnStretch(1, 1)
+            archive_texture_actions_layout.addLayout(archive_texture_actions_grid)
             archive_texture_refs_layout.addLayout(archive_texture_actions_layout)
 
             self.archive_preview_stack = QStackedWidget()
@@ -3534,7 +3617,7 @@ def run_gui() -> int:
                 lambda message, is_error: self.set_status_message(message, error=is_error)
             )
             self.research_tab.focus_archive_browser_requested.connect(
-                lambda: self.main_tabs.setCurrentWidget(self.archive_browser_tab)
+                lambda: self._activate_tool_widget(self.archive_browser_tab)
             )
             self.research_tab.extract_related_set_requested.connect(self.extract_related_archive_set_from_paths)
             self.research_tab.review_reference_in_text_search_requested.connect(
@@ -3551,6 +3634,7 @@ def run_gui() -> int:
                 current_code=self.ui_localizer.language_code,
             )
             self.settings_tab.add_setup_paths_sections(self.setup_section, self.paths_section)
+            self.settings_tab.add_archive_locations_section(self.archive_locations_section)
             self.settings_tab.theme_changed.connect(self._handle_theme_changed)
             self.settings_tab.language_changed.connect(self._handle_language_changed)
             self.settings_tab.export_language_requested.connect(self._export_language_file)
@@ -3596,10 +3680,20 @@ def run_gui() -> int:
                 self._handle_texture_editor_send_to_texture_workflow
             )
             self.main_tabs.insertTab(2, self.texture_editor_tab, "Texture Editor")
+            self._register_detachable_tool("texture_workflow", self.workflow_tab, "Texture Workflow")
+            self._register_detachable_tool("replace_assistant", self.replace_assistant_tab, "Replace Assistant")
+            self._register_detachable_tool("texture_editor", self.texture_editor_tab, "Texture Editor")
+            self._register_detachable_tool("archive_browser", self.archive_browser_tab, "Archive Browser")
+            self._register_detachable_tool("research", self.research_tab, "Research")
+            self._register_detachable_tool("text_search", self.text_search_tab, "Text Search")
+            self._build_window_tool_menu_actions()
             self.setCentralWidget(central)
 
             self.export_profile_action.triggered.connect(self.export_profile)
             self.import_profile_action.triggered.connect(self.import_profile)
+            self.detach_current_tab_action.triggered.connect(self._detach_current_tool_tab)
+            self.attach_current_tool_action.triggered.connect(self._attach_current_tool_tab)
+            self.attach_all_tools_action.triggered.connect(self._attach_all_detached_tools)
             self.export_diagnostics_action.triggered.connect(self.export_diagnostic_bundle)
             self.quick_start_menu_action.triggered.connect(self.show_quick_start_dialog)
             self.open_documentation_action.triggered.connect(self.show_about_dialog)
@@ -3765,14 +3859,254 @@ def run_gui() -> int:
             QTimer.singleShot(120, self._show_first_run_guide_if_needed)
             QTimer.singleShot(260, self._maybe_autoload_archive_on_startup)
 
+        def _register_detachable_tool(self, key: str, widget: QWidget, title: str) -> None:
+            if key in self._tool_widgets_by_key:
+                return
+            self._detachable_tool_order.append(key)
+            self._tool_widgets_by_key[key] = widget
+            self._tool_titles_by_key[key] = title
+
+        def _build_window_tool_menu_actions(self) -> None:
+            for key in self._detachable_tool_order:
+                title = self._tool_titles_by_key[key]
+                action = self.window_menu.addAction(f"Show {title}")
+                action.triggered.connect(lambda _checked=False, tool_key=key: self._activate_tool_key(tool_key))
+                self._tool_window_actions[key] = action
+            self._update_window_menu_state()
+
+        def _create_detached_tool_placeholder(self, key: str) -> QWidget:
+            existing = self._tool_placeholders_by_key.get(key)
+            if existing is not None:
+                return existing
+            title = self._tool_titles_by_key.get(key, "Tool")
+            placeholder = QWidget()
+            layout = QVBoxLayout(placeholder)
+            layout.setContentsMargins(24, 24, 24, 24)
+            layout.setSpacing(12)
+            layout.addStretch(1)
+            title_label = QLabel(f"{title} is open in a separate window.")
+            title_label.setObjectName("SectionTitle")
+            title_label.setAlignment(Qt.AlignCenter)
+            detail_label = QLabel("Use Show Window to bring it forward, or Attach Back to return it to this tab.")
+            detail_label.setObjectName("HintLabel")
+            detail_label.setWordWrap(True)
+            detail_label.setAlignment(Qt.AlignCenter)
+            button_row = QHBoxLayout()
+            button_row.setSpacing(8)
+            button_row.addStretch(1)
+            show_button = QPushButton("Show Window")
+            attach_button = QPushButton("Attach Back")
+            show_button.clicked.connect(lambda _checked=False, tool_key=key: self._activate_tool_key(tool_key))
+            attach_button.clicked.connect(lambda _checked=False, tool_key=key: self._attach_detached_tool(tool_key))
+            button_row.addWidget(show_button)
+            button_row.addWidget(attach_button)
+            button_row.addStretch(1)
+            layout.addWidget(title_label)
+            layout.addWidget(detail_label)
+            layout.addLayout(button_row)
+            layout.addStretch(1)
+            self._tool_placeholders_by_key[key] = placeholder
+            self._tool_keys_by_placeholder[placeholder] = key
+            return placeholder
+
+        def _tool_key_for_widget(self, widget: Optional[QWidget]) -> str:
+            if widget is None:
+                return ""
+            for key, tool_widget in self._tool_widgets_by_key.items():
+                if tool_widget is widget:
+                    return key
+            return self._tool_keys_by_placeholder.get(widget, "")
+
+        def _preferred_tool_tab_index(self, key: str) -> int:
+            try:
+                order_index = self._detachable_tool_order.index(key)
+            except ValueError:
+                return self.main_tabs.count()
+            preferred_index = 0
+            for previous_key in self._detachable_tool_order[:order_index]:
+                previous_widget = self._tool_widgets_by_key.get(previous_key)
+                previous_placeholder = self._tool_placeholders_by_key.get(previous_key)
+                previous_tab_index = -1
+                if previous_widget is not None:
+                    previous_tab_index = self.main_tabs.indexOf(previous_widget)
+                if previous_tab_index < 0 and previous_placeholder is not None:
+                    previous_tab_index = self.main_tabs.indexOf(previous_placeholder)
+                if previous_tab_index >= 0:
+                    preferred_index = previous_tab_index + 1
+            return min(preferred_index, self.main_tabs.count())
+
+        def _detach_current_tool_tab(self) -> None:
+            self._detach_tool_key(self._tool_key_for_widget(self.main_tabs.currentWidget()))
+
+        def _attach_current_tool_tab(self) -> None:
+            key = self._tool_key_for_widget(self.main_tabs.currentWidget())
+            if key:
+                self._attach_detached_tool(key)
+
+        def _detach_tool_key(self, key: str) -> None:
+            if not key or key in self._detached_tool_windows:
+                self._update_window_menu_state()
+                return
+            widget = self._tool_widgets_by_key.get(key)
+            title = self._tool_titles_by_key.get(key, "")
+            if widget is None or not title:
+                return
+            tab_index = self.main_tabs.indexOf(widget)
+            if tab_index < 0:
+                return
+            placeholder = self._create_detached_tool_placeholder(key)
+            self.main_tabs.removeTab(tab_index)
+            self.main_tabs.insertTab(tab_index, placeholder, title)
+            self.main_tabs.setCurrentWidget(placeholder)
+
+            window = DetachedToolWindow(self, key, title)
+            if not self.windowIcon().isNull():
+                window.setWindowIcon(self.windowIcon())
+            window.setCentralWidget(widget)
+            minimum_width, minimum_height = self._detached_tool_minimum_size(key)
+            window.setMinimumSize(minimum_width, minimum_height)
+            widget.setVisible(True)
+            widget.show()
+            widget.updateGeometry()
+            geometry = self.settings.value(f"window/detached/{key}/geometry")
+            if geometry:
+                window.restoreGeometry(geometry)
+            else:
+                window.resize(
+                    max(minimum_width, 900, int(self.width() * 0.72)),
+                    max(minimum_height, 620, int(self.height() * 0.72)),
+                )
+            self._detached_tool_windows[key] = window
+            window.show()
+            window.raise_()
+            window.activateWindow()
+            self._handle_tool_activated(widget)
+            self._update_window_menu_state()
+            self.schedule_settings_save()
+
+        def _detached_tool_minimum_size(self, key: str) -> Tuple[int, int]:
+            if key == "archive_browser":
+                return (1180, 680)
+            if key == "texture_workflow":
+                return (1120, 680)
+            if key == "texture_editor":
+                return (980, 640)
+            return (900, 620)
+
+        def _attach_detached_tool(self, key: str, *, select_after: bool = True) -> None:
+            window = self._detached_tool_windows.pop(key, None)
+            widget = self._tool_widgets_by_key.get(key)
+            if widget is None:
+                return
+            if window is not None:
+                self._save_detached_tool_geometry(key, window)
+                central_widget = window.takeCentralWidget()
+                if central_widget is not None:
+                    widget = central_widget
+                window.hide()
+                window.deleteLater()
+            placeholder = self._tool_placeholders_by_key.get(key)
+            tab_index = self.main_tabs.indexOf(placeholder) if placeholder is not None else -1
+            if tab_index >= 0:
+                self.main_tabs.removeTab(tab_index)
+            else:
+                tab_index = self._preferred_tool_tab_index(key)
+            self.main_tabs.insertTab(tab_index, widget, self._tool_titles_by_key.get(key, key))
+            widget.updateGeometry()
+            if select_after:
+                self.main_tabs.setCurrentWidget(widget)
+                widget.setVisible(True)
+                widget.show()
+                self._handle_tool_activated(widget)
+            self._update_window_menu_state()
+            self.schedule_settings_save()
+
+        def _attach_all_detached_tools(self, *_args, select_after: bool = False) -> None:
+            for key in list(self._detached_tool_windows.keys()):
+                self._attach_detached_tool(key, select_after=select_after)
+
+        def _save_detached_tool_geometry(self, key: str, window: DetachedToolWindow) -> None:
+            try:
+                self.settings.setValue(f"window/detached/{key}/geometry", window.saveGeometry())
+            except Exception:
+                pass
+
+        def _save_detached_tool_geometries(self) -> None:
+            for key, window in list(self._detached_tool_windows.items()):
+                self._save_detached_tool_geometry(key, window)
+
+        def _raise_detached_tool(self, key: str) -> bool:
+            window = self._detached_tool_windows.get(key)
+            if window is None:
+                return False
+            if window.isMinimized():
+                window.showNormal()
+            else:
+                window.show()
+            window.raise_()
+            window.activateWindow()
+            return True
+
+        def _activate_tool_key(self, key: str) -> None:
+            widget = self._tool_widgets_by_key.get(key)
+            if widget is not None:
+                self._activate_tool_widget(widget)
+
+        def _activate_tool_widget(self, widget: QWidget) -> None:
+            key = self._tool_key_for_widget(widget)
+            if key and self._raise_detached_tool(key):
+                self._handle_tool_activated(widget)
+                self._update_window_menu_state()
+                return
+            if self.main_tabs.indexOf(widget) >= 0:
+                self.main_tabs.setCurrentWidget(widget)
+            self._handle_tool_activated(widget)
+            self._update_window_menu_state()
+
+        def _is_tool_visible_or_current(self, widget: QWidget) -> bool:
+            key = self._tool_key_for_widget(widget)
+            window = self._detached_tool_windows.get(key)
+            if window is not None and window.isVisible():
+                return True
+            return self.main_tabs.currentWidget() is widget
+
+        def _handle_tool_activated(self, widget: QWidget) -> None:
+            if widget is self.workflow_tab:
+                self._apply_workflow_content_tab_layout()
+            elif widget is self.archive_browser_tab:
+                self._refresh_archive_browser_if_pending()
+            elif widget is self.research_tab:
+                self.research_tab.refresh_archive_picker_if_pending()
+
+        def _update_window_menu_state(self) -> None:
+            if not hasattr(self, "detach_current_tab_action"):
+                return
+            current_key = self._tool_key_for_widget(self.main_tabs.currentWidget())
+            current_widget = self._tool_widgets_by_key.get(current_key)
+            current_is_docked_tool = bool(current_key and current_widget is self.main_tabs.currentWidget())
+            self.detach_current_tab_action.setEnabled(current_is_docked_tool)
+            self.attach_current_tool_action.setEnabled(bool(current_key and current_key in self._detached_tool_windows))
+            self.attach_all_tools_action.setEnabled(bool(self._detached_tool_windows))
+
         def focus_quick_start_sections(self, *, include_chainner: bool) -> None:
-            self.main_tabs.setCurrentWidget(self.workflow_tab if include_chainner else self.settings_tab)
+            if include_chainner:
+                self._activate_tool_widget(self.workflow_tab)
+            else:
+                self.main_tabs.setCurrentWidget(self.settings_tab)
             self.setup_section.set_expanded(True)
             self.paths_section.set_expanded(True)
+            self.archive_locations_section.set_expanded(True)
             self.settings_section.set_expanded(False)
             self.dds_output_section.set_expanded(False)
             self.filters_section.set_expanded(False)
             self.chainner_section.set_expanded(include_chainner)
+
+        def focus_archive_locations(self) -> None:
+            self.main_tabs.setCurrentWidget(self.settings_tab)
+            self.archive_locations_section.set_expanded(True)
+            self.setup_section.set_expanded(False)
+            self.paths_section.set_expanded(False)
+            self.archive_package_root_edit.setFocus()
 
         def show_quick_start_dialog(self) -> None:
             dialog = QuickStartDialog(self)
@@ -3783,6 +4117,8 @@ def run_gui() -> int:
             return f"""
             <p><b>{APP_TITLE} v{APP_VERSION}</b> is a Windows desktop tool for Crimson Desert archive browsing and preview, supported archive patching, DDS rebuild workflows, visible-texture editing, replacement packaging, research, and text search.</p>
             <p>Use the search box and topic list on the left, or jump straight to:
+            <a href="topic:quick_start">Quick Start</a>,
+            <a href="topic:first_run_checklist">First Run Checklist</a>,
             <a href="topic:workflow_overview">Texture Workflow</a>,
             <a href="topic:workflow_profiles">Workflow Profiles</a>,
             <a href="topic:workflow_rules">Ordered Rules</a>,
@@ -3792,7 +4128,11 @@ def run_gui() -> int:
             <a href="topic:texture_editor">Texture Editor</a>,
             <a href="topic:replace_assistant">Replace Assistant</a>,
             <a href="topic:research">Research</a>,
-            <a href="topic:text_search">Text Search</a>.
+            <a href="topic:text_search">Text Search</a>,
+            <a href="topic:mod_packaging">Mod Packaging</a>,
+            <a href="topic:safety">Safety</a>,
+            <a href="topic:faq">FAQ</a>,
+            <a href="topic:troubleshooting">Troubleshooting</a>.
             </p>
             """
 
@@ -3823,6 +4163,44 @@ def run_gui() -> int:
                       <li><b>Settings</b>: appearance, cache/startup behavior, and persistent local preferences.</li>
                     </ul>
                     <p>If you are new to the app, start with <a href="topic:workflow_overview">Texture Workflow</a> and then review <a href="topic:compare_review">Compare &amp; Review</a>.</p>
+                    """,
+                },
+                {
+                    "id": "quick_start",
+                    "title": "Quick Start",
+                    "summary": "Fast orientation for choosing the correct first workflow.",
+                    "keywords": "quick start start here setup first run guide archive texture replace editor research text search",
+                    "html": """
+                    <p>Choose the first path based on what you are trying to do. You can move between tools later; the point is to avoid starting with the largest batch workflow when a smaller guided path is safer.</p>
+                    <ul>
+                      <li><b>Browse game files</b>: use <a href="topic:archive_browser">Archive Browser</a> to scan packages, filter, preview, and extract.</li>
+                      <li><b>Batch-process loose DDS files</b>: use <a href="topic:workflow_overview">Texture Workflow</a>, run a small subset, then review in <a href="topic:compare_review">Compare</a>.</li>
+                      <li><b>Replace one already-edited texture</b>: use <a href="topic:replace_assistant">Replace Assistant</a> so the original DDS controls rebuild metadata and output path.</li>
+                      <li><b>Edit a visible texture inside the app</b>: use <a href="topic:texture_editor">Texture Editor</a>, then send the flattened PNG onward.</li>
+                      <li><b>Understand a texture family</b>: use <a href="topic:research">Research</a> for grouped sets, classification, references, analysis, and notes.</li>
+                      <li><b>Find text, XML, JSON, Lua, or config strings</b>: use <a href="topic:text_search">Text Search</a>.</li>
+                    </ul>
+                    <p>For a first session, configure <b>texconv.exe</b>, scan a small source set, avoid technical-map upscaling, and compare output before exporting anything larger.</p>
+                    """,
+                },
+                {
+                    "id": "first_run_checklist",
+                    "title": "First Run Checklist",
+                    "summary": "Setup checklist for paths, tools, policy, and first test output.",
+                    "keywords": "first run checklist setup paths texconv workspace ncnn chainner policy preview compare",
+                    "html": """
+                    <ol>
+                      <li>Open <b>Settings</b> and run <b>Init Workspace</b> if you want the app to create the usual working folders.</li>
+                      <li>Set <b>texconv.exe path</b>. This is required for DDS preview, DDS-to-PNG conversion, Compare previews, and DDS rebuild.</li>
+                      <li>Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>. Use a tiny test folder first.</li>
+                      <li>Choose an upscaling backend: <b>Disabled</b> for rebuild testing, direct <b>Real-ESRGAN NCNN</b> for in-app upscale, or <b>chaiNNer</b> for an already-tested chain.</li>
+                      <li>Keep a safer <b>Texture Policy</b> preset and automatic rules enabled.</li>
+                      <li>Review <b>Workflow Profiles</b>, <b>Ordered Rules</b>, and <b>Matched Files</b> if you need per-file overrides.</li>
+                      <li>Click <b>Preview Policy</b> before <b>Start</b> to confirm what the planner will do.</li>
+                      <li>Run <b>Scan</b>, process a small batch, then review in <b>Compare</b>.</li>
+                      <li>Only after the small batch looks right, expand the folder filter or source root.</li>
+                    </ol>
+                    <p>If anything fails, open <a href="topic:troubleshooting">Troubleshooting &amp; Limits</a> and check the Live Log before changing many settings at once.</p>
                     """,
                 },
                 {
@@ -4003,6 +4381,35 @@ def run_gui() -> int:
                     """,
                 },
                 {
+                    "id": "texture_workflow_guides",
+                    "title": "Texture Workflow Guides",
+                    "summary": "Recipes for common DDS rebuild, upscale, and profile tasks.",
+                    "keywords": "texture workflow guides recipe rebuild upscale ncnn chainner dds staging profile exact path rules",
+                    "html": """
+                    <h4>Rebuild DDS without upscaling</h4>
+                    <ol>
+                      <li>Set <b>Original DDS root</b>, <b>PNG root</b>, <b>Output root</b>, and <b>texconv.exe</b>.</li>
+                      <li>Set backend to <b>Disabled</b>.</li>
+                      <li>Place edited PNG files under <b>PNG root</b> using matching relative paths.</li>
+                      <li>Use <b>Scan</b>, then <b>Preview Policy</b>, then <b>Start</b>.</li>
+                    </ol>
+                    <h4>Direct NCNN upscale test</h4>
+                    <ol>
+                      <li>Configure the NCNN executable and model folder.</li>
+                      <li>Start with color/UI/emissive content only, or assign exact-path rules for the files you want to test.</li>
+                      <li>Use a modest tile value if VRAM is limited. If the backend fails, lower tile size before changing models.</li>
+                      <li>Review in Compare and only then expand the filter.</li>
+                    </ol>
+                    <h4>Use profiles for a mixed folder</h4>
+                    <ol>
+                      <li>Create or duplicate workflow profiles for visible color, preserve-only technical maps, and any special DDS output needs.</li>
+                      <li>Add broad glob rules for common suffix families near the top.</li>
+                      <li>Use <b>Matched Files</b> to create exact-path rules for exceptions near the bottom.</li>
+                      <li>Open <b>Preview Policy</b> and confirm the final action column before running.</li>
+                    </ol>
+                    """,
+                },
+                {
                     "id": "compare_review",
                     "title": "Compare & Review",
                     "summary": "Side-by-side original/output DDS review.",
@@ -4024,6 +4431,15 @@ def run_gui() -> int:
                     "keywords": "archive browser pamt paz scan preview filter extract patch mod ready mesh audio video text dds workflow research texture editor",
                     "html": """
                     <p><b>Archive Browser</b> is the in-app inspection surface for Crimson Desert package data. It can browse archives in flat or tree view, preview many supported formats directly, extract files, and for supported workflows either patch the game archives or write mod-ready loose output with confirmation and backup support.</p>
+                    <div class="doc-callout doc-warning"><b>First scan note:</b> set <b>Settings &gt; Archive Locations &gt; Game / Package</b> first. Optional global sidecar indexing can take a long time because it reads many material sidecars to build reverse texture connections. If you enable it, let it complete; worker count and cache behavior are configured in <b>Settings &gt; Archive Browser Performance</b>.</div>
+                    <table>
+                      <tr><th>Area</th><th>What it is for</th><th>Typical actions</th></tr>
+                      <tr><td>Archive Files</td><td>Browsable index of package entries.</td><td>Filter, sort columns, resize columns, switch Flat/Folders/Categories, select files or folders.</td></tr>
+                      <tr><td>Preview</td><td>Fast look at the selected asset.</td><td>View images, text/XML, binary summaries, audio/video, 3D models, and sidecar-derived material context.</td></tr>
+                      <tr><td>Referenced Files</td><td>Connection map for the selected asset.</td><td>Find textures, material sidecars, skeletons, animations, metadata, packages, resolution status, and usage counts.</td></tr>
+                      <tr><td>Details</td><td>Structured metadata and diagnostics.</td><td>Check sizes, compression, package labels, strings, import summaries, preview diagnostics, and warnings.</td></tr>
+                      <tr><td>Mesh Actions</td><td>Model export/import and replacement workflow entry points.</td><td>Export OBJ/FBX, import mesh preview, import DDS preview, import mesh replacement, restore backups, edit material values.</td></tr>
+                    </table>
                     <ul>
                       <li>Scan package roots and cache the discovered archive index locally.</li>
                       <li>Filter by path, package, folder, likely role, size, and previewability, then switch between flat and tree browsing as needed.</li>
@@ -4034,6 +4450,75 @@ def run_gui() -> int:
                       <li>Send DDS content into Texture Workflow, open supported images in Texture Editor, or resolve items in Research.</li>
                     </ul>
                     <p>Not every archive format is editable. Browsing and preview support is broader than patch support, so use the visible actions beside the preview to see what is currently available for the selected entry.</p>
+                    """,
+                },
+                {
+                    "id": "archive_guides",
+                    "title": "Archive Browser Guides",
+                    "summary": "Simple archive scanning, filtering, extracting, and handoff recipes.",
+                    "keywords": "archive guide scan cache filter tree flat extract referenced files handoff research editor workflow",
+                    "html": """
+                    <h4>Scan packages</h4>
+                    <ol>
+                      <li>Set the package root in <b>Settings &gt; Archive Locations</b>. This should be the Crimson Desert folder or package root that contains the game archive files.</li>
+                      <li>Click <b>Scan</b>. Use the cached result on repeat scans when the package files have not changed.</li>
+                      <li>Use flat view when searching broadly and tree view when following folders.</li>
+                    </ol>
+                    <div class="doc-callout"><b>Finding things quickly:</b> the main search checks paths, basenames, and linked item/localization aliases when the item-name index is available. Search by a visible in-game name, a file suffix, a package number, or part of a model path.</div>
+                    <h4>Find useful files</h4>
+                    <ul>
+                      <li>Filter by path fragments, package, file extension, role, size, and previewability.</li>
+                      <li>Use inclusion filters for what you want and exclusion filters for noisy families.</li>
+                      <li>For meshes and sidecars, review <b>Referenced Files</b> to find related textures, XML, material sidecars, skeletons, and metadata.</li>
+                    </ul>
+                    <table>
+                      <tr><th>Goal</th><th>Use</th><th>Notes</th></tr>
+                      <tr><td>Find a character or item model</td><td>Search by file stem, folder, or in-game name; use <b>In-game Name</b> column when available.</td><td>Localization links come from package data and may not exist for every asset.</td></tr>
+                      <tr><td>Find textures used by a model</td><td>Select the model and read <b>Referenced Files</b>.</td><td>Resolved means the app found an archive entry; partial means metadata exists but some texture decoding or archive data is incomplete.</td></tr>
+                      <tr><td>Find material values</td><td>Look for <code>.pac_xml</code>, <code>.pam_xml</code>, <code>.pamlod_xml</code>, or <code>.pami</code> sidecars.</td><td>Use <b>Edit Material Values</b> when recognized fields are available.</td></tr>
+                      <tr><td>Understand a selected file</td><td>Open <b>Details</b>.</td><td>Details includes package, raw/stored size, compression, preview diagnostics, readable strings, and import summaries.</td></tr>
+                    </table>
+                    <h4>Extract or hand off</h4>
+                    <ul>
+                      <li><b>Export Selected</b> is the safest path for a small number of files.</li>
+                      <li><b>Export All</b> or filtered extraction is useful after you verify the filter matches exactly what you expect.</li>
+                      <li>Send supported DDS/images to <b>Texture Workflow</b>, <b>Texture Editor</b>, or <b>Research</b> when you want deeper processing.</li>
+                    </ul>
+                    <p>Archive patching is intentionally separate from normal browsing. Patch actions only appear for supported formats and use explicit confirmation plus backup/restore where available.</p>
+                    """,
+                },
+                {
+                    "id": "mesh_media_guides",
+                    "title": "Mesh, Audio & Media Guides",
+                    "summary": "How to approach model previews, mesh export/import, audio, video, and sidecar files.",
+                    "keywords": "mesh media model preview pam pamlod pac obj fbx gltf dae audio wem bnk video bk2 sidecar",
+                    "html": """
+                    <h4>Model preview</h4>
+                    <ul>
+                      <li>Open supported <code>.pam</code>, <code>.pamlod</code>, and <code>.pac</code> entries in Archive Browser to inspect geometry, bounds, materials, sidecars, and referenced textures.</li>
+                      <li>Use <b>3D Preview Settings</b> when textures, support maps, lighting, or orientation need adjustment for inspection.</li>
+                      <li>Referenced files are discovery aids. Export them with the model when you need context for external tools.</li>
+                    </ul>
+                    <h4>Mesh export and import</h4>
+                    <ul>
+                      <li><b>OBJ export</b> is the round-trip baseline when the app can write sidecar data needed for import preview.</li>
+                      <li><b>FBX export</b> is useful for external inspection, but not every FBX edit can be round-tripped into game data.</li>
+                      <li><b>GLB/glTF/DAE imports</b> are treated as static replacement sources where supported; skins, bones, animations, and complex material graphs are not converted into native game material data.</li>
+                    </ul>
+                    <table>
+                      <tr><th>Action</th><th>Use it when</th><th>Result</th></tr>
+                      <tr><td>Export OBJ</td><td>You want an editable round-trip source with companion metadata.</td><td>Writes mesh data and sidecar/context files where supported.</td></tr>
+                      <tr><td>Export FBX</td><td>You want inspection or DCC convenience.</td><td>Good for viewing; not a guarantee of patchable import.</td></tr>
+                      <tr><td>Import Mesh Preview</td><td>You want to test an OBJ/DAE/glTF/GLB replacement without writing output.</td><td>Builds a preview only.</td></tr>
+                      <tr><td>Import Mesh</td><td>You are ready to export a supported replacement.</td><td>Lets you choose archive patching or mod-ready loose output where supported.</td></tr>
+                      <tr><td>Edit Material Values</td><td>The selected mesh has a recognized XML/material sidecar.</td><td>Exports edited sidecar values as a mod-ready package instead of hand-editing raw XML blindly.</td></tr>
+                    </table>
+                    <h4>Audio, video, and text-like media</h4>
+                    <ul>
+                      <li>Preview supported audio/video where the local system codecs allow it.</li>
+                      <li>Use soundbank summaries to inspect <code>.bnk</code> structure.</li>
+                      <li>Use Text Search or Archive Preview for text-like formats before extracting large groups.</li>
+                    </ul>
                     """,
                 },
                 {
@@ -4095,6 +4580,39 @@ def run_gui() -> int:
                     """,
                 },
                 {
+                    "id": "mod_packaging",
+                    "title": "Mod Packaging & Output",
+                    "summary": "How loose output, mod-ready folders, metadata, and backups fit together.",
+                    "keywords": "mod packaging output loose mod ready info json no_encrypt package prefix backup restore export",
+                    "html": """
+                    <p>The app keeps normal workflow output and mod-ready packaging separate so you can review results before placing them into a mod manager.</p>
+                    <ul>
+                      <li><b>Output root</b> is the normal DDS result folder for Texture Workflow.</li>
+                      <li><b>Mod-ready export</b> writes a package-prefixed loose tree with metadata such as <code>info.json</code> and optional <code>.no_encrypt</code> when that export mode is enabled.</li>
+                      <li><b>Replace Assistant</b> is usually the cleanest path for one-off mod-ready texture output because it starts from the edited file and its matched original.</li>
+                      <li><b>Archive Browser</b> patch workflows are explicit, confirmed operations with backup/restore support where implemented. They are not part of ordinary browsing.</li>
+                    </ul>
+                    <p>Recommended practice: build into a review folder, inspect in Compare or an external viewer, then copy or point your mod manager at the final mod-ready folder.</p>
+                    """,
+                },
+                {
+                    "id": "safety",
+                    "title": "Safety Model",
+                    "summary": "Preserve-first defaults, technical texture risk, confirmations, and recoverability.",
+                    "keywords": "safety preserve technical texture normal mask packed vector height displacement backup confirmation dry run cache",
+                    "html": """
+                    <p>The app is conservative because many DDS files are data textures, not ordinary pictures. A texture that looks dull, flat, noisy, or channel-packed may be carrying normals, masks, vectors, height, or material response data.</p>
+                    <ul>
+                      <li><b>Texture Policy</b> and automatic rules try to keep risky technical maps away from generic visible PNG/upscale processing.</li>
+                      <li><b>Planner profiles</b> and <b>planner paths</b> are advanced controls for changing those assumptions when you know the file family.</li>
+                      <li><b>Preview Policy</b> is the per-file preflight view. Use it before large runs.</li>
+                      <li><b>Dry run</b> and small folder filters are useful for validating a plan without committing to a full output pass.</li>
+                      <li>Archive patching requires explicit action and uses backups where supported; extraction and preview are read-only.</li>
+                    </ul>
+                    <p>If you are not sure what a file is, classify or inspect it in Research before assigning an aggressive workflow profile.</p>
+                    """,
+                },
+                {
                     "id": "settings_files",
                     "title": "Settings, Files & Dependencies",
                     "summary": "Local config, cache, project files, and external dependencies.",
@@ -4121,6 +4639,22 @@ def run_gui() -> int:
                       <li><a href="https://www.nexusmods.com/crimsondesert/mods/62">Crimson Desert Unpacker</a></li>
                       <li><a href="https://www.nexusmods.com/crimsondesert/mods/84">Crimson Browser &amp; Mod Manager</a></li>
                     </ul>
+                    """,
+                },
+                {
+                    "id": "faq",
+                    "title": "FAQ",
+                    "summary": "Short answers to common setup, workflow, and output questions.",
+                    "keywords": "faq questions answers texconv ncnn chainner replace assistant texture workflow archive patch settings cache brightness technical maps",
+                    "html": """
+                    <p><b>Do I need texconv?</b><br/>Yes. DDS preview, DDS-to-PNG conversion, Compare previews, and DDS rebuild depend on <b>texconv.exe</b>.</p>
+                    <p><b>Should I upscale every texture?</b><br/>No. Start with visible color, UI, or emissive textures. Normals, packed masks, vectors, height maps, and displacement maps should usually stay preserve-first unless you know the family.</p>
+                    <p><b>When should I use Replace Assistant?</b><br/>Use it for one-off edited PNG/DDS replacements. Use Texture Workflow for batch rebuild or batch upscale of a loose DDS tree.</p>
+                    <p><b>What is the safest first backend?</b><br/>Use <b>Disabled</b> first to prove paths and DDS rebuild behavior. Then test direct <b>Real-ESRGAN NCNN</b> or a known-good <b>chaiNNer</b> chain on a small subset.</p>
+                    <p><b>Why did output brightness or detail change?</b><br/>Upscale models and correction modes can shift luma, contrast, alpha, or detail. Compare against the original, test a different model, reduce aggressive settings, or try Source Match correction for visible textures.</p>
+                    <p><b>Can the app patch archives directly?</b><br/>Only for supported workflows. Ordinary browsing, preview, and extraction are read-only; patch actions require explicit confirmation and use backup/restore support where implemented.</p>
+                    <p><b>Where are settings stored?</b><br/>The config file and cache are stored beside the executable or local source checkout. See <a href="topic:settings_files">Settings, Files &amp; Dependencies</a>.</p>
+                    <p><b>Why does search not find my topic?</b><br/>Try feature names, tab names, file types, field labels, or symptoms such as <code>texconv</code>, <code>brightness</code>, <code>normal</code>, <code>archive</code>, <code>profile</code>, or <code>mod-ready</code>.</p>
                     """,
                 },
                 {
@@ -4416,6 +4950,97 @@ def run_gui() -> int:
                         """,
                     },
                 ]
+                sections.extend(
+                    [
+                        {
+                            "id": "quick_start",
+                            "title": "Inicio rapido",
+                            "summary": "Ruta inicial para configurar juego, workspace y herramientas.",
+                            "keywords": "inicio rapido juego paquete workspace texconv sidecar",
+                            "html": """
+                            <ol>
+                              <li>Crea una carpeta dedicada para la app y coloca alli el .exe portable.</li>
+                              <li>En <b>Configuracion &gt; Ubicaciones de archivo</b>, define la ruta del juego/paquete.</li>
+                              <li>Ejecuta <b>Inicializar espacio</b> para crear workspace, tools, salida, PNG y extraccion.</li>
+                              <li>Descarga texconv, coloca texconv.exe bajo tools y configura su ruta.</li>
+                              <li>Escanea un conjunto pequeno antes de procesar archivos grandes.</li>
+                            </ol>
+                            <div class="doc-callout doc-warning"><b>Cache de sidecars:</b> puede tardar mucho, pero mejora referencias relacionadas, texturas conectadas a modelos y sidecars de material. Si lo activas, deja que termine.</div>
+                            """,
+                        },
+                        {
+                            "id": "archive_guides",
+                            "title": "Guias del explorador de archivos",
+                            "summary": "Como navegar, encontrar conexiones, extraer y enviar archivos a otros flujos.",
+                            "keywords": "archivo guia navegar referencias conexiones metadatos extraer material xml",
+                            "html": """
+                            <table>
+                              <tr><th>Objetivo</th><th>Usa</th><th>Notas</th></tr>
+                              <tr><td>Encontrar un modelo o item</td><td>Busca por ruta, extension, paquete o nombre en juego.</td><td>La columna <b>Nombre en juego</b> depende de datos de localizacion disponibles.</td></tr>
+                              <tr><td>Encontrar texturas relacionadas</td><td>Selecciona un modelo y revisa <b>Archivos referenciados</b>.</td><td>Muestra textura, sidecar, esqueleto, animacion, paquete y estado.</td></tr>
+                              <tr><td>Revisar metadatos</td><td>Abre <b>Detalles</b>.</td><td>Incluye tamano, compresion, cadenas legibles, diagnosticos y advertencias.</td></tr>
+                              <tr><td>Editar XML/material</td><td>Usa <b>Editar valores de material</b> cuando haya sidecar reconocido.</td><td>Exporta valores editados como paquete mod-ready.</td></tr>
+                            </table>
+                            <p>Usa filtros amplios primero, despues reduce por paquete, rol, extension, carpeta, tamano o vista previa. Para extracciones grandes, verifica el filtro antes de usar exportacion filtrada.</p>
+                            """,
+                        },
+                        {
+                            "id": "mesh_media_guides",
+                            "title": "Guias de malla, 3D y medios",
+                            "summary": "Exportar, previsualizar, reemplazar mallas y revisar sidecars.",
+                            "keywords": "malla 3d obj fbx gltf dae pac pam material sidecar textura",
+                            "html": """
+                            <table>
+                              <tr><th>Accion</th><th>Uso</th><th>Resultado</th></tr>
+                              <tr><td>Exportar OBJ</td><td>Edicion round-trip cuando hay sidecar compatible.</td><td>Escribe geometria y contexto para reimportar.</td></tr>
+                              <tr><td>Exportar FBX</td><td>Inspeccion o trabajo en DCC.</td><td>Util para ver; no garantiza reimportacion parcheable.</td></tr>
+                              <tr><td>Vista previa de importar malla</td><td>Probar OBJ/DAE/glTF/GLB sin escribir archivos.</td><td>Solo crea vista previa.</td></tr>
+                              <tr><td>Importar malla</td><td>Crear reemplazo soportado.</td><td>Permite parche o salida suelta mod-ready donde sea compatible.</td></tr>
+                            </table>
+                            """,
+                        },
+                        {
+                            "id": "mod_packaging",
+                            "title": "Empaquetado mod-ready",
+                            "summary": "Salida suelta, info.json, .no_encrypt y copias de seguridad.",
+                            "keywords": "mod ready paquete salida info json no_encrypt backup",
+                            "html": """
+                            <p>La salida normal y el paquete mod-ready estan separados para que puedas revisar antes de instalar.</p>
+                            <ul>
+                              <li><b>Output root</b> contiene resultados DDS normales.</li>
+                              <li><b>Exportacion mod-ready</b> crea estructura suelta con metadatos como info.json y opcional .no_encrypt.</li>
+                              <li>Los parches de archivo requieren confirmacion y usan backup/restauracion cuando esta disponible.</li>
+                            </ul>
+                            """,
+                        },
+                        {
+                            "id": "safety",
+                            "title": "Modelo de seguridad",
+                            "summary": "Preservacion, texturas tecnicas y operaciones con confirmacion.",
+                            "keywords": "seguridad preservar tecnicas normales mascaras backup dry run",
+                            "html": """
+                            <div class="doc-callout doc-danger">No todas las DDS son imagenes visibles. Normales, mascaras, altura, vectores y canales empaquetados pueden romperse si pasan por una ruta PNG generica.</div>
+                            <ul>
+                              <li>Empieza con politica segura y reglas automaticas activas.</li>
+                              <li>Usa <b>Vista de politica</b> antes de lotes grandes.</li>
+                              <li>Usa Research para clasificar familias dudosas antes de forzar perfiles agresivos.</li>
+                            </ul>
+                            """,
+                        },
+                        {
+                            "id": "faq",
+                            "title": "FAQ",
+                            "summary": "Respuestas cortas a preguntas frecuentes.",
+                            "keywords": "faq texconv sidecar ncnn chainner brillo archivo",
+                            "html": """
+                            <p><b>Necesito texconv?</b><br/>Si, para vista DDS, conversion DDS-PNG, comparacion y reconstruccion.</p>
+                            <p><b>Debo escalar todas las texturas?</b><br/>No. Empieza con color/UI/emisivo; conserva primero normales, mascaras y mapas tecnicos.</p>
+                            <p><b>Por que tarda el cache de sidecars?</b><br/>Lee muchos sidecars para crear conexiones globales. Es caro, pero util para referencias relacionadas.</p>
+                            <p><b>Cuando usar Asistente de reemplazo?</b><br/>Para una textura editada individual. Usa Flujo de texturas para lotes.</p>
+                            """,
+                        },
+                    ]
+                )
                 return title, intro_html, sections
 
             if normalized == "de":
@@ -4690,6 +5315,97 @@ def run_gui() -> int:
                         """,
                     },
                 ]
+                sections.extend(
+                    [
+                        {
+                            "id": "quick_start",
+                            "title": "Schnellstart",
+                            "summary": "Erste Schritte fuer Spielpfad, Workspace und Werkzeuge.",
+                            "keywords": "schnellstart spiel paket workspace texconv sidecar",
+                            "html": """
+                            <ol>
+                              <li>Erstelle einen eigenen App-Ordner und lege die portable .exe dort ab.</li>
+                              <li>Setze unter <b>Einstellungen &gt; Archiv-Orte</b> den Spiel-/Paketpfad.</li>
+                              <li>Fuehre <b>Arbeitsbereich einrichten</b> aus, um Workspace, tools, Ausgabe, PNG und Extraktion anzulegen.</li>
+                              <li>Lade texconv herunter, lege texconv.exe unter tools ab und konfiguriere den Pfad.</li>
+                              <li>Scanne zuerst einen kleinen Testsatz.</li>
+                            </ol>
+                            <div class="doc-callout doc-warning"><b>Sidecar-Cache:</b> kann lange dauern, verbessert aber verwandte Dateien, Modell-Textur-Verbindungen und Material-Sidecar-Suche. Wenn aktiviert, den ersten Lauf fertig werden lassen.</div>
+                            """,
+                        },
+                        {
+                            "id": "archive_guides",
+                            "title": "Archiv-Browser-Anleitungen",
+                            "summary": "Navigieren, Verbindungen finden, exportieren und an Workflows uebergeben.",
+                            "keywords": "archiv anleitung navigieren referenzen verbindungen metadaten export material xml",
+                            "html": """
+                            <table>
+                              <tr><th>Ziel</th><th>Bereich</th><th>Hinweis</th></tr>
+                              <tr><td>Modell oder Item finden</td><td>Suche nach Pfad, Endung, Paket oder Ingame-Name.</td><td>Die Spalte <b>Ingame-Name</b> nutzt verfuegbare Lokalisierungsdaten.</td></tr>
+                              <tr><td>Verwandte Texturen finden</td><td>Modell waehlen und <b>Referenzierte Dateien</b> lesen.</td><td>Zeigt Texturen, Sidecars, Skelette, Animationen, Paket und Status.</td></tr>
+                              <tr><td>Metadaten pruefen</td><td><b>Details</b> oeffnen.</td><td>Enthaelt Groesse, Kompression, lesbare Strings, Diagnostik und Warnungen.</td></tr>
+                              <tr><td>XML/Material bearbeiten</td><td><b>Materialwerte bearbeiten</b>, wenn ein Sidecar erkannt wurde.</td><td>Exportiert bearbeitete Werte als mod-fertiges Paket.</td></tr>
+                            </table>
+                            <p>Beginne mit breiten Filtern und verfeinere dann nach Paket, Rolle, Endung, Ordner, Groesse oder Vorschaufaehigkeit. Vor grossen Exporten den Filter pruefen.</p>
+                            """,
+                        },
+                        {
+                            "id": "mesh_media_guides",
+                            "title": "Mesh-, 3D- und Medien-Anleitungen",
+                            "summary": "Mashes exportieren, ersetzen, pruefen und Sidecars verstehen.",
+                            "keywords": "mesh 3d obj fbx gltf dae pac pam material sidecar textur",
+                            "html": """
+                            <table>
+                              <tr><th>Aktion</th><th>Verwendung</th><th>Ergebnis</th></tr>
+                              <tr><td>OBJ exportieren</td><td>Round-trip-Bearbeitung mit kompatiblem Sidecar.</td><td>Schreibt Geometrie und Kontext fuer Reimport.</td></tr>
+                              <tr><td>FBX exportieren</td><td>Inspektion oder DCC-Arbeit.</td><td>Gut zum Anzeigen; keine Garantie fuer patchbaren Reimport.</td></tr>
+                              <tr><td>Mesh-Importvorschau</td><td>OBJ/DAE/glTF/GLB testen, ohne Dateien zu schreiben.</td><td>Erzeugt nur eine Vorschau.</td></tr>
+                              <tr><td>Mesh importieren</td><td>Unterstuetzten Ersatz erstellen.</td><td>Erlaubt Patch oder mod-fertige Loose-Ausgabe, wo kompatibel.</td></tr>
+                            </table>
+                            """,
+                        },
+                        {
+                            "id": "mod_packaging",
+                            "title": "Mod-fertige Pakete",
+                            "summary": "Loose-Ausgabe, info.json, .no_encrypt und Backups.",
+                            "keywords": "mod ready paket ausgabe info json no_encrypt backup",
+                            "html": """
+                            <p>Normale Ausgabe und mod-fertige Pakete bleiben getrennt, damit Ergebnisse vor Installation geprueft werden koennen.</p>
+                            <ul>
+                              <li><b>Ausgabe-Stamm</b> enthaelt normale DDS-Ergebnisse.</li>
+                              <li><b>Mod-ready Export</b> erzeugt eine Loose-Struktur mit Metadaten wie info.json und optional .no_encrypt.</li>
+                              <li>Archiv-Patches brauchen Bestaetigung und nutzen Backup/Wiederherstellung, wo verfuegbar.</li>
+                            </ul>
+                            """,
+                        },
+                        {
+                            "id": "safety",
+                            "title": "Sicherheitsmodell",
+                            "summary": "Erhalt, technische Texturen und bestaetigte Operationen.",
+                            "keywords": "sicherheit erhalten technisch normalen masken backup dry run",
+                            "html": """
+                            <div class="doc-callout doc-danger">Nicht jede DDS ist ein sichtbares Bild. Normalen, Masken, Hoehe, Vektoren und gepackte Kanaele koennen durch generische PNG-Pfade kaputtgehen.</div>
+                            <ul>
+                              <li>Mit sicherer Richtlinie und aktiven automatischen Regeln starten.</li>
+                              <li><b>Richtlinienvorschau</b> vor grossen Laeufen nutzen.</li>
+                              <li>Unklare Familien in Recherche klassifizieren, bevor aggressive Profile erzwungen werden.</li>
+                            </ul>
+                            """,
+                        },
+                        {
+                            "id": "faq",
+                            "title": "FAQ",
+                            "summary": "Kurze Antworten auf haeufige Fragen.",
+                            "keywords": "faq texconv sidecar ncnn chainner helligkeit archiv",
+                            "html": """
+                            <p><b>Brauche ich texconv?</b><br/>Ja, fuer DDS-Vorschau, DDS-PNG-Konvertierung, Vergleich und DDS-Neuaufbau.</p>
+                            <p><b>Sollte ich alle Texturen hochskalieren?</b><br/>Nein. Mit Farbe/UI/Emissive starten; Normalen, Masken und technische Maps zuerst erhalten.</p>
+                            <p><b>Warum dauert der Sidecar-Cache lange?</b><br/>Er liest viele Sidecars fuer globale Verbindungen. Teuer, aber nuetzlich fuer verwandte Dateien.</p>
+                            <p><b>Wann nutze ich den Ersetzungsassistenten?</b><br/>Fuer eine einzelne bearbeitete Textur. Fuer Stapel den Textur-Workflow nutzen.</p>
+                            """,
+                        },
+                    ]
+                )
                 return title, intro_html, sections
 
             return f"{APP_TITLE} Documentation", self._build_about_intro_html(), self._build_about_sections()
@@ -5092,7 +5808,7 @@ def run_gui() -> int:
             self.show_quick_start_on_launch = False
             self.settings.setValue("ui/startup_setup_shown", True)
             self.settings.sync()
-            self.focus_quick_start_sections(include_chainner=False)
+            self.focus_archive_locations()
             self.show_quick_start_dialog()
 
         def _add_path_row(
@@ -5337,7 +6053,7 @@ def run_gui() -> int:
             normalized = clamp_splitter_sizes(
                 total_width,
                 sizes,
-                [300, 320, 300],
+                [260, 280, 300],
                 fallback_weights=[18, 34, 48],
             )
             if len(normalized) < 3:
@@ -5402,7 +6118,7 @@ def run_gui() -> int:
             )
             self.archive_splitter.setSizes(
                 self._normalize_archive_splitter_sizes(
-                    build_responsive_splitter_sizes(total_width, [18, 34, 48], [300, 320, 300]),
+                    build_responsive_splitter_sizes(total_width, [18, 34, 48], [260, 280, 300]),
                     total_width,
                 )
             )
@@ -5638,18 +6354,21 @@ def run_gui() -> int:
                 return
             font_metrics = header.fontMetrics()
             min_widths = {
-                0: max(320, font_metrics.horizontalAdvance("Name") + 48),
-                1: max(78, font_metrics.horizontalAdvance("Folder") + 28),
-                2: max(112, font_metrics.horizontalAdvance("9999.9 KB") + 28),
-                3: max(84, font_metrics.horizontalAdvance("Partial") + 28),
-                4: max(132, font_metrics.horizontalAdvance("0009/20.pamt") + 28),
+                0: max(180, font_metrics.horizontalAdvance("Name") + 48),
+                1: max(160, font_metrics.horizontalAdvance("In-game Name") + 28),
+                2: max(72, font_metrics.horizontalAdvance("Folder") + 28),
+                3: max(112, font_metrics.horizontalAdvance("9999.9 KB") + 28),
+                4: max(84, font_metrics.horizontalAdvance("Partial") + 28),
+                5: max(132, font_metrics.horizontalAdvance("0009/20.pamt") + 28),
+                6: max(220, font_metrics.horizontalAdvance("Path") + 48),
             }
             max_widths = {
-                0: 440,
-                1: 110,
-                2: 160,
-                3: 120,
-                4: 180,
+                0: 360,
+                1: 280,
+                2: 110,
+                3: 160,
+                4: 120,
+                5: 180,
             }
             self.archive_tree.setUpdatesEnabled(False)
             try:
@@ -5659,7 +6378,7 @@ def run_gui() -> int:
                     content_width = self.archive_tree.sizeHintForColumn(column) + 28
                     width = max(min_widths.get(column, 72), content_width)
                     max_width = max_widths.get(column)
-                    if max_width is not None:
+                    if max_width is not None and column != 6:
                         width = min(width, max_width)
                     header.resizeSection(column, width)
             finally:
@@ -6411,6 +7130,7 @@ def run_gui() -> int:
             self.text_search_tab.main_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
             self.setup_section.toggled.connect(self.schedule_settings_save)
             self.paths_section.toggled.connect(self.schedule_settings_save)
+            self.archive_locations_section.toggled.connect(self.schedule_settings_save)
             self.settings_section.toggled.connect(self.schedule_settings_save)
             self.dds_output_section.toggled.connect(self.schedule_settings_save)
             self.filters_section.toggled.connect(self.schedule_settings_save)
@@ -6502,6 +7222,7 @@ def run_gui() -> int:
                 self._refresh_archive_browser_if_pending()
             if 0 <= index < self.main_tabs.count() and self.main_tabs.widget(index) is self.research_tab:
                 self.research_tab.refresh_archive_picker_if_pending()
+            self._update_window_menu_state()
             self._save_settings()
 
         def _refresh_archive_browser_view(self) -> None:
@@ -6518,14 +7239,14 @@ def run_gui() -> int:
 
         def _refresh_or_defer_archive_browser_view(self, *, activate_tab: bool) -> None:
             if activate_tab:
-                self.main_tabs.setCurrentWidget(self.archive_browser_tab)
-            if self.main_tabs.currentWidget() is self.archive_browser_tab:
+                self._activate_tool_widget(self.archive_browser_tab)
+            if self._is_tool_visible_or_current(self.archive_browser_tab):
                 self._refresh_archive_browser_view()
             else:
                 self.archive_browser_refresh_pending = True
 
         def _refresh_or_defer_research_archive_picker(self) -> None:
-            if self.main_tabs.currentWidget() is self.research_tab:
+            if self._is_tool_visible_or_current(self.research_tab):
                 self.research_tab.refresh_archive_picker()
             else:
                 self.research_tab.mark_archive_picker_dirty()
@@ -6541,7 +7262,7 @@ def run_gui() -> int:
 
         def _apply_workflow_content_tab_layout(self, *_args) -> None:
             compare_active = (
-                self.main_tabs.currentWidget() is self.workflow_tab
+                self._is_tool_visible_or_current(self.workflow_tab)
                 and self.content_tabs.currentWidget() is self.compare_tab
             )
             if compare_active:
@@ -6756,10 +7477,12 @@ def run_gui() -> int:
                 )
             self.settings.setValue("sections/setup_expanded", self.setup_section.toggle_button.isChecked())
             self.settings.setValue("sections/paths_expanded", self.paths_section.toggle_button.isChecked())
+            self.settings.setValue("sections/archive_locations_expanded", self.archive_locations_section.toggle_button.isChecked())
             self.settings.setValue("sections/settings_expanded", self.settings_section.toggle_button.isChecked())
             self.settings.setValue("sections/dds_output_expanded", self.dds_output_section.toggle_button.isChecked())
             self.settings.setValue("sections/filters_expanded", self.filters_section.toggle_button.isChecked())
             self.settings.setValue("sections/chainner_expanded", self.chainner_section.toggle_button.isChecked())
+            self._save_detached_tool_geometries()
             self.settings.sync()
 
         def schedule_settings_save(self, *_args) -> None:
@@ -7105,6 +7828,7 @@ def run_gui() -> int:
             )
             self.setup_section.set_expanded(self._read_bool("sections/setup_expanded", False))
             self.paths_section.set_expanded(self._read_bool("sections/paths_expanded", False))
+            self.archive_locations_section.set_expanded(self._read_bool("sections/archive_locations_expanded", False))
             self.settings_section.set_expanded(self._read_bool("sections/settings_expanded", False))
             self.dds_output_section.set_expanded(self._read_bool("sections/dds_output_expanded", False))
             self.filters_section.set_expanded(self._read_bool("sections/filters_expanded", False))
@@ -8011,7 +8735,7 @@ def run_gui() -> int:
                         return
 
                 self.archive_package_root_edit.setText(selected_path)
-                self.main_tabs.setCurrentWidget(self.archive_browser_tab)
+                self._activate_tool_widget(self.archive_browser_tab)
                 self.set_status_message(f"Auto-detected archive package root: {selected_path}")
                 self.append_log(f"Using detected archive package root: {selected_path}")
 
@@ -8451,7 +9175,7 @@ def run_gui() -> int:
             self._check_game_update_and_invalidate_archive_cache(package_root)
             self._activate_archive_browser_on_scan_complete = activate_archive_tab
             if activate_archive_tab:
-                self.main_tabs.setCurrentWidget(self.archive_browser_tab)
+                self._activate_tool_widget(self.archive_browser_tab)
             self.archive_scan_progress_label.setText("Preparing archive refresh..." if force_refresh else "Preparing archive scan / cache load...")
             self.archive_scan_progress_bar.setRange(0, 0)
             self.archive_scan_progress_bar.setFormat("Working...")
@@ -8459,8 +9183,8 @@ def run_gui() -> int:
                 True,
                 "Preparing Archive Browser",
                 (
-                    "Loading the archive index first. Texture sidecar bindings will be warmed up next, "
-                    "then the browser and previews will be enabled."
+                    "Loading the archive index first. Texture sidecar bindings can continue warming in the background "
+                    "after the browser opens."
                 ),
             )
             self.set_status_message("Refreshing archives..." if force_refresh else "Loading archives...")
@@ -8570,6 +9294,11 @@ def run_gui() -> int:
                 if isinstance(payload.get("item_search_aliases"), dict)
                 else {}
             )
+            self.archive_item_display_names = (
+                payload.get("item_display_names", {})
+                if isinstance(payload.get("item_display_names"), dict)
+                else {}
+            )
             self.archive_sidecar_entries_by_texture_path = (
                 payload.get("sidecar_entries_by_texture_path", {})
                 if isinstance(payload.get("sidecar_entries_by_texture_path"), Mapping)
@@ -8648,7 +9377,7 @@ def run_gui() -> int:
             timing_summary = str(payload.get("timing_summary", "")).strip()
             rendering_archive_view = (
                 self._activate_archive_browser_on_scan_complete
-                or self.main_tabs.currentWidget() is self.archive_browser_tab
+                or self._is_tool_visible_or_current(self.archive_browser_tab)
             )
             self.archive_scan_progress_label.setText(
                 "Rendering archive browser view..." if rendering_archive_view else "Finalizing archive load..."
@@ -8675,7 +9404,7 @@ def run_gui() -> int:
             timings: Optional[Dict[str, float]] = None,
             timing_summary: str = "",
         ) -> None:
-            waiting_for_sidecar = False
+            start_sidecar_after_finalize = False
             try:
                 completion_text = (
                     f"Loaded {len(self.archive_entries):,} archive entries from cache."
@@ -8697,13 +9426,13 @@ def run_gui() -> int:
                     and self.archive_entries
                     and performance_settings.enable_sidecar_indexing
                 ):
-                    waiting_for_sidecar = True
-                    self.archive_browser_warmup_pending = True
+                    start_sidecar_after_finalize = True
+                    self.archive_browser_warmup_pending = False
                     self.archive_browser_warmup_completion_text = completion_text
-                    warmup_text = "Building texture sidecar cache before enabling archive browsing..."
-                    self.archive_tree.setEnabled(False)
+                    warmup_text = "Loading texture sidecar cache in the background..."
+                    self.archive_tree.setEnabled(True)
                     self.archive_stats_label.setText(
-                        f"{len(self.archive_entries):,} archive entries loaded. Warming texture sidecar cache before browsing."
+                        f"{len(self.archive_entries):,} archive entries loaded. Texture sidecar cache is warming in the background."
                     )
                     self.archive_scan_progress_label.setText(
                         "Archive entries loaded. Texture sidecar cache is tracked in the compact status indicator."
@@ -8714,8 +9443,8 @@ def run_gui() -> int:
                     self._set_archive_sidecar_status(warmup_text)
                     self.set_status_message(warmup_text)
                     self.append_archive_log(warmup_text)
-                    return
-                self.archive_sidecar_pending_start = False
+                else:
+                    self.archive_sidecar_pending_start = False
                 self._refresh_or_defer_archive_browser_view(
                     activate_tab=self._activate_archive_browser_on_scan_complete,
                 )
@@ -8730,10 +9459,10 @@ def run_gui() -> int:
                 self._set_archive_warmup_overlay(False)
             finally:
                 self.archive_scan_finalize_pending = False
-                if waiting_for_sidecar:
+                if start_sidecar_after_finalize:
                     if self.worker_thread is None and self.archive_sidecar_thread is None:
                         QTimer.singleShot(0, self._start_archive_sidecar_index_worker)
-                elif self.worker_thread is None:
+                if self.worker_thread is None:
                     self.set_busy(False, build_mode=False)
 
         def _start_archive_sidecar_index_worker(self) -> None:
@@ -8764,7 +9493,7 @@ def run_gui() -> int:
             package_root = Path(package_root_text).expanduser()
 
             if self.archive_browser_warmup_pending:
-                progress_text = "Building texture sidecar cache before enabling archive browsing..."
+                progress_text = "Loading texture sidecar cache..."
             else:
                 progress_text = "Checking texture sidecar cache in background..."
             if not self.archive_browser_warmup_pending:
@@ -9431,6 +10160,24 @@ def run_gui() -> int:
                 return "Text/Metadata"
             return "Other"
 
+        def _archive_entry_model_base_keys(self, entry: ArchiveEntry) -> Tuple[str, ...]:
+            stem = PurePosixPath(entry.basename.replace("\\", "/")).stem.strip().lower()
+            if not stem:
+                return ()
+            keys = [stem]
+            for suffix in ("_l", "_r", "_u", "_s", "_t", "_index01", "_index02", "_index03"):
+                if stem.endswith(suffix):
+                    keys.append(stem[: -len(suffix)])
+                    break
+            return tuple(dict.fromkeys(keys))
+
+        def _archive_entry_in_game_name(self, entry: ArchiveEntry) -> str:
+            for key in self._archive_entry_model_base_keys(entry):
+                display_name = str(self.archive_item_display_names.get(key, "") or "").strip()
+                if display_name:
+                    return display_name
+            return ""
+
         def _archive_category_sort_key(self, category: str) -> Tuple[int, str]:
             order = {
                 "Texture": 0,
@@ -9462,7 +10209,8 @@ def run_gui() -> int:
         ) -> QTreeWidgetItem:
             item = QTreeWidgetItem(parent)
             item.setText(0, folder_key[-1] if folder_key else "(root)")
-            item.setText(1, "Folder")
+            item.setText(2, "Folder")
+            item.setText(6, "/".join(folder_key))
             item.setData(0, Qt.UserRole, "folder")
             item.setData(0, Qt.UserRole + 1, folder_key)
             item.setData(0, Qt.UserRole + 2, False)
@@ -9486,7 +10234,7 @@ def run_gui() -> int:
         def _create_archive_category_item(self, parent: QTreeWidget, category: str, entry_indexes: Sequence[int]) -> QTreeWidgetItem:
             item = QTreeWidgetItem(parent)
             item.setText(0, f"{category} ({len(entry_indexes):,})")
-            item.setText(1, "Category")
+            item.setText(2, "Category")
             item.setData(0, Qt.UserRole, "category")
             item.setData(0, Qt.UserRole + 1, category)
             item.setData(0, Qt.UserRole + 2, False)
@@ -9511,15 +10259,21 @@ def run_gui() -> int:
             entry = self.archive_filtered_entries[entry_index]
             normalized_parts = tuple(part for part in PurePosixPath(entry.path.replace("\\", "/")).parts if part)
             size_text, size_tooltip = self._archive_entry_display_size(entry)
-            item.setText(0, entry.path if show_full_path else (normalized_parts[-1] if normalized_parts else entry.basename))
-            item.setText(1, entry.extension or "-")
-            item.setText(2, size_text)
-            item.setText(3, entry.compression_label)
-            item.setText(4, entry.package_label)
+            display_name = normalized_parts[-1] if normalized_parts else entry.basename
+            item.setText(0, display_name)
+            item.setText(1, self._archive_entry_in_game_name(entry) or "-")
+            item.setText(2, entry.extension or "-")
+            item.setText(3, size_text)
+            item.setText(4, entry.compression_label)
+            item.setText(5, entry.package_label)
+            item.setText(6, entry.path if show_full_path else "/".join(normalized_parts[:-1]))
             item.setData(0, Qt.UserRole, "file")
             item.setData(0, Qt.UserRole + 1, entry_index)
             item.setToolTip(0, entry.path)
-            item.setToolTip(2, size_tooltip)
+            in_game_name = self._archive_entry_in_game_name(entry)
+            if in_game_name:
+                item.setToolTip(1, in_game_name)
+            item.setToolTip(3, size_tooltip)
 
         def _cancel_archive_tree_clear(self) -> None:
             self.archive_tree_clear_timer.stop()
@@ -9589,10 +10343,12 @@ def run_gui() -> int:
                 return
             item = QTreeWidgetItem()
             item.setText(0, f"{total_entries - rendered_count:,} more entries hidden from the live view")
-            item.setText(1, "Filter")
-            item.setText(2, "-")
+            item.setText(1, "-")
+            item.setText(2, "Filter")
             item.setText(3, "-")
-            item.setText(4, "Refine filters")
+            item.setText(4, "-")
+            item.setText(5, "Refine filters")
+            item.setText(6, "Use package/path/extension filters or Folders view.")
             item.setFlags(Qt.ItemIsEnabled)
             item.setData(0, Qt.UserRole, "notice")
             item.setToolTip(
@@ -9732,7 +10488,8 @@ def run_gui() -> int:
                         if folder_item is None:
                             folder_item = QTreeWidgetItem(parent_item)
                             folder_item.setText(0, part)
-                            folder_item.setText(1, "Folder")
+                            folder_item.setText(2, "Folder")
+                            folder_item.setText(6, "/".join(folder_key))
                             folder_item.setData(0, Qt.UserRole, "category_subfolder")
                             folder_item.setData(0, Qt.UserRole + 1, folder_key)
                             folder_item.setToolTip(0, "/".join(folder_key))
@@ -10198,11 +10955,11 @@ def run_gui() -> int:
                 self.set_status_message(f"Texture Editor source not found: {source_path}", error=True)
                 return
             texture_binding = binding if isinstance(binding, TextureEditorSourceBinding) else None
-            self.main_tabs.setCurrentWidget(self.texture_editor_tab)
+            self._activate_tool_widget(self.texture_editor_tab)
             self.texture_editor_tab.open_source_path(source_path, binding=texture_binding)
 
         def _show_archive_browser_from_texture_editor(self, archive_relative_path: str = "") -> None:
-            self.main_tabs.setCurrentWidget(self.archive_browser_tab)
+            self._activate_tool_widget(self.archive_browser_tab)
             normalized_path = PurePosixPath(str(archive_relative_path or "").replace("\\", "/")).as_posix().strip()
             if not self.archive_entries:
                 QMessageBox.information(
@@ -10289,7 +11046,7 @@ def run_gui() -> int:
             if entry is None or entry.extension != ".dds":
                 self.set_status_message("Select a single archive DDS file first.", error=True)
                 return
-            self.main_tabs.setCurrentWidget(self.research_tab)
+            self._activate_tool_widget(self.research_tab)
             self.research_tab.focus_references_for_path(entry.path, auto_resolve=True)
 
         def _open_compare_in_texture_editor(self) -> None:
@@ -10705,7 +11462,7 @@ def run_gui() -> int:
                 self.set_status_message(f"Texture Editor export not found: {source_path}", error=True)
                 return
             del binding
-            self.main_tabs.setCurrentWidget(self.replace_assistant_tab)
+            self._activate_tool_widget(self.replace_assistant_tab)
             self.replace_assistant_tab.import_external_sources(
                 [source_path],
                 select_path=source_path,
@@ -10785,7 +11542,7 @@ def run_gui() -> int:
             if clear_original_root is None:
                 self.set_status_message("Texture Editor export to Texture Workflow cancelled.")
                 return
-            self.main_tabs.setCurrentWidget(self.workflow_tab)
+            self._activate_tool_widget(self.workflow_tab)
             self.content_tabs.setCurrentIndex(0)
             self._set_texture_editor_export_progress("Staging flattened PNG for Texture Workflow...")
             self.set_status_message("Staging Texture Editor export for Texture Workflow...")
@@ -10863,7 +11620,7 @@ def run_gui() -> int:
                 self.phase_value.setText("Idle")
                 self.phase_progress_value.setText("Ready")
                 self.current_file_value.setText("Idle")
-                self.main_tabs.setCurrentWidget(self.workflow_tab)
+                self._activate_tool_widget(self.workflow_tab)
                 self.content_tabs.setCurrentIndex(0)
                 self.set_status_message(
                     f"Texture Editor export staged for Workflow in Texture Editor PNG root and filter focused on {relative_path}.",
@@ -10887,7 +11644,7 @@ def run_gui() -> int:
                     error=True,
                 )
                 return
-            self.main_tabs.setCurrentWidget(self.workflow_tab)
+            self._activate_tool_widget(self.workflow_tab)
             self.content_tabs.setCurrentWidget(self.compare_tab)
             self.refresh_compare_list(select_current=True)
             target_item = None
@@ -11125,6 +11882,7 @@ def run_gui() -> int:
                 preview_image=None,
                 loose_preview_image=None,
                 preview_model=self._clone_archive_preview_model(result.preview_model, strip_images=True),
+                prepared_preview_model=None,
             )
 
         def _load_preview_image_if_available(self, image_path: str) -> object:
@@ -12329,9 +13087,12 @@ def run_gui() -> int:
                 group_item.setText(0, f"{relation_group} ({group_item.childCount()})")
             self.archive_texture_refs_group.setVisible(bool(self.current_archive_model_texture_references))
             if self.current_archive_model_texture_references:
+                total_width = max(1, self.archive_preview_content_splitter.width())
                 sizes = self.archive_preview_content_splitter.sizes()
-                if len(sizes) < 2 or sizes[1] < 360:
-                    self.archive_preview_content_splitter.setSizes([920, 600])
+                right_width = max(260, min(500, int(total_width * 0.40)))
+                left_width = max(300, total_width - right_width)
+                if len(sizes) < 2 or sizes[1] < 260 or sum(sizes) > total_width + 80:
+                    self.archive_preview_content_splitter.setSizes([left_width, right_width])
                 self._layout_archive_texture_reference_columns()
                 QTimer.singleShot(0, self._layout_archive_texture_reference_columns)
             else:
@@ -12346,16 +13107,16 @@ def run_gui() -> int:
                 return
 
             viewport_width = max(0, tree.viewport().width())
-            available_width = max(viewport_width, 320)
-            reference_width = 190
-            status_width = 112
-            part_width = 180
-            slot_width = 160
-            visual_width = 112
-            package_width = 96
+            available_width = max(viewport_width, 260)
+            reference_width = 150
+            status_width = 98
+            part_width = 140
+            slot_width = 126
+            visual_width = 90
+            package_width = 82
             uses_width = 52
             archive_width = max(
-                200,
+                160,
                 available_width - (reference_width + status_width + part_width + slot_width + visual_width + package_width + uses_width + 12),
             )
 
@@ -12375,9 +13136,9 @@ def run_gui() -> int:
                 and self.current_archive_model_texture_references
             ):
                 sizes = self.archive_preview_content_splitter.sizes()
-                if len(sizes) >= 2 and sizes[1] < 280:
+                if len(sizes) >= 2 and sizes[1] < 260:
                     total = max(1, sum(sizes))
-                    right = max(280, min(420, total // 2))
+                    right = max(260, min(420, total // 2))
                     self.archive_preview_content_splitter.setSizes([max(1, total - right), right])
             self._layout_archive_texture_reference_columns()
 
@@ -14430,7 +15191,7 @@ def run_gui() -> int:
                 current_visual = header.visualIndex(logical_index)
                 if current_visual >= 0 and current_visual != logical_index:
                     header.moveSection(current_visual, logical_index)
-            default_widths = [480, 78, 145, 72, 130]
+            default_widths = [260, 220, 78, 145, 72, 130, 360]
             for column, width in enumerate(default_widths[: self.archive_tree.columnCount()]):
                 header.resizeSection(column, width)
             self.schedule_settings_save()
@@ -19303,7 +20064,7 @@ def run_gui() -> int:
                         workflow_filters.append(relative_path)
                     if workflow_filters and len(workflow_filters) <= 256:
                         self.filters_edit.setPlainText("\n".join(workflow_filters))
-                    self.main_tabs.setCurrentWidget(self.workflow_tab)
+                    self._activate_tool_widget(self.workflow_tab)
                     if workflow_filters and len(workflow_filters) == 1:
                         self.set_status_message(
                             f"Extracted {extracted} archive DDS file(s) to {output_root_value}, set Original DDS root, and focused the workflow filter on {workflow_filters[0]}."
@@ -19585,7 +20346,7 @@ def run_gui() -> int:
             self.set_status_message("Scanning DDS files...")
             self.append_log("Starting scan.")
             self.reset_progress()
-            self.main_tabs.setCurrentWidget(self.workflow_tab)
+            self._activate_tool_widget(self.workflow_tab)
             self.content_tabs.setCurrentIndex(0)
 
             worker = ScanWorker(self.collect_config())
@@ -19675,7 +20436,7 @@ def run_gui() -> int:
                     "Warning: DDS-to-PNG conversion is enabled while the upscaling backend is disabled, so Start will convert DDS files to PNG and stop."
                 )
             self.reset_progress()
-            self.main_tabs.setCurrentWidget(self.workflow_tab)
+            self._activate_tool_widget(self.workflow_tab)
             self.content_tabs.setCurrentIndex(0)
 
             worker = DdsToPngWorker(config)
@@ -19727,7 +20488,7 @@ def run_gui() -> int:
             self.set_status_message("Preparing build...")
             self.append_log("Starting build.")
             self.reset_progress()
-            self.main_tabs.setCurrentWidget(self.workflow_tab)
+            self._activate_tool_widget(self.workflow_tab)
             self.content_tabs.setCurrentIndex(0)
 
             worker = BuildWorker(config)
@@ -19774,7 +20535,7 @@ def run_gui() -> int:
 
         def _open_classification_review_for_paths(self, paths: Sequence[str]) -> None:
             path_list = [str(path).strip() for path in paths if str(path).strip()]
-            self.main_tabs.setCurrentWidget(self.research_tab)
+            self._activate_tool_widget(self.research_tab)
             if not path_list:
                 self.set_status_message(
                     "Build paused so you can review DDS files that still need a saved local classification in Research -> Classification Review."
@@ -19811,7 +20572,7 @@ def run_gui() -> int:
                 return
             if not self.text_search_tab.review_archive_entry(entry, highlight_query=query):
                 return
-            self.main_tabs.setCurrentWidget(self.text_search_tab)
+            self._activate_tool_widget(self.text_search_tab)
 
         def _check_unclassified_files_before_build(self, config: AppConfig) -> None:
             def task(on_log: Callable[[str], None]) -> Dict[str, object]:
@@ -20061,7 +20822,7 @@ def run_gui() -> int:
             if summary.log_csv_path:
                 self.append_log(f"CSV log saved to {summary.log_csv_path}")
             self.refresh_compare_list(select_current=True)
-            self.main_tabs.setCurrentWidget(self.workflow_tab)
+            self._activate_tool_widget(self.workflow_tab)
             self.content_tabs.setCurrentIndex(1)
             self._last_build_unknown_review_result = None
 
@@ -20086,7 +20847,7 @@ def run_gui() -> int:
             )
             if summary.log_csv_path:
                 self.append_log(f"CSV log saved to {summary.log_csv_path}")
-            self.main_tabs.setCurrentWidget(self.workflow_tab)
+            self._activate_tool_widget(self.workflow_tab)
             self.content_tabs.setCurrentIndex(0)
 
         def _handle_build_cancelled(self, message: str) -> None:
@@ -20225,7 +20986,7 @@ def run_gui() -> int:
             if not relative_path:
                 self.set_status_message("Select a DDS file in Compare first.", error=True)
                 return
-            self.main_tabs.setCurrentWidget(self.research_tab)
+            self._activate_tool_widget(self.research_tab)
             self.research_tab.focus_texture_analysis_for_compare_path(relative_path, refresh_snapshot=True)
 
         def _sync_compare_scrollbar(self, source_bar, target_bar, value: int) -> None:
@@ -20579,6 +21340,8 @@ def run_gui() -> int:
                     pass
 
             self._shutting_down = True
+            self._save_detached_tool_geometries()
+            self._attach_all_detached_tools(select_after=False)
             nonlocal _active_main_window
             _active_main_window = None
             self._cancel_archive_tree_clear()

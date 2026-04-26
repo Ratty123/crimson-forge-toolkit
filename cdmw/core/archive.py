@@ -96,7 +96,7 @@ class LazyArchiveEntryRowIndex(Mapping[str, Sequence[ArchiveEntry]]):
             for key, value in (rows or {}).items()
             if str(key or "").strip()
         }
-        self._entries = list(entries)
+        self._entries = entries
         self._resolved: OrderedDict[str, Tuple[ArchiveEntry, ...]] = OrderedDict()
         self._resolved_limit = 4096
 
@@ -828,14 +828,14 @@ def _collect_archive_scan_sources_from_entries(
         for raw_path in (getattr(entry, "pamt_path", None), getattr(entry, "paz_file", None)):
             if raw_path is None:
                 continue
+            archive_path = raw_path if isinstance(raw_path, Path) else Path(raw_path).expanduser()
             try:
-                resolved_path = Path(raw_path).expanduser().resolve()
-            except OSError:
-                resolved_path = Path(raw_path).expanduser()
-            normalized_key = str(resolved_path).strip().lower()
+                normalized_key = os.path.normcase(os.fspath(archive_path)).strip().lower()
+            except (OSError, TypeError, ValueError):
+                normalized_key = str(archive_path).strip().lower()
             if not normalized_key or normalized_key in unique_archive_paths:
                 continue
-            unique_archive_paths[normalized_key] = resolved_path
+            unique_archive_paths[normalized_key] = archive_path
 
     sources: List[Tuple[str, int, int]] = []
     for archive_path in sorted(unique_archive_paths.values(), key=lambda value: str(value).lower()):

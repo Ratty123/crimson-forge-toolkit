@@ -28,10 +28,13 @@ from cdmw.constants import (
     DEFAULT_UI_LOG_FONT_BOLD,
     DEFAULT_UI_LOG_FONT_FAMILY,
     DEFAULT_UI_LOG_FONT_SIZE,
+    DEFAULT_UI_LOG_COLOR_SCHEME,
     DEFAULT_UI_LOG_TEXT_STYLE,
+    DEFAULT_UI_PREVIEW_COLOR_SCHEME,
     DEFAULT_UI_THEME,
     LOG_FONT_FAMILY_OPTIONS,
     UI_LOG_TEXT_STYLE_OPTIONS,
+    UI_TEXT_COLOR_SCHEME_OPTIONS,
     UI_FONT_SIZE_MAX,
     UI_FONT_SIZE_MIN,
     UI_FONT_FAMILY_OPTIONS,
@@ -206,9 +209,22 @@ class SettingsTab(QWidget):
         for key, label in UI_LOG_TEXT_STYLE_OPTIONS:
             self.log_text_style_combo.addItem(label, key)
         self.log_text_style_combo.setToolTip(
-            "Controls syntax colors for logs, archive details, preview details, and referenced-file detail panes."
+            "Controls highlighting intensity for logs, archive details, preview details, and referenced-file detail panes."
         )
-        appearance_layout.addRow("Log / details style", self.log_text_style_combo)
+        appearance_layout.addRow("Highlight intensity", self.log_text_style_combo)
+        self.log_color_scheme_combo = QComboBox()
+        self.preview_color_scheme_combo = QComboBox()
+        for key, label in UI_TEXT_COLOR_SCHEME_OPTIONS:
+            self.log_color_scheme_combo.addItem(label, key)
+            self.preview_color_scheme_combo.addItem(label, key)
+        self.log_color_scheme_combo.setToolTip(
+            "Color palette used for timestamps, warnings, errors, paths, numbers, backend names, and progress values in log panes."
+        )
+        self.preview_color_scheme_combo.setToolTip(
+            "Color palette used for code/text previews and archive Details metadata panes."
+        )
+        appearance_layout.addRow("Log color scheme", self.log_color_scheme_combo)
+        appearance_layout.addRow("Preview/details color scheme", self.preview_color_scheme_combo)
         self.verbose_archive_logs_checkbox = QCheckBox("Show verbose Archive Browser logs")
         self.verbose_archive_logs_checkbox.setToolTip(
             "Shows timing, cache, and worker diagnostics in the Archive Scan Log. Leave this off for cleaner day-to-day browsing."
@@ -593,6 +609,8 @@ class SettingsTab(QWidget):
         self.log_font_size_spin.valueChanged.connect(self._handle_appearance_changed)
         self.log_font_bold_checkbox.toggled.connect(self._handle_appearance_changed)
         self.log_text_style_combo.currentIndexChanged.connect(self._handle_appearance_changed)
+        self.log_color_scheme_combo.currentIndexChanged.connect(self._handle_appearance_changed)
+        self.preview_color_scheme_combo.currentIndexChanged.connect(self._handle_appearance_changed)
         for checkbox in (
             self.auto_load_archive_checkbox,
             self.prefer_cache_checkbox,
@@ -629,6 +647,10 @@ class SettingsTab(QWidget):
         """Place app setup and path controls at the top of Settings without duplicating state."""
         self.left_column.insertWidget(0, setup_section)
         self.right_column.insertWidget(0, paths_section)
+
+    def add_archive_locations_section(self, archive_locations_section: QWidget) -> None:
+        """Place archive package/extraction paths with other persistent Settings controls."""
+        self.left_column.insertWidget(1, archive_locations_section)
 
     def _create_int_spin(self, *, minimum: int, maximum: int, step: int, suffix: str = "") -> QSpinBox:
         spin = QSpinBox()
@@ -797,6 +819,8 @@ class SettingsTab(QWidget):
         self.settings.setValue("appearance/log_font_size", self.current_log_font_size())
         self.settings.setValue("appearance/log_font_bold", self.current_log_font_bold())
         self.settings.setValue("appearance/log_text_style", self.current_log_text_style())
+        self.settings.setValue("appearance/log_color_scheme", self.current_log_color_scheme())
+        self.settings.setValue("appearance/preview_color_scheme", self.current_preview_color_scheme())
         self.settings.setValue("preferences/auto_load_archive_on_startup", self.auto_load_archive_checkbox.isChecked())
         self.settings.setValue(
             "preferences/prefer_archive_cache_on_startup",
@@ -1042,6 +1066,14 @@ class SettingsTab(QWidget):
             self.settings.value("appearance/log_text_style", DEFAULT_UI_LOG_TEXT_STYLE)
             or DEFAULT_UI_LOG_TEXT_STYLE
         )
+        log_color_scheme = str(
+            self.settings.value("appearance/log_color_scheme", DEFAULT_UI_LOG_COLOR_SCHEME)
+            or DEFAULT_UI_LOG_COLOR_SCHEME
+        )
+        preview_color_scheme = str(
+            self.settings.value("appearance/preview_color_scheme", DEFAULT_UI_PREVIEW_COLOR_SCHEME)
+            or DEFAULT_UI_PREVIEW_COLOR_SCHEME
+        )
         self.set_theme_selection(resolved_theme_key)
         family_index = self.ui_font_family_combo.findData(ui_font_family)
         if family_index < 0:
@@ -1079,6 +1111,18 @@ class SettingsTab(QWidget):
         self.log_text_style_combo.blockSignals(True)
         self.log_text_style_combo.setCurrentIndex(max(0, style_index))
         self.log_text_style_combo.blockSignals(False)
+        log_scheme_index = self.log_color_scheme_combo.findData(log_color_scheme)
+        if log_scheme_index < 0:
+            log_scheme_index = self.log_color_scheme_combo.findData(DEFAULT_UI_LOG_COLOR_SCHEME)
+        self.log_color_scheme_combo.blockSignals(True)
+        self.log_color_scheme_combo.setCurrentIndex(max(0, log_scheme_index))
+        self.log_color_scheme_combo.blockSignals(False)
+        preview_scheme_index = self.preview_color_scheme_combo.findData(preview_color_scheme)
+        if preview_scheme_index < 0:
+            preview_scheme_index = self.preview_color_scheme_combo.findData(DEFAULT_UI_PREVIEW_COLOR_SCHEME)
+        self.preview_color_scheme_combo.blockSignals(True)
+        self.preview_color_scheme_combo.setCurrentIndex(max(0, preview_scheme_index))
+        self.preview_color_scheme_combo.blockSignals(False)
 
     def set_language_selection(self, language_code: str) -> None:
         code = str(language_code or "en").strip() or "en"
@@ -1350,3 +1394,11 @@ class SettingsTab(QWidget):
     def current_log_text_style(self) -> str:
         data = self.log_text_style_combo.currentData()
         return str(data) if data is not None else DEFAULT_UI_LOG_TEXT_STYLE
+
+    def current_log_color_scheme(self) -> str:
+        data = self.log_color_scheme_combo.currentData()
+        return str(data) if data is not None else DEFAULT_UI_LOG_COLOR_SCHEME
+
+    def current_preview_color_scheme(self) -> str:
+        data = self.preview_color_scheme_combo.currentData()
+        return str(data) if data is not None else DEFAULT_UI_PREVIEW_COLOR_SCHEME

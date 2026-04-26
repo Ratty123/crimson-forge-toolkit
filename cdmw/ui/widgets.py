@@ -10,6 +10,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QCursor,
     QDesktopServices,
@@ -19,6 +20,7 @@ from PySide6.QtGui import (
     QMatrix4x4,
     QOpenGLFunctions,
     QPainter,
+    QPalette,
     QPen,
     QPixmap,
     QVector2D,
@@ -4918,11 +4920,87 @@ def _theme_is_light(theme_key: str) -> bool:
 
 
 _TEXT_HIGHLIGHT_STYLES = {"rich", "calm", "plain"}
+_TEXT_COLOR_SCHEMES = {"theme", "vscode", "terminal", "accessible", "solarized"}
 
 
 def _normalize_text_highlight_style(style: object) -> str:
     value = str(style or "rich").strip().lower()
     return value if value in _TEXT_HIGHLIGHT_STYLES else "rich"
+
+
+def _normalize_text_color_scheme(scheme: object) -> str:
+    value = str(scheme or "theme").strip().lower()
+    return value if value in _TEXT_COLOR_SCHEMES else "theme"
+
+
+def _scheme_palette(theme_key: str, scheme: object) -> Optional[Dict[str, str]]:
+    normalized = _normalize_text_color_scheme(scheme)
+    if normalized == "theme":
+        return None
+    light = _theme_is_light(theme_key)
+    if normalized == "terminal":
+        return {
+            "comment": "#6b7280" if light else "#7dd3fc",
+            "keyword": "#7c3aed" if light else "#f0abfc",
+            "string": "#047857" if light else "#86efac",
+            "number": "#b45309" if light else "#fbbf24",
+            "tag": "#0369a1" if light else "#93c5fd",
+            "attribute": "#be123c" if light else "#fda4af",
+            "section": "#0f766e" if light else "#5eead4",
+            "key": "#b45309" if light else "#fde68a",
+            "entity": "#9333ea" if light else "#d8b4fe",
+            "bracket": "#4b5563" if light else "#d1d5db",
+            "success": "#047857" if light else "#22c55e",
+            "warning": "#a16207" if light else "#facc15",
+            "error": "#b91c1c" if light else "#f87171",
+        }
+    if normalized == "accessible":
+        return {
+            "comment": "#525252" if light else "#bdbdbd",
+            "keyword": "#0000aa" if light else "#8ab4ff",
+            "string": "#006400" if light else "#b7f7c1",
+            "number": "#7a3e00" if light else "#ffd27d",
+            "tag": "#003f8c" if light else "#9bd1ff",
+            "attribute": "#6f1d8f" if light else "#e3b5ff",
+            "section": "#004d40" if light else "#9ff7e8",
+            "key": "#5f3700" if light else "#ffe08a",
+            "entity": "#7a3e00" if light else "#ffd27d",
+            "bracket": "#333333" if light else "#eeeeee",
+            "success": "#006400" if light else "#76ff7a",
+            "warning": "#8a5a00" if light else "#ffdd57",
+            "error": "#a00000" if light else "#ff8a80",
+        }
+    if normalized == "solarized":
+        return {
+            "comment": "#657b83",
+            "keyword": "#6c71c4",
+            "string": "#2aa198",
+            "number": "#d33682",
+            "tag": "#268bd2",
+            "attribute": "#b58900",
+            "section": "#859900",
+            "key": "#b58900",
+            "entity": "#cb4b16",
+            "bracket": "#839496",
+            "success": "#859900",
+            "warning": "#b58900",
+            "error": "#dc322f",
+        }
+    return {
+        "comment": "#008000" if light else "#6a9955",
+        "keyword": "#af00db" if light else "#c586c0",
+        "string": "#a31515" if light else "#ce9178",
+        "number": "#098658" if light else "#b5cea8",
+        "tag": "#0451a5" if light else "#569cd6",
+        "attribute": "#001080" if light else "#9cdcfe",
+        "section": "#795e26" if light else "#4ec9b0",
+        "key": "#001080" if light else "#9cdcfe",
+        "entity": "#795e26" if light else "#d7ba7d",
+        "bracket": "#333333" if light else "#d4d4d4",
+        "success": "#098658" if light else "#6a9955",
+        "warning": "#b45309" if light else "#fbbf24",
+        "error": "#c0362c" if light else "#f48771",
+    }
 
 
 class PreviewSyntaxHighlighter(QSyntaxHighlighter):
@@ -4938,10 +5016,11 @@ class PreviewSyntaxHighlighter(QSyntaxHighlighter):
         "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
     }
 
-    def __init__(self, document, theme_key: str, highlight_style: str = "rich"):
+    def __init__(self, document, theme_key: str, highlight_style: str = "rich", color_scheme: str = "theme"):
         super().__init__(document)
         self.language = "plain"
         self.highlight_style = _normalize_text_highlight_style(highlight_style)
+        self.color_scheme = _normalize_text_color_scheme(color_scheme)
         self.comment_format = QTextCharFormat()
         self.keyword_format = QTextCharFormat()
         self.string_format = QTextCharFormat()
@@ -4980,6 +5059,21 @@ class PreviewSyntaxHighlighter(QSyntaxHighlighter):
             self.key_format = make(base_color)
             self.entity_format = make(base_color)
             self.bracket_format = make(base_color)
+        else:
+            scheme = _scheme_palette(theme_key, self.color_scheme)
+        if self.highlight_style == "plain":
+            pass
+        elif scheme is not None:
+            self.comment_format = make(scheme["comment"], italic=True)
+            self.keyword_format = make(scheme["keyword"], bold=True)
+            self.string_format = make(scheme["string"])
+            self.number_format = make(scheme["number"])
+            self.tag_format = make(scheme["tag"], bold=True)
+            self.attribute_format = make(scheme["attribute"])
+            self.section_format = make(scheme["section"], bold=True)
+            self.key_format = make(scheme["key"])
+            self.entity_format = make(scheme["entity"])
+            self.bracket_format = make(scheme["bracket"])
         elif calm:
             self.comment_format = make(theme["text_muted"], italic=True)
             self.keyword_format = make(theme["accent"])
@@ -5020,6 +5114,13 @@ class PreviewSyntaxHighlighter(QSyntaxHighlighter):
         if normalized == self.highlight_style:
             return
         self.highlight_style = normalized
+        self.set_theme(getattr(self, "current_theme_key", "") or "graphite")
+
+    def set_color_scheme(self, scheme: str) -> None:
+        normalized = _normalize_text_color_scheme(scheme)
+        if normalized == self.color_scheme:
+            return
+        self.color_scheme = normalized
         self.set_theme(getattr(self, "current_theme_key", "") or "graphite")
 
     def set_language_for_extension(self, extension: str) -> None:
@@ -5153,10 +5254,18 @@ class _LineNumberArea(QWidget):
 
 
 class CodePreviewEditor(QPlainTextEdit):
-    def __init__(self, *, theme_key: str, parent: Optional[QWidget] = None, highlight_style: str = "rich"):
+    def __init__(
+        self,
+        *,
+        theme_key: str,
+        parent: Optional[QWidget] = None,
+        highlight_style: str = "rich",
+        color_scheme: str = "theme",
+    ):
         super().__init__(parent)
         self.theme_key = theme_key
         self._highlight_style = _normalize_text_highlight_style(highlight_style)
+        self._color_scheme = _normalize_text_color_scheme(color_scheme)
         self._match_selections: list[QTextEdit.ExtraSelection] = []
         self._search_query = ""
         self._search_matches: list[Tuple[int, int]] = []
@@ -5167,6 +5276,7 @@ class CodePreviewEditor(QPlainTextEdit):
             self.document(),
             theme_key,
             self._highlight_style,
+            self._color_scheme,
         )
         self.setReadOnly(True)
         self.setLineWrapMode(QPlainTextEdit.NoWrap)
@@ -5279,6 +5389,11 @@ class CodePreviewEditor(QPlainTextEdit):
         self._highlight_style = _normalize_text_highlight_style(style)
         if hasattr(self.syntax_highlighter, "set_highlight_style"):
             self.syntax_highlighter.set_highlight_style(self._highlight_style)
+
+    def set_color_scheme(self, scheme: str) -> None:
+        self._color_scheme = _normalize_text_color_scheme(scheme)
+        if hasattr(self.syntax_highlighter, "set_color_scheme"):
+            self.syntax_highlighter.set_color_scheme(self._color_scheme)
         else:
             self.syntax_highlighter.rehighlight()
 
@@ -5425,11 +5540,12 @@ class LogHighlighter(QSyntaxHighlighter):
     _number_re = re.compile(r"(?<![\w./\\-])\d+(?:[.,]\d+)?\b")
     _arrow_re = re.compile(r"->")
 
-    def __init__(self, document, theme_key: str, highlight_style: str = "rich"):
+    def __init__(self, document, theme_key: str, highlight_style: str = "rich", color_scheme: str = "theme"):
         super().__init__(document)
         self.current_theme_key = theme_key
         self._bold_enabled = True
         self.highlight_style = _normalize_text_highlight_style(highlight_style)
+        self.color_scheme = _normalize_text_color_scheme(color_scheme)
         self.timestamp_format = QTextCharFormat()
         self.error_format = QTextCharFormat()
         self.warning_format = QTextCharFormat()
@@ -5454,6 +5570,7 @@ class LogHighlighter(QSyntaxHighlighter):
         theme = get_theme(theme_key)
         light = _theme_is_light(theme_key)
         calm = self.highlight_style == "calm"
+        scheme = _scheme_palette(theme_key, self.color_scheme)
 
         def make_format(
             color: str,
@@ -5472,17 +5589,17 @@ class LogHighlighter(QSyntaxHighlighter):
             return fmt
 
         self.timestamp_format = make_format(theme["text_muted"])
-        self.error_format = make_format(theme["error"] if not calm else theme["warning_text"], bold=True)
-        self.warning_format = make_format(theme["warning_text"], bold=True)
-        self.success_format = make_format("#098658" if light else "#6a9955", bold=True)
-        self.phase_format = make_format(theme["accent"], bold=True)
+        self.error_format = make_format((scheme or {}).get("error", theme["error"] if not calm else theme["warning_text"]), bold=True)
+        self.warning_format = make_format((scheme or {}).get("warning", theme["warning_text"]), bold=True)
+        self.success_format = make_format((scheme or {}).get("success", "#098658" if light else "#6a9955"), bold=True)
+        self.phase_format = make_format((scheme or {}).get("tag", theme["accent"]), bold=True)
         self.path_format = make_format(theme["text_strong"], bold=True)
-        self.progress_format = make_format(theme["accent"], bold=True)
-        self.action_format = make_format("#0451a5" if light else "#569cd6", bold=True)
-        self.backend_format = make_format(theme["accent"], bold=True)
-        self.key_format = make_format("#795e26" if light else "#d7ba7d", bold=True)
-        self.value_format = make_format("#a31515" if light else "#ce9178")
-        self.number_format = make_format("#098658" if light else "#b5cea8")
+        self.progress_format = make_format((scheme or {}).get("number", theme["accent"]), bold=True)
+        self.action_format = make_format((scheme or {}).get("keyword", "#0451a5" if light else "#569cd6"), bold=True)
+        self.backend_format = make_format((scheme or {}).get("tag", theme["accent"]), bold=True)
+        self.key_format = make_format((scheme or {}).get("key", "#795e26" if light else "#d7ba7d"), bold=True)
+        self.value_format = make_format((scheme or {}).get("string", "#a31515" if light else "#ce9178"))
+        self.number_format = make_format((scheme or {}).get("number", "#098658" if light else "#b5cea8"))
         self.separator_format = make_format(theme["text_muted"], bold=True)
 
         warning_bg = QColor(theme["warning_bg"])
@@ -5519,6 +5636,10 @@ class LogHighlighter(QSyntaxHighlighter):
 
     def set_highlight_style(self, style: str) -> None:
         self.highlight_style = _normalize_text_highlight_style(style)
+        self.set_theme(self.current_theme_key)
+
+    def set_color_scheme(self, scheme: str) -> None:
+        self.color_scheme = _normalize_text_color_scheme(scheme)
         self.set_theme(self.current_theme_key)
 
     def highlightBlock(self, text: str) -> None:  # type: ignore[override]
@@ -5601,10 +5722,11 @@ class ArchiveDetailsHighlighter(QSyntaxHighlighter):
     _hex_offset_re = re.compile(r"^\s*([0-9A-F]{4})(?=\s)")
     _hex_byte_re = re.compile(r"\b[0-9A-F]{2}\b")
 
-    def __init__(self, document, theme_key: str, highlight_style: str = "rich"):
+    def __init__(self, document, theme_key: str, highlight_style: str = "rich", color_scheme: str = "theme"):
         super().__init__(document)
         self.current_theme_key = theme_key
         self.highlight_style = _normalize_text_highlight_style(highlight_style)
+        self.color_scheme = _normalize_text_color_scheme(color_scheme)
         self.section_format = QTextCharFormat()
         self.label_format = QTextCharFormat()
         self.path_format = QTextCharFormat()
@@ -5620,6 +5742,7 @@ class ArchiveDetailsHighlighter(QSyntaxHighlighter):
         theme = get_theme(theme_key)
         light = _theme_is_light(theme_key)
         calm = self.highlight_style == "calm"
+        scheme = _scheme_palette(theme_key, self.color_scheme)
 
         def make_format(
             color: str,
@@ -5634,18 +5757,22 @@ class ArchiveDetailsHighlighter(QSyntaxHighlighter):
             fmt.setFontItalic(italic)
             return fmt
 
-        self.section_format = make_format(theme["accent"] if not calm else theme["text_strong"], bold=True)
-        self.label_format = make_format("#795e26" if light else "#d7ba7d", bold=True)
+        self.section_format = make_format((scheme or {}).get("section", theme["accent"] if not calm else theme["text_strong"]), bold=True)
+        self.label_format = make_format((scheme or {}).get("key", "#795e26" if light else "#d7ba7d"), bold=True)
         self.path_format = make_format(theme["text_strong"], bold=True)
-        self.number_format = make_format("#098658" if light else "#b5cea8")
-        self.warning_format = make_format(theme["warning_text"], bold=True)
-        self.hex_offset_format = make_format("#0451a5" if light else "#569cd6", bold=True)
-        self.hex_byte_format = make_format("#ce9178" if light else "#d7ba7d")
+        self.number_format = make_format((scheme or {}).get("number", "#098658" if light else "#b5cea8"))
+        self.warning_format = make_format((scheme or {}).get("warning", theme["warning_text"]), bold=True)
+        self.hex_offset_format = make_format((scheme or {}).get("tag", "#0451a5" if light else "#569cd6"), bold=True)
+        self.hex_byte_format = make_format((scheme or {}).get("string", "#ce9178" if light else "#d7ba7d"))
         self.muted_format = make_format(theme["text_muted"], italic=True)
         self.rehighlight()
 
     def set_highlight_style(self, style: str) -> None:
         self.highlight_style = _normalize_text_highlight_style(style)
+        self.set_theme(self.current_theme_key)
+
+    def set_color_scheme(self, scheme: str) -> None:
+        self.color_scheme = _normalize_text_color_scheme(scheme)
         self.set_theme(self.current_theme_key)
 
     def highlightBlock(self, text: str) -> None:  # type: ignore[override]
@@ -5690,12 +5817,20 @@ class ArchiveDetailsHighlighter(QSyntaxHighlighter):
 
 
 class ArchiveDetailsEditor(CodePreviewEditor):
-    def __init__(self, *, theme_key: str, parent: Optional[QWidget] = None, highlight_style: str = "rich"):
-        super().__init__(theme_key=theme_key, parent=parent, highlight_style=highlight_style)
+    def __init__(
+        self,
+        *,
+        theme_key: str,
+        parent: Optional[QWidget] = None,
+        highlight_style: str = "rich",
+        color_scheme: str = "theme",
+    ):
+        super().__init__(theme_key=theme_key, parent=parent, highlight_style=highlight_style, color_scheme=color_scheme)
         self.syntax_highlighter = ArchiveDetailsHighlighter(
             self.document(),
             theme_key,
             self._highlight_style,
+            self._color_scheme,
         )
         self.set_theme(theme_key)
 
@@ -5756,9 +5891,10 @@ _QUICK_START_HTML_ES = """
 </ul>
 <h3>Configuracion inicial recomendada</h3>
 <ol>
-  <li>Abre <b>Configuracion</b>. <b>Configuracion inicial</b> esta a la izquierda y <b>Rutas</b> a la derecha.</li>
-  <li>Haz clic en <b>Inicializar espacio</b>.</li>
-  <li>Configura <b>texconv.exe</b>. Las vistas DDS, conversion DDS-a-PNG, comparacion y reconstruccion DDS dependen de el.</li>
+  <li>Crea una carpeta dedicada para la app y coloca alli el <b>.exe</b> portable para mantener juntos configuracion, cache, herramientas y workspace.</li>
+  <li>Abre <b>Configuracion &gt; Ubicaciones de archivo</b> y define la ruta del juego/paquete de Crimson Desert. Usa deteccion automatica si aplica.</li>
+  <li>Abre <b>Configuracion &gt; Setup</b> y haz clic en <b>Inicializar espacio</b>.</li>
+  <li>Descarga <b>texconv</b>, coloca <b>texconv.exe</b> bajo la carpeta tools del workspace y configura la ruta de texconv.</li>
   <li>Define <b>Raiz DDS original</b>, <b>Raiz PNG</b> y <b>Raiz de salida</b>. Activa staging DDS solo si quieres una carpeta PNG previa al escalado.</li>
   <li>Elige un backend de escalado: desactivado, <b>Real-ESRGAN NCNN</b> directo o <b>chaiNNer</b>.</li>
   <li>Empieza con una politica de texturas segura y deja las reglas automaticas activadas para preservar mapas tecnicos riesgosos.</li>
@@ -5776,6 +5912,8 @@ _QUICK_START_HTML_ES = """
   <li><b>Escalado</b>: backend, politica, controles NCNN y notas.</li>
   <li><b>Comparar</b>: revision lado a lado antes de lotes grandes.</li>
 </ul>
+<h3>Nota sobre cache de sidecars</h3>
+<p>Crear el cache global de sidecars puede tardar mucho en archivos grandes. Mejora referencias inversas DDS, conexiones de texturas de modelos y busqueda de sidecars/materiales. Si lo activas, deja que termine; se configura en <b>Configuracion &gt; Rendimiento del explorador de archivos</b>.</p>
 <h3>Advertencia sobre texturas tecnicas</h3>
 <p>Las texturas visibles de color no son iguales que mapas tecnicos. Altura, desplazamiento, normales, mascaras, vectores y otros DDS sensibles son mas riesgosos al pasar por PNG.</p>
 <ul>
@@ -5802,9 +5940,10 @@ _QUICK_START_HTML_DE = """
 </ul>
 <h3>Empfohlene Starteinrichtung</h3>
 <ol>
-  <li>Oeffne <b>Einstellungen</b>. <b>Einrichtung</b> ist links und <b>Pfade</b> rechts.</li>
-  <li>Klicke auf <b>Arbeitsbereich einrichten</b>.</li>
-  <li>Konfiguriere <b>texconv.exe</b>. DDS-Vorschau, DDS-zu-PNG, Vergleich und DDS-Neuaufbau haengen davon ab.</li>
+  <li>Erstelle einen eigenen Ordner fuer die App und lege die portable <b>.exe</b> dort ab, damit Konfiguration, Cache, Tools und Workspace zusammen bleiben.</li>
+  <li>Oeffne <b>Einstellungen &gt; Archiv-Orte</b> und setze den Crimson-Desert-Spiel-/Paketpfad. Nutze Auto-Erkennung, wenn moeglich.</li>
+  <li>Oeffne <b>Einstellungen &gt; Einrichtung</b> und klicke auf <b>Arbeitsbereich einrichten</b>.</li>
+  <li>Lade <b>texconv</b> herunter, lege <b>texconv.exe</b> im tools-Ordner des Workspace ab und konfiguriere den texconv-Pfad.</li>
   <li>Setze <b>Original-DDS-Stamm</b>, <b>PNG-Stamm</b> und <b>Ausgabe-Stamm</b>. Aktiviere DDS-Staging nur fuer einen separaten PNG-Staging-Ordner.</li>
   <li>Waehle ein Upscaling-Backend: deaktiviert, direktes <b>Real-ESRGAN NCNN</b> oder <b>chaiNNer</b>.</li>
   <li>Starte mit einer sicheren Textur-Richtlinie und lasse automatische Regeln aktiv, damit riskante technische Maps erhalten bleiben.</li>
@@ -5822,6 +5961,8 @@ _QUICK_START_HTML_DE = """
   <li><b>Upscaling</b>: Backend, Richtlinie, NCNN-Steuerung und Notizen.</li>
   <li><b>Vergleichen</b>: Seit-an-Seit-Pruefung vor groesseren Laeufen.</li>
 </ul>
+<h3>Hinweis zum Sidecar-Cache</h3>
+<p>Der globale Sidecar-Cache kann bei grossen Archiven lange dauern. Er verbessert DDS-Rueckreferenzen, Modell-Textur-Verbindungen und Material-Sidecar-Suche. Wenn du ihn aktivierst, lass den ersten Lauf fertig werden; die Optionen findest du unter <b>Einstellungen &gt; Archiv-Browser-Leistung</b>.</p>
 <h3>Warnung zu technischen Texturen</h3>
 <p>Sichtbare Farbtexturen sind nicht dasselbe wie technische Maps. Hoehe, Displacement, Normalen, Masken, Vektoren und andere empfindliche DDS-Dateien sind riskanter, wenn sie ueber PNG laufen.</p>
 <ul>
@@ -5853,7 +5994,7 @@ class QuickStartDialog(QDialog):
         layout.addWidget(title_label)
 
         intro_label = QLabel(
-            "Before running archive previews or texture workflows, configure Setup and Paths under Settings. The same controls are used by Texture Workflow, Archive Browser previews, Replace Assistant, and Texture Editor handoffs."
+            "Start by putting the portable EXE in its own app folder, setting the Crimson Desert game/package path in Settings > Archive Locations, then clicking Init Workspace. Configure texconv before judging DDS preview or rebuild failures."
         )
         intro_label.setObjectName("HintLabel")
         intro_label.setWordWrap(True)
@@ -5877,10 +6018,11 @@ class QuickStartDialog(QDialog):
             </ul>
             <h3>Recommended Startup Setup</h3>
             <ol>
-              <li>Open <b>Settings</b>. <b>Setup</b> is on the left and <b>Paths</b> is on the right.</li>
-              <li>Click <b>Init Workspace</b>.</li>
-              <li>Configure <b>texconv.exe</b>. DDS preview, DDS-to-PNG conversion, compare previews, and DDS rebuild all depend on it.</li>
-              <li>Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>. Enable DDS staging only if you want a separate pre-upscale PNG staging folder.</li>
+              <li>Create or choose a dedicated folder for the app, then place the portable <b>.exe</b> there so config, cache, tools, and workspace folders stay together.</li>
+              <li>Open <b>Settings &gt; Archive Locations</b> and set the Crimson Desert game/package path. Use <b>Auto-detect</b> if the game is in a common install location.</li>
+              <li>Open <b>Settings &gt; Setup</b> and click <b>Init Workspace</b>.</li>
+              <li>Download <b>texconv</b> from the DirectXTex releases page, place <b>texconv.exe</b> under the workspace tools folder, then set <b>texconv.exe path</b>.</li>
+              <li>Confirm <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>. Enable DDS staging only if you want a separate pre-upscale PNG staging folder.</li>
               <li>Choose an upscaling backend in <b>Upscaling</b>: disabled, direct <b>Real-ESRGAN NCNN</b>, or <b>chaiNNer</b>.</li>
               <li>Keep a safer <b>Texture Policy</b> preset first and leave automatic rules enabled so risky technical DDS files are preserved instead of pushed through the visible PNG path.</li>
               <li>Open <b>Profiles, Rules &amp; Matches</b> and review the starter workflow assignments before running a batch.</li>
@@ -5889,6 +6031,48 @@ class QuickStartDialog(QDialog):
               <li>Run a small subset first, then review the output in <b>Compare</b> before trying a larger batch.</li>
               <li>If you already edited a texture outside the app, use <b>Replace Assistant</b> instead of the batch workflow.</li>
               <li>If you want to edit visible textures inside the app, open them in <b>Texture Editor</b> and then send the flattened result back into <b>Replace Assistant</b> or <b>Texture Workflow</b>.</li>
+            </ol>
+            <h3>Pick The Right Starting Path</h3>
+            <ul>
+              <li><b>I want to look inside the game files</b>: open <b>Archive Browser</b>, choose a package root, scan, filter, preview, and extract selected files.</li>
+              <li><b>I want to batch-process loose DDS files</b>: use <b>Texture Workflow</b> with a small folder first, then review in <b>Compare</b>.</li>
+              <li><b>I already edited one texture</b>: use <b>Replace Assistant</b> so the original DDS controls format, dimensions, mips, and output path.</li>
+              <li><b>I want to edit inside the app</b>: use <b>Texture Editor</b>, save a project if you need layers later, then export or send the flattened PNG onward.</li>
+              <li><b>I need to understand what a texture family is</b>: use <b>Research</b> for grouped sets, classifications, references, analysis, and notes.</li>
+              <li><b>I am searching for XML, JSON, Lua, or config strings</b>: use <b>Text Search</b> against archives or loose folders.</li>
+            </ul>
+            <h3>Sidecar Cache Note</h3>
+            <p>Building the global sidecar cache is intentionally optional because it can be expensive on large archives. It improves DDS related-file discovery, reverse references, mesh texture connections, and material-sidecar lookup. If you enable it, let the first run finish even when it takes a long time. Configure sidecar indexing and worker count in <b>Settings &gt; Archive Browser Performance</b>.</p>
+            <h3>Simple Guides</h3>
+            <h4>Scan and extract from archives</h4>
+            <ol>
+              <li>Open <b>Archive Browser</b> and set the package root that contains the Crimson Desert archives.</li>
+              <li>Click <b>Scan</b>. Use cache on repeat scans unless you know the files changed.</li>
+              <li>Filter by package, path, role, extension, previewable state, or search text.</li>
+              <li>Preview the selected item. Use <b>Referenced Files</b> when a mesh or sidecar exposes related textures and metadata.</li>
+              <li>Use <b>Export Selected</b>, <b>Export All</b>, or workflow-specific export actions when you want loose files.</li>
+            </ol>
+            <h4>Batch rebuild or upscale textures</h4>
+            <ol>
+              <li>Set <b>Original DDS root</b>, <b>PNG root</b>, <b>Output root</b>, and <b>texconv.exe</b>.</li>
+              <li>Choose a safer <b>Texture Policy</b> and review <b>Profiles, Rules &amp; Matches</b>.</li>
+              <li>Pick <b>Disabled</b> for DDS rebuild testing, <b>Real-ESRGAN NCNN</b> for direct upscale, or <b>chaiNNer</b> for a known-good external chain.</li>
+              <li>Click <b>Preview Policy</b>, then <b>Scan</b>, then run a small batch with <b>Start</b>.</li>
+              <li>Open <b>Compare</b> and check color, alpha, detail, size, mips, and technical channels before scaling up.</li>
+            </ol>
+            <h4>Replace one edited texture</h4>
+            <ol>
+              <li>Open <b>Replace Assistant</b> and import the edited PNG or DDS.</li>
+              <li>Let the app match the original DDS, or choose the original manually.</li>
+              <li>Review the detected dimensions, format hints, original path, and output plan.</li>
+              <li>Build the result and inspect it before placing the loose folder into a mod manager.</li>
+            </ol>
+            <h4>Edit a visible texture in the app</h4>
+            <ol>
+              <li>Open an image or supported DDS in <b>Texture Editor</b>.</li>
+              <li>Use layers, masks, selections, brushes, clone/heal, gradients, patch, smudge, or adjustments.</li>
+              <li>Save a project if you need to return to the editable layered state.</li>
+              <li>Export or send the flattened PNG to <b>Replace Assistant</b>, <b>Texture Workflow</b>, or <b>Compare</b>.</li>
             </ol>
             <h3>Main Workflow Areas</h3>
             <ul>
@@ -5946,8 +6130,17 @@ class QuickStartDialog(QDialog):
               <li><b>Wrong chaiNNer paths</b>: hardcoded chain folders can make chaiNNer read from or write to the wrong place.</li>
               <li><b>Brightness drift</b>: review in <b>Compare</b>, try a different model, or test a Source Match correction mode.</li>
             </ul>
+            <h3>FAQ</h3>
+            <p><b>Do I need texconv?</b><br/>Yes for DDS preview, DDS-to-PNG conversion, Compare previews, and DDS rebuild. Configure it before judging workflow failures.</p>
+            <p><b>Should I upscale every texture?</b><br/>No. Start with visible color, UI, or emissive textures. Normals, masks, packed maps, vectors, height, and displacement data should usually stay preserve-first until you understand the file family.</p>
+            <p><b>When should I use Replace Assistant instead of Texture Workflow?</b><br/>Use Replace Assistant for one-off edited PNG/DDS replacements. Use Texture Workflow for batch conversion, batch rebuild, or batch upscale of a loose DDS tree.</p>
+            <p><b>What is the safest first backend?</b><br/>Use <b>Disabled</b> to prove paths and DDS rebuild settings first. Then test direct <b>Real-ESRGAN NCNN</b> or a known-good <b>chaiNNer</b> chain on a small subset.</p>
+            <p><b>Why did my output look too bright, too dark, or too sharp?</b><br/>Upscale models and color correction can shift luma, contrast, and detail. Compare against the original, try a different model, reduce aggressive settings, or test Source Match correction for visible textures.</p>
+            <p><b>Can the app edit archive files directly?</b><br/>Only for supported patch workflows, and those flows use explicit confirmation and backup/restore support. Normal browsing, previewing, and extraction are read-only.</p>
+            <p><b>Where are settings and cache stored?</b><br/>Settings and archive cache are stored beside the executable or local checkout, so portable builds keep their local state near the app.</p>
+            <p><b>Why does Documentation have many topics?</b><br/>The documentation window is topic-based. Search by feature, field, file type, backend, or error symptom, then open the focused topic instead of reading one long page.</p>
             <h3>Documentation</h3>
-            <p>The top-level <b>Documentation</b> menu now opens a searchable in-app documentation browser with deeper workflow topics, including planner profiles and planner paths.</p>
+            <p>The top-level <b>Documentation</b> menu opens a topic-based, searchable in-app documentation browser. Use it for deeper guides, field references, advanced planner behavior, troubleshooting, and FAQs.</p>
             <h3>Local State</h3>
             <p>The app auto-saves its settings beside the EXE and also stores archive scan cache beside it.</p>
             """
@@ -5962,10 +6155,12 @@ class QuickStartDialog(QDialog):
 
         button_row = QHBoxLayout()
         button_row.setSpacing(8)
+        self.open_archive_locations_button = QPushButton("Open Archive Locations")
         self.open_setup_button = QPushButton("Open Setup && Paths")
         self.open_chainner_button = QPushButton("Open chaiNNer Setup")
         self.open_docs_button = QPushButton("Open Documentation")
         self.close_button = QPushButton("Close")
+        button_row.addWidget(self.open_archive_locations_button)
         button_row.addWidget(self.open_setup_button)
         button_row.addWidget(self.open_chainner_button)
         button_row.addWidget(self.open_docs_button)
@@ -5973,6 +6168,7 @@ class QuickStartDialog(QDialog):
         button_row.addWidget(self.close_button)
         layout.addLayout(button_row)
 
+        self.open_archive_locations_button.clicked.connect(self._open_archive_locations)
         self.open_setup_button.clicked.connect(self._open_setup)
         self.open_chainner_button.clicked.connect(self._open_chainner_setup)
         self.open_docs_button.clicked.connect(self._open_docs)
@@ -5984,6 +6180,10 @@ class QuickStartDialog(QDialog):
 
     def _open_chainner_setup(self) -> None:
         self.parent_window.focus_quick_start_sections(include_chainner=True)
+        self.accept()
+
+    def _open_archive_locations(self) -> None:
+        self.parent_window.focus_archive_locations()
         self.accept()
 
     def _open_docs(self) -> None:
@@ -6021,6 +6221,14 @@ class AboutDialog(QDialog):
         title_label.setFont(title_font)
         layout.addWidget(title_label)
 
+        self.intro_html = intro_html
+        guide_label = QLabel(
+            "Search or choose a topic on the left. The reader shows one topic at a time so longer documentation stays navigable."
+        )
+        guide_label.setObjectName("HintLabel")
+        guide_label.setWordWrap(True)
+        layout.addWidget(guide_label)
+
         search_row = QHBoxLayout()
         search_row.setSpacing(8)
         search_label = QLabel("Search")
@@ -6055,11 +6263,9 @@ class AboutDialog(QDialog):
         self.browser.setReadOnly(True)
         self.browser.setOpenLinks(False)
         self.browser.setOpenExternalLinks(False)
-        document_html = self._build_document_html(title, intro_html)
         self.browser.setFont(self.font())
         self.browser.document().setDefaultFont(self.font())
-        self.browser.setProperty("_i18n_source_html", document_html)
-        self.browser.setHtml(document_html)
+        self.browser.setProperty("_i18n_source_html", "")
         splitter.addWidget(self.browser)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -6080,7 +6286,7 @@ class AboutDialog(QDialog):
         if self._initial_section_id:
             self.select_section(self._initial_section_id)
         elif self.topic_list.count() > 0:
-            self.topic_list.setCurrentRow(0)
+            self._select_first_topic()
 
     def _build_document_html(self, title: str, intro_html: str) -> str:
         section_html: List[str] = []
@@ -6099,6 +6305,32 @@ class AboutDialog(QDialog):
             + "<hr/>".join(section_html)
         )
 
+    def _build_section_html(self, section: Dict[str, str]) -> str:
+        section_id = str(section.get("id", "") or "").strip()
+        section_title = str(section.get("title", "") or "").strip() or "Documentation"
+        section_summary = str(section.get("summary", "") or "").strip()
+        section_body = str(section.get("html", "") or "")
+        category = self._section_category(section)
+        summary_html = f"<p><i>{section_summary}</i></p>" if section_summary else ""
+        category_html = f"<p><b>{category}</b></p>" if category else ""
+        css = """
+        <style>
+        h2 { margin-top: 0; }
+        h4 { margin-bottom: 4px; }
+        table { border-collapse: collapse; width: 100%; margin: 8px 0 12px 0; }
+        th, td { border: 1px solid #6b7280; padding: 5px 7px; vertical-align: top; }
+        th { background: rgba(127, 127, 127, 0.18); font-weight: 600; }
+        .doc-callout { border-left: 4px solid #3b82f6; padding: 7px 10px; margin: 8px 0; background: rgba(59, 130, 246, 0.10); }
+        .doc-warning { border-left-color: #f59e0b; background: rgba(245, 158, 11, 0.12); }
+        .doc-danger { border-left-color: #ef4444; background: rgba(239, 68, 68, 0.10); }
+        .doc-ok { border-left-color: #22c55e; background: rgba(34, 197, 94, 0.10); }
+        .pill { border: 1px solid #6b7280; border-radius: 4px; padding: 1px 4px; white-space: nowrap; }
+        </style>
+        """
+        if section_id == "overview":
+            return f"{css}<h2>{section_title}</h2>{category_html}{summary_html}{self.intro_html}<hr/>{section_body}"
+        return f"{css}<h2>{section_title}</h2>{category_html}{summary_html}{section_body}"
+
     @staticmethod
     def _topic_search_text(section: Dict[str, str]) -> str:
         title = str(section.get("title", "") or "")
@@ -6106,6 +6338,98 @@ class AboutDialog(QDialog):
         body = str(section.get("html", "") or "")
         plain_body = re.sub(r"<[^>]+>", " ", body)
         return f"{title}\n{keywords}\n{plain_body}".lower()
+
+    @staticmethod
+    def _section_category(section: Dict[str, str]) -> str:
+        category = str(section.get("category", "") or "").strip()
+        if category:
+            return category
+        section_id = str(section.get("id", "") or "").strip()
+        if section_id in {"overview", "quick_start", "first_run_checklist", "faq"}:
+            return "Start Here"
+        if section_id.startswith("workflow_") or section_id in {"dds_output", "upscaling_backends", "texture_workflow_guides", "compare_review"}:
+            return "Texture Workflow"
+        if section_id in {"archive_browser", "archive_guides", "mesh_media_guides"}:
+            return "Archive Browser"
+        if section_id in {"texture_editor", "replace_assistant", "research", "text_search"}:
+            return "Tools"
+        if section_id in {"mod_packaging", "safety", "settings_files", "troubleshooting"}:
+            return "Reference"
+        return "Other"
+
+    @staticmethod
+    def _category_sort_key(category: str) -> Tuple[int, str]:
+        order = {
+            "Start Here": 0,
+            "Texture Workflow": 1,
+            "Archive Browser": 2,
+            "Tools": 3,
+            "Reference": 4,
+            "Other": 99,
+        }
+        return (order.get(category, 50), category.lower())
+
+    def _localized_category_label(self, category: str) -> str:
+        language_code = self._current_language_code()
+        labels = {
+            "es": {
+                "Start Here": "Primeros pasos",
+                "Texture Workflow": "Flujo de texturas",
+                "Archive Browser": "Explorador de archivos",
+                "Tools": "Herramientas",
+                "Reference": "Referencia",
+                "Other": "Otros",
+            },
+            "de": {
+                "Start Here": "Start",
+                "Texture Workflow": "Textur-Workflow",
+                "Archive Browser": "Archiv-Browser",
+                "Tools": "Werkzeuge",
+                "Reference": "Referenz",
+                "Other": "Weitere Themen",
+            },
+        }
+        return labels.get(language_code, {}).get(category, category)
+
+    def _add_topic_group_header(self, category: str) -> None:
+        item = QListWidgetItem("")
+        item.setFlags(Qt.NoItemFlags)
+        item.setData(Qt.UserRole, "")
+        item.setSizeHint(QSize(0, 30))
+        self.topic_list.addItem(item)
+
+        header_widget = QWidget()
+        header_widget.setAttribute(Qt.WA_TransparentForMouseEvents)
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(8, 5, 8, 3)
+        header_layout.setSpacing(8)
+
+        label = QLabel(self._localized_category_label(category).upper())
+        label_font = QFont(self.topic_list.font())
+        label_font.setBold(True)
+        label_font.setPointSize(max(8, label_font.pointSize() - 1))
+        label.setFont(label_font)
+        label.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+        divider = QFrame()
+        divider.setFrameShape(QFrame.HLine)
+        divider.setFrameShadow(QFrame.Plain)
+        divider.setAttribute(Qt.WA_TransparentForMouseEvents)
+        divider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        palette = self.topic_list.palette()
+        muted = palette.color(QPalette.Disabled, QPalette.Text)
+        if not muted.isValid():
+            muted = palette.color(QPalette.Text)
+        divider_color = palette.color(QPalette.Mid)
+        if not divider_color.isValid():
+            divider_color = muted
+        label.setStyleSheet(f"color: {muted.name()};")
+        divider.setStyleSheet(f"color: {divider_color.name()}; background: {divider_color.name()}; max-height: 1px;")
+
+        header_layout.addWidget(label, stretch=0)
+        header_layout.addWidget(divider, stretch=1)
+        self.topic_list.setItemWidget(item, header_widget)
 
     def _refresh_topic_list(self) -> None:
         query = self.search_edit.text().strip().lower()
@@ -6117,16 +6441,25 @@ class AboutDialog(QDialog):
         ]
         self.topic_list.blockSignals(True)
         self.topic_list.clear()
+        grouped_sections: Dict[str, List[Dict[str, str]]] = {}
         for section in self._filtered_sections:
-            item = QListWidgetItem(str(section.get("title", "") or "Untitled"))
-            item.setData(Qt.UserRole, str(section.get("id", "") or ""))
-            summary = str(section.get("summary", "") or "")
-            if summary:
-                item.setToolTip(summary)
-            self.topic_list.addItem(item)
+            grouped_sections.setdefault(self._section_category(section), []).append(section)
+        for category in sorted(grouped_sections, key=self._category_sort_key):
+            self._add_topic_group_header(category)
+            for section in grouped_sections[category]:
+                item = QListWidgetItem(str(section.get("title", "") or "Untitled"))
+                item.setData(Qt.UserRole, str(section.get("id", "") or ""))
+                item.setForeground(QBrush(self.topic_list.palette().color(QPalette.Text)))
+                summary = str(section.get("summary", "") or "")
+                if summary:
+                    item.setToolTip(summary)
+                self.topic_list.addItem(item)
         self.topic_list.blockSignals(False)
         self.topic_count_label.setText(self._format_topic_count(len(self._filtered_sections)))
         if not self._filtered_sections:
+            self.browser.setHtml(
+                "<h2>No Matching Topics</h2><p>Try a broader search term such as <b>DDS</b>, <b>archive</b>, <b>profile</b>, <b>replace</b>, or <b>FAQ</b>.</p>"
+            )
             return
         if current_section_id:
             for index in range(self.topic_list.count()):
@@ -6134,7 +6467,14 @@ class AboutDialog(QDialog):
                 if str(item.data(Qt.UserRole) or "") == current_section_id:
                     self.topic_list.setCurrentItem(item)
                     return
-        self.topic_list.setCurrentRow(0)
+        self._select_first_topic()
+
+    def _select_first_topic(self) -> None:
+        for index in range(self.topic_list.count()):
+            item = self.topic_list.item(index)
+            if str(item.data(Qt.UserRole) or ""):
+                self.topic_list.setCurrentItem(item)
+                return
 
     def _current_language_code(self) -> str:
         parent = self.parent()
@@ -6163,25 +6503,36 @@ class AboutDialog(QDialog):
             item = self.topic_list.item(index)
             if str(item.data(Qt.UserRole) or "") == target_id:
                 self.topic_list.setCurrentItem(item)
-                self._scroll_to_section(target_id)
+                self._render_section(target_id)
                 return
         self.search_edit.clear()
         for index in range(self.topic_list.count()):
             item = self.topic_list.item(index)
             if str(item.data(Qt.UserRole) or "") == target_id:
                 self.topic_list.setCurrentItem(item)
-                self._scroll_to_section(target_id)
+                self._render_section(target_id)
                 return
 
     def _handle_topic_changed(self, current: Optional[QListWidgetItem], _previous: Optional[QListWidgetItem]) -> None:
         if current is None:
             return
-        self._scroll_to_section(str(current.data(Qt.UserRole) or ""))
+        self._render_section(str(current.data(Qt.UserRole) or ""))
 
     def _scroll_to_section(self, section_id: str) -> None:
         if not section_id:
             return
         QTimer.singleShot(0, lambda: self.browser.scrollToAnchor(section_id))
+
+    def _render_section(self, section_id: str) -> None:
+        if not section_id:
+            return
+        for section in self._sections:
+            if str(section.get("id", "") or "") == section_id:
+                html = self._build_section_html(section)
+                self.browser.setProperty("_i18n_source_html", html)
+                self.browser.setHtml(html)
+                QTimer.singleShot(0, lambda: self.browser.moveCursor(QTextCursor.Start))
+                return
 
     def _handle_anchor_clicked(self, url: QUrl) -> None:
         if url.scheme() in {"http", "https"}:

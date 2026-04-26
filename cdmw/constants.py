@@ -187,6 +187,15 @@ UI_LOG_TEXT_STYLE_OPTIONS = (
     ("calm", "Calm diagnostics"),
     ("plain", "Plain text"),
 )
+DEFAULT_UI_LOG_COLOR_SCHEME = "theme"
+DEFAULT_UI_PREVIEW_COLOR_SCHEME = "theme"
+UI_TEXT_COLOR_SCHEME_OPTIONS = (
+    ("theme", "Follow app theme"),
+    ("vscode", "VS Code classic"),
+    ("terminal", "Terminal contrast"),
+    ("accessible", "Accessible contrast"),
+    ("solarized", "Solarized"),
+)
 UI_FONT_FAMILY_OPTIONS = (
     "Segoe UI",
     "Aptos",
