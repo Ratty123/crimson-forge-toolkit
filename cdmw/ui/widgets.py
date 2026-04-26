@@ -443,6 +443,8 @@ def responsive_sidebar_bounds(widget: Optional[QWidget] = None, *, role: str = "
     scale = ui_scale_for(widget)
     if role == "wide":
         values = (380, 500, 680)
+    elif role == "workflow":
+        values = (440, 640, 840)
     elif role == "tool":
         values = (220, 260, 340)
     elif role == "narrow":

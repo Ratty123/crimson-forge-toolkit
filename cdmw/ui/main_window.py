@@ -1636,7 +1636,7 @@ def run_gui() -> int:
 
             self.workflow_splitter.addWidget(self.left_scroll_area)
             self.workflow_splitter.addWidget(self.right_panel)
-            workflow_nav_min, _workflow_nav_pref, workflow_nav_max = responsive_sidebar_bounds(self, role="normal")
+            workflow_nav_min, _workflow_nav_pref, workflow_nav_max = responsive_sidebar_bounds(self, role="workflow")
             workflow_content_min, _workflow_content_pref, _workflow_content_max = responsive_sidebar_bounds(self, role="wide")
             self.left_panel.setMinimumWidth(workflow_nav_min)
             self.left_scroll_area.setMinimumWidth(workflow_nav_min)
@@ -1645,7 +1645,7 @@ def run_gui() -> int:
             self.workflow_splitter.setStretchFactor(0, 1)
             self.workflow_splitter.setStretchFactor(1, 2)
             self.workflow_splitter.setSizes(
-                build_responsive_splitter_sizes(1180, [32, 68], [workflow_nav_min, workflow_content_min])
+                build_responsive_splitter_sizes(1180, [42, 58], [workflow_nav_min, workflow_content_min])
             )
 
             self.paths_section = CollapsibleSection("Paths", expanded=False)
@@ -6137,10 +6137,10 @@ def run_gui() -> int:
             self.archive_splitter.setSizes(sizes)
 
         def _apply_default_splitter_sizes(self, total_width: int) -> None:
-            workflow_nav_min, _workflow_nav_pref, _workflow_nav_max = responsive_sidebar_bounds(self, role="normal")
+            workflow_nav_min, _workflow_nav_pref, _workflow_nav_max = responsive_sidebar_bounds(self, role="workflow")
             workflow_content_min, _workflow_content_pref, _workflow_content_max = responsive_sidebar_bounds(self, role="wide")
             self.workflow_splitter.setSizes(
-                build_responsive_splitter_sizes(total_width, [32, 68], [workflow_nav_min, workflow_content_min])
+                build_responsive_splitter_sizes(total_width, [42, 58], [workflow_nav_min, workflow_content_min])
             )
             available_right_height = max(420, self.height() - 260)
             progress_min_height = getattr(self, "progress_group_min_height", 190)
@@ -6195,13 +6195,13 @@ def run_gui() -> int:
                             fallback_weights=[18, 82],
                         )
                     elif splitter is self.workflow_splitter:
-                        workflow_nav_min, _workflow_nav_pref, _workflow_nav_max = responsive_sidebar_bounds(self, role="normal")
+                        workflow_nav_min, _workflow_nav_pref, _workflow_nav_max = responsive_sidebar_bounds(self, role="workflow")
                         workflow_content_min, _workflow_content_pref, _workflow_content_max = responsive_sidebar_bounds(self, role="wide")
                         sizes = clamp_splitter_sizes(
                             total_width,
                             sizes,
                             [workflow_nav_min, workflow_content_min],
-                            fallback_weights=[32, 68],
+                            fallback_weights=[42, 58],
                         )
                     elif splitter is self.compare_splitter:
                         sizes = clamp_splitter_sizes(total_width, sizes, [220, 520], fallback_weights=[22, 78])
