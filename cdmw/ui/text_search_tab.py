@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QSizePolicy,
+    QStackedWidget,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
@@ -47,10 +48,12 @@ from cdmw.models import ArchiveEntry, RunCancelled
 from cdmw.ui.themes import get_theme
 from cdmw.ui.widgets import (
     CodePreviewEditor,
+    EmptyStatePanel,
     FlatSectionPanel,
     LogHighlighter,
     build_responsive_splitter_sizes,
     clamp_splitter_sizes,
+    responsive_sidebar_bounds,
 )
 
 
@@ -384,7 +387,14 @@ class TextSearchTab(QWidget):
         self.results_tree.header().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.results_tree.header().resizeSection(0, 260)
         self.results_tree.header().resizeSection(3, 360)
-        results_layout.addWidget(self.results_tree, stretch=1)
+        self.results_stack = QStackedWidget()
+        self.results_empty_state = EmptyStatePanel(
+            "Ready to search",
+            "Enter a string or regex, then run Search. Matching files will appear here with package and path context.",
+        )
+        self.results_stack.addWidget(self.results_empty_state)
+        self.results_stack.addWidget(self.results_tree)
+        results_layout.addWidget(self.results_stack, stretch=1)
         self.main_splitter.addWidget(results_group)
 
         preview_group = FlatSectionPanel("Preview")
@@ -441,13 +451,19 @@ class TextSearchTab(QWidget):
         preview_layout.addLayout(preview_toolbar)
         preview_layout.addWidget(self.preview_text_edit, stretch=1)
         self.main_splitter.addWidget(preview_group)
-        controls_group.setMinimumWidth(300)
-        results_group.setMinimumWidth(260)
-        preview_group.setMinimumWidth(360)
+        controls_min, _controls_pref, controls_max = responsive_sidebar_bounds(self, role="wide")
+        results_min, _results_pref, _results_max = responsive_sidebar_bounds(self, role="narrow")
+        preview_min, _preview_pref, _preview_max = responsive_sidebar_bounds(self, role="wide")
+        controls_group.setMinimumWidth(controls_min)
+        controls_group.setMaximumWidth(controls_max)
+        results_group.setMinimumWidth(results_min)
+        preview_group.setMinimumWidth(preview_min)
         self.main_splitter.setStretchFactor(0, 2)
         self.main_splitter.setStretchFactor(1, 2)
         self.main_splitter.setStretchFactor(2, 4)
-        self.main_splitter.setSizes(build_responsive_splitter_sizes(1670, [26, 22, 52], [300, 260, 360]))
+        self.main_splitter.setSizes(
+            build_responsive_splitter_sizes(1670, [24, 24, 52], [controls_min, results_min, preview_min])
+        )
 
         self.log_highlighter = LogHighlighter(self.log_view.document(), theme_key)
         log_font = QFont("Consolas")
@@ -506,18 +522,29 @@ class TextSearchTab(QWidget):
 
     def set_splitter_sizes(self, sizes: Sequence[int]) -> None:
         if sizes:
-            total_width = max(self.width() - 32, sum([300, 260, 360]))
+            controls_min, _controls_pref, _controls_max = responsive_sidebar_bounds(self, role="wide")
+            results_min, _results_pref, _results_max = responsive_sidebar_bounds(self, role="narrow")
+            preview_min, _preview_pref, _preview_max = responsive_sidebar_bounds(self, role="wide")
+            total_width = max(self.width() - 32, sum([controls_min, results_min, preview_min]))
             self.main_splitter.setSizes(
-                clamp_splitter_sizes(total_width, sizes, [300, 260, 360], fallback_weights=[26, 22, 52])
+                clamp_splitter_sizes(
+                    total_width,
+                    sizes,
+                    [controls_min, results_min, preview_min],
+                    fallback_weights=[24, 24, 52],
+                )
             )
 
     def splitter_sizes(self) -> List[int]:
         return self.main_splitter.sizes()
 
     def apply_responsive_splitter_sizes(self, total_width: Optional[int] = None) -> None:
-        available_width = total_width or max(self.width() - 32, sum([300, 260, 360]))
+        controls_min, _controls_pref, _controls_max = responsive_sidebar_bounds(self, role="wide")
+        results_min, _results_pref, _results_max = responsive_sidebar_bounds(self, role="narrow")
+        preview_min, _preview_pref, _preview_max = responsive_sidebar_bounds(self, role="wide")
+        available_width = total_width or max(self.width() - 32, sum([controls_min, results_min, preview_min]))
         self.main_splitter.setSizes(
-            build_responsive_splitter_sizes(available_width, [26, 22, 52], [300, 260, 360])
+            build_responsive_splitter_sizes(available_width, [24, 24, 52], [controls_min, results_min, preview_min])
         )
 
     def auto_fit_columns(self) -> None:
@@ -747,6 +774,8 @@ class TextSearchTab(QWidget):
         self.export_selected_button.setEnabled(can_interact and has_selection)
         self.export_all_button.setEnabled(can_interact and has_results)
         self.results_tree.setEnabled(not busy)
+        if hasattr(self, "results_stack"):
+            self.results_stack.setCurrentWidget(self.results_tree if has_results or busy else self.results_empty_state)
         self.clear_log_button.setEnabled(not busy)
         has_preview_text = bool(self.preview_text_cache)
         self.preview_find_edit.setEnabled(has_preview_text)
@@ -832,6 +861,7 @@ class TextSearchTab(QWidget):
         self.search_results = []
         self._clear_pending_result_population()
         self.results_tree.clear()
+        self.results_stack.setCurrentWidget(self.results_tree)
         self.current_preview_result = None
         self.last_search_stats = TextSearchRunStats(source_kind=source_kind, candidate_count=0, searched_count=0)
         self.last_search_query = query
@@ -962,6 +992,7 @@ class TextSearchTab(QWidget):
         self.search_progress_bar.setValue(1)
         self.search_progress_bar.setFormat("Ready")
         self._clear_pending_result_population()
+        self.results_stack.setCurrentWidget(self.results_tree if self.search_results else self.results_empty_state)
 
     def _flush_result_population_batch(self) -> None:
         if not self._pending_result_indexes:
@@ -973,6 +1004,7 @@ class TextSearchTab(QWidget):
         self.results_tree.setUpdatesEnabled(False)
         self.results_tree.addTopLevelItems(batch)
         self.results_tree.setUpdatesEnabled(True)
+        self.results_stack.setCurrentWidget(self.results_tree)
         populated = self._pending_result_total - len(self._pending_result_indexes)
         self.search_progress_label.setText(f"Populating results... {populated} / {self._pending_result_total}")
         self.search_progress_bar.setRange(0, max(1, self._pending_result_total))

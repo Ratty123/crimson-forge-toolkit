@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -60,6 +60,7 @@ from cdmw.models import (
 )
 from cdmw.ui.localization import BUILTIN_LANGUAGES
 from cdmw.ui.themes import UI_THEME_SCHEMES
+from cdmw.ui.widgets import scaled_px
 
 
 class SettingsTab(QWidget):
@@ -99,6 +100,7 @@ class SettingsTab(QWidget):
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(12, 12, 12, 12)
         content_layout.setSpacing(10)
+        content_layout.setAlignment(Qt.AlignTop)
 
         summary = QLabel(
             "Persistent global preferences for startup behavior, archive loading, UI layout memory, safety prompts, and 3D preview rendering."
@@ -109,6 +111,8 @@ class SettingsTab(QWidget):
         content_layout.addWidget(summary)
 
         columns_widget = QWidget()
+        columns_widget.setMaximumWidth(scaled_px(1680, self))
+        columns_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         columns_layout = QHBoxLayout(columns_widget)
         columns_layout.setContentsMargins(0, 0, 0, 0)
         columns_layout.setSpacing(12)
@@ -120,7 +124,7 @@ class SettingsTab(QWidget):
         self.right_column.setSpacing(10)
         columns_layout.addLayout(self.left_column, stretch=1)
         columns_layout.addLayout(self.right_column, stretch=1)
-        content_layout.addWidget(columns_widget)
+        content_layout.addWidget(columns_widget, alignment=Qt.AlignTop | Qt.AlignHCenter)
 
         appearance_group = QGroupBox("Appearance")
         appearance_layout = QFormLayout(appearance_group)

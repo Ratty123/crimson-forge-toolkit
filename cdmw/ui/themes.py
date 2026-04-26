@@ -469,6 +469,20 @@ def build_app_stylesheet(
         border: 1px solid {theme["border"]};
         border-radius: 5px;
     }}
+    QWidget#EmptyStatePanel {{
+        background: {theme["preview_bg"]};
+        border: 1px dashed {theme["border_strong"]};
+        border-radius: 5px;
+    }}
+    QLabel#EmptyStateTitle {{
+        color: {theme["text_strong"]};
+        font-weight: 600;
+        background: transparent;
+    }}
+    QLabel#EmptyStateDetail {{
+        color: {theme["text_muted"]};
+        background: transparent;
+    }}
     QGroupBox {{
         border: 1px solid {theme["border"]};
         border-radius: 5px;
@@ -675,32 +689,6 @@ def build_app_stylesheet(
     }}
     QAbstractScrollArea {{
         background: transparent;
-    }}
-    QScrollBar:vertical, QScrollBar:horizontal {{
-        background: {theme["surface"]};
-        border: 1px solid {theme["border"]};
-        border-radius: 4px;
-        margin: 0px;
-    }}
-    QScrollBar:vertical {{
-        width: 13px;
-    }}
-    QScrollBar:horizontal {{
-        height: 13px;
-    }}
-    QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
-        background: {theme["button_border"]};
-        border-radius: 4px;
-        min-height: 28px;
-        min-width: 28px;
-    }}
-    QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{
-        background: {theme["accent"]};
-    }}
-    QScrollBar::add-line, QScrollBar::sub-line,
-    QScrollBar::add-page, QScrollBar::sub-page {{
-        background: transparent;
-        border: none;
     }}
     QListWidget::item {{
         padding: {metrics["list_pad_y"] + 1}px {metrics["list_pad_x"]}px;

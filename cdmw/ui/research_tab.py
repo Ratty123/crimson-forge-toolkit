@@ -90,6 +90,7 @@ from cdmw.ui.widgets import (
     PreviewScrollArea,
     clamp_splitter_sizes,
     build_responsive_splitter_sizes,
+    responsive_sidebar_bounds,
 )
 
 
@@ -605,7 +606,13 @@ class ResearchTab(QWidget):
         self.right_panel_stack.addWidget(self.archive_picker_group)
         self.right_panel_stack.addWidget(self.analysis_detail_group)
         self.main_splitter.addWidget(self.right_panel_stack)
-        self.main_splitter.setSizes(build_responsive_splitter_sizes(1800, [65, 35], [720, 360]))
+        details_min, _details_pref, details_max = responsive_sidebar_bounds(self, role="wide")
+        self.tab_widget.setMinimumWidth(560)
+        self.right_panel_stack.setMinimumWidth(details_min)
+        self.right_panel_stack.setMaximumWidth(details_max)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+        self.main_splitter.setSizes(build_responsive_splitter_sizes(1800, [68, 32], [560, details_min]))
 
         self.refresh_button.clicked.connect(self.refresh_research)
         self.ui_constraint_refresh_button.clicked.connect(self.refresh_ui_constraints)
@@ -1915,8 +1922,12 @@ class ResearchTab(QWidget):
         return tab
 
     def apply_responsive_splitter_sizes(self, total_width: Optional[int] = None) -> None:
-        total_width = total_width or max(self.width() - 32, sum([720, 360]))
-        self.main_splitter.setSizes(build_responsive_splitter_sizes(total_width, [65, 35], [720, 360]))
+        details_min, _details_pref, details_max = responsive_sidebar_bounds(self, role="wide")
+        if hasattr(self, "right_panel_stack"):
+            self.right_panel_stack.setMinimumWidth(details_min)
+            self.right_panel_stack.setMaximumWidth(details_max)
+        total_width = total_width or max(self.width() - 32, sum([560, details_min]))
+        self.main_splitter.setSizes(build_responsive_splitter_sizes(total_width, [68, 32], [560, details_min]))
         if hasattr(self, "groups_splitter"):
             self.groups_splitter.setSizes(
                 build_responsive_splitter_sizes(max(total_width - 80, 880), [44, 56], [520, 360])
@@ -1989,9 +2000,12 @@ class ResearchTab(QWidget):
         self.apply_responsive_splitter_sizes()
 
     def set_main_splitter_sizes(self, sizes: Sequence[int], *, total_width: Optional[int] = None) -> None:
-        available_width = total_width or max(self.width() - 32, sum([720, 360]))
+        details_min, _details_pref, details_max = responsive_sidebar_bounds(self, role="wide")
+        if hasattr(self, "right_panel_stack"):
+            self.right_panel_stack.setMaximumWidth(details_max)
+        available_width = total_width or max(self.width() - 32, sum([560, details_min]))
         self.main_splitter.setSizes(
-            clamp_splitter_sizes(available_width, sizes, [720, 360], fallback_weights=[65, 35])
+            clamp_splitter_sizes(available_width, sizes, [560, details_min], fallback_weights=[68, 32])
         )
 
     def set_groups_splitter_sizes(self, sizes: Sequence[int], *, total_width: Optional[int] = None) -> None:

@@ -424,6 +424,41 @@ def clamp_splitter_sizes(
     )
 
 
+def ui_scale_for(widget: Optional[QWidget] = None) -> float:
+    """Return a conservative logical-pixel scale for font/DPI-aware sizing."""
+    font = widget.font() if widget is not None else QApplication.font()
+    metrics = font.pixelSize()
+    if metrics <= 0:
+        point_size = font.pointSizeF()
+        metrics = point_size if point_size > 0 else 11.0
+    return max(0.85, min(1.7, float(metrics) / 11.0))
+
+
+def scaled_px(value: int, widget: Optional[QWidget] = None) -> int:
+    return max(1, int(round(float(value) * ui_scale_for(widget))))
+
+
+def responsive_sidebar_bounds(widget: Optional[QWidget] = None, *, role: str = "normal") -> Tuple[int, int, int]:
+    scale = ui_scale_for(widget)
+    if role == "wide":
+        values = (380, 500, 680)
+    elif role == "tool":
+        values = (220, 260, 340)
+    elif role == "narrow":
+        values = (280, 340, 460)
+    else:
+        values = (320, 420, 560)
+    return tuple(max(1, int(round(value * scale))) for value in values)  # type: ignore[return-value]
+
+
+def set_sidebar_width_policy(widget: QWidget, *, role: str = "normal") -> None:
+    minimum, preferred, maximum = responsive_sidebar_bounds(widget, role=role)
+    widget.setMinimumWidth(minimum)
+    widget.setMaximumWidth(maximum)
+    widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+    widget.resize(preferred, widget.height())
+
+
 class FlatSectionPanel(QWidget):
     """Simple titled panel without QGroupBox title-over-border rendering."""
 
@@ -453,6 +488,41 @@ class FlatSectionPanel(QWidget):
         self.body_layout.setContentsMargins(*body_margins)
         self.body_layout.setSpacing(body_spacing)
         outer_layout.addWidget(self.body_frame, stretch=1)
+
+
+class EmptyStatePanel(QWidget):
+    """Centered low-noise guidance for empty tables, previews, and idle panes."""
+
+    def __init__(self, title: str, detail: str = "", *, compact: bool = False):
+        super().__init__()
+        self.setObjectName("EmptyStatePanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout = QVBoxLayout(self)
+        pad_x = scaled_px(18 if compact else 28, self)
+        pad_y = scaled_px(16 if compact else 24, self)
+        layout.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
+        layout.setSpacing(scaled_px(6, self))
+        layout.addStretch(1)
+
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("EmptyStateTitle")
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setWordWrap(True)
+        layout.addWidget(self.title_label)
+
+        self.detail_label = QLabel(detail)
+        self.detail_label.setObjectName("EmptyStateDetail")
+        self.detail_label.setAlignment(Qt.AlignCenter)
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setVisible(bool(detail))
+        layout.addWidget(self.detail_label)
+        layout.addStretch(1)
+
+    def set_text(self, title: str, detail: str = "") -> None:
+        self.title_label.setText(title)
+        self.detail_label.setText(detail)
+        self.detail_label.setVisible(bool(detail))
 
 
 class PreviewLabel(QLabel):

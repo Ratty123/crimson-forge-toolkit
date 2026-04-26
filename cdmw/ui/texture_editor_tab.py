@@ -137,7 +137,7 @@ from cdmw.models import (
     TextureEditorToolSettings,
     TextureEditorWorkspace,
 )
-from cdmw.ui.widgets import build_responsive_splitter_sizes
+from cdmw.ui.widgets import build_responsive_splitter_sizes, responsive_sidebar_bounds
 
 
 def _rgba_array_to_qimage(array: np.ndarray) -> QImage:
@@ -1854,8 +1854,9 @@ class TextureEditorTab(QWidget):
 
         self.tool_panel = QWidget()
         self.tool_panel.setObjectName("EditorLeftSidebar")
-        self.tool_panel.setMinimumWidth(200)
-        self.tool_panel.setMaximumWidth(220)
+        editor_tool_min, _editor_tool_pref, editor_tool_max = responsive_sidebar_bounds(self, role="tool")
+        self.tool_panel.setMinimumWidth(editor_tool_min)
+        self.tool_panel.setMaximumWidth(editor_tool_max)
         tool_layout = QVBoxLayout(self.tool_panel)
         tool_layout.setContentsMargins(12, 12, 12, 12)
         tool_layout.setSpacing(8)
@@ -1951,8 +1952,8 @@ class TextureEditorTab(QWidget):
         self.left_scroll.setObjectName("EditorSidebarScroll")
         self.left_scroll.setWidgetResizable(True)
         self.left_scroll.setFrameShape(QFrame.NoFrame)
-        self.left_scroll.setMinimumWidth(218)
-        self.left_scroll.setMaximumWidth(246)
+        self.left_scroll.setMinimumWidth(editor_tool_min)
+        self.left_scroll.setMaximumWidth(editor_tool_max)
         self.left_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.left_scroll.setWidget(self.tool_panel)
         self.main_splitter.addWidget(self.left_scroll)
@@ -2895,14 +2896,17 @@ class TextureEditorTab(QWidget):
         self.right_scroll = QScrollArea()
         self.right_scroll.setWidgetResizable(True)
         self.right_scroll.setFrameShape(QFrame.NoFrame)
-        self.right_scroll.setMinimumWidth(210)
-        self.right_scroll.setMaximumWidth(290)
+        editor_inspector_min, _editor_inspector_pref, editor_inspector_max = responsive_sidebar_bounds(self, role="narrow")
+        self.right_scroll.setMinimumWidth(editor_inspector_min)
+        self.right_scroll.setMaximumWidth(editor_inspector_max)
         self.right_scroll.setWidget(self.right_panel)
         self.main_splitter.addWidget(self.right_scroll)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 8)
         self.main_splitter.setStretchFactor(2, 2)
-        self.main_splitter.setSizes(build_responsive_splitter_sizes(2040, [11, 74, 15], [218, 480, 210]))
+        self.main_splitter.setSizes(
+            build_responsive_splitter_sizes(2040, [12, 70, 18], [editor_tool_min, 520, editor_inspector_min])
+        )
 
         self._connect_signals()
         self._rebuild_brush_preset_combo(preserve_key="custom")
@@ -2915,13 +2919,15 @@ class TextureEditorTab(QWidget):
         QTimer.singleShot(0, self._apply_responsive_splitter_defaults)
 
     def _apply_responsive_splitter_defaults(self) -> None:
-        total_width = max(self.width() - 32, sum([218, 480, 210]))
+        editor_tool_min, _editor_tool_pref, _editor_tool_max = responsive_sidebar_bounds(self, role="tool")
+        editor_inspector_min, _editor_inspector_pref, _editor_inspector_max = responsive_sidebar_bounds(self, role="narrow")
+        total_width = max(self.width() - 32, sum([editor_tool_min, 520, editor_inspector_min]))
         if self.document is None:
-            left_width = 226
+            left_width = editor_tool_min
             self.main_splitter.setSizes([left_width, max(520, total_width - left_width), 0])
             return
         self.main_splitter.setSizes(
-            build_responsive_splitter_sizes(total_width, [11, 74, 15], [218, 480, 210])
+            build_responsive_splitter_sizes(total_width, [12, 70, 18], [editor_tool_min, 520, editor_inspector_min])
         )
 
     def _apply_document_tab_bar_style(self, font: QFont) -> None:
@@ -3022,8 +3028,9 @@ class TextureEditorTab(QWidget):
         self.right_panel.setVisible(has_doc)
         self.right_scroll.setVisible(has_doc)
         if has_doc:
-            self.right_scroll.setMinimumWidth(210)
-            self.right_scroll.setMaximumWidth(290)
+            editor_inspector_min, _editor_inspector_pref, editor_inspector_max = responsive_sidebar_bounds(self, role="narrow")
+            self.right_scroll.setMinimumWidth(editor_inspector_min)
+            self.right_scroll.setMaximumWidth(editor_inspector_max)
             right_handle.setVisible(True)
             right_handle.setEnabled(True)
         else:
@@ -3031,8 +3038,9 @@ class TextureEditorTab(QWidget):
             self.right_scroll.setMaximumWidth(0)
             right_handle.setVisible(False)
             right_handle.setEnabled(False)
-            total_width = max(self.width() - 32, 760)
-            left_width = 226
+            editor_tool_min, _editor_tool_pref, _editor_tool_max = responsive_sidebar_bounds(self, role="tool")
+            total_width = max(self.width() - 32, editor_tool_min + 520)
+            left_width = editor_tool_min
             self.main_splitter.setSizes([left_width, max(520, total_width - left_width), 0])
         if has_doc and not right_sidebar_was_visible:
             QTimer.singleShot(0, self._apply_responsive_splitter_defaults)

@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QSpinBox,
+    QStackedWidget,
     QTextBrowser,
     QToolButton,
     QTreeWidget,
@@ -90,11 +91,14 @@ from cdmw.models import (
     TextureEditorSourceBinding,
 )
 from cdmw.ui.widgets import (
+    EmptyStatePanel,
     FlatSectionPanel,
     PreviewLabel,
     PreviewScrollArea,
     clamp_splitter_sizes,
     build_responsive_splitter_sizes,
+    responsive_sidebar_bounds,
+    set_sidebar_width_policy,
 )
 
 
@@ -942,7 +946,14 @@ class ReplaceAssistantTab(QWidget):
         self.queue_tree.setToolTip(
             "Columns can be resized or reordered. Use the horizontal scrollbar when the queue is narrower than the full column set."
         )
-        queue_group_layout.addWidget(self.queue_tree)
+        self.queue_stack = QStackedWidget()
+        self.queue_empty_state = EmptyStatePanel(
+            "Import edited textures",
+            "Add PNG or DDS files to build a replacement package. The queue will show matched originals, package targets, and any unresolved items.",
+        )
+        self.queue_stack.addWidget(self.queue_empty_state)
+        self.queue_stack.addWidget(self.queue_tree)
+        queue_group_layout.addWidget(self.queue_stack, stretch=1)
         queue_layout.addWidget(queue_group)
         self.main_splitter.addWidget(self.queue_panel)
 
@@ -996,7 +1007,7 @@ class ReplaceAssistantTab(QWidget):
         self.main_splitter.addWidget(self.preview_panel)
 
         self.settings_panel = QWidget()
-        self.settings_panel.setMinimumWidth(420)
+        set_sidebar_width_policy(self.settings_panel, role="wide")
         settings_layout = QVBoxLayout(self.settings_panel)
         settings_layout.setContentsMargins(0, 0, 0, 0)
         settings_layout.setSpacing(8)
@@ -1248,14 +1259,19 @@ class ReplaceAssistantTab(QWidget):
         self.settings_scroll.setWidget(self.settings_panel)
         self.settings_scroll.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.settings_scroll.setMinimumWidth(420)
+        settings_min, _settings_pref, settings_max = responsive_sidebar_bounds(self, role="wide")
+        self.settings_scroll.setMinimumWidth(settings_min)
+        self.settings_scroll.setMaximumWidth(settings_max)
         self.main_splitter.addWidget(self.settings_scroll)
-        self.queue_panel.setMinimumWidth(280)
-        self.preview_panel.setMinimumWidth(360)
+        queue_min, _queue_pref, queue_max = responsive_sidebar_bounds(self, role="normal")
+        preview_min, _preview_pref, _preview_max = responsive_sidebar_bounds(self, role="wide")
+        self.queue_panel.setMinimumWidth(queue_min)
+        self.queue_panel.setMaximumWidth(queue_max)
+        self.preview_panel.setMinimumWidth(preview_min)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setStretchFactor(2, 0)
-        self.main_splitter.setSizes(build_responsive_splitter_sizes(1800, [24, 34, 42], [280, 360, 420]))
+        self.main_splitter.setSizes(build_responsive_splitter_sizes(1800, [22, 48, 30], [queue_min, preview_min, settings_min]))
 
         self.add_files_button.clicked.connect(self.import_files)
         self.add_folder_button.clicked.connect(self.import_folder)
@@ -1329,21 +1345,27 @@ class ReplaceAssistantTab(QWidget):
         QTimer.singleShot(0, self._apply_responsive_splitter_defaults)
 
     def _apply_responsive_splitter_defaults(self) -> None:
-        total_width = max(self.width() - 32, sum([280, 360, 420]))
+        queue_min, _queue_pref, _queue_max = responsive_sidebar_bounds(self, role="normal")
+        preview_min, _preview_pref, _preview_max = responsive_sidebar_bounds(self, role="wide")
+        settings_min, _settings_pref, _settings_max = responsive_sidebar_bounds(self, role="wide")
+        total_width = max(self.width() - 32, sum([queue_min, preview_min, settings_min]))
         self.main_splitter.setSizes(
-            build_responsive_splitter_sizes(total_width, [24, 34, 42], [280, 360, 420])
+            build_responsive_splitter_sizes(total_width, [22, 48, 30], [queue_min, preview_min, settings_min])
         )
 
     def set_splitter_sizes(self, sizes: Sequence[int], *, total_width: Optional[int] = None) -> None:
         if not sizes:
             return
-        available_width = total_width or max(self.width() - 32, sum([280, 360, 420]))
+        queue_min, _queue_pref, _queue_max = responsive_sidebar_bounds(self, role="normal")
+        preview_min, _preview_pref, _preview_max = responsive_sidebar_bounds(self, role="wide")
+        settings_min, _settings_pref, _settings_max = responsive_sidebar_bounds(self, role="wide")
+        available_width = total_width or max(self.width() - 32, sum([queue_min, preview_min, settings_min]))
         self.main_splitter.setSizes(
             clamp_splitter_sizes(
                 available_width,
                 sizes,
-                [280, 360, 420],
-                fallback_weights=[24, 34, 42],
+                [queue_min, preview_min, settings_min],
+                fallback_weights=[22, 48, 30],
             )
         )
 
@@ -1351,9 +1373,12 @@ class ReplaceAssistantTab(QWidget):
         return self.main_splitter.sizes()
 
     def apply_responsive_splitter_sizes(self, total_width: Optional[int] = None) -> None:
-        available_width = total_width or max(self.width() - 32, sum([280, 360, 420]))
+        queue_min, _queue_pref, _queue_max = responsive_sidebar_bounds(self, role="normal")
+        preview_min, _preview_pref, _preview_max = responsive_sidebar_bounds(self, role="wide")
+        settings_min, _settings_pref, _settings_max = responsive_sidebar_bounds(self, role="wide")
+        available_width = total_width or max(self.width() - 32, sum([queue_min, preview_min, settings_min]))
         self.main_splitter.setSizes(
-            build_responsive_splitter_sizes(available_width, [24, 34, 42], [280, 360, 420])
+            build_responsive_splitter_sizes(available_width, [22, 48, 30], [queue_min, preview_min, settings_min])
         )
 
     def auto_fit_columns(self) -> None:
@@ -1680,6 +1705,8 @@ class ReplaceAssistantTab(QWidget):
         self.enable_automatic_texture_rules_checkbox.setEnabled(not busy and show_ncnn)
         self.enable_unsafe_technical_override_checkbox.setEnabled(not busy and show_ncnn)
         self.retry_smaller_tile_checkbox.setEnabled(not busy and show_ncnn)
+        if hasattr(self, "queue_stack"):
+            self.queue_stack.setCurrentWidget(self.queue_tree if has_items or busy else self.queue_empty_state)
 
     def append_log(self, message: str) -> None:
         self.log_view.appendPlainText(message)
@@ -1727,6 +1754,7 @@ class ReplaceAssistantTab(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Importing...")
         self.status_label.setText("Importing edited files...")
+        self.queue_stack.setCurrentWidget(self.queue_tree)
         self.append_log("Importing edited files into Replace Assistant queue...")
         worker = ReplaceAssistantImportWorker(
             paths,
@@ -1860,6 +1888,7 @@ class ReplaceAssistantTab(QWidget):
         self.queue_tree.blockSignals(True)
         self.queue_tree.setUpdatesEnabled(False)
         self.queue_tree.clear()
+        self.queue_stack.setCurrentWidget(self.queue_tree if self.items else self.queue_empty_state)
         current_row: Optional[QTreeWidgetItem] = None
         for index, item in enumerate(self.items):
             original_text = ""
@@ -2505,6 +2534,7 @@ class ReplaceAssistantTab(QWidget):
         self.items.clear()
         self.last_built_output_root = None
         self.queue_tree.clear()
+        self.queue_stack.setCurrentWidget(self.queue_empty_state)
         self.preview_label.clear_preview("Select a file to preview it here.")
         self.preview_title_label.setText("Select an imported file")
         self.preview_meta_label.setText("Select a file to preview it here.")

@@ -235,6 +235,7 @@ def run_gui() -> int:
         PreviewLabel,
         PreviewScrollArea,
         QuickStartDialog,
+        responsive_sidebar_bounds,
     )
     from cdmw.ui.research_tab import ResearchTab
     from cdmw.ui.settings_tab import SettingsTab
@@ -1634,9 +1635,17 @@ def run_gui() -> int:
 
             self.workflow_splitter.addWidget(self.left_scroll_area)
             self.workflow_splitter.addWidget(self.right_panel)
+            workflow_nav_min, _workflow_nav_pref, workflow_nav_max = responsive_sidebar_bounds(self, role="normal")
+            workflow_content_min, _workflow_content_pref, _workflow_content_max = responsive_sidebar_bounds(self, role="wide")
+            self.left_panel.setMinimumWidth(workflow_nav_min)
+            self.left_scroll_area.setMinimumWidth(workflow_nav_min)
+            self.left_scroll_area.setMaximumWidth(workflow_nav_max)
+            self.right_panel.setMinimumWidth(workflow_content_min)
             self.workflow_splitter.setStretchFactor(0, 1)
             self.workflow_splitter.setStretchFactor(1, 2)
-            self.workflow_splitter.setSizes([420, 760])
+            self.workflow_splitter.setSizes(
+                build_responsive_splitter_sizes(1180, [32, 68], [workflow_nav_min, workflow_content_min])
+            )
 
             self.paths_section = CollapsibleSection("Paths", expanded=False)
             paths_group = QWidget()
@@ -2901,8 +2910,9 @@ def run_gui() -> int:
             archive_tab_layout.addWidget(self.archive_splitter, stretch=1)
 
             archive_controls_group = FlatSectionPanel("Archive Controls")
-            archive_controls_group.setMinimumWidth(260)
-            archive_controls_group.setMaximumWidth(390)
+            archive_controls_min, _archive_controls_pref, archive_controls_max = responsive_sidebar_bounds(self, role="normal")
+            archive_controls_group.setMinimumWidth(archive_controls_min)
+            archive_controls_group.setMaximumWidth(archive_controls_max)
             archive_controls_layout = archive_controls_group.body_layout
             archive_controls_layout.setContentsMargins(10, 10, 10, 10)
             archive_controls_layout.setSpacing(8)
@@ -3216,8 +3226,8 @@ def run_gui() -> int:
             self.archive_controls_scroll = QScrollArea()
             self.archive_controls_scroll.setWidgetResizable(True)
             self.archive_controls_scroll.setFrameShape(QFrame.NoFrame)
-            self.archive_controls_scroll.setMinimumWidth(300)
-            self.archive_controls_scroll.setMaximumWidth(430)
+            self.archive_controls_scroll.setMinimumWidth(archive_controls_min)
+            self.archive_controls_scroll.setMaximumWidth(archive_controls_max)
             archive_controls_wrapper = QWidget()
             archive_controls_wrapper_layout = QVBoxLayout(archive_controls_wrapper)
             archive_controls_wrapper_layout.setContentsMargins(0, 0, 0, 0)
@@ -3228,7 +3238,8 @@ def run_gui() -> int:
             self.archive_splitter.addWidget(self.archive_controls_scroll)
 
             archive_files_group = FlatSectionPanel("Archive Files")
-            archive_files_group.setMinimumWidth(280)
+            archive_files_min, _archive_files_pref, _archive_files_max = responsive_sidebar_bounds(self, role="narrow")
+            archive_files_group.setMinimumWidth(archive_files_min)
             archive_files_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self.archive_files_group = archive_files_group
             archive_files_layout = archive_files_group.body_layout
@@ -3268,11 +3279,12 @@ def run_gui() -> int:
             self.archive_splitter.addWidget(archive_files_group)
 
             archive_preview_group = FlatSectionPanel("Archive Preview")
-            archive_preview_group.setMinimumWidth(300)
+            archive_preview_min, _archive_preview_pref, _archive_preview_max = responsive_sidebar_bounds(self, role="wide")
+            archive_preview_group.setMinimumWidth(archive_preview_min)
             archive_preview_container_layout = archive_preview_group.body_layout
             archive_preview_container_layout.setSpacing(6)
             archive_preview_main_widget = QWidget()
-            archive_preview_main_widget.setMinimumWidth(300)
+            archive_preview_main_widget.setMinimumWidth(archive_preview_min)
             archive_preview_main_layout = QVBoxLayout(archive_preview_main_widget)
             archive_preview_main_layout.setContentsMargins(0, 0, 0, 0)
             archive_preview_main_layout.setSpacing(6)
@@ -3589,7 +3601,13 @@ def run_gui() -> int:
             self.archive_splitter.setStretchFactor(0, 0)
             self.archive_splitter.setStretchFactor(1, 1)
             self.archive_splitter.setStretchFactor(2, 2)
-            self.archive_splitter.setSizes([360, 640, 760])
+            self.archive_splitter.setSizes(
+                build_responsive_splitter_sizes(
+                    1760,
+                    [18, 31, 51],
+                    [archive_controls_min, archive_files_min, archive_preview_min],
+                )
+            )
             self.main_tabs.addTab(self.archive_browser_tab, "Archive Browser")
 
             self.text_search_tab = TextSearchTab(
@@ -6050,20 +6068,22 @@ def run_gui() -> int:
             return sizes or None
 
         def _normalize_archive_splitter_sizes(self, sizes: Sequence[int], total_width: int) -> List[int]:
+            controls_min, _controls_pref, controls_max = responsive_sidebar_bounds(self, role="normal")
+            files_min, _files_pref, _files_max = responsive_sidebar_bounds(self, role="narrow")
+            preview_min, _preview_pref, _preview_max = responsive_sidebar_bounds(self, role="wide")
             normalized = clamp_splitter_sizes(
                 total_width,
                 sizes,
-                [260, 280, 300],
-                fallback_weights=[18, 34, 48],
+                [controls_min, files_min, preview_min],
+                fallback_weights=[18, 31, 51],
             )
             if len(normalized) < 3:
                 return normalized
-            max_controls_width = 430
-            if normalized[0] > max_controls_width:
-                overflow = normalized[0] - max_controls_width
-                normalized[0] = max_controls_width
+            if normalized[0] > controls_max:
+                overflow = normalized[0] - controls_max
+                normalized[0] = controls_max
                 normalized[2] += overflow
-            normalized[2] = max(300, int(total_width) - normalized[0] - normalized[1])
+            normalized[2] = max(preview_min, int(total_width) - normalized[0] - normalized[1])
             return normalized
 
         def _archive_files_preferred_width(self) -> int:
@@ -6101,8 +6121,10 @@ def run_gui() -> int:
             self.archive_splitter.setSizes(sizes)
 
         def _apply_default_splitter_sizes(self, total_width: int) -> None:
+            workflow_nav_min, _workflow_nav_pref, _workflow_nav_max = responsive_sidebar_bounds(self, role="normal")
+            workflow_content_min, _workflow_content_pref, _workflow_content_max = responsive_sidebar_bounds(self, role="wide")
             self.workflow_splitter.setSizes(
-                build_responsive_splitter_sizes(total_width, [34, 66], [320, 420])
+                build_responsive_splitter_sizes(total_width, [32, 68], [workflow_nav_min, workflow_content_min])
             )
             available_right_height = max(420, self.height() - 260)
             progress_min_height = getattr(self, "progress_group_min_height", 190)
@@ -6118,7 +6140,15 @@ def run_gui() -> int:
             )
             self.archive_splitter.setSizes(
                 self._normalize_archive_splitter_sizes(
-                    build_responsive_splitter_sizes(total_width, [18, 34, 48], [260, 280, 300]),
+                    build_responsive_splitter_sizes(
+                        total_width,
+                        [18, 31, 51],
+                        [
+                            responsive_sidebar_bounds(self, role="normal")[0],
+                            responsive_sidebar_bounds(self, role="narrow")[0],
+                            responsive_sidebar_bounds(self, role="wide")[0],
+                        ],
+                    ),
                     total_width,
                 )
             )
@@ -6149,7 +6179,14 @@ def run_gui() -> int:
                             fallback_weights=[18, 82],
                         )
                     elif splitter is self.workflow_splitter:
-                        sizes = clamp_splitter_sizes(total_width, sizes, [320, 420], fallback_weights=[34, 66])
+                        workflow_nav_min, _workflow_nav_pref, _workflow_nav_max = responsive_sidebar_bounds(self, role="normal")
+                        workflow_content_min, _workflow_content_pref, _workflow_content_max = responsive_sidebar_bounds(self, role="wide")
+                        sizes = clamp_splitter_sizes(
+                            total_width,
+                            sizes,
+                            [workflow_nav_min, workflow_content_min],
+                            fallback_weights=[32, 68],
+                        )
                     elif splitter is self.compare_splitter:
                         sizes = clamp_splitter_sizes(total_width, sizes, [220, 520], fallback_weights=[22, 78])
                     elif splitter is self.archive_splitter:
