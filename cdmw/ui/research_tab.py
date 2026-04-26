@@ -85,6 +85,7 @@ from cdmw.core.research import (
 from cdmw.core.pipeline import describe_processing_path_kind
 from cdmw.models import AppConfig, ArchiveEntry, ArchivePreviewResult
 from cdmw.ui.widgets import (
+    EmptyStateTreeWidget,
     FlatSectionPanel,
     PreviewLabel,
     PreviewScrollArea,
@@ -1176,7 +1177,10 @@ class ResearchTab(QWidget):
             "Texture Set Grouper",
             "Bundles related texture members and sidecars such as base/_color, _n/_wn, _sp, _m/_ma/_mg, _d/_dmap/_disp, _op/_dr, XML, and material files."
         )
-        self.texture_group_tree = QTreeWidget()
+        self.texture_group_tree = EmptyStateTreeWidget(
+            "Refresh research",
+            "Texture sets will appear here after the archive view has been analyzed.",
+        )
         self.texture_group_tree.setAlternatingRowColors(True)
         self.texture_group_tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self.texture_group_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1194,7 +1198,10 @@ class ResearchTab(QWidget):
             "Texture-Type Classifier",
             "Classifies archive textures as color, normal, mask, roughness, emissive, UI, impostor, or unknown using naming/path heuristics plus exact sidecar bindings from files such as .pac.xml and .pami when available."
         )
-        self.classifier_tree = QTreeWidget()
+        self.classifier_tree = EmptyStateTreeWidget(
+            "No classifications yet",
+            "Run Refresh Research to classify visible DDS files and review confidence by package.",
+        )
         self.classifier_tree.setRootIsDecorated(False)
         self.classifier_tree.setAlternatingRowColors(True)
         self.classifier_tree.setUniformRowHeights(True)
@@ -1256,7 +1263,10 @@ class ResearchTab(QWidget):
         unknown_left_layout.setContentsMargins(0, 0, 0, 0)
         unknown_left_layout.setSpacing(8)
 
-        self.unknown_group_tree = QTreeWidget()
+        self.unknown_group_tree = EmptyStateTreeWidget(
+            "No unknown groups",
+            "Unclassified texture families will appear here when the current archive view contains unresolved DDS files.",
+        )
         self.unknown_group_tree.setRootIsDecorated(False)
         self.unknown_group_tree.setAlternatingRowColors(True)
         self.unknown_group_tree.setUniformRowHeights(True)
@@ -1335,7 +1345,10 @@ class ResearchTab(QWidget):
         self.unknown_members_hint_label.setWordWrap(True)
         self.unknown_members_hint_label.setObjectName("HintLabel")
         unknown_members_layout.addWidget(self.unknown_members_hint_label)
-        self.unknown_member_tree = QTreeWidget()
+        self.unknown_member_tree = EmptyStateTreeWidget(
+            "Select a family",
+            "Files in the selected unknown group will appear here.",
+        )
         self.unknown_member_tree.setRootIsDecorated(False)
         self.unknown_member_tree.setAlternatingRowColors(True)
         self.unknown_member_tree.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -1477,7 +1490,10 @@ class ResearchTab(QWidget):
         reference_group_layout = QVBoxLayout(reference_group)
         reference_group_layout.setContentsMargins(10, 12, 10, 10)
         reference_group_layout.setSpacing(8)
-        self.reference_tree = QTreeWidget()
+        self.reference_tree = EmptyStateTreeWidget(
+            "No material references",
+            "Resolve references to list sidecar, skeleton, animation, and texture relationships.",
+        )
         self.reference_tree.setRootIsDecorated(False)
         self.reference_tree.setAlternatingRowColors(True)
         self.reference_tree.setUniformRowHeights(True)
@@ -1494,7 +1510,10 @@ class ResearchTab(QWidget):
         sidecar_layout = QVBoxLayout(sidecar_group)
         sidecar_layout.setContentsMargins(10, 12, 10, 10)
         sidecar_layout.setSpacing(8)
-        self.sidecar_tree = QTreeWidget()
+        self.sidecar_tree = EmptyStateTreeWidget(
+            "No sidecars discovered",
+            "Sidecar discovery results will appear here after analysis.",
+        )
         self.sidecar_tree.setRootIsDecorated(False)
         self.sidecar_tree.setAlternatingRowColors(True)
         self.sidecar_tree.setUniformRowHeights(True)
@@ -1540,7 +1559,10 @@ class ResearchTab(QWidget):
         ui_constraints_actions.addWidget(self.ui_constraint_status_label, stretch=1)
         ui_constraints_actions.addWidget(self.ui_constraint_progress)
         ui_constraints_group_layout.addLayout(ui_constraints_actions)
-        self.ui_constraint_tree = QTreeWidget()
+        self.ui_constraint_tree = EmptyStateTreeWidget(
+            "No UI constraints",
+            "Refresh UI constraints to identify referenced files that must preserve dimensions or format.",
+        )
         self.ui_constraint_tree.setRootIsDecorated(False)
         self.ui_constraint_tree.setAlternatingRowColors(True)
         self.ui_constraint_tree.setUniformRowHeights(True)
@@ -1564,7 +1586,10 @@ class ResearchTab(QWidget):
         heatmap_group_layout = QVBoxLayout(heatmap_group)
         heatmap_group_layout.setContentsMargins(10, 12, 10, 10)
         heatmap_group_layout.setSpacing(8)
-        self.heatmap_tree = QTreeWidget()
+        self.heatmap_tree = EmptyStateTreeWidget(
+            "No usage heatmap",
+            "Texture usage hotspots will appear here after research refresh.",
+        )
         self.heatmap_tree.setAlternatingRowColors(True)
         self.heatmap_tree.setHeaderLabels(
             ["Label", "Heat", "Textures", "Sets", "Normals", "UI", "Sidecars", "Impostors"]
@@ -1609,7 +1634,10 @@ class ResearchTab(QWidget):
         tree_layout = QVBoxLayout(tree_container)
         tree_layout.setContentsMargins(0, 0, 0, 0)
         tree_layout.setSpacing(0)
-        self.archive_picker_tree = QTreeWidget()
+        self.archive_picker_tree = EmptyStateTreeWidget(
+            "No archive files",
+            "Scan archives or broaden the Archive Browser filter to populate this picker.",
+        )
         self.archive_picker_tree.setHeaderLabels(["Name", "Type", "Package"])
         self.archive_picker_tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self.archive_picker_tree.setSelectionBehavior(QTreeWidget.SelectRows)
@@ -1757,7 +1785,10 @@ class ResearchTab(QWidget):
             "Mip Analysis",
             "Compares matching DDS files in Original DDS root and Output root. Results appear only when both roots exist and contain the same relative file path."
         )
-        self.mip_tree = QTreeWidget()
+        self.mip_tree = EmptyStateTreeWidget(
+            "No mip analysis",
+            "Refresh research with original and output roots available to compare mip behavior.",
+        )
         self.mip_tree.setRootIsDecorated(False)
         self.mip_tree.setAlternatingRowColors(True)
         self.mip_tree.setHeaderLabels(["Path", "Original", "Rebuilt", "Mips", "Warnings"])
@@ -1775,7 +1806,10 @@ class ResearchTab(QWidget):
             "Scans normal-like DDS files from the current Original DDS root and Output root independently. "
             "This can show results even if no rebuilt outputs exist yet."
         )
-        self.normal_tree = QTreeWidget()
+        self.normal_tree = EmptyStateTreeWidget(
+            "No normal-map validation",
+            "Normal validation results will appear here after research refresh.",
+        )
         self.normal_tree.setRootIsDecorated(False)
         self.normal_tree.setAlternatingRowColors(True)
         self.normal_tree.setHeaderLabels(["Path", "Root", "Format", "Size", "Issues"])
@@ -1794,27 +1828,30 @@ class ResearchTab(QWidget):
             "Class, terrain-group, and profile sections are heuristic summaries and are labeled as such."
         )
         self.budget_tabs = QTabWidget()
-        self.budget_file_tree = QTreeWidget()
+        self.budget_file_tree = EmptyStateTreeWidget(
+            "No texture budget data",
+            "Per-file budget rows will appear here after visible textures are analyzed.",
+        )
         self.budget_file_tree.setRootIsDecorated(False)
         self.budget_file_tree.setAlternatingRowColors(True)
         self.budget_file_tree.setUniformRowHeights(True)
         self.budget_file_tree.setHeaderLabels(["Path", "Delta", "Ratio", "Size", "Type", "Risk"])
         self.budget_file_tree.header().resizeSection(0, 340)
         self.budget_tabs.addTab(self.budget_file_tree, "Files")
-        self.budget_class_tree = QTreeWidget()
+        self.budget_class_tree = EmptyStateTreeWidget("No class summary", "Class-level budget totals will appear here.")
         self.budget_class_tree.setRootIsDecorated(False)
         self.budget_class_tree.setAlternatingRowColors(True)
         self.budget_class_tree.setUniformRowHeights(True)
         self.budget_class_tree.setHeaderLabels(["Texture Type", "Affected", "Byte Delta", "Avg Risk", "Band"])
         self.budget_tabs.addTab(self.budget_class_tree, "Class Risk")
-        self.budget_group_tree = QTreeWidget()
+        self.budget_group_tree = EmptyStateTreeWidget("No group summary", "Grouped texture budget totals will appear here.")
         self.budget_group_tree.setRootIsDecorated(False)
         self.budget_group_tree.setAlternatingRowColors(True)
         self.budget_group_tree.setUniformRowHeights(True)
         self.budget_group_tree.setHeaderLabels(["Group", "Textures", "Byte Delta", "Avg Ratio", "Risk", "Band"])
         self.budget_group_tree.header().resizeSection(0, 300)
         self.budget_tabs.addTab(self.budget_group_tree, "Terrain-Like Groups")
-        self.budget_profile_tree = QTreeWidget()
+        self.budget_profile_tree = EmptyStateTreeWidget("No profile summary", "Profile budget totals will appear here.")
         self.budget_profile_tree.setRootIsDecorated(False)
         self.budget_profile_tree.setAlternatingRowColors(True)
         self.budget_profile_tree.setUniformRowHeights(True)
@@ -1909,7 +1946,10 @@ class ResearchTab(QWidget):
         list_layout = QVBoxLayout(list_group)
         list_layout.setContentsMargins(10, 12, 10, 10)
         list_layout.setSpacing(8)
-        self.notes_tree = QTreeWidget()
+        self.notes_tree = EmptyStateTreeWidget(
+            "No notes saved",
+            "Saved research notes for archive, search, and compare targets will appear here.",
+        )
         self.notes_tree.setRootIsDecorated(False)
         self.notes_tree.setAlternatingRowColors(True)
         self.notes_tree.setHeaderLabels(["Target", "Tags", "Updated", "Source"])

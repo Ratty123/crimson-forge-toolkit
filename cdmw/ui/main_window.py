@@ -224,6 +224,7 @@ def run_gui() -> int:
         AboutDialog,
         ArchiveDetailsEditor,
         CodePreviewEditor,
+        EmptyStateTreeWidget,
         FlatSectionPanel,
         build_responsive_splitter_sizes,
         clamp_splitter_sizes,
@@ -1959,7 +1960,10 @@ def run_gui() -> int:
             profiles_button_row.addStretch(1)
             profiles_layout.addLayout(profiles_button_row)
 
-            self.workflow_profiles_tree = QTreeWidget()
+            self.workflow_profiles_tree = EmptyStateTreeWidget(
+                "No workflow profiles",
+                "Add a profile to define reusable DDS output and upscale settings.",
+            )
             self.workflow_profiles_tree.setRootIsDecorated(False)
             self.workflow_profiles_tree.setAlternatingRowColors(True)
             self.workflow_profiles_tree.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -2088,7 +2092,10 @@ def run_gui() -> int:
             rules_button_row.addStretch(1)
             rules_layout.addLayout(rules_button_row)
 
-            self.workflow_rules_tree = QTreeWidget()
+            self.workflow_rules_tree = EmptyStateTreeWidget(
+                "No matching rules",
+                "Add rules to assign workflow profiles by path, package, size, or role.",
+            )
             self.workflow_rules_tree.setRootIsDecorated(False)
             self.workflow_rules_tree.setAlternatingRowColors(True)
             self.workflow_rules_tree.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -2222,7 +2229,10 @@ def run_gui() -> int:
             self.workflow_matched_summary_label.setObjectName("HintLabel")
             self.workflow_matched_summary_label.setWordWrap(True)
             matched_layout.addWidget(self.workflow_matched_summary_label)
-            self.workflow_matched_files_tree = QTreeWidget()
+            self.workflow_matched_files_tree = EmptyStateTreeWidget(
+                "No matched files",
+                "Scan or refresh workflow matching to see which DDS files use each profile.",
+            )
             self.workflow_matched_files_tree.setRootIsDecorated(False)
             self.workflow_matched_files_tree.setAlternatingRowColors(True)
             self.workflow_matched_files_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -3245,7 +3255,10 @@ def run_gui() -> int:
             archive_files_layout = archive_files_group.body_layout
             archive_files_layout.setSpacing(0)
 
-            self.archive_tree = QTreeWidget()
+            self.archive_tree = EmptyStateTreeWidget(
+                "No archive files loaded",
+                "Scan archive packages to browse, preview, extract, and route files.",
+            )
             self.archive_tree.setHeaderLabels(["Name", "In-game Name", "Type", "Size", "Comp", "Package", "Path"])
             self.archive_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
             self.archive_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -3481,7 +3494,10 @@ def run_gui() -> int:
             archive_texture_refs_layout = QVBoxLayout(self.archive_texture_refs_group)
             archive_texture_refs_layout.setContentsMargins(10, 10, 10, 10)
             archive_texture_refs_layout.setSpacing(8)
-            self.archive_texture_refs_tree = QTreeWidget()
+            self.archive_texture_refs_tree = EmptyStateTreeWidget(
+                "No referenced files",
+                "Select a model or material entry to inspect related sidecars, textures, and companion files.",
+            )
             self.archive_texture_refs_tree.setColumnCount(8)
             self.archive_texture_refs_tree.setHeaderLabels(
                 ["Reference", "Status", "Part / Material", "Slot", "Visual", "Archive Path", "Package", "Uses"]
