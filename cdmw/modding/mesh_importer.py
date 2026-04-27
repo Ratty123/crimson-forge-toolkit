@@ -2,7 +2,7 @@
 
 Pipeline: Export .pac → edit in Blender → save .obj → import_obj() → build_pac() → repack
 
-The OBJ file must have been exported by CrimsonForge (contains source_path
+The OBJ file must have been exported by this app (contains source_path
 and source_format comments). The original PAC/PAM binary is needed to
 preserve metadata (names, materials, bones, flags) that OBJ cannot store.
 """
@@ -224,7 +224,7 @@ def _match_obj_roundtrip_sidecar_submeshes(
 def import_obj(obj_path: str) -> ParsedMesh:
     """Import an OBJ file back into a ParsedMesh.
 
-    Reads CrimsonForge metadata comments (source_path, source_format)
+    Reads OBJ round-trip metadata comments (source_path, source_format)
     to identify the original game file.
 
     Returns:

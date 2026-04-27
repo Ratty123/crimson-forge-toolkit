@@ -61,7 +61,10 @@ _EXACT_STEM_TEXTURE_TYPE_OVERRIDES: Dict[str, str] = {
 _GROUP_SUFFIX_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"_(?:cd|dif|diff|di|color|colour|col|c|albedo|alb|base|basecolor|base_color|bc|bcol|detaildiffuse|detailcolor|grimediffuse)$", re.IGNORECASE),
     re.compile(r"_d$", re.IGNORECASE),
-    re.compile(r"_(?:wn|n|no|nor|nm|nrm|norm|normal|normalmap|detailnormal|grimenormal)$", re.IGNORECASE),
+    re.compile(
+        r"_(?:wn|n|no|nor|nm|nrm|norm|normal|normalmap|normal_opengl|normal_directx|normal_dx|normal_gl|detailnormal|grimenormal)$",
+        re.IGNORECASE,
+    ),
     re.compile(r"_(?:xvector|yvector|zvector|vector|pivotpos|pivot|position|pos|flow|velocity|dr|op)$", re.IGNORECASE),
     re.compile(r"_(?:height|hgt|hei|he|h|disp|displacement|dmap|bump|parallax|pom|ssdm|depth)$", re.IGNORECASE),
     re.compile(r"_(?:mask_1bit)$", re.IGNORECASE),
@@ -109,6 +112,10 @@ _ALL_TEXTURE_TYPES: Tuple[str, ...] = (
 
 _TECHNICAL_TEXTURE_TYPES = frozenset({"normal", "roughness", "mask", "height", "vector"})
 _LOSSY_PNG_RISK_TYPES = frozenset({"height", "vector", "roughness", "mask"})
+
+
+def _texture_path_text(path_value: object) -> str:
+    return str(path_value or "").replace("\\", "/")
 
 
 @dataclass(slots=True, frozen=True)
@@ -776,7 +783,7 @@ def _semantic_hint_from_sidecar_parameter(
 
 
 def _select_exact_sidecar_semantic_hint(
-    path_value: str,
+    path_value: str | Path,
     sidecar_texts: Sequence[str],
 ) -> Optional[Tuple[str, str, int, Tuple[str, ...], Tuple[str, ...]]]:
     normalized_target = normalize_texture_reference_for_sidecar_lookup(path_value)
@@ -848,11 +855,11 @@ def describe_texture_preset(preset: str) -> str:
     return get_texture_preset_definition(preset).description
 
 
-def classify_texture_type(path_value: str) -> str:
-    registered = get_registered_texture_classification(path_value)
+def classify_texture_type(path_value: str | Path) -> str:
+    normalized = _texture_path_text(path_value)
+    registered = get_registered_texture_classification(normalized)
     if registered is not None:
         return str(registered.texture_type or "unknown").strip().lower() or "unknown"
-    normalized = path_value.replace("\\", "/")
     lowered = normalized.lower()
     stem = PurePosixPath(normalized).stem.lower()
     exact_override = _EXACT_STEM_TEXTURE_TYPE_OVERRIDES.get(stem)
@@ -902,8 +909,8 @@ def _sorted_tuple(values: Iterable[str]) -> Tuple[str, ...]:
     return tuple(sorted(unique))
 
 
-def _path_stem(path_value: str) -> str:
-    normalized = path_value.replace("\\", "/")
+def _path_stem(path_value: str | Path) -> str:
+    normalized = _texture_path_text(path_value)
     return PurePosixPath(normalized).stem.lower()
 
 
@@ -915,12 +922,13 @@ def _stem_has_token(stem_value: str, *tokens: str) -> bool:
 
 
 def _infer_family_semantics(
-    path_value: str,
+    path_value: str | Path,
     *,
     family_members: Sequence[str],
 ) -> Optional[Tuple[str, str, int, str]]:
-    current_normalized = path_value.replace("\\", "/").lower()
-    current_stem = _path_stem(path_value)
+    normalized_path = _texture_path_text(path_value)
+    current_normalized = normalized_path.lower()
+    current_stem = _path_stem(normalized_path)
     sibling_stems = {
         _path_stem(member)
         for member in family_members
@@ -1006,7 +1014,7 @@ def _infer_preview_semantics(
 
 
 def infer_texture_semantics(
-    path_value: str,
+    path_value: str | Path,
     *,
     sidecar_texts: Sequence[str] = (),
     original_texconv_format: str = "",
@@ -1014,9 +1022,10 @@ def infer_texture_semantics(
     family_members: Sequence[str] = (),
     preview_sample: Optional[TexturePreviewSample] = None,
 ) -> TextureSemanticProfile:
-    lowered = path_value.replace("\\", "/").lower()
-    stem_lower = _path_stem(path_value)
-    texture_type = classify_texture_type(path_value)
+    path_text = _texture_path_text(path_value)
+    lowered = path_text.lower()
+    stem_lower = _path_stem(path_text)
+    texture_type = classify_texture_type(path_text)
     semantic_subtype = texture_type
     confidence = 55 if texture_type == "unknown" else 72
     alpha_mode = "present" if has_alpha else "none"
@@ -1024,7 +1033,7 @@ def infer_texture_semantics(
     evidence: List[str] = []
     combined_sidecar_text = "\n".join(text.lower() for text in sidecar_texts if text).lower()
     original_upper = original_texconv_format.strip().upper()
-    exact_sidecar_hint = _select_exact_sidecar_semantic_hint(path_value, sidecar_texts)
+    exact_sidecar_hint = _select_exact_sidecar_semantic_hint(path_text, sidecar_texts)
 
     if exact_sidecar_hint is not None:
         texture_type, semantic_subtype, confidence, exact_evidence, exact_packed_channels = exact_sidecar_hint
@@ -1313,7 +1322,7 @@ def infer_texture_semantics(
             evidence.append(f"single-channel-like source format {original_upper}")
 
     if texture_type == "unknown" and family_members:
-        family_hint = _infer_family_semantics(path_value, family_members=family_members)
+        family_hint = _infer_family_semantics(path_text, family_members=family_members)
         if family_hint is not None:
             texture_type, semantic_subtype, confidence, reason = family_hint
             evidence.append(reason)
@@ -1333,7 +1342,7 @@ def infer_texture_semantics(
         evidence.append(f"precision-sensitive format {original_upper}")
         confidence = max(confidence, 90)
 
-    registered = get_registered_texture_classification(path_value)
+    registered = get_registered_texture_classification(path_text)
     if registered is not None:
         texture_type = str(registered.texture_type or texture_type).strip().lower() or texture_type
         semantic_subtype = str(registered.semantic_subtype or texture_type).strip().lower() or texture_type
@@ -1346,7 +1355,7 @@ def infer_texture_semantics(
             packed_channels = []
 
     return TextureSemanticProfile(
-        path=path_value,
+        path=path_text,
         texture_type=texture_type,
         semantic_subtype=semantic_subtype,
         confidence=confidence,
@@ -1357,7 +1366,7 @@ def infer_texture_semantics(
 
 
 def suggest_texture_upscale_decision(
-    path_value: str,
+    path_value: str | Path,
     *,
     preset: str = UPSCALE_TEXTURE_PRESET_BALANCED,
     original_texconv_format: str = "",
@@ -1578,8 +1587,8 @@ def _strip_family_suffix(stem: str) -> str:
     return candidate or stem
 
 
-def derive_texture_group_key(path_value: str) -> str:
-    normalized = path_value.replace("\\", "/")
+def derive_texture_group_key(path_value: str | Path) -> str:
+    normalized = _texture_path_text(path_value)
     if "/" in normalized:
         folder, filename = normalized.rsplit("/", 1)
     else:

@@ -130,7 +130,7 @@ def export_obj(mesh: ParsedMesh, output_dir: str, name: str = "",
     lines = [
         f"# Crimson Desert Mesh — {base}",
         f"# {len(mesh.submeshes)} submesh(es), {mesh.total_vertices} verts, {mesh.total_faces} faces",
-        "# Exported by CrimsonForge",
+        "# Exported by Crimson Desert Mod Workbench",
         f"# source_path: {mesh.path}",
         f"# source_format: {mesh.format}",
         f"mtllib {os.path.basename(mtl_path)}",
@@ -219,7 +219,7 @@ def _format_mtl_texture_reference(texture_name: str) -> str:
 def _write_mtl(path, submeshes):
     """Write a Wavefront MTL material file."""
     seen = set()
-    lines = ["# Crimson Desert Materials — CrimsonForge", ""]
+    lines = ["# Crimson Desert Materials", ""]
     for sm in submeshes:
         n = sm.material or sm.name
         if n in seen:
@@ -356,7 +356,7 @@ def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
     def header_ext(b):
         W(b, "FBXHeaderVersion", [1003])
         W(b, "FBXVersion", [7400])
-        W(b, "Creator", ["CrimsonForge Mesh Exporter"])
+        W(b, "Creator", ["Crimson Desert Mod Workbench Mesh Exporter"])
 
     W(buf, "FBXHeaderExtension", children=[header_ext])
 
@@ -543,7 +543,7 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
     def header_ext(b):
         W(b, "FBXHeaderVersion", [1003])
         W(b, "FBXVersion", [7400])
-        W(b, "Creator", ["CrimsonForge Mesh+Skeleton Exporter"])
+        W(b, "Creator", ["Crimson Desert Mod Workbench Mesh+Skeleton Exporter"])
     W(buf, "FBXHeaderExtension", children=[header_ext])
 
     # GlobalSettings

@@ -1008,6 +1008,11 @@ MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODES: Tuple[str, ...] = (
     "sampler_swap_base_on_unit2",
     "sampler_swap_material_on_unit0",
     "base_color",
+    "texture_probe",
+    "height_depth",
+    "material_response",
+    "metal_shine",
+    "roughness_response",
 )
 
 MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODE_LABELS: Dict[str, str] = {
@@ -1028,6 +1033,11 @@ MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODE_LABELS: Dict[str, str] = {
     "sampler_swap_base_on_unit2": "Base On Unit 2",
     "sampler_swap_material_on_unit0": "Material On Unit 0",
     "base_color": "Base Color Guarded",
+    "texture_probe": "Selected Texture Probe",
+    "height_depth": "Height / Depth Response",
+    "material_response": "Material Mask Response",
+    "metal_shine": "Metal / Shine Response",
+    "roughness_response": "Roughness Response",
 }
 
 MODEL_PREVIEW_ALPHA_HANDLING_MODES: Tuple[str, ...] = (
@@ -1101,6 +1111,7 @@ MODEL_PREVIEW_DIFFUSE_SWIZZLE_LABELS: Dict[str, str] = {
 class ModelPreviewRenderSettings:
     use_textures_by_default: bool = True
     high_quality_by_default: bool = True
+    alignment_use_final_output_preview: bool = False
     visible_texture_mode: str = "mesh_base_first"
     render_diagnostic_mode: str = "lit"
     alpha_handling_mode: str = "default"
@@ -1171,7 +1182,7 @@ def clamp_archive_performance_settings(
         sidecar_worker_count=max(0, min(16, sidecar_worker_count)),
         preview_cache_limit=max(12, min(256, preview_cache_limit)),
         quick_then_full_preview=bool(current.quick_then_full_preview),
-        maximum_indexing_priority=bool(current.maximum_indexing_priority),
+        maximum_indexing_priority=bool(current.enable_sidecar_indexing) and bool(current.maximum_indexing_priority),
     )
 
 

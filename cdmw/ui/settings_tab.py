@@ -1004,6 +1004,10 @@ class SettingsTab(QWidget):
     def _apply_archive_performance_control_states(self) -> None:
         enabled = self.archive_sidecar_indexing_checkbox.isChecked()
         manual = int(self.archive_sidecar_worker_mode_combo.currentData() or 0) == 1
+        if not enabled and self.archive_maximum_indexing_priority_checkbox.isChecked():
+            self.archive_maximum_indexing_priority_checkbox.blockSignals(True)
+            self.archive_maximum_indexing_priority_checkbox.setChecked(False)
+            self.archive_maximum_indexing_priority_checkbox.blockSignals(False)
         self.archive_sidecar_worker_mode_combo.setEnabled(enabled)
         self.archive_sidecar_worker_spin.setEnabled(enabled and manual)
         self.archive_maximum_indexing_priority_checkbox.setEnabled(enabled)
@@ -1021,7 +1025,9 @@ class SettingsTab(QWidget):
             self.archive_sidecar_worker_spin.setValue(max(1, clamped.sidecar_worker_count or 4))
             self.archive_preview_cache_limit_spin.setValue(clamped.preview_cache_limit)
             self.archive_quick_then_full_checkbox.setChecked(clamped.quick_then_full_preview)
-            self.archive_maximum_indexing_priority_checkbox.setChecked(clamped.maximum_indexing_priority)
+            self.archive_maximum_indexing_priority_checkbox.setChecked(
+                clamped.enable_sidecar_indexing and clamped.maximum_indexing_priority
+            )
         finally:
             for widget in self._archive_performance_setting_widgets():
                 widget.blockSignals(False)
@@ -1039,7 +1045,10 @@ class SettingsTab(QWidget):
                 sidecar_worker_count=worker_count,
                 preview_cache_limit=self.archive_preview_cache_limit_spin.value(),
                 quick_then_full_preview=self.archive_quick_then_full_checkbox.isChecked(),
-                maximum_indexing_priority=self.archive_maximum_indexing_priority_checkbox.isChecked(),
+                maximum_indexing_priority=(
+                    self.archive_sidecar_indexing_checkbox.isChecked()
+                    and self.archive_maximum_indexing_priority_checkbox.isChecked()
+                ),
             )
         )
 

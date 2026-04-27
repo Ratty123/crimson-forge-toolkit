@@ -53,6 +53,8 @@ from cdmw.ui.widgets import (
     LogHighlighter,
     build_responsive_splitter_sizes,
     clamp_splitter_sizes,
+    has_persistent_tree_column_widths,
+    make_tree_columns_persistent,
     responsive_sidebar_bounds,
 )
 
@@ -387,6 +389,13 @@ class TextSearchTab(QWidget):
         self.results_tree.header().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.results_tree.header().resizeSection(0, 260)
         self.results_tree.header().resizeSection(3, 360)
+        make_tree_columns_persistent(
+            self.results_tree,
+            self.settings,
+            "text_search/results",
+            minimum_width=56,
+            save_callback=self.schedule_settings_save,
+        )
         self.results_stack = QStackedWidget()
         self.results_empty_state = EmptyStatePanel(
             "Ready to search",
@@ -550,6 +559,8 @@ class TextSearchTab(QWidget):
     def auto_fit_columns(self) -> None:
         header = self.results_tree.header()
         if header is None or self.results_tree.columnCount() <= 0:
+            return
+        if has_persistent_tree_column_widths(self.settings, "text_search/results", self.results_tree.columnCount(), minimum_width=56):
             return
         viewport_width = max(self.results_tree.viewport().width(), self.results_tree.width() - 24, 0)
         if viewport_width <= 0:

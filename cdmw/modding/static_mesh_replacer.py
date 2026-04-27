@@ -19,6 +19,8 @@ from .mesh_parser import ParsedMesh, SubMesh, _compute_smooth_normals, inspect_m
 
 logger = get_logger("core.static_mesh_replacer")
 
+_STATIC_REPLACEMENT_VERTEX_LIMIT = 65535
+
 
 @dataclass
 class StaticSubmeshMapping:
@@ -81,12 +83,13 @@ class StaticTextureSlotOverride:
 class StaticMeshReplacementOptions:
     transform: StaticReplacementTransform = field(default_factory=StaticReplacementTransform)
     submesh_mappings: list[StaticSubmeshMapping] = field(default_factory=list)
-    material_mapping_mode: str = "reuse_original_slots"
+    material_mapping_mode: str = "source_driven_materials"
     allow_merge_source_submeshes: bool = True
     allow_empty_target_submeshes: bool = True
-    rebuild_material_sidecar: bool = True
+    rebuild_material_sidecar: bool = False
     enable_missing_base_color_parameters: bool = False
     texture_slot_overrides: list[StaticTextureSlotOverride] = field(default_factory=list)
+    texture_output_size_mode: str = "source"
     source_part_adjustments: list[StaticSourcePartAdjustment] = field(default_factory=list)
     original_part_copies: list[StaticOriginalPartCopy] = field(default_factory=list)
     replace_lods: bool = False
@@ -294,6 +297,8 @@ def build_static_replacement_preview_mesh(
     original_mesh: ParsedMesh,
     replacement_mesh: ParsedMesh,
     options: StaticMeshReplacementOptions | None = None,
+    *,
+    max_source_faces_per_submesh: int | None = None,
 ) -> ParsedMesh:
     """Build the mapped/transformed preview mesh without serializing a PAC/PAM payload."""
     normalized_options = options or StaticMeshReplacementOptions()
@@ -329,6 +334,8 @@ def build_static_replacement_preview_mesh(
         replacement_mesh,
         complete_mappings,
         normalized_options,
+        enforce_vertex_limit=False,
+        max_source_faces_per_submesh=max_source_faces_per_submesh,
     )
 
 
@@ -360,6 +367,7 @@ def suggest_static_submesh_mappings(
             )
         ]
 
+    spatial_cache = _StaticMappingSpatialCache()
     assignments: dict[int, list[int]] = {index: [] for index in range(len(original_mesh.submeshes))}
     for source_index in render_source_indices:
         source = replacement_mesh.submeshes[source_index]
@@ -368,6 +376,7 @@ def suggest_static_submesh_mappings(
             original_mesh.submeshes,
             source_mesh=replacement_mesh,
             target_mesh=original_mesh,
+            spatial_cache=spatial_cache,
         )
         assignments.setdefault(best_target, []).append(source_index)
     confidence_by_target_source: dict[tuple[int, int], float] = {}
@@ -385,6 +394,7 @@ def suggest_static_submesh_mappings(
                 target_submesh=target,
                 source_mesh=replacement_mesh,
                 target_mesh=original_mesh,
+                spatial_cache=spatial_cache,
             )
 
     for target_index, target in enumerate(original_mesh.submeshes):
@@ -403,6 +413,7 @@ def suggest_static_submesh_mappings(
                 target_submesh=target,
                 source_mesh=replacement_mesh,
                 target_mesh=original_mesh,
+                spatial_cache=spatial_cache,
             ),
         )
         donor_sources.remove(stolen_source)
@@ -414,6 +425,7 @@ def suggest_static_submesh_mappings(
             target_submesh=target,
             source_mesh=replacement_mesh,
             target_mesh=original_mesh,
+            spatial_cache=spatial_cache,
         )
 
     _rebalance_duplicate_material_assignments(
@@ -421,6 +433,7 @@ def suggest_static_submesh_mappings(
         confidence_by_target_source,
         original_mesh,
         replacement_mesh,
+        spatial_cache=spatial_cache,
     )
 
     mappings: list[StaticSubmeshMapping] = []
@@ -461,6 +474,7 @@ def suggest_static_submesh_mappings(
                 target_submesh=original_mesh.submeshes[largest_target],
                 source_mesh=replacement_mesh,
                 target_mesh=original_mesh,
+                spatial_cache=spatial_cache,
             )
             for source_index in unassigned
         ]
@@ -475,6 +489,8 @@ def _rebalance_duplicate_material_assignments(
     confidence_by_target_source: dict[tuple[int, int], float],
     original_mesh: ParsedMesh,
     replacement_mesh: ParsedMesh,
+    *,
+    spatial_cache: "_StaticMappingSpatialCache | None" = None,
 ) -> None:
     targets_by_material: dict[str, list[int]] = {}
     for target_index, target in enumerate(original_mesh.submeshes):
@@ -505,6 +521,7 @@ def _rebalance_duplicate_material_assignments(
                 target_submesh=representative_target,
                 source_mesh=replacement_mesh,
                 target_mesh=original_mesh,
+                spatial_cache=spatial_cache,
             ),
             reverse=True,
         )
@@ -522,6 +539,7 @@ def _rebalance_duplicate_material_assignments(
                 target_submesh=target,
                 source_mesh=replacement_mesh,
                 target_mesh=original_mesh,
+                spatial_cache=spatial_cache,
             )
 
 
@@ -731,6 +749,9 @@ def _build_mapped_replacement_mesh(
     replacement_mesh: ParsedMesh,
     mappings: list[StaticSubmeshMapping],
     options: StaticMeshReplacementOptions,
+    *,
+    enforce_vertex_limit: bool = True,
+    max_source_faces_per_submesh: int | None = None,
 ) -> ParsedMesh:
     effective_replacement_mesh, preserve_source_indices = _replacement_mesh_with_original_part_copies(
         original_mesh,
@@ -743,6 +764,7 @@ def _build_mapped_replacement_mesh(
         options.transform,
         options.source_part_adjustments,
         global_transform_exempt_indices=preserve_source_indices,
+        max_source_faces_per_submesh=max_source_faces_per_submesh,
     )
     adjustments_by_index = _source_part_adjustments_by_index(options.source_part_adjustments)
     mapped_submeshes: list[SubMesh] = []
@@ -759,9 +781,10 @@ def _build_mapped_replacement_mesh(
             )
         ]
         merged = _merge_source_submeshes(source_parts, target)
-        if len(merged.vertices) > 65535:
+        if enforce_vertex_limit and len(merged.vertices) > _STATIC_REPLACEMENT_VERTEX_LIMIT:
             raise ValueError(
-                f"Static replacement target {target_index} has {len(merged.vertices):,} vertices; current serializers use 16-bit indices."
+                f"Static replacement target {target_index} has {len(merged.vertices):,} vertices; "
+                f"current serializers use 16-bit indices and support at most {_STATIC_REPLACEMENT_VERTEX_LIMIT:,} vertices per target."
             )
         mapped_submeshes.append(merged)
 
@@ -786,10 +809,15 @@ def _transformed_replacement_sources(
     transform: StaticReplacementTransform,
     source_part_adjustments: list[StaticSourcePartAdjustment] | None = None,
     global_transform_exempt_indices: set[int] | None = None,
+    *,
+    max_source_faces_per_submesh: int | None = None,
 ) -> list[SubMesh]:
     sources = [copy.deepcopy(submesh) for submesh in replacement_mesh.submeshes]
     if not sources:
         return sources
+    max_preview_faces = _normalized_preview_face_limit(max_source_faces_per_submesh)
+    if max_preview_faces > 0:
+        sources = [_decimate_submesh_for_preview(submesh, max_preview_faces) for submesh in sources]
 
     adjustments_by_index = _source_part_adjustments_by_index(source_part_adjustments or [])
     for source_index, submesh in enumerate(sources):
@@ -807,9 +835,9 @@ def _transformed_replacement_sources(
     alignment_replacement_mesh = copy.copy(replacement_mesh)
     alignment_replacement_mesh.submeshes = [
         submesh
-        for source_index, submesh in enumerate(replacement_mesh.submeshes)
+        for source_index, submesh in enumerate(sources)
         if source_index not in exempt_indices
-    ] or list(replacement_mesh.submeshes)
+    ] or list(sources)
 
     all_vertices = [vertex for submesh in transform_bound_sources for vertex in submesh.vertices]
     src_min, src_max = _bbox(all_vertices)
@@ -937,20 +965,112 @@ def _merge_source_submeshes(submeshes: list[SubMesh], target: SubMesh) -> SubMes
     return merged
 
 
+def _normalized_preview_face_limit(value: int | None) -> int:
+    try:
+        limit = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, limit)
+
+
+def _decimate_submesh_for_preview(submesh: SubMesh, max_faces: int) -> SubMesh:
+    faces = list(submesh.faces or [])
+    if max_faces <= 0 or len(faces) <= max_faces:
+        return submesh
+    if not submesh.vertices:
+        return submesh
+
+    step = max(1, math.ceil(len(faces) / float(max_faces)))
+    sampled_faces = faces[::step][:max_faces]
+    source_to_preview: dict[int, int] = {}
+    preview_vertices: list[tuple[float, float, float]] = []
+    preview_faces: list[tuple[int, int, int]] = []
+
+    for face in sampled_faces:
+        remapped_face: list[int] = []
+        for raw_index in face[:3]:
+            try:
+                source_index = int(raw_index)
+            except (TypeError, ValueError):
+                remapped_face = []
+                break
+            if source_index < 0 or source_index >= len(submesh.vertices):
+                remapped_face = []
+                break
+            preview_index = source_to_preview.get(source_index)
+            if preview_index is None:
+                preview_index = len(preview_vertices)
+                source_to_preview[source_index] = preview_index
+                preview_vertices.append(submesh.vertices[source_index])
+            remapped_face.append(preview_index)
+        if len(remapped_face) == 3:
+            preview_faces.append((remapped_face[0], remapped_face[1], remapped_face[2]))
+
+    if not preview_faces:
+        return submesh
+
+    ordered_source_indices = [
+        source_index
+        for source_index, _preview_index in sorted(source_to_preview.items(), key=lambda item: item[1])
+    ]
+    preview = copy.deepcopy(submesh)
+    preview.vertices = preview_vertices
+    preview.faces = preview_faces
+    preview.uvs = (
+        [submesh.uvs[source_index] for source_index in ordered_source_indices]
+        if len(submesh.uvs) == len(submesh.vertices)
+        else []
+    )
+    preview.normals = (
+        [submesh.normals[source_index] for source_index in ordered_source_indices]
+        if len(submesh.normals) == len(submesh.vertices)
+        else []
+    )
+    preview.bone_indices = (
+        [submesh.bone_indices[source_index] for source_index in ordered_source_indices]
+        if len(submesh.bone_indices) == len(submesh.vertices)
+        else []
+    )
+    preview.bone_weights = (
+        [submesh.bone_weights[source_index] for source_index in ordered_source_indices]
+        if len(submesh.bone_weights) == len(submesh.vertices)
+        else []
+    )
+    preview.source_vertex_map = (
+        [submesh.source_vertex_map[source_index] for source_index in ordered_source_indices]
+        if len(submesh.source_vertex_map) == len(submesh.vertices)
+        else []
+    )
+    preview.vertex_count = len(preview.vertices)
+    preview.face_count = len(preview.faces)
+    preview.source_vertex_offsets = []
+    preview.source_index_offset = -1
+    preview.source_index_count = len(preview.faces) * 3
+    return preview
+
+
 def _best_target_index_for_source(
     source: SubMesh,
     targets: list[SubMesh],
     *,
     source_mesh: ParsedMesh | None = None,
     target_mesh: ParsedMesh | None = None,
+    spatial_cache: "_StaticMappingSpatialCache | None" = None,
 ) -> int:
     best_index, _best_score = _best_target_match_for_source(
         source,
         targets,
         source_mesh=source_mesh,
         target_mesh=target_mesh,
+        spatial_cache=spatial_cache,
     )
     return best_index
+
+
+@dataclass
+class _StaticMappingSpatialCache:
+    mesh_bounds_by_id: dict[int, tuple[tuple[float, float, float], tuple[float, float, float]]] = field(default_factory=dict)
+    submesh_center_by_id: dict[tuple[int, int], tuple[float, float, float] | None] = field(default_factory=dict)
 
 
 def _best_target_match_for_source(
@@ -959,6 +1079,7 @@ def _best_target_match_for_source(
     *,
     source_mesh: ParsedMesh | None = None,
     target_mesh: ParsedMesh | None = None,
+    spatial_cache: _StaticMappingSpatialCache | None = None,
 ) -> tuple[int, float]:
     source_text = _name_text(source)
     best_index = 0
@@ -972,6 +1093,7 @@ def _best_target_match_for_source(
             target_submesh=target,
             source_mesh=source_mesh,
             target_mesh=target_mesh,
+            spatial_cache=spatial_cache,
         )
         if score > best_score:
             best_score = score
@@ -1011,6 +1133,7 @@ def _token_score(
     target_submesh: SubMesh | None = None,
     source_mesh: ParsedMesh | None = None,
     target_mesh: ParsedMesh | None = None,
+    spatial_cache: _StaticMappingSpatialCache | None = None,
 ) -> float:
     source_tokens = _semantic_tokens(source_text)
     target_tokens = _semantic_tokens(target_text)
@@ -1037,7 +1160,13 @@ def _token_score(
     if source_submesh is not None and target_submesh is not None:
         score += _submesh_size_similarity_score(source_submesh, target_submesh)
     if source_submesh is not None and target_submesh is not None and source_mesh is not None and target_mesh is not None:
-        score += _submesh_spatial_similarity_score(source_submesh, source_mesh, target_submesh, target_mesh)
+        score += _submesh_spatial_similarity_score(
+            source_submesh,
+            source_mesh,
+            target_submesh,
+            target_mesh,
+            spatial_cache=spatial_cache,
+        )
     return score
 
 
@@ -1077,9 +1206,11 @@ def _submesh_spatial_similarity_score(
     source_mesh: ParsedMesh,
     target: SubMesh,
     target_mesh: ParsedMesh,
+    *,
+    spatial_cache: _StaticMappingSpatialCache | None = None,
 ) -> float:
-    source_center = _normalized_submesh_center(source, source_mesh)
-    target_center = _normalized_submesh_center(target, target_mesh)
+    source_center = _normalized_submesh_center(source, source_mesh, spatial_cache=spatial_cache)
+    target_center = _normalized_submesh_center(target, target_mesh, spatial_cache=spatial_cache)
     if source_center is None or target_center is None:
         return 0.0
     distance = math.sqrt(sum((source_center[index] - target_center[index]) ** 2 for index in range(3)))
@@ -1089,25 +1220,41 @@ def _submesh_spatial_similarity_score(
 def _normalized_submesh_center(
     submesh: SubMesh,
     mesh: ParsedMesh,
+    *,
+    spatial_cache: _StaticMappingSpatialCache | None = None,
 ) -> tuple[float, float, float] | None:
     if not submesh.vertices:
         return None
-    mesh_vertices = [
-        vertex
-        for candidate in mesh.submeshes
-        if not _is_marker_submesh(candidate)
-        for vertex in candidate.vertices
-    ]
-    if not mesh_vertices:
-        return None
-    mesh_min, mesh_max = _bbox(mesh_vertices)
+    cache_key = (id(mesh), id(submesh))
+    if spatial_cache is not None and cache_key in spatial_cache.submesh_center_by_id:
+        return spatial_cache.submesh_center_by_id[cache_key]
+    mesh_bounds_key = id(mesh)
+    if spatial_cache is not None and mesh_bounds_key in spatial_cache.mesh_bounds_by_id:
+        mesh_min, mesh_max = spatial_cache.mesh_bounds_by_id[mesh_bounds_key]
+    else:
+        mesh_vertices = [
+            vertex
+            for candidate in mesh.submeshes
+            if not _is_marker_submesh(candidate)
+            for vertex in candidate.vertices
+        ]
+        if not mesh_vertices:
+            if spatial_cache is not None:
+                spatial_cache.submesh_center_by_id[cache_key] = None
+            return None
+        mesh_min, mesh_max = _bbox(mesh_vertices)
+        if spatial_cache is not None:
+            spatial_cache.mesh_bounds_by_id[mesh_bounds_key] = (mesh_min, mesh_max)
     mesh_dims = _dims(mesh_min, mesh_max)
     submesh_min, submesh_max = _bbox(submesh.vertices)
     center = _center(submesh_min, submesh_max)
-    return tuple(
+    normalized_center = tuple(
         0.5 if mesh_dims[index] <= 1e-8 else (center[index] - mesh_min[index]) / mesh_dims[index]
         for index in range(3)
     )
+    if spatial_cache is not None:
+        spatial_cache.submesh_center_by_id[cache_key] = normalized_center
+    return normalized_center
 
 
 def _dominant_axis(mesh: ParsedMesh) -> str:

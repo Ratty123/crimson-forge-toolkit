@@ -91,6 +91,8 @@ from cdmw.ui.widgets import (
     PreviewScrollArea,
     clamp_splitter_sizes,
     build_responsive_splitter_sizes,
+    has_persistent_tree_column_widths,
+    make_tree_columns_persistent,
     responsive_sidebar_bounds,
 )
 
@@ -486,6 +488,7 @@ class ResearchTab(QWidget):
         get_current_archive_path: Callable[[], str],
         get_current_text_search_path: Callable[[], str],
         get_current_compare_path: Callable[[], str],
+        get_archive_browser_tree_state: Optional[Callable[[], Dict[str, object]]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -500,6 +503,7 @@ class ResearchTab(QWidget):
         self.get_current_archive_path = get_current_archive_path
         self.get_current_text_search_path = get_current_text_search_path
         self.get_current_compare_path = get_current_compare_path
+        self.get_archive_browser_tree_state = get_archive_browser_tree_state
         self.notes_path = self.base_dir / "research_notes.json"
         self.notes: Dict[str, ResearchNote] = load_research_notes(self.notes_path)
         self.refresh_thread: Optional[QThread] = None
@@ -528,6 +532,7 @@ class ResearchTab(QWidget):
         self.archive_picker_entries: List[ArchiveEntry] = []
         self.archive_picker_entry_index_by_path: Dict[str, int] = {}
         self.archive_picker_entry_by_path: Dict[str, ArchiveEntry] = {}
+        self.archive_picker_lazy_entry_index_by_path: Dict[str, int] = {}
         self.archive_picker_child_folders: Dict[tuple[str, ...], List[tuple[str, tuple[str, ...]]]] = {}
         self.archive_picker_direct_files: Dict[tuple[str, ...], List[int]] = {}
         self.archive_picker_folder_entry_indexes: Dict[tuple[str, ...], List[int]] = {}
@@ -698,16 +703,63 @@ class ResearchTab(QWidget):
             _shutdown_thread(thread)
 
     def refresh_archive_picker(self) -> None:
-        entries = list(self.get_filtered_archive_entries()) or list(self.get_archive_entries())
-        self.archive_picker_entries = [entry for entry in entries if isinstance(entry, ArchiveEntry)]
-        self.archive_picker_entry_index_by_path = {
-            self._normalize_archive_path(entry.path).casefold(): index
-            for index, entry in enumerate(self.archive_picker_entries)
-        }
-        self.archive_picker_entry_by_path = {
-            self._normalize_archive_path(entry.path): entry for entry in self.archive_picker_entries
-        }
-        self._rebuild_archive_picker_index()
+        entries = self.get_filtered_archive_entries()
+        if not entries:
+            entries = self.get_archive_entries()
+        if isinstance(entries, list):
+            self.archive_picker_entries = entries  # Archive Browser owns this list; keep the shared reference.
+        else:
+            self.archive_picker_entries = [entry for entry in entries if isinstance(entry, ArchiveEntry)]
+        self.archive_picker_lazy_entry_index_by_path = {}
+        eager_path_maps = len(self.archive_picker_entries) <= 100_000
+        if eager_path_maps:
+            self.archive_picker_entry_index_by_path = {
+                self._normalize_archive_path(entry.path).casefold(): index
+                for index, entry in enumerate(self.archive_picker_entries)
+            }
+            self.archive_picker_entry_by_path = {
+                self._normalize_archive_path(entry.path): entry for entry in self.archive_picker_entries
+            }
+        else:
+            self.archive_picker_entry_index_by_path = {}
+            self.archive_picker_entry_by_path = {}
+        reused_browser_index = False
+        browser_tree_state = (
+            self.get_archive_browser_tree_state()
+            if self.get_archive_browser_tree_state is not None
+            else {}
+        )
+        if (
+            isinstance(browser_tree_state, dict)
+            and browser_tree_state.get("entries") is self.archive_picker_entries
+            and browser_tree_state.get("tree_index_ready", False)
+        ):
+            child_folders = browser_tree_state.get("tree_child_folders")
+            direct_files = browser_tree_state.get("tree_direct_files")
+            folder_indexes = browser_tree_state.get("tree_folder_entry_indexes")
+            folder_stats = browser_tree_state.get("tree_folder_preview_stats")
+            if (
+                isinstance(child_folders, dict)
+                and isinstance(direct_files, dict)
+                and isinstance(folder_indexes, dict)
+                and isinstance(folder_stats, dict)
+            ):
+                self.archive_picker_child_folders = child_folders
+                self.archive_picker_direct_files = direct_files
+                self.archive_picker_folder_entry_indexes = folder_indexes
+                self.archive_picker_folder_preview_stats = folder_stats
+                self.archive_picker_items_by_folder_key = {}
+                reused_browser_index = True
+        skipped_large_index = False
+        if not reused_browser_index and len(self.archive_picker_entries) > 100_000:
+            self.archive_picker_child_folders = {}
+            self.archive_picker_direct_files = {}
+            self.archive_picker_folder_entry_indexes = {}
+            self.archive_picker_folder_preview_stats = {}
+            self.archive_picker_items_by_folder_key = {}
+            skipped_large_index = True
+        elif not reused_browser_index:
+            self._rebuild_archive_picker_index()
         self.archive_picker_tree.blockSignals(True)
         self.archive_picker_tree.clear()
         self.archive_picker_items_by_folder_key = {}
@@ -725,6 +777,14 @@ class ResearchTab(QWidget):
             if self.archive_picker_entries
             else "No archive files are available yet. Scan archives or broaden the current Archive Browser filter."
         )
+        if self.archive_picker_entries and not eager_path_maps:
+            self.archive_picker_status_label.setText(
+                f"{len(self.archive_picker_entries):,} archive file(s) available. Path lookups are lazy to keep RAM usage down."
+            )
+        if skipped_large_index:
+            self.archive_picker_status_label.setText(
+                "Archive Files is waiting for the Archive Browser tree index. Open or refresh the Archive Browser view, or narrow the current filter."
+            )
         self.archive_picker_refresh_pending = False
 
     def mark_archive_picker_dirty(self) -> None:
@@ -838,7 +898,7 @@ class ResearchTab(QWidget):
         normalized = self._normalize_archive_path(path_value)
         if not normalized:
             return False
-        entry_index = self.archive_picker_entry_index_by_path.get(normalized.casefold())
+        entry_index = self._archive_picker_entry_index_for_path(normalized)
         if entry_index is None:
             self.archive_picker_status_label.setText(
                 f"Reference points to {normalized}, but that file is not visible in the current Archive Files list."
@@ -861,6 +921,35 @@ class ResearchTab(QWidget):
         self.archive_picker_tree.setCurrentItem(file_item)
         self.archive_picker_tree.scrollToItem(file_item, QAbstractItemView.PositionAtCenter)
         return True
+
+    def _archive_picker_entry_index_for_path(self, path_value: str) -> Optional[int]:
+        normalized = self._normalize_archive_path(path_value)
+        if not normalized:
+            return None
+        normalized_key = normalized.casefold()
+        entry_index = self.archive_picker_entry_index_by_path.get(normalized_key)
+        if entry_index is not None:
+            return entry_index
+        entry_index = self.archive_picker_lazy_entry_index_by_path.get(normalized_key)
+        if entry_index is not None:
+            return entry_index
+        for index, entry in enumerate(self.archive_picker_entries):
+            if self._normalize_archive_path(entry.path).casefold() == normalized_key:
+                self.archive_picker_lazy_entry_index_by_path[normalized_key] = index
+                return index
+        return None
+
+    def _archive_picker_entry_for_path(self, path_value: str) -> Optional[ArchiveEntry]:
+        normalized = self._normalize_archive_path(path_value)
+        if not normalized:
+            return None
+        entry = self.archive_picker_entry_by_path.get(normalized)
+        if entry is not None:
+            return entry
+        entry_index = self._archive_picker_entry_index_for_path(normalized)
+        if entry_index is None or not (0 <= entry_index < len(self.archive_picker_entries)):
+            return None
+        return self.archive_picker_entries[entry_index]
 
     def _find_archive_picker_file_item(
         self,
@@ -1125,6 +1214,34 @@ class ResearchTab(QWidget):
             if isinstance(row, MaterialTextureReferenceRow) and str(row.related_path or "").strip()
         ]
 
+    def _make_tree_columns_persistent(
+        self,
+        tree: QTreeWidget,
+        storage_name: str,
+        *,
+        minimum_width: int = 56,
+    ) -> None:
+        make_tree_columns_persistent(
+            tree,
+            self.settings,
+            f"research/{storage_name}",
+            minimum_width=minimum_width,
+        )
+
+    def _has_saved_tree_columns(
+        self,
+        tree: QTreeWidget,
+        storage_name: str,
+        *,
+        minimum_width: int = 56,
+    ) -> bool:
+        return has_persistent_tree_column_widths(
+            self.settings,
+            f"research/{storage_name}",
+            tree.columnCount(),
+            minimum_width=minimum_width,
+        )
+
     def _build_archive_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1186,6 +1303,7 @@ class ResearchTab(QWidget):
         self.texture_group_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.texture_group_tree.setHeaderLabels(["Group", "Members", "Kinds", "Packages"])
         self.texture_group_tree.header().resizeSection(0, 280)
+        self._make_tree_columns_persistent(self.texture_group_tree, "texture_group")
         group_layout.addWidget(self.texture_group_tree, stretch=1)
         groups_splitter.addWidget(group_group)
 
@@ -1210,6 +1328,7 @@ class ResearchTab(QWidget):
         self.classifier_tree.header().resizeSection(1, 120)
         self.classifier_tree.header().resizeSection(2, 90)
         self.classifier_tree.header().resizeSection(3, 120)
+        self._make_tree_columns_persistent(self.classifier_tree, "classifier")
         classifier_layout.addWidget(self.classifier_tree, stretch=1)
         groups_splitter.addWidget(classifier_group)
         groups_splitter.setSizes(build_responsive_splitter_sizes(1380, [44, 56], [520, 360]))
@@ -1278,6 +1397,7 @@ class ResearchTab(QWidget):
         self.unknown_group_tree.header().resizeSection(1, 220)
         self.unknown_group_tree.header().resizeSection(2, 110)
         self.unknown_group_tree.header().resizeSection(3, 120)
+        self._make_tree_columns_persistent(self.unknown_group_tree, "unknown_group")
         unknown_left_layout.addWidget(self.unknown_group_tree, stretch=1)
 
         unknown_actions_widget = QWidget()
@@ -1359,6 +1479,7 @@ class ResearchTab(QWidget):
         self.unknown_member_tree.header().resizeSection(2, 130)
         self.unknown_member_tree.header().resizeSection(3, 90)
         self.unknown_member_tree.header().resizeSection(4, 120)
+        self._make_tree_columns_persistent(self.unknown_member_tree, "unknown_member")
         unknown_members_layout.addWidget(self.unknown_member_tree, stretch=1)
         unknown_left_layout.addWidget(unknown_members_group)
         unknown_splitter.addWidget(unknown_left_panel)
@@ -1503,6 +1624,7 @@ class ResearchTab(QWidget):
         self.reference_tree.header().resizeSection(2, 110)
         self.reference_tree.header().resizeSection(3, 220)
         self.reference_tree.header().resizeSection(4, 80)
+        self._make_tree_columns_persistent(self.reference_tree, "reference")
         reference_group_layout.addWidget(self.reference_tree)
         reference_splitter.addWidget(reference_group)
 
@@ -1522,6 +1644,7 @@ class ResearchTab(QWidget):
         self.sidecar_tree.header().resizeSection(1, 160)
         self.sidecar_tree.header().resizeSection(2, 90)
         self.sidecar_tree.header().resizeSection(3, 120)
+        self._make_tree_columns_persistent(self.sidecar_tree, "sidecar")
         sidecar_layout.addWidget(self.sidecar_tree)
         reference_splitter.addWidget(sidecar_group)
         reference_splitter.setSizes(build_responsive_splitter_sizes(1540, [52, 48], [520, 360]))
@@ -1574,6 +1697,7 @@ class ResearchTab(QWidget):
         self.ui_constraint_tree.header().resizeSection(2, 90)
         self.ui_constraint_tree.header().resizeSection(3, 90)
         self.ui_constraint_tree.header().resizeSection(4, 220)
+        self._make_tree_columns_persistent(self.ui_constraint_tree, "ui_constraint")
         ui_constraints_group_layout.addWidget(self.ui_constraint_tree)
         ui_constraints_layout.addWidget(ui_constraints_group, stretch=1)
         sub_tabs.addTab(ui_constraints_tab, "UI Constraints")
@@ -1595,6 +1719,7 @@ class ResearchTab(QWidget):
             ["Label", "Heat", "Textures", "Sets", "Normals", "UI", "Sidecars", "Impostors"]
         )
         self.heatmap_tree.header().resizeSection(0, 360)
+        self._make_tree_columns_persistent(self.heatmap_tree, "heatmap")
         heatmap_group_layout.addWidget(self.heatmap_tree)
         heatmap_layout.addWidget(heatmap_group, stretch=1)
         sub_tabs.addTab(heatmap_tab, "Heatmap")
@@ -1648,6 +1773,7 @@ class ResearchTab(QWidget):
         self.archive_picker_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.archive_picker_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.archive_picker_tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self._make_tree_columns_persistent(self.archive_picker_tree, "archive_picker")
         tree_layout.addWidget(self.archive_picker_tree)
         self.archive_picker_splitter.addWidget(tree_container)
 
@@ -1793,6 +1919,7 @@ class ResearchTab(QWidget):
         self.mip_tree.setAlternatingRowColors(True)
         self.mip_tree.setHeaderLabels(["Path", "Original", "Rebuilt", "Mips", "Warnings"])
         self.mip_tree.header().resizeSection(0, 320)
+        self._make_tree_columns_persistent(self.mip_tree, "mip")
         mip_layout.addWidget(self.mip_tree, stretch=1)
         splitter.addWidget(mip_group)
 
@@ -1814,6 +1941,7 @@ class ResearchTab(QWidget):
         self.normal_tree.setAlternatingRowColors(True)
         self.normal_tree.setHeaderLabels(["Path", "Root", "Format", "Size", "Issues"])
         self.normal_tree.header().resizeSection(0, 340)
+        self._make_tree_columns_persistent(self.normal_tree, "normal")
         normal_layout.addWidget(self.normal_tree, stretch=1)
         splitter.addWidget(normal_group)
 
@@ -1837,12 +1965,14 @@ class ResearchTab(QWidget):
         self.budget_file_tree.setUniformRowHeights(True)
         self.budget_file_tree.setHeaderLabels(["Path", "Delta", "Ratio", "Size", "Type", "Risk"])
         self.budget_file_tree.header().resizeSection(0, 340)
+        self._make_tree_columns_persistent(self.budget_file_tree, "budget_file")
         self.budget_tabs.addTab(self.budget_file_tree, "Files")
         self.budget_class_tree = EmptyStateTreeWidget("No class summary", "Class-level budget totals will appear here.")
         self.budget_class_tree.setRootIsDecorated(False)
         self.budget_class_tree.setAlternatingRowColors(True)
         self.budget_class_tree.setUniformRowHeights(True)
         self.budget_class_tree.setHeaderLabels(["Texture Type", "Affected", "Byte Delta", "Avg Risk", "Band"])
+        self._make_tree_columns_persistent(self.budget_class_tree, "budget_class")
         self.budget_tabs.addTab(self.budget_class_tree, "Class Risk")
         self.budget_group_tree = EmptyStateTreeWidget("No group summary", "Grouped texture budget totals will appear here.")
         self.budget_group_tree.setRootIsDecorated(False)
@@ -1850,12 +1980,14 @@ class ResearchTab(QWidget):
         self.budget_group_tree.setUniformRowHeights(True)
         self.budget_group_tree.setHeaderLabels(["Group", "Textures", "Byte Delta", "Avg Ratio", "Risk", "Band"])
         self.budget_group_tree.header().resizeSection(0, 300)
+        self._make_tree_columns_persistent(self.budget_group_tree, "budget_group")
         self.budget_tabs.addTab(self.budget_group_tree, "Terrain-Like Groups")
         self.budget_profile_tree = EmptyStateTreeWidget("No profile summary", "Profile budget totals will appear here.")
         self.budget_profile_tree.setRootIsDecorated(False)
         self.budget_profile_tree.setAlternatingRowColors(True)
         self.budget_profile_tree.setUniformRowHeights(True)
         self.budget_profile_tree.setHeaderLabels(["Profile", "Total Delta", "Total Ratio", "Changed", "Upscaled"])
+        self._make_tree_columns_persistent(self.budget_profile_tree, "budget_profile")
         self.budget_tabs.addTab(self.budget_profile_tree, "Profile")
         budget_layout.addWidget(self.budget_tabs, stretch=1)
         splitter.addWidget(budget_group)
@@ -1956,6 +2088,7 @@ class ResearchTab(QWidget):
         self.notes_tree.header().resizeSection(0, 360)
         self.notes_tree.header().resizeSection(1, 200)
         self.notes_tree.header().resizeSection(2, 180)
+        self._make_tree_columns_persistent(self.notes_tree, "notes")
         list_layout.addWidget(self.notes_tree)
         splitter.addWidget(list_group)
         splitter.setSizes(build_responsive_splitter_sizes(1400, [52, 48], [360, 360]))
@@ -1995,9 +2128,12 @@ class ResearchTab(QWidget):
         *,
         stretch_column: int,
         min_widths: Dict[int, int],
+        storage_name: str = "",
     ) -> None:
         header = tree.header()
         if header is None or tree.columnCount() <= 0:
+            return
+        if storage_name and self._has_saved_tree_columns(tree, storage_name):
             return
         viewport_width = max(tree.viewport().width(), tree.width() - 24, 0)
         if viewport_width <= 0:
@@ -2019,22 +2155,22 @@ class ResearchTab(QWidget):
             tree.setUpdatesEnabled(True)
 
     def auto_fit_columns(self) -> None:
-        self._auto_fit_tree_columns(self.archive_picker_tree, stretch_column=0, min_widths={0: 260, 1: 90, 2: 110})
-        self._auto_fit_tree_columns(self.texture_group_tree, stretch_column=0, min_widths={0: 280, 1: 86, 2: 150, 3: 120})
-        self._auto_fit_tree_columns(self.classifier_tree, stretch_column=0, min_widths={0: 280, 1: 110, 2: 90, 3: 120, 4: 220})
-        self._auto_fit_tree_columns(self.unknown_group_tree, stretch_column=0, min_widths={0: 280, 1: 180, 2: 120, 3: 120})
-        self._auto_fit_tree_columns(self.unknown_member_tree, stretch_column=0, min_widths={0: 260, 1: 90, 2: 110, 3: 90, 4: 110, 5: 220})
-        self._auto_fit_tree_columns(self.reference_tree, stretch_column=0, min_widths={0: 260, 1: 220, 2: 90, 3: 180, 4: 80, 5: 110})
-        self._auto_fit_tree_columns(self.sidecar_tree, stretch_column=0, min_widths={0: 280, 1: 140, 2: 90, 3: 110, 4: 180})
-        self._auto_fit_tree_columns(self.ui_constraint_tree, stretch_column=0, min_widths={0: 260, 1: 220, 2: 90, 3: 90, 4: 180})
-        self._auto_fit_tree_columns(self.heatmap_tree, stretch_column=0, min_widths={0: 300, 1: 120, 2: 110, 3: 110, 4: 110, 5: 110})
-        self._auto_fit_tree_columns(self.mip_tree, stretch_column=0, min_widths={0: 280, 1: 120, 2: 120, 3: 80, 4: 200})
-        self._auto_fit_tree_columns(self.normal_tree, stretch_column=0, min_widths={0: 280, 1: 120, 2: 110, 3: 90, 4: 220})
-        self._auto_fit_tree_columns(self.budget_file_tree, stretch_column=0, min_widths={0: 280, 1: 100, 2: 80, 3: 120, 4: 100, 5: 80})
-        self._auto_fit_tree_columns(self.budget_class_tree, stretch_column=0, min_widths={0: 180, 1: 90, 2: 110, 3: 90, 4: 100})
-        self._auto_fit_tree_columns(self.budget_group_tree, stretch_column=0, min_widths={0: 240, 1: 90, 2: 110, 3: 90, 4: 80, 5: 100})
-        self._auto_fit_tree_columns(self.budget_profile_tree, stretch_column=0, min_widths={0: 180, 1: 110, 2: 90, 3: 90, 4: 90})
-        self._auto_fit_tree_columns(self.notes_tree, stretch_column=0, min_widths={0: 280, 1: 160, 2: 160, 3: 120})
+        self._auto_fit_tree_columns(self.archive_picker_tree, stretch_column=0, min_widths={0: 260, 1: 90, 2: 110}, storage_name="archive_picker")
+        self._auto_fit_tree_columns(self.texture_group_tree, stretch_column=0, min_widths={0: 280, 1: 86, 2: 150, 3: 120}, storage_name="texture_group")
+        self._auto_fit_tree_columns(self.classifier_tree, stretch_column=0, min_widths={0: 280, 1: 110, 2: 90, 3: 120, 4: 220}, storage_name="classifier")
+        self._auto_fit_tree_columns(self.unknown_group_tree, stretch_column=0, min_widths={0: 280, 1: 180, 2: 120, 3: 120}, storage_name="unknown_group")
+        self._auto_fit_tree_columns(self.unknown_member_tree, stretch_column=0, min_widths={0: 260, 1: 90, 2: 110, 3: 90, 4: 110, 5: 220}, storage_name="unknown_member")
+        self._auto_fit_tree_columns(self.reference_tree, stretch_column=0, min_widths={0: 260, 1: 220, 2: 90, 3: 180, 4: 80, 5: 110}, storage_name="reference")
+        self._auto_fit_tree_columns(self.sidecar_tree, stretch_column=0, min_widths={0: 280, 1: 140, 2: 90, 3: 110, 4: 180}, storage_name="sidecar")
+        self._auto_fit_tree_columns(self.ui_constraint_tree, stretch_column=0, min_widths={0: 260, 1: 220, 2: 90, 3: 90, 4: 180}, storage_name="ui_constraint")
+        self._auto_fit_tree_columns(self.heatmap_tree, stretch_column=0, min_widths={0: 300, 1: 120, 2: 110, 3: 110, 4: 110, 5: 110}, storage_name="heatmap")
+        self._auto_fit_tree_columns(self.mip_tree, stretch_column=0, min_widths={0: 280, 1: 120, 2: 120, 3: 80, 4: 200}, storage_name="mip")
+        self._auto_fit_tree_columns(self.normal_tree, stretch_column=0, min_widths={0: 280, 1: 120, 2: 110, 3: 90, 4: 220}, storage_name="normal")
+        self._auto_fit_tree_columns(self.budget_file_tree, stretch_column=0, min_widths={0: 280, 1: 100, 2: 80, 3: 120, 4: 100, 5: 80}, storage_name="budget_file")
+        self._auto_fit_tree_columns(self.budget_class_tree, stretch_column=0, min_widths={0: 180, 1: 90, 2: 110, 3: 90, 4: 100}, storage_name="budget_class")
+        self._auto_fit_tree_columns(self.budget_group_tree, stretch_column=0, min_widths={0: 240, 1: 90, 2: 110, 3: 90, 4: 80, 5: 100}, storage_name="budget_group")
+        self._auto_fit_tree_columns(self.budget_profile_tree, stretch_column=0, min_widths={0: 180, 1: 110, 2: 90, 3: 90, 4: 90}, storage_name="budget_profile")
+        self._auto_fit_tree_columns(self.notes_tree, stretch_column=0, min_widths={0: 280, 1: 160, 2: 160, 3: 120}, storage_name="notes")
 
     def _apply_responsive_splitter_defaults(self) -> None:
         self.apply_responsive_splitter_sizes()
@@ -3352,10 +3488,16 @@ class ResearchTab(QWidget):
             self._update_unknown_resolver_controls()
             return
         texconv_path = Path(self.get_texconv_path()).expanduser() if self.get_texconv_path().strip() else None
+        selected_entry = self._archive_picker_entry_for_path(member.path)
+        selected_entries_by_path = (
+            {self._normalize_archive_path(member.path): selected_entry}
+            if selected_entry is not None
+            else {}
+        )
         detail_text = build_unknown_resolver_detail(
             group,
             member.path,
-            entries_by_path=self.archive_picker_entry_by_path,
+            entries_by_path=selected_entries_by_path,
             texconv_path=texconv_path,
         )
         self.unknown_detail_edit.setPlainText(detail_text)
@@ -3705,7 +3847,7 @@ class ResearchTab(QWidget):
     def _render_unknown_preview_for_member(self, member: Optional[UnknownResolverMember]) -> None:
         self._ensure_archive_picker_ready()
         entry = (
-            self.archive_picker_entry_by_path.get(self._normalize_archive_path(member.path))
+            self._archive_picker_entry_for_path(member.path)
             if member is not None
             else None
         )

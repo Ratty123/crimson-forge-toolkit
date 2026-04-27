@@ -13,6 +13,22 @@ def raise_if_cancelled(stop_event: Optional[threading.Event], message: str = "Pr
         raise RunCancelled(message)
 
 
+def hidden_subprocess_kwargs() -> Dict[str, object]:
+    if os.name != "nt":
+        return {}
+
+    kwargs: Dict[str, object] = {}
+    creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= int(getattr(subprocess, "STARTF_USESHOWWINDOW", 0))
+    startupinfo.wShowWindow = int(getattr(subprocess, "SW_HIDE", 0))
+    kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
 def run_process_with_cancellation(
     cmd: Sequence[str],
     stop_event: Optional[threading.Event] = None,
@@ -20,10 +36,6 @@ def run_process_with_cancellation(
     on_poll: Optional[Callable[[], None]] = None,
     on_cancel: Optional[Callable[[subprocess.Popen], None]] = None,
 ) -> Tuple[int, str, str]:
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
     env: Optional[Dict[str, str]] = None
     if env_overrides:
         env = dict(os.environ)
@@ -40,8 +52,8 @@ def run_process_with_cancellation(
         text=True,
         encoding="utf-8",
         errors="replace",
-        creationflags=creationflags,
         env=env,
+        **hidden_subprocess_kwargs(),
     )
 
     try:

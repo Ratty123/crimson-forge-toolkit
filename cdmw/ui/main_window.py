@@ -16,18 +16,23 @@ from collections.abc import Mapping
 from collections import Counter, OrderedDict
 from html import escape
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from cdmw.constants import *
 from cdmw.models import *
 from cdmw.core.archive import *
 from cdmw.core.archive import (
     _attach_model_sidecar_texture_preview_paths,
+    _attach_model_support_texture_preview_paths,
+    _attach_model_texture_preview_paths,
     _extract_archive_model_sidecar_texture_references,
     _infer_model_preview_normal_strength,
     _is_material_sidecar_extension,
+    _normalize_model_visible_texture_mode,
     _parse_archive_model_sidecar_texture_bindings,
     _resolve_model_texture_semantic_details,
+    _strip_archive_model_family_variant_suffix,
+    iter_archive_equipment_model_alias_stems,
     read_archive_entry_data,
 )
 from cdmw.core.classification_registry import (
@@ -35,6 +40,8 @@ from cdmw.core.classification_registry import (
     get_registered_texture_classification,
 )
 from cdmw.core.item_index import build_archive_item_search_index
+from cdmw.core.mesh_baseline import read_archive_entry_baseline_data
+from cdmw.core.mesh_preflight import MeshImportPreflight, build_mesh_import_preflight
 from cdmw.core.archive_modding import (
     ARCHIVE_AUDIO_EXPORT_EXTENSIONS,
     ARCHIVE_AUDIO_PATCH_EXTENSIONS,
@@ -54,6 +61,18 @@ from cdmw.core.archive_modding import (
     patch_archive_entries,
     parsed_mesh_to_preview_model,
     restore_archive_patch_backup,
+)
+from cdmw.core.final_package_preview import (
+    FinalPackagePreviewResult,
+    TEXTURE_PLAN_STATUS_IGNORED_ADVANCED,
+    TEXTURE_PLAN_STATUS_LIKELY_GREY,
+    TEXTURE_PLAN_STATUS_READY,
+    TEXTURE_PLAN_STATUS_REVIEW,
+    TEXTURE_PLAN_STATUS_SUPPORT_ONLY,
+    build_dds_override_table_row,
+    build_final_package_preview,
+    build_replacement_texture_plan_rows,
+    simplified_part_label,
 )
 from cdmw.modding.mesh_parser import ParsedMesh, parse_mesh
 from cdmw.modding.scene_importer import (
@@ -82,7 +101,11 @@ from cdmw.modding.static_mesh_replacer import (
     _semantic_tokens,
     _transformed_replacement_sources,
 )
-from cdmw.modding.material_replacer import group_replacement_texture_sets
+from cdmw.modding.material_replacer import (
+    classify_texture_assignment_guidance,
+    group_replacement_texture_sets,
+    is_shared_material_layer_texture,
+)
 from cdmw.core.model_export import export_model_preview_to_obj
 from cdmw.core.mod_package import (
     MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY,
@@ -96,6 +119,7 @@ from cdmw.core.material_sidecar_editor import (
     detect_material_sidecar_related_files,
     detect_material_sidecar_preview_model_candidates,
     discover_material_sidecar_preview_overrides,
+    discover_material_sidecar_preview_overrides_for_edits,
     discover_material_sidecar_values,
     export_material_sidecar_mod_package,
     is_material_sidecar_entry,
@@ -117,6 +141,8 @@ class MeshImportSetupSelection:
     import_mode: str
     supplemental_files: Tuple[Path, ...] = ()
     scene_import_result: Optional[SceneImportResult] = None
+    original_mesh: Optional[ParsedMesh] = None
+    preflight: Optional[MeshImportPreflight] = None
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -144,9 +170,9 @@ def mesh_import_mode_availability(
     elif suffix == ".dae":
         guidance = "DAE imports use Mesh Replacement. Round-trip edit remains OBJ-only."
     elif has_roundtrip_sidecar:
-        guidance = "A CrimsonForge OBJ sidecar was found, so Round-trip edit is selected by default."
+        guidance = "An OBJ round-trip sidecar was found, so Round-trip edit is selected by default."
     else:
-        guidance = "No CrimsonForge OBJ sidecar was found. Mesh Replacement is selected by default."
+        guidance = "No OBJ round-trip sidecar was found. Mesh Replacement is selected by default."
     if is_obj and (has_roundtrip_sidecar or not static_enabled):
         default_mode = "roundtrip"
     elif static_enabled:
@@ -165,7 +191,7 @@ def mesh_import_mode_availability(
 
 def run_gui() -> int:
     try:
-        from PySide6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, QUrl, QObject, Signal, Slot
+        from PySide6.QtCore import QModelIndex, QEvent, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, QObject, Signal, Slot
         from PySide6.QtGui import (
             QBrush,
             QColor,
@@ -175,6 +201,7 @@ def run_gui() -> int:
             QImageReader,
             QPainter,
             QPainterPath,
+            QPen,
             QPixmap,
         )
         from PySide6.QtWidgets import (
@@ -201,6 +228,7 @@ def run_gui() -> int:
             QMessageBox,
             QPlainTextEdit,
             QProgressBar,
+            QProgressDialog,
             QPushButton,
             QRadioButton,
             QScrollArea,
@@ -209,6 +237,7 @@ def run_gui() -> int:
             QStackedWidget,
             QSpinBox,
             QTabWidget,
+            QTextBrowser,
             QToolButton,
             QTreeWidget,
             QTreeWidgetItem,
@@ -230,7 +259,9 @@ def run_gui() -> int:
         clamp_splitter_sizes,
         CollapsibleSection,
         ensure_app_wheel_guard,
+        has_persistent_tree_column_widths,
         LogHighlighter,
+        make_tree_columns_persistent,
         MediaPreviewWidget,
         ModelPreviewWidget,
         PreviewLabel,
@@ -635,6 +666,7 @@ def run_gui() -> int:
             min_size_kb: int = 0,
             previewable_only: bool = False,
             item_search_aliases: Optional[Mapping[str, str]] = None,
+            game_executable_fingerprints: Optional[Mapping[str, Mapping[str, object]]] = None,
         ):
             super().__init__()
             self.package_root = package_root
@@ -651,10 +683,79 @@ def run_gui() -> int:
             self.min_size_kb = min_size_kb
             self.previewable_only = previewable_only
             self.item_search_aliases = dict(item_search_aliases or {})
+            self.game_executable_fingerprints = {
+                str(key): dict(value)
+                for key, value in (game_executable_fingerprints or {}).items()
+                if isinstance(value, Mapping)
+            }
+            self.updated_game_executable_fingerprints: Optional[Dict[str, Dict[str, object]]] = None
             self.stop_event = threading.Event()
 
         def stop(self) -> None:
             self.stop_event.set()
+
+        def _check_game_update_and_invalidate_archive_cache(self) -> None:
+            executable_path = resolve_crimson_desert_executable(self.package_root)
+            if executable_path is None:
+                return
+
+            try:
+                stat_result = executable_path.stat()
+            except OSError as exc:
+                self.log_message.emit(f"Game update check skipped: could not read {executable_path}: {exc}")
+                return
+
+            executable_key = str(executable_path).strip().lower()
+            current_size = int(stat_result.st_size)
+            current_mtime_ns = int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000)))
+            records: Dict[str, Dict[str, object]] = {
+                str(key): dict(value)
+                for key, value in self.game_executable_fingerprints.items()
+                if isinstance(value, Mapping)
+            }
+            previous_record = records.get(executable_key, {})
+            previous_hash = str(previous_record.get("sha256", "") or "").strip()
+            previous_size = int(previous_record.get("size", -1) or -1)
+            previous_mtime_ns = int(previous_record.get("mtime_ns", -1) or -1)
+
+            if previous_hash and previous_size == current_size and previous_mtime_ns == current_mtime_ns:
+                return
+
+            try:
+                current_hash = sha256_file(executable_path)
+            except OSError as exc:
+                self.log_message.emit(f"Game update check skipped: could not hash {executable_path}: {exc}")
+                return
+
+            records[executable_key] = {
+                "path": str(executable_path),
+                "sha256": current_hash,
+                "size": current_size,
+                "mtime_ns": current_mtime_ns,
+                "checked_at": time.time(),
+            }
+            self.updated_game_executable_fingerprints = records
+
+            if not previous_hash:
+                self.log_message.emit(f"Recorded CrimsonDesert.exe hash baseline: {executable_path}")
+                return
+            if previous_hash == current_hash:
+                return
+
+            deleted_paths = invalidate_archive_browser_cache(
+                self.package_root,
+                self.cache_root,
+                on_log=self.log_message.emit,
+            )
+            if deleted_paths:
+                self.log_message.emit(
+                    "Game update detected via CrimsonDesert.exe hash. "
+                    f"Archive Browser cache invalidated ({len(deleted_paths):,} file(s))."
+                )
+            else:
+                self.log_message.emit(
+                    "Game update detected via CrimsonDesert.exe hash. No existing Archive Browser cache file needed deletion."
+                )
 
         @Slot()
         def run(self) -> None:
@@ -665,7 +766,10 @@ def run_gui() -> int:
                     self.log_message.emit(f"Refreshing archive packages under {self.package_root}")
                 else:
                     self.log_message.emit(f"Loading archive packages under {self.package_root}")
-                entries, source, cache_path, timings = scan_archive_entries_cached(
+                game_update_started_at = time.perf_counter()
+                self._check_game_update_and_invalidate_archive_cache()
+                timings["game_update_check_s"] = max(0.0, float(time.perf_counter() - game_update_started_at))
+                entries, source, cache_path, scan_timings = scan_archive_entries_cached(
                     self.package_root,
                     self.cache_root,
                     force_refresh=self.force_refresh,
@@ -673,23 +777,63 @@ def run_gui() -> int:
                     on_progress=self.progress_changed.emit,
                     stop_event=self.stop_event,
                 )
-                item_index_started_at = time.perf_counter()
+                timings.update(scan_timings)
                 item_search_aliases: Dict[str, str] = {}
                 item_display_names: Dict[str, str] = {}
-                try:
-                    item_index = build_archive_item_search_index(
+                path_index: Dict[str, List[ArchiveEntry]] = {}
+                basename_index: Dict[str, List[ArchiveEntry]] = {}
+                extension_index: Dict[str, List[ArchiveEntry]] = {}
+                derived_cache = None
+                derived_cache_needs_write = False
+                if entries and not self.force_refresh:
+                    self.log_message.emit("Checking archive derived index cache...")
+                    self.progress_changed.emit(0, 0, "Checking archive derived index cache...")
+                    derived_cache = load_archive_derived_index_cache(
+                        self.package_root,
+                        self.cache_root,
                         entries,
                         on_log=self.log_message.emit,
-                        stop_event=self.stop_event,
+                        timings=timings,
                     )
-                    item_search_aliases = dict(item_index.model_base_aliases)
-                    item_display_names = dict(getattr(item_index, "model_base_display_names", {}) or {})
-                except RunCancelled:
-                    raise
-                except Exception as exc:
-                    self.log_message.emit(f"Warning: item-name search index unavailable: {exc}")
-                timings["item_search_index_s"] = max(0.0, float(time.perf_counter() - item_index_started_at))
+                if isinstance(derived_cache, dict):
+                    item_search_aliases = dict(derived_cache.get("item_search_aliases", {}) or {})
+                    item_display_names = dict(derived_cache.get("item_display_names", {}) or {})
+                    timings.setdefault("item_search_index_s", 0.0)
+                else:
+                    derived_cache_needs_write = bool(entries)
+                    self.log_message.emit("Building item-name search index...")
+                    self.progress_changed.emit(0, 0, "Building item-name search index...")
+                    item_index_started_at = time.perf_counter()
+                    try:
+                        item_index = build_archive_item_search_index(
+                            entries,
+                            on_log=self.log_message.emit,
+                            stop_event=self.stop_event,
+                        )
+                        item_search_aliases = dict(item_index.model_base_aliases)
+                        item_display_names = dict(getattr(item_index, "model_base_display_names", {}) or {})
+                    except RunCancelled:
+                        raise
+                    except Exception as exc:
+                        self.log_message.emit(f"Warning: item-name search index unavailable: {exc}")
+                    timings["item_search_index_s"] = max(0.0, float(time.perf_counter() - item_index_started_at))
+                self.log_message.emit("Building archive path lookup index...")
+                self.progress_changed.emit(0, 0, "Building archive path lookup index...")
+                path_index_started_at = time.perf_counter()
+                path_index = build_archive_entry_path_index(entries)
+                timings["entry_path_index_s"] = max(0.0, float(time.perf_counter() - path_index_started_at))
+                self.log_message.emit("Building archive basename lookup index...")
+                self.progress_changed.emit(0, 0, "Building archive basename lookup index...")
+                basename_index_started_at = time.perf_counter()
+                basename_index = build_archive_entry_basename_index(entries)
+                timings["entry_basename_index_s"] = max(0.0, float(time.perf_counter() - basename_index_started_at))
+                self.log_message.emit("Building archive extension lookup index...")
+                self.progress_changed.emit(0, 0, "Building archive extension lookup index...")
+                extension_index_started_at = time.perf_counter()
+                extension_index = build_archive_entry_extension_index(entries)
+                timings["entry_extension_index_s"] = max(0.0, float(time.perf_counter() - extension_index_started_at))
                 self.log_message.emit("Preparing archive browser state from loaded entries...")
+                self.progress_changed.emit(0, 0, "Preparing archive browser state from loaded entries...")
                 browser_state_started_at = time.perf_counter()
                 browser_state = prepare_archive_browser_state(
                     entries,
@@ -703,31 +847,27 @@ def run_gui() -> int:
                     min_size_kb=self.min_size_kb,
                     previewable_only=self.previewable_only,
                     item_search_aliases=item_search_aliases,
+                    archive_entries_by_basename=basename_index,
+                    archive_entries_by_normalized_path=path_index,
                     build_structure_children=True,
                     build_tree_index=self.build_tree_index,
                     on_progress=self.progress_changed.emit,
                     stop_event=self.stop_event,
                 )
                 timings["browser_state_s"] = max(0.0, float(time.perf_counter() - browser_state_started_at))
-                path_index_started_at = time.perf_counter()
-                path_index = build_archive_entry_path_index(entries)
-                timings["entry_path_index_s"] = max(0.0, float(time.perf_counter() - path_index_started_at))
-                basename_index_started_at = time.perf_counter()
-                basename_index = build_archive_entry_basename_index(entries)
-                timings["entry_basename_index_s"] = max(0.0, float(time.perf_counter() - basename_index_started_at))
-                extension_index_started_at = time.perf_counter()
-                extension_index = build_archive_entry_extension_index(entries)
-                timings["entry_extension_index_s"] = max(0.0, float(time.perf_counter() - extension_index_started_at))
                 timings["total_s"] = max(0.0, float(time.perf_counter() - started_at))
                 timing_summary = _format_timing_summary(
                     "Archive scan timings",
                     source,
                     timings,
                     (
+                        ("game_update_check_s", "game_update"),
                         ("cache_check_s", "cache_check"),
                         ("cache_load_s", "cache_load"),
                         ("archive_scan_s", "archive_scan"),
                         ("cache_write_s", "cache_write"),
+                        ("derived_cache_check_s", "derived_check"),
+                        ("derived_cache_load_s", "derived_load"),
                         ("item_search_index_s", "item_search"),
                         ("browser_state_s", "browser_state"),
                         ("entry_path_index_s", "path_index"),
@@ -747,6 +887,8 @@ def run_gui() -> int:
                         "extension_index": extension_index,
                         "item_search_aliases": item_search_aliases,
                         "item_display_names": item_display_names,
+                        "derived_cache_needs_write": derived_cache_needs_write,
+                        "game_executable_fingerprints": self.updated_game_executable_fingerprints,
                         "timings": timings,
                         "timing_summary": timing_summary,
                     }
@@ -756,6 +898,53 @@ def run_gui() -> int:
                     self.error.emit(str(exc))
             except Exception as exc:
                 self.error.emit(str(exc))
+            finally:
+                self.finished.emit()
+
+    class ArchiveDerivedIndexCacheWriteWorker(QObject):
+        log_message = Signal(str)
+        finished = Signal()
+
+        def __init__(
+            self,
+            package_root: Path,
+            cache_root: Path,
+            entries: Sequence[ArchiveEntry],
+            *,
+            item_search_aliases: Optional[Mapping[str, str]] = None,
+            item_display_names: Optional[Mapping[str, str]] = None,
+        ):
+            super().__init__()
+            self.package_root = package_root
+            self.cache_root = cache_root
+            self.entries = entries
+            self.item_search_aliases = dict(item_search_aliases or {})
+            self.item_display_names = dict(item_display_names or {})
+            self.stop_event = threading.Event()
+
+        def stop(self) -> None:
+            self.stop_event.set()
+
+        @Slot()
+        def run(self) -> None:
+            try:
+                if self.stop_event.is_set():
+                    return
+                self.log_message.emit("Writing lightweight archive derived index cache in background...")
+                timings: Dict[str, float] = {}
+                save_archive_derived_index_cache(
+                    self.package_root,
+                    self.cache_root,
+                    self.entries,
+                    item_search_aliases=self.item_search_aliases,
+                    item_display_names=self.item_display_names,
+                    on_log=self.log_message.emit,
+                    timings=timings,
+                )
+                elapsed = float(timings.get("derived_cache_write_s", 0.0) or 0.0)
+                self.log_message.emit(f"Lightweight archive derived index cache write finished in {elapsed:.2f}s.")
+            except Exception as exc:
+                self.log_message.emit(f"Warning: archive derived index cache could not be written: {exc}")
             finally:
                 self.finished.emit()
 
@@ -998,6 +1187,8 @@ def run_gui() -> int:
             entries: Sequence[ArchiveEntry],
             *,
             entries_by_extension: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
+            entries_by_normalized_path: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+            entries_by_basename: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
             request_signature: Tuple[object, ...] = (),
             preferred_path: str = "",
             build_tree_index: bool = True,
@@ -1017,6 +1208,8 @@ def run_gui() -> int:
             # before the worker even starts running.
             self.entries = entries
             self.entries_by_extension = entries_by_extension or {}
+            self.entries_by_normalized_path = entries_by_normalized_path or {}
+            self.entries_by_basename = entries_by_basename or {}
             self.request_signature = tuple(request_signature or ())
             self.preferred_path = preferred_path
             self.build_tree_index = build_tree_index
@@ -1054,6 +1247,8 @@ def run_gui() -> int:
                     min_size_kb=self.min_size_kb,
                     previewable_only=self.previewable_only,
                     item_search_aliases=self.item_search_aliases,
+                    archive_entries_by_basename=self.entries_by_basename,
+                    archive_entries_by_normalized_path=self.entries_by_normalized_path,
                     build_structure_children=False,
                     build_tree_index=self.build_tree_index,
                     on_progress=self.progress_changed.emit,
@@ -1249,6 +1444,7 @@ def run_gui() -> int:
             sidecar_entries_by_texture_basename: Optional[Dict[str, Sequence[ArchiveEntry]]],
             loose_search_roots: Sequence[Path],
             visible_texture_mode: str = "mesh_base_first",
+            support_texture_slots: Sequence[str] = ("normal", "material", "height"),
             include_loose_preview_assets: bool = False,
             sidecar_generation: int = 0,
         ):
@@ -1263,6 +1459,14 @@ def run_gui() -> int:
             self.sidecar_entries_by_texture_basename = sidecar_entries_by_texture_basename
             self.loose_search_roots = list(loose_search_roots)
             self.visible_texture_mode = str(visible_texture_mode or "").strip().lower() or "mesh_base_first"
+            self.support_texture_slots = tuple(
+                slot
+                for slot in ("normal", "material", "height")
+                if str(slot) in {
+                    str(value or "").strip().lower()
+                    for value in (support_texture_slots or ())
+                }
+            )
             self.include_loose_preview_assets = include_loose_preview_assets
             self.sidecar_generation = int(sidecar_generation)
             self.stop_event = threading.Event()
@@ -1288,6 +1492,7 @@ def run_gui() -> int:
                     sidecar_entries_by_texture_basename=self.sidecar_entries_by_texture_basename,
                     include_loose_preview_assets=self.include_loose_preview_assets,
                     visible_texture_mode=self.visible_texture_mode,
+                    support_texture_slots=self.support_texture_slots,
                     stop_event=self.stop_event,
                 )
                 timings["worker_build_s"] = max(0.0, float(time.perf_counter() - worker_build_started_at))
@@ -1394,6 +1599,230 @@ def run_gui() -> int:
             event.ignore()
             self.owner._attach_detached_tool(self.tool_key, select_after=False)
 
+    class StartupProgressCard(QFrame):
+        def __init__(self, parent: Optional[QWidget] = None) -> None:
+            super().__init__(parent)
+            self.setObjectName("StartupSplashCard")
+            self.setAttribute(Qt.WA_StyledBackground, False)
+            self.setAutoFillBackground(False)
+            self._current = 0
+            self._total = 0
+            self._phase = 0.0
+            self._raw_progress = 0.0
+            self._target_progress = 0.0
+            self._display_progress = 0.0
+            self._has_determinate_progress = False
+            self._animation_started_at = time.monotonic()
+            self._timer = QTimer(self)
+            self._timer.setTimerType(Qt.PreciseTimer)
+            self._timer.setInterval(16)
+            self._timer.timeout.connect(self._advance_progress_phase)
+            self._timer.start()
+
+        def set_progress(self, current: int = 0, total: int = 0) -> None:
+            previous_raw_progress = self._raw_progress
+            previous_total = self._total
+            next_total = max(0, int(total or 0))
+            self._total = next_total
+            if next_total > 0:
+                self._current = min(max(int(current or 0), 0), next_total)
+                next_raw_progress = min(max(self._current / max(next_total, 1), 0.0), 1.0)
+                stage_restarted = (
+                    self._has_determinate_progress
+                    and (
+                        next_raw_progress + 0.015 < previous_raw_progress
+                        or (previous_total > 0 and previous_total != next_total and next_raw_progress + 0.02 < self._target_progress)
+                    )
+                )
+                if stage_restarted:
+                    self._target_progress = min(0.965, max(self._target_progress, self._display_progress) + 0.045)
+                elif next_raw_progress >= 0.999:
+                    self._target_progress = max(self._target_progress, min(0.96, self._target_progress + 0.035))
+                else:
+                    self._target_progress = max(self._target_progress, next_raw_progress)
+                self._raw_progress = next_raw_progress
+                self._has_determinate_progress = True
+            else:
+                self._current = 0
+            self.update()
+
+        def stop(self) -> None:
+            self._timer.stop()
+
+        def _advance_progress_phase(self) -> None:
+            if not self.isVisible():
+                return
+            now = time.monotonic()
+            self._phase = ((now - self._animation_started_at) * 0.34) % 1.0
+            should_update = True
+            if self._has_determinate_progress and self._display_progress < self._target_progress:
+                delta = self._target_progress - self._display_progress
+                self._display_progress = min(self._target_progress, self._display_progress + max(0.003, delta * 0.16))
+            if should_update:
+                self.update()
+
+        def _rounded_path(self, rect, radius: float = 12.0) -> QPainterPath:
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(rect), radius, radius)
+            return path
+
+        def _rounded_path_length(self, rect, radius: float = 12.0) -> float:
+            width = max(float(rect.width()), 1.0)
+            height = max(float(rect.height()), 1.0)
+            radius = min(max(float(radius), 0.0), width * 0.5, height * 0.5)
+            return max(1.0, (2.0 * (width + height - (4.0 * radius))) + (2.0 * 3.141592653589793 * radius))
+
+        def _draw_path_segment(
+            self,
+            painter: QPainter,
+            path: QPainterPath,
+            path_length: float,
+            start: float,
+            span: float,
+            color: QColor,
+            width: float,
+        ) -> None:
+            span = min(max(float(span), 0.0), 1.0)
+            if span <= 0.0:
+                return
+            pen = QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            if span < 0.995:
+                dash = max(0.1, span * path_length)
+                gap = max(1.0, path_length - dash)
+                width_units = max(float(width), 0.1)
+                pen.setDashPattern([dash / width_units, gap / width_units])
+                pen.setDashOffset(-((float(start) % 1.0) * path_length) / width_units)
+            painter.setPen(pen)
+            painter.drawPath(path)
+
+        def paintEvent(self, event) -> None:  # type: ignore[override]
+            card_rect = self.rect().adjusted(0, 0, -1, -1)
+            if card_rect.width() <= 4 or card_rect.height() <= 4:
+                return
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#17191f"))
+            painter.drawRoundedRect(card_rect, 12, 12)
+
+            rect = card_rect.adjusted(2, 2, -2, -2)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(60, 70, 85, 185), 1.1))
+            painter.drawRoundedRect(rect, 12, 12)
+
+            path = self._rounded_path(rect, 12.0)
+            path_length = self._rounded_path_length(rect, 12.0)
+            start = 0.015
+            accent = QColor("#34a7f4")
+            glow = QColor(52, 167, 244, 42)
+            if self._has_determinate_progress:
+                progress = min(max(self._display_progress, 0.0), 0.985)
+                if progress > 0.01:
+                    self._draw_path_segment(painter, path, path_length, start, progress, QColor(52, 167, 244, 22), 2.8)
+
+            sweep_start = start + self._phase
+            sweep_span = 0.18 if self._has_determinate_progress else 0.24
+            self._draw_path_segment(painter, path, path_length, sweep_start, sweep_span, glow, 3.6)
+            self._draw_path_segment(painter, path, path_length, sweep_start, sweep_span, accent, 1.8)
+
+    class StartupSplashDialog(QDialog):
+        def __init__(self):
+            super().__init__(None)
+            self.setWindowTitle("CDMW")
+            self.setWindowFlags(Qt.SplashScreen | Qt.FramelessWindowHint)
+            self.setAttribute(Qt.WA_TranslucentBackground, True)
+            self.setModal(False)
+            self.setFixedSize(420, 250)
+            self.setObjectName("StartupSplash")
+            self._last_event_flush = 0.0
+
+            root_layout = QVBoxLayout(self)
+            root_layout.setContentsMargins(0, 0, 0, 0)
+            root_layout.setSpacing(0)
+
+            self.progress_card = StartupProgressCard(self)
+            root_layout.addWidget(self.progress_card)
+
+            card_layout = QVBoxLayout(self.progress_card)
+            card_layout.setContentsMargins(24, 22, 24, 22)
+            card_layout.setSpacing(14)
+
+            logo_label = QLabel("CDMW")
+            logo_label.setObjectName("StartupSplashLogo")
+            logo_label.setAlignment(Qt.AlignCenter)
+            logo_label.setMinimumHeight(76)
+            card_layout.addWidget(logo_label)
+
+            title_label = QLabel("Crimson Desert Mod Workbench")
+            title_label.setObjectName("StartupSplashTitle")
+            title_label.setAlignment(Qt.AlignCenter)
+            card_layout.addWidget(title_label)
+
+            self.detail_label = QLabel("Starting application...")
+            self.detail_label.setObjectName("StartupSplashDetail")
+            self.detail_label.setAlignment(Qt.AlignCenter)
+            self.detail_label.setWordWrap(True)
+            self.detail_label.setMinimumHeight(40)
+            card_layout.addWidget(self.detail_label)
+
+            self.setStyleSheet(
+                """
+                QDialog#StartupSplash {
+                    background: transparent;
+                }
+                QFrame#StartupSplashCard {
+                    background: transparent;
+                }
+                QLabel#StartupSplashLogo {
+                    color: #f5f8ff;
+                    font-size: 40px;
+                    font-weight: 800;
+                    letter-spacing: 2px;
+                    background: #222733;
+                    border: 1px solid #3d4655;
+                    border-radius: 8px;
+                }
+                QLabel#StartupSplashTitle {
+                    color: #dce5f2;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+                QLabel#StartupSplashDetail {
+                    color: #aeb9c8;
+                    font-size: 12px;
+                }
+                """
+            )
+
+        def center_on_screen(self) -> None:
+            screen = QApplication.primaryScreen()
+            if screen is None:
+                return
+            available = screen.availableGeometry()
+            frame = self.frameGeometry()
+            frame.moveCenter(available.center())
+            self.move(frame.topLeft())
+
+        def set_detail(self, detail: str, current: int = 0, total: int = 0) -> None:
+            text = str(detail or "Starting application...").strip() or "Starting application..."
+            self.detail_label.setText(text)
+            self.progress_card.set_progress(current, total)
+            now = time.monotonic()
+            app = QApplication.instance()
+            if (
+                app is not None
+                and app.thread() == QThread.currentThread()
+                and self.isVisible()
+                and now - self._last_event_flush >= 0.045
+            ):
+                self._last_event_flush = now
+                app.processEvents()
+
+        def finish(self) -> None:
+            self.progress_card.stop()
+            self.hide()
+            self.deleteLater()
+
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
             super().__init__()
@@ -1410,6 +1839,9 @@ def run_gui() -> int:
                 language_code=str(self.settings.value("appearance/language", "en") or "en"),
             )
             self._settings_ready = False
+            self._startup_splash_window = None
+            self._startup_splash_holds_main_window = False
+            self._startup_splash_released = False
             self.current_theme_key = str(self.settings.value("appearance/theme", DEFAULT_UI_THEME))
             self.show_quick_start_on_launch = (
                 not self.settings.contains("ui/startup_setup_shown")
@@ -1425,6 +1857,9 @@ def run_gui() -> int:
             self.archive_scan_worker: Optional[ArchiveScanWorker] = None
             self.archive_sidecar_thread: Optional[QThread] = None
             self.archive_sidecar_worker: Optional[ArchiveSidecarIndexWorker] = None
+            self.archive_derived_cache_thread: Optional[QThread] = None
+            self.archive_derived_cache_worker: Optional[ArchiveDerivedIndexCacheWriteWorker] = None
+            self.archive_derived_cache_write_pending = False
             self.archive_filter_worker: Optional[ArchiveFilterWorker] = None
             self.build_worker: Optional[BuildWorker] = None
             self.dds_to_png_worker: Optional[DdsToPngWorker] = None
@@ -1973,6 +2408,13 @@ def run_gui() -> int:
             self.workflow_profiles_tree.header().resizeSection(1, 130)
             self.workflow_profiles_tree.header().resizeSection(2, 220)
             self.workflow_profiles_tree.header().resizeSection(3, 240)
+            make_tree_columns_persistent(
+                self.workflow_profiles_tree,
+                self.settings,
+                "main/workflow_profiles",
+                minimum_width=56,
+                save_callback=self.schedule_settings_save,
+            )
             profiles_layout.addWidget(self.workflow_profiles_tree)
 
             profile_detail_group = QGroupBox("Selected Profile")
@@ -2111,6 +2553,13 @@ def run_gui() -> int:
             self.workflow_rules_tree.header().resizeSection(6, 90)
             self.workflow_rules_tree.header().resizeSection(7, 120)
             self.workflow_rules_tree.header().resizeSection(8, 150)
+            make_tree_columns_persistent(
+                self.workflow_rules_tree,
+                self.settings,
+                "main/workflow_rules",
+                minimum_width=48,
+                save_callback=self.schedule_settings_save,
+            )
             rules_layout.addWidget(self.workflow_rules_tree)
 
             rule_detail_group = QGroupBox("Selected Rule")
@@ -2246,6 +2695,13 @@ def run_gui() -> int:
             self.workflow_matched_files_tree.header().resizeSection(4, 200)
             self.workflow_matched_files_tree.header().resizeSection(5, 220)
             self.workflow_matched_files_tree.header().resizeSection(6, 150)
+            make_tree_columns_persistent(
+                self.workflow_matched_files_tree,
+                self.settings,
+                "main/workflow_matched_files",
+                minimum_width=56,
+                save_callback=self.schedule_settings_save,
+            )
             matched_layout.addWidget(self.workflow_matched_files_tree)
 
             filters_layout.addWidget(filters_label)
@@ -2495,6 +2951,7 @@ def run_gui() -> int:
             self.mod_ready_structure_combo = QComboBox()
             self.mod_ready_structure_combo.addItem("Game-relative folders", "game_relative")
             self.mod_ready_structure_combo.addItem("files/ wrapper", "files_wrapper")
+            self.mod_ready_structure_combo.addItem("Custom compact paths", "custom_compact_paths")
             self.mod_ready_manifest_checkbox = QCheckBox(MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY["manifest_json"].label)
             self.mod_ready_manifest_checkbox.setChecked(True)
             self.mod_ready_mod_json_checkbox = QCheckBox(MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY["mod_json"].label)
@@ -2569,7 +3026,7 @@ def run_gui() -> int:
             mod_package_layout.addWidget(make_help_button("Choose the metadata/layout profile to target. Universal writes broadly compatible metadata; individual profiles bias the folder structure for that manager."), 5, 2)
             mod_package_layout.addWidget(QLabel("Structure"), 6, 0)
             mod_package_layout.addWidget(self.mod_ready_structure_combo, 6, 1)
-            mod_package_layout.addWidget(make_help_button("Game-relative folders write files directly under paths such as object/... . The files/ wrapper places payload files under files/ and points metadata at that folder."), 6, 2)
+            mod_package_layout.addWidget(make_help_button("Game-relative folders keep exact archive paths. The files/ wrapper places those paths under files/. Custom compact paths writes character model and sidecar payloads as character/<name> while keeping textures under character/texture/."), 6, 2)
             mod_ready_generate_grid = QGridLayout()
             mod_ready_generate_grid.setContentsMargins(0, 0, 0, 0)
             mod_ready_generate_grid.setHorizontalSpacing(18)
@@ -2896,9 +3353,7 @@ def run_gui() -> int:
             self.archive_splitter = QSplitter(Qt.Horizontal)
             self.archive_splitter.setChildrenCollapsible(False)
 
-            self.archive_warmup_overlay = QDialog(self)
-            self.archive_warmup_overlay.setWindowTitle("Preparing Archive Browser")
-            self.archive_warmup_overlay.setWindowModality(Qt.ApplicationModal)
+            self.archive_warmup_overlay = QFrame(self.archive_browser_tab)
             self.archive_warmup_overlay.setMinimumWidth(520)
             self.archive_warmup_overlay.setObjectName("ArchiveWarmupOverlay")
             archive_warmup_layout = QVBoxLayout(self.archive_warmup_overlay)
@@ -3288,6 +3743,8 @@ def run_gui() -> int:
             archive_header.resizeSection(3, 72)
             archive_header.resizeSection(4, 130)
             self._apply_archive_tree_header_settings()
+            for section in range(self.archive_tree.columnCount()):
+                archive_header.setSectionResizeMode(section, QHeaderView.Interactive)
             archive_files_layout.addWidget(self.archive_tree)
             self.archive_splitter.addWidget(archive_files_group)
 
@@ -3520,6 +3977,13 @@ def run_gui() -> int:
             texture_refs_header.setSectionResizeMode(5, QHeaderView.Interactive)
             texture_refs_header.setSectionResizeMode(6, QHeaderView.Interactive)
             texture_refs_header.setSectionResizeMode(7, QHeaderView.Fixed)
+            make_tree_columns_persistent(
+                self.archive_texture_refs_tree,
+                self.settings,
+                "main/archive_texture_refs",
+                minimum_width=56,
+                save_callback=self.schedule_settings_save,
+            )
             archive_texture_refs_layout.addWidget(self.archive_texture_refs_tree)
             archive_texture_actions_layout = QVBoxLayout()
             archive_texture_actions_layout.setSpacing(6)
@@ -3646,6 +4110,14 @@ def run_gui() -> int:
                 get_current_archive_path=self.current_archive_path_for_research,
                 get_current_text_search_path=self.text_search_tab.current_result_path,
                 get_current_compare_path=self.current_compare_path_for_research,
+                get_archive_browser_tree_state=lambda: {
+                    "entries": self.archive_filtered_entries,
+                    "tree_child_folders": self.archive_tree_child_folders,
+                    "tree_direct_files": self.archive_tree_direct_files,
+                    "tree_folder_entry_indexes": self.archive_tree_folder_entry_indexes,
+                    "tree_folder_preview_stats": self.archive_tree_folder_preview_stats,
+                    "tree_index_ready": self.archive_tree_index_ready,
+                },
             )
             self.research_tab.status_message_requested.connect(
                 lambda message, is_error: self.set_status_message(message, error=is_error)
@@ -6234,23 +6706,73 @@ def run_gui() -> int:
             if research_notes_sizes:
                 self.research_tab.set_notes_splitter_sizes(research_notes_sizes, total_width=total_width)
 
+        def _startup_archive_autoload_expected(self) -> bool:
+            if self.show_quick_start_on_launch:
+                return False
+            if not self._preference_bool("auto_load_archive_on_startup", False):
+                return False
+            package_root_text = self.archive_package_root_edit.text().strip()
+            if not package_root_text:
+                return False
+            return Path(package_root_text).expanduser().exists()
+
+        def attach_startup_splash(self, splash: Optional[object], *, hold_main_window: bool = False) -> None:
+            self._startup_splash_window = splash
+            self._startup_splash_holds_main_window = bool(hold_main_window)
+            self._startup_splash_released = False
+            self._update_startup_splash("Preparing application...")
+
+        def _update_startup_splash(self, detail: str, current: int = 0, total: int = 0) -> None:
+            splash = getattr(self, "_startup_splash_window", None)
+            if splash is None:
+                return
+            try:
+                splash.set_detail(detail, current, total)
+            except Exception:
+                pass
+
+        def _release_startup_splash(self) -> None:
+            if getattr(self, "_startup_splash_released", False):
+                return
+            self._startup_splash_released = True
+            if (
+                getattr(self, "_startup_splash_holds_main_window", False)
+                and not self.isVisible()
+                and not getattr(self, "_shutting_down", False)
+            ):
+                self.show()
+            splash = getattr(self, "_startup_splash_window", None)
+            self._startup_splash_window = None
+            self._startup_splash_holds_main_window = False
+            if splash is not None:
+                try:
+                    splash.finish()
+                except Exception:
+                    pass
+
         def _maybe_autoload_archive_on_startup(self) -> None:
             if self.show_quick_start_on_launch:
+                self._release_startup_splash()
                 return
             if not self._preference_bool("auto_load_archive_on_startup", False):
+                self._release_startup_splash()
                 return
             if self.worker_thread is not None or self.archive_entries:
+                self._release_startup_splash()
                 return
 
             package_root_text = self.archive_package_root_edit.text().strip()
             if not package_root_text:
+                self._release_startup_splash()
                 return
             package_root = Path(package_root_text).expanduser()
             if not package_root.exists():
                 self.append_archive_log(f"Startup archive auto-load skipped: package root does not exist: {package_root}")
+                self._release_startup_splash()
                 return
 
             self.append_archive_log("Startup archive auto-load is enabled.")
+            self._update_startup_splash("Loading Archive Browser...")
             self.scan_archives(
                 force_refresh=not self._preference_bool("prefer_archive_cache_on_startup", True),
                 activate_archive_tab=False,
@@ -6404,6 +6926,8 @@ def run_gui() -> int:
         def _autofit_archive_tree_columns(self) -> None:
             header = self.archive_tree.header()
             if header is None:
+                return
+            if self._parse_archive_tree_column_ints("ui/archive_tree_column_widths", clamp_to_columns=False):
                 return
             font_metrics = header.fontMetrics()
             min_widths = {
@@ -7283,6 +7807,12 @@ def run_gui() -> int:
             self._rebuild_archive_extension_filter_choices()
             self._rebuild_archive_structure_filter_controls()
             rebuild_tree_index = self._archive_tree_view_enabled() and not self.archive_tree_index_ready
+            if rebuild_tree_index and self.archive_entries and self.worker_thread is None:
+                current_entry = self._current_archive_entry()
+                current_entry_path = current_entry.path if current_entry is not None else ""
+                self._start_archive_filter_worker(current_entry_path)
+                self.archive_browser_refresh_pending = False
+                return
             self._populate_archive_tree(rebuild_index=rebuild_tree_index)
             self.archive_browser_refresh_pending = False
 
@@ -7367,6 +7897,10 @@ def run_gui() -> int:
             preview_settings = self._current_model_preview_render_settings()
             self.settings.setValue("archive/model_use_textures", preview_settings.use_textures_by_default)
             self.settings.setValue("archive/model_high_quality", preview_settings.high_quality_by_default)
+            self.settings.setValue(
+                "preview/alignment_use_final_output_preview",
+                preview_settings.alignment_use_final_output_preview,
+            )
             self.settings.setValue("archive/model_preview_dark_background", self.archive_model_preview_darkmode_button.isChecked())
             archive_performance_settings = self._current_archive_performance_settings()
             self.settings.setValue("archive/enable_sidecar_indexing", archive_performance_settings.enable_sidecar_indexing)
@@ -9212,11 +9746,20 @@ def run_gui() -> int:
                 except Exception:
                     pass
 
+        def _stop_archive_derived_cache_worker(self) -> None:
+            self.archive_derived_cache_write_pending = False
+            if self.archive_derived_cache_worker is not None:
+                try:
+                    self.archive_derived_cache_worker.stop()
+                except Exception:
+                    pass
+
         def scan_archives(self, force_refresh: bool = False, *, activate_archive_tab: bool = True) -> None:
             self._cancel_archive_tree_population()
             if self._background_task_active():
                 return
             self._stop_archive_sidecar_worker()
+            self._stop_archive_derived_cache_worker()
             self.archive_sidecar_request_id += 1
             self.archive_sidecar_pending_start = False
             package_root_text = self.archive_package_root_edit.text().strip()
@@ -9225,13 +9768,13 @@ def run_gui() -> int:
                 return
 
             package_root = Path(package_root_text).expanduser()
-            self._check_game_update_and_invalidate_archive_cache(package_root)
             self._activate_archive_browser_on_scan_complete = activate_archive_tab
             if activate_archive_tab:
                 self._activate_tool_widget(self.archive_browser_tab)
             self.archive_scan_progress_label.setText("Preparing archive refresh..." if force_refresh else "Preparing archive scan / cache load...")
             self.archive_scan_progress_bar.setRange(0, 0)
             self.archive_scan_progress_bar.setFormat("Working...")
+            self._update_startup_splash("Preparing archive refresh..." if force_refresh else "Preparing archive scan / cache load...")
             self._set_archive_warmup_overlay(
                 True,
                 "Preparing Archive Browser",
@@ -9261,6 +9804,7 @@ def run_gui() -> int:
                 exclude_common_technical_suffixes=self.archive_exclude_common_technical_checkbox.isChecked(),
                 min_size_kb=self.archive_min_size_spin.value(),
                 previewable_only=self.archive_previewable_only_checkbox.isChecked(),
+                game_executable_fingerprints=self._load_game_executable_fingerprints(),
             )
             thread = QThread(self)
             worker.moveToThread(thread)
@@ -9297,6 +9841,7 @@ def run_gui() -> int:
 
         def _handle_archive_scan_progress(self, current: int, total: int, detail: str) -> None:
             self.archive_scan_progress_label.setText(detail)
+            self._update_startup_splash(detail, current, total)
             if total > 0:
                 completed_value = min(max(current, 0), total)
                 display_value = min(completed_value + 1, total) if detail.startswith("Parsing ") else completed_value
@@ -9323,6 +9868,9 @@ def run_gui() -> int:
 
         def _handle_archive_scan_complete(self, result: object) -> None:
             payload = result if isinstance(result, dict) else {}
+            updated_fingerprints = payload.get("game_executable_fingerprints")
+            if isinstance(updated_fingerprints, Mapping):
+                self._save_game_executable_fingerprints(updated_fingerprints)
             self._clear_archive_preview_cache()
             self.archive_entries = payload.get("entries", []) if isinstance(payload.get("entries"), list) else []
             self.archive_entries_by_normalized_path = (
@@ -9351,6 +9899,9 @@ def run_gui() -> int:
                 payload.get("item_display_names", {})
                 if isinstance(payload.get("item_display_names"), dict)
                 else {}
+            )
+            self.archive_derived_cache_write_pending = bool(
+                payload.get("derived_cache_needs_write") and self.archive_entries
             )
             self.archive_sidecar_entries_by_texture_path = (
                 payload.get("sidecar_entries_by_texture_path", {})
@@ -9510,13 +10061,64 @@ def run_gui() -> int:
                 self.set_status_message(completion_text)
                 self.append_archive_log(completion_text)
                 self._set_archive_warmup_overlay(False)
+                self._release_startup_splash()
             finally:
                 self.archive_scan_finalize_pending = False
+                if self.archive_derived_cache_write_pending:
+                    QTimer.singleShot(0, self._start_archive_derived_index_cache_writer)
                 if start_sidecar_after_finalize:
                     if self.worker_thread is None and self.archive_sidecar_thread is None:
                         QTimer.singleShot(0, self._start_archive_sidecar_index_worker)
                 if self.worker_thread is None:
                     self.set_busy(False, build_mode=False)
+
+        def _start_archive_derived_index_cache_writer(self) -> None:
+            if self._shutting_down:
+                self.archive_derived_cache_write_pending = False
+                return
+            if not self.archive_derived_cache_write_pending:
+                return
+            if self.archive_derived_cache_thread is not None:
+                return
+            if not self.archive_entries:
+                self.archive_derived_cache_write_pending = False
+                return
+            package_root_text = self.archive_package_root_edit.text().strip()
+            if not package_root_text:
+                self.archive_derived_cache_write_pending = False
+                return
+
+            self.archive_derived_cache_write_pending = False
+            worker = ArchiveDerivedIndexCacheWriteWorker(
+                Path(package_root_text).expanduser(),
+                self.archive_cache_root,
+                self.archive_entries,
+                item_search_aliases=self.archive_item_search_aliases,
+                item_display_names=self.archive_item_display_names,
+            )
+            thread = QThread(self)
+            worker.moveToThread(thread)
+
+            thread.started.connect(worker.run)
+            worker.log_message.connect(self.append_log)
+            worker.log_message.connect(self.append_archive_log)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._cleanup_archive_derived_cache_refs)
+
+            self.archive_derived_cache_worker = worker
+            self.archive_derived_cache_thread = thread
+            try:
+                thread.start(QThread.LowPriority)
+            except Exception:
+                thread.start()
+
+        def _cleanup_archive_derived_cache_refs(self) -> None:
+            self.archive_derived_cache_thread = None
+            self.archive_derived_cache_worker = None
+            if self.archive_derived_cache_write_pending and not self._shutting_down:
+                QTimer.singleShot(0, self._start_archive_derived_index_cache_writer)
 
         def _start_archive_sidecar_index_worker(self) -> None:
             if self._shutting_down:
@@ -9973,6 +10575,9 @@ def run_gui() -> int:
             current_entry = self._current_archive_entry()
             current_entry_path = current_entry.path if current_entry is not None else ""
             rebuild_tree_index = bool(self._archive_tree_view_enabled() and not self.archive_tree_index_ready and self.archive_filtered_entries)
+            if rebuild_tree_index and self.archive_entries:
+                self._start_archive_filter_worker(current_entry_path)
+                return
             self._populate_archive_tree(current_entry_path, rebuild_index=rebuild_tree_index)
 
         def _update_archive_filter_button_state(self) -> None:
@@ -10052,13 +10657,12 @@ def run_gui() -> int:
             self.archive_scan_progress_bar.setFormat("Working...")
             self.set_status_message("Applying archive filters...")
             self.append_archive_log("Applying archive filters...")
-            app = QApplication.instance()
-            if app is not None:
-                app.processEvents()
 
             worker = ArchiveFilterWorker(
                 self.archive_entries,
                 entries_by_extension=self.archive_entries_by_extension,
+                entries_by_normalized_path=self.archive_entries_by_normalized_path,
+                entries_by_basename=self.archive_entries_by_basename,
                 request_signature=request_signature,
                 preferred_path=preferred_path,
                 build_tree_index=self._archive_tree_view_enabled(),
@@ -10218,10 +10822,15 @@ def run_gui() -> int:
             if not stem:
                 return ()
             keys = [stem]
-            for suffix in ("_l", "_r", "_u", "_s", "_t", "_index01", "_index02", "_index03"):
-                if stem.endswith(suffix):
-                    keys.append(stem[: -len(suffix)])
-                    break
+            grouped_stem = derive_texture_group_key(entry.basename).strip().lower()
+            if grouped_stem and grouped_stem not in keys:
+                keys.append(grouped_stem)
+            family_stem = _strip_archive_model_family_variant_suffix(stem)
+            if family_stem and family_stem not in keys:
+                keys.append(family_stem)
+            for alias_stem in iter_archive_equipment_model_alias_stems(stem):
+                if alias_stem not in keys:
+                    keys.append(alias_stem)
             return tuple(dict.fromkeys(keys))
 
         def _archive_entry_in_game_name(self, entry: ArchiveEntry) -> str:
@@ -10677,7 +11286,10 @@ def run_gui() -> int:
             self._cancel_archive_tree_clear()
             self._cancel_archive_tree_population()
             if rebuild_index:
-                self._rebuild_archive_tree_index()
+                self.archive_tree_index_ready = False
+                if self.archive_entries and self.worker_thread is None:
+                    self._start_archive_filter_worker(preferred_path)
+                    return
             self.archive_tree.blockSignals(True)
 
             def render_into_empty_tree() -> None:
@@ -11929,13 +12541,44 @@ def run_gui() -> int:
                 }
             )
 
-        def _clone_archive_preview_result_for_cache(self, result: ArchivePreviewResult) -> ArchivePreviewResult:
+        def _archive_preview_result_cacheable(self, result: ArchivePreviewResult) -> bool:
+            if getattr(result, "preview_model", None) is None:
+                return True
+            prepared_preview = getattr(result, "prepared_preview_model", None)
+            if not isinstance(prepared_preview, PreparedModelPreviewData):
+                return False
+            total_vertex_bytes = self._archive_preview_result_prepared_bytes(result)
+            total_index_count = sum(
+                max(0, int(getattr(batch, "index_count", 0) or 0))
+                for batch in getattr(prepared_preview, "batches", ()) or ()
+            )
+            return total_vertex_bytes <= 24 * 1024 * 1024 and total_index_count <= 350_000
+
+        def _archive_preview_result_prepared_bytes(self, result: ArchivePreviewResult) -> int:
+            prepared_preview = getattr(result, "prepared_preview_model", None)
+            if not isinstance(prepared_preview, PreparedModelPreviewData):
+                return 0
+            return sum(
+                len(getattr(batch, "vertex_blob", b"") or b"")
+                for batch in getattr(prepared_preview, "batches", ()) or ()
+            )
+
+        def _clone_archive_preview_result_for_cache(
+            self,
+            result: ArchivePreviewResult,
+            *,
+            keep_prepared_model: bool = False,
+        ) -> ArchivePreviewResult:
             return dataclasses.replace(
                 result,
                 preview_image=None,
                 loose_preview_image=None,
                 preview_model=self._clone_archive_preview_model(result.preview_model, strip_images=True),
-                prepared_preview_model=None,
+                prepared_preview_model=(
+                    getattr(result, "prepared_preview_model", None)
+                    if keep_prepared_model
+                    else None
+                ),
             )
 
         def _load_preview_image_if_available(self, image_path: str) -> object:
@@ -11996,6 +12639,13 @@ def run_gui() -> int:
                 (
                     ("cache_lookup_s", "cache_lookup"),
                     ("worker_build_s", "worker_build"),
+                    ("entry_read_s", "read"),
+                    ("model_sidecar_refs_s", "sidecar_refs"),
+                    ("model_geometry_s", "geometry"),
+                    ("model_base_texture_attach_s", "base_tex"),
+                    ("model_sidecar_texture_attach_s", "sidecar_tex"),
+                    ("model_support_texture_attach_s", "support_tex"),
+                    ("model_texture_references_s", "refs"),
                     ("image_attach_s", "image_attach"),
                     ("ui_apply_s", "ui_apply"),
                     ("model_apply_s", "model_apply"),
@@ -12033,6 +12683,19 @@ def run_gui() -> int:
             self.archive_preview_cache.clear()
             self.archive_preview_cache_keys.clear()
 
+        @staticmethod
+        def _archive_preview_support_texture_slots(settings: ModelPreviewRenderSettings) -> Tuple[str, ...]:
+            if bool(getattr(settings, "disable_all_support_maps", False)):
+                return ()
+            slots: List[str] = []
+            if not bool(getattr(settings, "disable_normal_map", False)):
+                slots.append("normal")
+            if not bool(getattr(settings, "disable_material_map", False)):
+                slots.append("material")
+            if not bool(getattr(settings, "disable_height_map", False)):
+                slots.append("height")
+            return tuple(slots)
+
         def _archive_preview_cache_key(
             self,
             entry: Optional[ArchiveEntry],
@@ -12049,6 +12712,7 @@ def run_gui() -> int:
             if include_loose_preview_assets:
                 loose_roots_key = "|".join(str(path).strip().lower() for path in loose_search_roots)
             preview_settings = self._current_model_preview_render_settings()
+            support_slots_key = ",".join(self._archive_preview_support_texture_slots(preview_settings))
             pamt_stamp = self._archive_file_stamp_for_cache(getattr(entry, "pamt_path", None))
             paz_stamp = self._archive_file_stamp_for_cache(getattr(entry, "paz_file", None))
             pathc_stamp = ""
@@ -12073,6 +12737,9 @@ def run_gui() -> int:
                     texconv_key,
                     f"sidecars:{self.archive_sidecar_generation if sidecar_generation is None else int(sidecar_generation)}",
                     str(preview_settings.visible_texture_mode),
+                    f"texdim:{int(preview_settings.preview_texture_max_dimension)}",
+                    f"lodim:{int(preview_settings.low_quality_texture_max_dimension)}",
+                    f"support:{support_slots_key}",
                     "hq" if preview_settings.high_quality_by_default else "lq",
                     "tex" if preview_settings.use_textures_by_default else "flat",
                     "loose" if include_loose_preview_assets else "archive",
@@ -12099,15 +12766,43 @@ def run_gui() -> int:
             if cached is None:
                 return None
             self.archive_preview_cache.move_to_end(cache_key)
-            return cached
+            return self._attach_archive_preview_result_images(cached)
 
         def _store_cached_archive_preview_result(self, cache_key: str, result: ArchivePreviewResult) -> None:
             if not cache_key:
                 return
-            self.archive_preview_cache[cache_key] = self._clone_archive_preview_result_for_cache(result)
+            if not self._archive_preview_result_cacheable(result):
+                return
+            keep_prepared_model = (
+                getattr(result, "preview_model", None) is not None
+                and isinstance(getattr(result, "prepared_preview_model", None), PreparedModelPreviewData)
+            )
+            self.archive_preview_cache[cache_key] = self._clone_archive_preview_result_for_cache(
+                result,
+                keep_prepared_model=keep_prepared_model,
+            )
             self.archive_preview_cache.move_to_end(cache_key)
+            self._trim_archive_preview_cache()
+
+        def _trim_archive_preview_cache(self) -> None:
             while len(self.archive_preview_cache) > self.archive_preview_cache_limit:
                 self.archive_preview_cache.popitem(last=False)
+            prepared_byte_budget = 160 * 1024 * 1024
+            total_prepared_bytes = sum(
+                self._archive_preview_result_prepared_bytes(cached_result)
+                for cached_result in self.archive_preview_cache.values()
+            )
+            if total_prepared_bytes <= prepared_byte_budget:
+                return
+            for existing_key in list(self.archive_preview_cache.keys()):
+                if total_prepared_bytes <= prepared_byte_budget:
+                    break
+                cached_result = self.archive_preview_cache.get(existing_key)
+                prepared_bytes = self._archive_preview_result_prepared_bytes(cached_result) if cached_result is not None else 0
+                if prepared_bytes <= 0:
+                    continue
+                self.archive_preview_cache.pop(existing_key, None)
+                total_prepared_bytes -= prepared_bytes
 
         def _handle_archive_current_item_change(
             self,
@@ -12284,6 +12979,7 @@ def run_gui() -> int:
                 self.archive_sidecar_entries_by_texture_basename,
                 loose_search_roots,
                 visible_texture_mode=preview_settings.visible_texture_mode,
+                support_texture_slots=self._archive_preview_support_texture_slots(preview_settings),
                 include_loose_preview_assets=include_loose_preview_assets,
                 sidecar_generation=self.archive_sidecar_generation,
             )
@@ -12320,13 +13016,6 @@ def run_gui() -> int:
                         if current_entry is not None and not self.archive_preview_showing_loose:
                             QTimer.singleShot(0, lambda entry=current_entry: self._render_archive_preview(entry))
                         return
-                    if source == "preview_cache":
-                        image_attach_started_at = time.perf_counter()
-                        result = self._attach_archive_preview_result_images(result)
-                        request_phase_timings["image_attach_s"] = max(
-                            0.0,
-                            float(time.perf_counter() - image_attach_started_at),
-                        )
                     self._store_cached_archive_preview_result(cache_key, result)
                     self._apply_archive_preview_result(
                         result,
@@ -12644,6 +13333,10 @@ def run_gui() -> int:
                 ModelPreviewRenderSettings(
                     use_textures_by_default=self._read_bool("archive/model_use_textures", defaults.use_textures_by_default),
                     high_quality_by_default=self._read_bool("archive/model_high_quality", defaults.high_quality_by_default),
+                    alignment_use_final_output_preview=self._read_bool(
+                        "preview/alignment_use_final_output_preview",
+                        defaults.alignment_use_final_output_preview,
+                    ),
                     visible_texture_mode=str(
                         self.settings.value("preview/visible_texture_mode", defaults.visible_texture_mode)
                         or defaults.visible_texture_mode
@@ -12759,7 +13452,7 @@ def run_gui() -> int:
             dialog.raise_()
             dialog.activateWindow()
 
-        def _open_modal_model_preview_settings_dialog(self, parent_dialog: QDialog) -> None:
+        def _open_modal_model_preview_settings_dialog(self, parent_dialog: QDialog) -> QDialog:
             dialog = ModelPreviewSettingsDialog(
                 settings=self._current_model_preview_render_settings(),
                 archive_performance_settings=self._current_archive_performance_settings(),
@@ -12783,6 +13476,7 @@ def run_gui() -> int:
             dialog.show()
             dialog.raise_()
             dialog.activateWindow()
+            return dialog
 
         def _handle_clear_archive_preview_cache_requested(self) -> None:
             cleared_count = len(self.archive_preview_cache)
@@ -12797,7 +13491,10 @@ def run_gui() -> int:
             apply_toggle_defaults: bool,
         ) -> None:
             preview_settings = self._current_model_preview_render_settings()
-            set_model_texture_display_preview_max_dimension(preview_settings.preview_texture_max_dimension)
+            set_model_texture_display_preview_max_dimension(
+                preview_settings.preview_texture_max_dimension,
+                low_quality_value=preview_settings.low_quality_texture_max_dimension,
+            )
             widget.set_render_settings(preview_settings)
             if apply_toggle_defaults:
                 widget.set_use_textures(bool(preview_settings.use_textures_by_default))
@@ -12832,14 +13529,22 @@ def run_gui() -> int:
             preview_settings = settings if isinstance(settings, ModelPreviewRenderSettings) else self._current_model_preview_render_settings()
             preview_settings = clamp_model_preview_render_settings(preview_settings)
             self._model_preview_render_settings = preview_settings
-            set_model_texture_display_preview_max_dimension(preview_settings.preview_texture_max_dimension)
+            set_model_texture_display_preview_max_dimension(
+                preview_settings.preview_texture_max_dimension,
+                low_quality_value=preview_settings.low_quality_texture_max_dimension,
+            )
             for widget in self.findChildren(ModelPreviewWidget):
                 widget.set_render_settings(preview_settings)
                 widget.set_use_textures(bool(preview_settings.use_textures_by_default))
                 widget.set_high_quality_textures(bool(preview_settings.high_quality_by_default))
             if (
                 previous_settings.preview_texture_max_dimension != preview_settings.preview_texture_max_dimension
+                or previous_settings.low_quality_texture_max_dimension != preview_settings.low_quality_texture_max_dimension
                 or previous_settings.visible_texture_mode != preview_settings.visible_texture_mode
+                or previous_settings.disable_all_support_maps != preview_settings.disable_all_support_maps
+                or previous_settings.disable_normal_map != preview_settings.disable_normal_map
+                or previous_settings.disable_material_map != preview_settings.disable_material_map
+                or previous_settings.disable_height_map != preview_settings.disable_height_map
             ):
                 self._schedule_current_model_preview_asset_refresh()
             preview_model = None
@@ -12862,8 +13567,7 @@ def run_gui() -> int:
             self._archive_performance_settings = performance_settings
             self.archive_preview_cache_limit = performance_settings.preview_cache_limit
             self._sync_archive_performance_settings_controls()
-            while len(self.archive_preview_cache) > self.archive_preview_cache_limit:
-                self.archive_preview_cache.popitem(last=False)
+            self._trim_archive_preview_cache()
             if previous_cache_limit != self.archive_preview_cache_limit:
                 self.append_archive_log(f"Archive preview cache size set to {self.archive_preview_cache_limit}.")
             if previous_sidecar_indexing_enabled and not performance_settings.enable_sidecar_indexing:
@@ -13418,6 +14122,13 @@ def run_gui() -> int:
             header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
             header.setSectionResizeMode(3, QHeaderView.Stretch)
             header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+            make_tree_columns_persistent(
+                tree,
+                self.settings,
+                "dialog/material_sidecar_related_files",
+                minimum_width=48,
+                save_callback=self.schedule_settings_save,
+            )
             layout.addWidget(tree, stretch=1)
 
             button_row = QHBoxLayout()
@@ -13513,6 +14224,8 @@ def run_gui() -> int:
             self,
             preview_model: Optional[object],
             sidecar_text: str,
+            *,
+            edited_values: Optional[Mapping[str, str]] = None,
         ) -> Tuple[str, ...]:
             if not isinstance(preview_model, ModelPreviewData):
                 return ()
@@ -13523,7 +14236,10 @@ def run_gui() -> int:
             ]
             if not meshes:
                 return ()
-            overrides = discover_material_sidecar_preview_overrides(sidecar_text)
+            if edited_values is None:
+                overrides = discover_material_sidecar_preview_overrides(sidecar_text)
+            else:
+                overrides = discover_material_sidecar_preview_overrides_for_edits(sidecar_text, edited_values)
             if not overrides:
                 return ()
             notes: List[str] = []
@@ -13672,6 +14388,13 @@ def run_gui() -> int:
             header.setSectionResizeMode(2, QHeaderView.Interactive)
             header.setSectionResizeMode(3, QHeaderView.Interactive)
             header.setSectionResizeMode(4, QHeaderView.Stretch)
+            make_tree_columns_persistent(
+                tree,
+                self.settings,
+                "dialog/material_sidecar_values",
+                minimum_width=56,
+                save_callback=self.schedule_settings_save,
+            )
             editor_layout.addWidget(tree, stretch=1)
 
             selected_value_row = QGridLayout()
@@ -13709,7 +14432,24 @@ def run_gui() -> int:
             preview_layout.addWidget(preview_status_label)
             material_preview_widget = ModelPreviewWidget("Click Show Preview to build an approximate model preview.", theme_key=self.current_theme_key)
             material_preview_widget.setMinimumWidth(420)
-            self._configure_model_preview_widget(material_preview_widget, apply_toggle_defaults=True)
+
+            def _material_value_preview_render_settings(*, material_effects_active: bool = False) -> ModelPreviewRenderSettings:
+                del material_effects_active
+                return clamp_model_preview_render_settings(self._current_model_preview_render_settings())
+
+            def _configure_material_value_preview_widget(*, material_effects_active: bool = False) -> None:
+                preview_settings = _material_value_preview_render_settings(material_effects_active=material_effects_active)
+                set_model_texture_display_preview_max_dimension(
+                    preview_settings.preview_texture_max_dimension,
+                    low_quality_value=preview_settings.low_quality_texture_max_dimension,
+                )
+                material_preview_widget.set_render_settings(preview_settings)
+                material_preview_widget.set_use_textures(
+                    False if material_effects_active else bool(preview_settings.use_textures_by_default)
+                )
+                material_preview_widget.set_high_quality_textures(bool(preview_settings.high_quality_by_default))
+
+            _configure_material_value_preview_widget()
             preview_layout.addWidget(material_preview_widget, stretch=1)
             content_splitter.addWidget(editor_panel)
             content_splitter.addWidget(preview_panel)
@@ -13760,6 +14500,7 @@ def run_gui() -> int:
                     return
                 item.setText(3, str(text or ""))
                 item.setToolTip(3, str(text or ""))
+                _schedule_live_preview_for_item(item)
 
             def _handle_material_tree_item_changed(item: QTreeWidgetItem, column: int) -> None:
                 if column == 3 and item is _current_item():
@@ -13778,6 +14519,7 @@ def run_gui() -> int:
                 if color.isValid():
                     item.setText(3, color.name())
                     _sync_selected_value_from_tree()
+                    _schedule_live_preview_for_item(item)
 
             def _reset_selected() -> None:
                 item = _current_item()
@@ -13785,6 +14527,7 @@ def run_gui() -> int:
                     original_value = str(item.data(3, Qt.UserRole) or "")
                     item.setText(3, original_value)
                     _sync_selected_value_from_tree()
+                    _schedule_live_preview_for_item(item)
 
             row_kind_by_id = {row.row_id: row.kind for row in rows}
             preview_model_entry_state: Dict[str, object] = {"entry": None, "resolved": False}
@@ -13846,6 +14589,8 @@ def run_gui() -> int:
                 except Exception as exc:
                     preview_status_label.setText(f"Material edit cannot be previewed yet: {exc}")
                     return
+                material_preview_edits = _edited_values({"color", "float"})
+                material_effects_active = bool(material_preview_edits)
                 preview_generation["value"] += 1
                 generation = preview_generation["value"]
                 texconv_text = self.texconv_path_edit.text().strip()
@@ -13853,7 +14598,7 @@ def run_gui() -> int:
                 if texconv_path is not None and not texconv_path.is_file():
                     texconv_path = None
                 companion_entry = self._find_archive_preview_companion_entry(preview_model_entry)
-                preview_settings = self._current_model_preview_render_settings()
+                preview_settings = _material_value_preview_render_settings(material_effects_active=material_effects_active)
                 preview_status_label.setText(
                     "Building approximate material preview..."
                     if texconv_path is not None
@@ -13904,17 +14649,30 @@ def run_gui() -> int:
                                     sidecar_texts_by_basename=sidecar_texts_by_basename,
                                 )
                             )
-                        notes.extend(self._apply_material_sidecar_preview_overrides_to_model(preview_model, preview_sidecar_text))
+                        notes.extend(
+                            self._apply_material_sidecar_preview_overrides_to_model(
+                                preview_model,
+                                preview_sidecar_text,
+                                edited_values=material_preview_edits,
+                            )
+                        )
                     warnings = list(self._material_sidecar_texture_resolution_warnings(preview_sidecar_text)) if include_texture_edits else []
                     if texconv_path is None:
                         warnings.append("texconv.exe is not configured, so texture-backed preview paths cannot be refreshed.")
-                    return generation, dataclasses.replace(result, preview_model=preview_model), tuple(notes), tuple(warnings), bool(live)
+                    return (
+                        generation,
+                        dataclasses.replace(result, preview_model=preview_model),
+                        tuple(notes),
+                        tuple(warnings),
+                        bool(live),
+                        material_effects_active,
+                    )
 
                 def _handle_complete(result: object) -> None:
-                    if not isinstance(result, tuple) or len(result) != 5:
+                    if not isinstance(result, tuple) or len(result) != 6:
                         preview_status_label.setText("Material preview finished with an unexpected result payload.")
                         return
-                    result_generation, preview_result, notes, warnings, was_live = result
+                    result_generation, preview_result, notes, warnings, was_live, material_effects_active_result = result
                     if int(result_generation) != int(preview_generation["value"]) or not dialog.isVisible():
                         return
                     if not isinstance(preview_result, ArchivePreviewResult) or not isinstance(preview_result.preview_model, ModelPreviewData):
@@ -13923,13 +14681,19 @@ def run_gui() -> int:
                         preview_status_label.setText(detail or "No model preview available for this material sidecar.")
                         return
                     result_with_images = self._attach_archive_preview_result_images(preview_result)
-                    self._configure_model_preview_widget(material_preview_widget, apply_toggle_defaults=True)
+                    _configure_material_value_preview_widget(
+                        material_effects_active=bool(material_effects_active_result)
+                    )
                     material_preview_widget.set_model(result_with_images.preview_model)
-                    if material_preview_widget.textures_available():
+                    if bool(material_effects_active_result):
+                        material_preview_widget.set_use_textures(False)
+                    elif material_preview_widget.textures_available():
                         material_preview_widget.set_use_textures(True)
                     status_parts = ["Approximate sidecar preview"]
                     if was_live:
                         status_parts.append("live color/scalar refresh")
+                    if material_effects_active_result:
+                        status_parts.append("edited material values shown as solid preview overlay")
                     status_parts.extend(str(note) for note in notes if str(note or "").strip())
                     status_parts.extend(str(warning) for warning in warnings if str(warning or "").strip())
                     preview_status_label.setText("\n".join(status_parts))
@@ -13943,6 +14707,8 @@ def run_gui() -> int:
 
             def _schedule_live_preview_for_item(item: Optional[QTreeWidgetItem]) -> None:
                 if item is None or preview_model_entry_state.get("entry") is None or not live_preview_checkbox.isChecked():
+                    if item is not None and live_preview_checkbox.isChecked() and not bool(preview_model_entry_state.get("resolved")):
+                        preview_status_label.setText("Preview model lookup is still pending; live preview will be available after lookup finishes.")
                     return
                 if item.text(1) not in {"color", "float"}:
                     preview_status_label.setText("Texture path edits refresh when you click Refresh Preview.")
@@ -14449,6 +15215,7 @@ def run_gui() -> int:
             intro_text: str,
             references: Sequence[ArchiveModelTextureReference],
             confirm_button_text: str = "Continue",
+            default_checked: bool = True,
         ) -> Optional[Tuple[ArchiveEntry, ...]]:
             resolved_references: List[ArchiveModelTextureReference] = []
             seen_paths: set[str] = set()
@@ -14493,6 +15260,13 @@ def run_gui() -> int:
             header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
             header.setSectionResizeMode(3, QHeaderView.Stretch)
             header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+            make_tree_columns_persistent(
+                tree,
+                self.settings,
+                "dialog/archive_reference_selection",
+                minimum_width=48,
+                save_callback=self.schedule_settings_save,
+            )
 
             def _reference_type_label(reference: ArchiveModelTextureReference) -> str:
                 relation_group = str(getattr(reference, "relation_group", "") or "").strip().lower()
@@ -14529,7 +15303,7 @@ def run_gui() -> int:
                     ]
                 )
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-                item.setCheckState(0, Qt.Checked)
+                item.setCheckState(0, Qt.Checked if default_checked else Qt.Unchecked)
                 item.setData(0, Qt.UserRole, index)
                 item.setToolTip(3, resolved_entry.path)
                 tree.addTopLevelItem(item)
@@ -14899,6 +15673,7 @@ def run_gui() -> int:
             structure_combo = QComboBox()
             structure_combo.addItem("Game-relative folders", "game_relative")
             structure_combo.addItem("files/ wrapper", "files_wrapper")
+            structure_combo.addItem("Custom compact paths", "custom_compact_paths")
             create_zip_checkbox = QCheckBox(MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY["ready_zip"].label)
             create_zip_checkbox.setChecked(False)
             mod_json_checkbox = QCheckBox(MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY["mod_json"].label)
@@ -14939,7 +15714,7 @@ def run_gui() -> int:
             form_layout.addWidget(make_help_button("Choose the metadata/layout profile to target. Universal writes broadly compatible metadata; individual profiles bias the folder structure for that manager."), 5, 3)
             form_layout.addWidget(QLabel("Folder structure"), 6, 0)
             form_layout.addWidget(structure_combo, 6, 1, 1, 2)
-            form_layout.addWidget(make_help_button("Game-relative folders write files directly under paths such as object/... . The files/ wrapper places payload files under files/ and points metadata at that folder."), 6, 3)
+            form_layout.addWidget(make_help_button("Game-relative folders keep exact archive paths. The files/ wrapper places those paths under files/. Custom compact paths writes character model and sidecar payloads as character/<name> while keeping textures under character/texture/."), 6, 3)
             conflict_mode_label = QLabel("Conflict mode")
             target_language_label = QLabel("Target language")
             conflict_mode_help = make_help_button("CDUMM compatibility metadata. Normal leaves manager conflict behavior unchanged; Override asks compatible managers to prefer this mod when conflicts are detected.")
@@ -15370,9 +16145,29 @@ def run_gui() -> int:
             patched: bool,
             backup_dir: Optional[Path] = None,
             loose_package_root: Optional[Path] = None,
+            final_preview_result: Optional[FinalPackagePreviewResult] = None,
         ) -> None:
-            self._attach_archive_model_preview_images(import_result.preview_model)
+            preview_model_for_display = (
+                final_preview_result.preview_model
+                if isinstance(final_preview_result, FinalPackagePreviewResult)
+                else import_result.preview_model
+            )
+            self._attach_archive_model_preview_images(preview_model_for_display)
             detail_lines = list(import_result.summary_lines)
+            if isinstance(final_preview_result, FinalPackagePreviewResult):
+                detail_lines.append("")
+                detail_lines.extend(final_preview_result.summary_lines)
+                if final_preview_result.warnings:
+                    detail_lines.append("Final preview warnings:")
+                    detail_lines.extend(f"- {warning}" for warning in final_preview_result.warnings)
+                if final_preview_result.binding_rows:
+                    detail_lines.append("Final texture bindings:")
+                    for row in final_preview_result.binding_rows[:12]:
+                        detail_lines.append(
+                            f"- {row.material_name or row.part_name or 'Material'} | {row.role} | {row.status} | {row.texture_path}"
+                        )
+                    if len(final_preview_result.binding_rows) > 12:
+                        detail_lines.append(f"- ... {len(final_preview_result.binding_rows) - 12:,} more binding(s)")
             if import_result.import_issues:
                 detail_lines.append("")
                 detail_lines.append("Import validation:")
@@ -15397,7 +16192,7 @@ def run_gui() -> int:
             elif not patched:
                 warning_badge = "Import preview"
                 warning_text = "This rebuilt mesh preview has not been written back to the game archives yet."
-            prepared_model, prepared_preview_model = ModelPreviewWidget.prepare_model_preview(import_result.preview_model)
+            prepared_model, prepared_preview_model = ModelPreviewWidget.prepare_model_preview(preview_model_for_display)
             preview_result = ArchivePreviewResult(
                 status="ok",
                 title=entry.basename,
@@ -15424,13 +16219,17 @@ def run_gui() -> int:
             *,
             destination: str,
             source_obj_path: Path,
+            final_preview_result: Optional[FinalPackagePreviewResult] = None,
         ) -> bool:
             issues = tuple(import_result.import_issues or ())
             actionable_issues = [
                 issue for issue in issues if issue.status != ImportIssueStatus.AUTO_FIXED.value
             ]
             if not actionable_issues:
-                return True
+                return self._confirm_final_package_grey_warnings(
+                    final_preview_result,
+                    destination=destination,
+                )
 
             status_counts = Counter(issue.status for issue in issues)
             message_lines = [
@@ -15481,7 +16280,45 @@ def run_gui() -> int:
             no_button = prompt.button(QMessageBox.No)
             if no_button is not None:
                 no_button.setText("Cancel")
-            return prompt.exec() == QMessageBox.Yes
+            if prompt.exec() != QMessageBox.Yes:
+                return False
+            return self._confirm_final_package_grey_warnings(
+                final_preview_result,
+                destination=destination,
+            )
+
+        def _confirm_final_package_grey_warnings(
+            self,
+            final_preview_result: Optional[FinalPackagePreviewResult],
+            *,
+            destination: str,
+        ) -> bool:
+            if destination == "patch" or not isinstance(final_preview_result, FinalPackagePreviewResult):
+                return True
+            affected_materials = list(final_preview_result.likely_grey_materials or [])
+            if not affected_materials:
+                return True
+            shown_materials = "\n".join(f"- {material}" for material in affected_materials[:12])
+            if len(affected_materials) > 12:
+                shown_materials += f"\n- ... {len(affected_materials) - 12:,} more material(s)"
+            missing_paths = "\n".join(f"- {path}" for path in list(final_preview_result.missing_texture_paths or [])[:8])
+            message = (
+                "The final package preview found visible materials with no final base/color/emissive DDS binding.\n\n"
+                "This will likely be grey in-game for affected materials:\n"
+                f"{shown_materials}"
+            )
+            if missing_paths:
+                message += "\n\nMissing final DDS payload path(s):\n" + missing_paths
+            message += "\n\nCancel export and fix the texture plan, or export anyway?"
+            prompt = QMessageBox(self)
+            prompt.setIcon(QMessageBox.Warning)
+            prompt.setWindowTitle("Likely Grey In-Game")
+            prompt.setText(message)
+            cancel_button = prompt.addButton("Cancel", QMessageBox.RejectRole)
+            export_button = prompt.addButton("Export Anyway", QMessageBox.AcceptRole)
+            prompt.setDefaultButton(cancel_button)
+            prompt.exec()
+            return prompt.clickedButton() is export_button
 
         def _attach_archive_model_preview_images(self, preview_model: Optional[object]) -> None:
             if preview_model is None:
@@ -15513,6 +16350,7 @@ def run_gui() -> int:
             title: str,
             intro_text: str,
             confirm_button_text: str,
+            default_checked: bool = True,
         ) -> Optional[Tuple[ArchiveEntry, ...]]:
             references = self._current_archive_related_references_for_entry(entry)
             return self._prompt_archive_reference_selection(
@@ -15520,6 +16358,7 @@ def run_gui() -> int:
                 intro_text=intro_text,
                 references=references,
                 confirm_button_text=confirm_button_text,
+                default_checked=default_checked,
             )
 
         def _prompt_archive_mesh_import_supplemental_files(
@@ -15561,7 +16400,15 @@ def run_gui() -> int:
             source_dialog.setDefaultButton(files_button)
             source_dialog.exec()
             clicked_source = source_dialog.clickedButton()
-            supported_suffixes = set(SCENE_TEXTURE_SOURCE_EXTENSIONS) | {".xml", ".pami", ".pac_xml", ".pam_xml", ".pamlod_xml"}
+            supported_suffixes = set(SCENE_TEXTURE_SOURCE_EXTENSIONS) | {
+                ".xml",
+                ".pami",
+                ".pac_xml",
+                ".pam_xml",
+                ".pamlod_xml",
+                ".app_xml",
+                ".prefabdata_xml",
+            }
             if clicked_source == folder_button:
                 selected_dir = QFileDialog.getExistingDirectory(
                     self,
@@ -15582,7 +16429,7 @@ def run_gui() -> int:
                 self,
                 title,
                 str(self.settings_file_path.parent),
-                "Supplemental Files (*.png *.jpg *.jpeg *.dds *.xml *.pami *.pac_xml *.pam_xml *.pamlod_xml);;Texture Sources (*.png *.jpg *.jpeg *.dds);;DDS Files (*.dds);;Image Files (*.png *.jpg *.jpeg);;Material Sidecars (*.xml *.pami *.pac_xml *.pam_xml *.pamlod_xml)",
+                "Supplemental Files (*.png *.jpg *.jpeg *.dds *.xml *.pami *.pac_xml *.pam_xml *.pamlod_xml *.app_xml *.prefabdata_xml);;Texture Sources (*.png *.jpg *.jpeg *.dds);;DDS Files (*.dds);;Image Files (*.png *.jpg *.jpeg);;Material Sidecars (*.xml *.pami *.pac_xml *.pam_xml *.pamlod_xml *.app_xml *.prefabdata_xml)",
             )
             if not selected_files:
                 return ()
@@ -15618,9 +16465,21 @@ def run_gui() -> int:
             *,
             title: str,
         ) -> Optional[MeshImportSetupSelection]:
+            startup_progress = QProgressDialog("Analyzing imported mesh...", "", 0, 0, self)
+            startup_progress.setWindowTitle("Mesh Import Preflight")
+            startup_progress.setCancelButton(None)
+            startup_progress.setMinimumDuration(0)
+            startup_progress.setAutoClose(False)
+            startup_progress.setWindowModality(Qt.WindowModal)
+            startup_progress.show()
+            QApplication.processEvents()
             try:
+                startup_progress.setLabelText("Reading replacement scene...")
+                QApplication.processEvents()
                 scene_import_result = import_scene_mesh_with_report(scene_path)
             except Exception as exc:
+                startup_progress.close()
+                QApplication.processEvents()
                 QMessageBox.warning(
                     self,
                     "Mesh Import Unsupported",
@@ -15632,15 +16491,33 @@ def run_gui() -> int:
             is_obj = suffix == ".obj"
             has_roundtrip_sidecar = self._has_valid_obj_roundtrip_sidecar(scene_path) if is_obj else False
             profile: Optional[ReplacementAssetProfile] = None
+            original_mesh_for_setup: Optional[ParsedMesh] = None
             try:
-                original_data, _decompressed, _note = read_archive_entry_data(entry)
+                startup_progress.setLabelText("Reading original mesh donor...")
+                QApplication.processEvents()
+                original_data = read_archive_entry_baseline_data(entry, read_entry_data=read_archive_entry_data).data
+                original_mesh_for_setup = parse_mesh(original_data, entry.path)
+                startup_progress.setLabelText("Checking asset compatibility...")
+                QApplication.processEvents()
                 profile = analyze_replacement_asset(
                     entry,
-                    archive_entries_by_basename=dict(self.archive_entries_by_basename),
-                    parsed_mesh=parse_mesh(original_data, entry.path),
+                    archive_entries_by_basename=self.archive_entries_by_basename,
+                    parsed_mesh=original_mesh_for_setup,
                 )
             except Exception:
                 profile = None
+                original_mesh_for_setup = None
+            preflight = build_mesh_import_preflight(
+                entry,
+                scene_path,
+                replacement_mesh=scene_import_result.mesh,
+                original_mesh=original_mesh_for_setup,
+                import_diagnostics=scene_import_result.diagnostics,
+            )
+            startup_progress.setLabelText(preflight.summary)
+            QApplication.processEvents()
+            startup_progress.close()
+            QApplication.processEvents()
 
             dialog = QDialog(self)
             dialog.setWindowTitle(title)
@@ -15698,6 +16575,15 @@ def run_gui() -> int:
             guidance_label.setWordWrap(True)
             guidance_label.setObjectName("HintLabel")
             mode_layout.addWidget(guidance_label)
+            static_limits_label = QLabel(
+                "Mesh Replacement automates common part and texture mappings, but some assets still need manual texture-slot review. "
+                "Start by testing without patched .pac_xml; sidecar rebuild is advanced and often needs manual shader/material review. "
+                "Automatic texture assignment is an estimate, and the preview can be darker, brighter, shinier, or less saturated than the game. "
+                "Clear texture names help: BaseColor/Albedo/_o, Normal/_n, Height/Disp, _ma/_mg/ORM/RMA/AO/Roughness/Metallic."
+            )
+            static_limits_label.setWordWrap(True)
+            static_limits_label.setObjectName("HintLabel")
+            mode_layout.addWidget(static_limits_label)
             if availability.default_mode == "roundtrip":
                 roundtrip_radio.setChecked(True)
             elif availability.default_mode == "static_replacement":
@@ -15719,10 +16605,24 @@ def run_gui() -> int:
                     diagnostics_layout.addWidget(line_label)
                 layout.addWidget(diagnostics_group)
 
+            preflight_group = QGroupBox("Preflight")
+            preflight_layout = QVBoxLayout(preflight_group)
+            for line in preflight.detail_lines:
+                line_label = QLabel(str(line))
+                line_label.setWordWrap(True)
+                line_label.setObjectName("HintLabel")
+                if preflight.severity == "warning" and (
+                    "large" in str(line).lower() or "slow" in str(line).lower()
+                ):
+                    line_label.setStyleSheet("color: #facc15;")
+                preflight_layout.addWidget(line_label)
+            layout.addWidget(preflight_group)
+
             supplemental_group = QGroupBox("Supplemental Files")
             supplemental_layout = QVBoxLayout(supplemental_group)
             supplemental_hint = QLabel(
-                "Detected texture files are checked by default. Add local textures or material sidecars here instead of answering separate prompts."
+                "Detected texture files are checked by default. Add local textures or material sidecars here instead of answering separate prompts. "
+                "Material sidecars are advanced files; include or patch them only when the generated package needs sidecar-specific shader bindings."
             )
             supplemental_hint.setWordWrap(True)
             supplemental_hint.setObjectName("HintLabel")
@@ -15730,7 +16630,15 @@ def run_gui() -> int:
             supplemental_list = QListWidget()
             supplemental_list.setMinimumHeight(150)
             supplemental_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-            supported_suffixes = set(SCENE_TEXTURE_SOURCE_EXTENSIONS) | {".xml", ".pami", ".pac_xml", ".pam_xml", ".pamlod_xml"}
+            supported_suffixes = set(SCENE_TEXTURE_SOURCE_EXTENSIONS) | {
+                ".xml",
+                ".pami",
+                ".pac_xml",
+                ".pam_xml",
+                ".pamlod_xml",
+                ".app_xml",
+                ".prefabdata_xml",
+            }
             seen_paths: set[str] = set()
 
             def _add_supplemental_path(path: Path, *, checked: bool = True) -> None:
@@ -15751,11 +16659,7 @@ def run_gui() -> int:
                 item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
                 supplemental_list.addItem(item)
 
-            auto_paths = (
-                tuple(scene_import_result.discovered_texture_files)
-                + tuple(scene_import_result.extracted_embedded_files)
-                + tuple(discover_scene_texture_files(scene_path, scene_import_result.mesh))
-            )
+            auto_paths = tuple(scene_import_result.discovered_texture_files) + tuple(scene_import_result.extracted_embedded_files)
             for auto_path in auto_paths:
                 _add_supplemental_path(auto_path, checked=True)
 
@@ -15776,7 +16680,7 @@ def run_gui() -> int:
                     dialog,
                     "Add Supplemental Files",
                     str(scene_path.parent),
-                    "Supplemental Files (*.png *.jpg *.jpeg *.dds *.xml *.pami *.pac_xml *.pam_xml *.pamlod_xml);;Texture Sources (*.png *.jpg *.jpeg *.dds);;DDS Files (*.dds);;Material Sidecars (*.xml *.pami *.pac_xml *.pam_xml *.pamlod_xml)",
+                    "Supplemental Files (*.png *.jpg *.jpeg *.dds *.xml *.pami *.pac_xml *.pam_xml *.pamlod_xml *.app_xml *.prefabdata_xml);;Texture Sources (*.png *.jpg *.jpeg *.dds);;DDS Files (*.dds);;Material Sidecars (*.xml *.pami *.pac_xml *.pam_xml *.pamlod_xml *.app_xml *.prefabdata_xml)",
                 )
                 for raw_path in selected_files:
                     if raw_path:
@@ -15836,6 +16740,8 @@ def run_gui() -> int:
                 import_mode=import_mode,
                 supplemental_files=tuple(supplemental_files),
                 scene_import_result=scene_import_result,
+                original_mesh=original_mesh_for_setup,
+                preflight=preflight,
             )
 
         def _start_archive_mesh_export(self, entry: ArchiveEntry, export_format: str) -> None:
@@ -15927,10 +16833,10 @@ def run_gui() -> int:
             profile: Optional[ReplacementAssetProfile] = None
             if entry is not None:
                 try:
-                    original_data, _decompressed, _note = read_archive_entry_data(entry)
+                    original_data = read_archive_entry_baseline_data(entry, read_entry_data=read_archive_entry_data).data
                     profile = analyze_replacement_asset(
                         entry,
-                        archive_entries_by_basename=dict(self.archive_entries_by_basename),
+                        archive_entries_by_basename=self.archive_entries_by_basename,
                         parsed_mesh=parse_mesh(original_data, entry.path),
                     )
                     compatibility_note = f"\n\nMesh replacement compatibility: {profile.support_level} ({profile.category_hint})."
@@ -15975,11 +16881,20 @@ def run_gui() -> int:
             return "(" + ", ".join(cls._format_static_alignment_number(part) for part in value) + ")"
 
         @classmethod
-        def _build_archive_static_placement_context_html(cls, entry: ArchiveEntry, obj_path: Path) -> Tuple[str, Dict[str, object]]:
+        def _build_archive_static_placement_context_html(
+            cls,
+            entry: ArchiveEntry,
+            obj_path: Path,
+            *,
+            original_mesh: Optional[ParsedMesh] = None,
+            replacement_mesh: Optional[ParsedMesh] = None,
+        ) -> Tuple[str, Dict[str, object]]:
             try:
-                original_data, _decompressed, _note = read_archive_entry_data(entry)
-                original_mesh = parse_mesh(original_data, entry.path)
-                replacement_mesh = import_scene_mesh(obj_path)
+                if original_mesh is None:
+                    original_data = read_archive_entry_baseline_data(entry, read_entry_data=read_archive_entry_data).data
+                    original_mesh = parse_mesh(original_data, entry.path)
+                if replacement_mesh is None:
+                    replacement_mesh = import_scene_mesh(obj_path)
                 context_lines = describe_static_placement_context(original_mesh, replacement_mesh)
                 parsed: Dict[str, object] = {}
                 for line in context_lines:
@@ -16084,11 +16999,31 @@ def run_gui() -> int:
             }
             group = QGroupBox("Asset Compatibility")
             group_layout = QVBoxLayout(group)
-            group_layout.setSpacing(10)
+            group_layout.setContentsMargins(8, 6, 8, 6)
+            group_layout.setSpacing(5)
             facts = {str(label): str(value) for label, value in profile.facts}
 
+            def _section_label(title: str, body_html: str, *, accent: str = "#8b949e") -> QLabel:
+                label = QLabel(
+                    "<div style='font-size:12px; line-height:1.22; padding:4px 6px; border-left:3px solid "
+                    f"{accent}; background:#24292f;'>"
+                    "<div style='margin-bottom:2px;'>"
+                    f"<span style='color:{accent}; font-weight:700;'>{escape(title)}</span>"
+                    "</div>"
+                    "<div>"
+                    f"{body_html}"
+                    "</div>"
+                    "</div>"
+                )
+                label.setWordWrap(True)
+                label.setTextFormat(Qt.RichText)
+                label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                label.setMinimumWidth(0)
+                label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                return label
+
             chip_row = QHBoxLayout()
-            chip_row.setSpacing(8)
+            chip_row.setSpacing(6)
 
             def _chip(label_text: str, value_text: str, color: str = "") -> QLabel:
                 chip = QLabel(f"{label_text}: {value_text}")
@@ -16097,9 +17032,10 @@ def run_gui() -> int:
                     "QLabel {"
                     f"background: {theme['surface_alt']};"
                     f"border: 1px solid {theme['border']};"
-                    "border-radius: 4px;"
-                    "padding: 4px 8px;"
+                    "border-radius: 3px;"
+                    "padding: 2px 6px;"
                     f"color: {color or theme['text']};"
+                    "font-size: 11px;"
                     "font-weight: 600;"
                     "}"
                 )
@@ -16119,9 +17055,18 @@ def run_gui() -> int:
             group_layout.addLayout(chip_row)
 
             metric_labels = {"Submeshes", "Faces", "Vertices", "UVs", "Skinning", "LOD", "Sidecar", "Texture slots"}
-            metrics_grid = QGridLayout()
-            metrics_grid.setHorizontalSpacing(16)
-            metrics_grid.setVerticalSpacing(5)
+            metrics_frame = QFrame()
+            metrics_frame.setStyleSheet(
+                "QFrame {"
+                f"background: {theme['surface']};"
+                f"border: 1px solid {theme['border']};"
+                "border-radius: 6px;"
+                "}"
+            )
+            metrics_grid = QGridLayout(metrics_frame)
+            metrics_grid.setContentsMargins(7, 5, 7, 5)
+            metrics_grid.setHorizontalSpacing(14)
+            metrics_grid.setVerticalSpacing(2)
             metric_index = 0
             for label_text, value_text in profile.facts:
                 if label_text not in metric_labels:
@@ -16140,59 +17085,76 @@ def run_gui() -> int:
                 metrics_grid.addWidget(value, row, column + 1)
                 metric_index += 1
             if metric_index:
-                group_layout.addLayout(metrics_grid)
+                group_layout.addWidget(metrics_frame)
 
             related_by_role: Dict[str, List[str]] = {}
             for related in profile.related_files:
                 related_by_role.setdefault(related.role, []).append(PurePosixPath(related.path).name)
-            related_summary = "None found"
+            related_summary = "<span style='color:#8b949e;'>None found</span>"
             if related_by_role:
-                related_summary = " | ".join(
-                    f"{role}: {', '.join(names[:3])}" + (" ..." if len(names) > 3 else "")
-                    for role, names in related_by_role.items()
+                related_summary = (
+                    "<table cellspacing='0' cellpadding='0' style='width:100%;'>"
+                    + "".join(
+                        "<tr>"
+                        f"<td style='color:#79c0ff; font-weight:700; padding:1px 10px 1px 0; white-space:nowrap;'>{escape(role)}</td>"
+                        f"<td style='color:#f0f6fc; padding:1px 0; word-break:break-all;'>{escape(', '.join(names[:4]))}"
+                        f"<span style='color:#8b949e;'>{' ...' if len(names) > 4 else ''}</span></td>"
+                        "</tr>"
+                        for role, names in related_by_role.items()
+                    )
+                    + "</table>"
                 )
-            related_label = QLabel(f"Related files\n{related_summary}")
-            related_label.setWordWrap(True)
-            related_label.setMinimumWidth(0)
-            related_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            related_label.setObjectName("HintLabel")
-            related_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            group_layout.addWidget(related_label)
+            group_layout.addWidget(_section_label("Related files", related_summary, accent="#79c0ff"))
 
             if getattr(profile, "required_companions", ()):
                 companion_names = [PurePosixPath(path).name for path in profile.required_companions[:8]]
-                companions_label = QLabel(
-                    "Required companions\n"
-                    + ", ".join(companion_names)
-                    + (" ..." if len(profile.required_companions) > len(companion_names) else "")
+                companions_body = (
+                    f"<span style='color:#f0f6fc;'>{escape(', '.join(companion_names))}</span>"
+                    f"<span style='color:#8b949e;'>{' ...' if len(profile.required_companions) > len(companion_names) else ''}</span>"
                 )
-                companions_label.setWordWrap(True)
-                companions_label.setMinimumWidth(0)
-                companions_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-                companions_label.setObjectName("HintLabel")
-                companions_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                companions_label = _section_label("Required companions", companions_body, accent="#f2cc60")
                 companions_label.setToolTip("\n".join(profile.required_companions[:80]))
                 group_layout.addWidget(companions_label)
 
             if profile.texture_summary:
-                texture_summary = " | ".join(
-                    f"{label}: {value}" for label, value in profile.texture_summary[:8]
+                texture_pairs = list(profile.texture_summary[:8])
+                texture_rows = []
+                for index in range(0, len(texture_pairs), 2):
+                    first_label, first_value = texture_pairs[index]
+                    second_html = "<td></td><td></td>"
+                    if index + 1 < len(texture_pairs):
+                        second_label, second_value = texture_pairs[index + 1]
+                        second_html = (
+                            f"<td style='color:#8b949e; padding:1px 10px 1px 18px; white-space:nowrap;'>{escape(str(second_label))}</td>"
+                            f"<td style='color:#f0f6fc; font-weight:600; padding:1px 0; white-space:nowrap;'>{escape(str(second_value))}</td>"
+                        )
+                    texture_rows.append(
+                        "<tr>"
+                        f"<td style='color:#8b949e; padding:1px 10px 1px 0; white-space:nowrap;'>{escape(str(first_label))}</td>"
+                        f"<td style='color:#f0f6fc; font-weight:600; padding:1px 0; white-space:nowrap;'>{escape(str(first_value))}</td>"
+                        f"{second_html}"
+                        "</tr>"
+                    )
+                texture_summary = (
+                    "<table cellspacing='0' cellpadding='0' style='width:100%;'>"
+                    + "".join(texture_rows)
+                    + "</table>"
                 )
-                texture_label = QLabel(f"Texture slots\n{texture_summary}")
-                texture_label.setWordWrap(True)
-                texture_label.setMinimumWidth(0)
-                texture_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-                texture_label.setObjectName("HintLabel")
-                texture_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                group_layout.addWidget(texture_label)
+                group_layout.addWidget(_section_label("Texture slots", texture_summary, accent="#d2a8ff"))
 
             messages = list(profile.errors) + list(profile.warnings)
             if messages:
-                message_label = QLabel("\n".join(f"- {message}" for message in messages[:6]))
-                message_label.setWordWrap(True)
-                message_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                message_label.setStyleSheet("color: #fca5a5;" if profile.errors else "color: #facc15;")
-                group_layout.addWidget(message_label)
+                message_body = "".join(
+                    f"<div style='margin:1px 0;'>- {escape(message)}</div>"
+                    for message in messages[:6]
+                )
+                group_layout.addWidget(
+                    _section_label(
+                        "Warnings" if not profile.errors else "Blocking issues",
+                        message_body,
+                        accent="#fca5a5" if profile.errors else "#facc15",
+                    )
+                )
             parent_layout.addWidget(group)
 
         def _prompt_archive_static_replacement_options(
@@ -16201,11 +17163,80 @@ def run_gui() -> int:
             obj_path: Path,
             supplemental_files: Sequence[Path] = (),
             import_diagnostics: Sequence[str] = (),
+            scene_import_result: Optional[SceneImportResult] = None,
+            original_mesh: Optional[ParsedMesh] = None,
         ) -> Optional[StaticMeshReplacementOptions]:
+            startup_progress = QProgressDialog("Preparing Mesh Replacement Alignment...", "", 0, 0, self)
+            startup_progress.setWindowTitle("Preparing Alignment")
+            startup_progress.setCancelButton(None)
+            startup_progress.setMinimumDuration(0)
+            startup_progress.setAutoClose(False)
+            startup_progress.setWindowModality(Qt.WindowModal)
+            startup_progress.show()
+            QApplication.processEvents()
+            startup_progress_closed = {"closed": False}
+
+            def _alignment_startup_step(message: str) -> None:
+                if startup_progress_closed["closed"]:
+                    return
+                startup_progress.setLabelText(message)
+                startup_progress.setValue(0)
+                QApplication.processEvents()
+
+            def _finish_alignment_startup_progress() -> None:
+                if startup_progress_closed["closed"]:
+                    return
+                startup_progress_closed["closed"] = True
+                startup_progress.close()
+                QApplication.processEvents()
+
+            _alignment_startup_step("Creating alignment window...")
             dialog = QDialog(self)
+            dialog.setObjectName("MeshReplacementAlignmentDialog")
             dialog.setWindowTitle("Mesh Replacement Alignment")
-            dialog.setMinimumSize(1120, 700)
+            dialog.setMinimumSize(980, 700)
             dialog.setSizeGripEnabled(True)
+            dialog.setStyleSheet(
+                dialog.styleSheet()
+                + """
+                QDialog#MeshReplacementAlignmentDialog QLabel {
+                    font-size: 12px;
+                }
+                QDialog#MeshReplacementAlignmentDialog QLabel#HintLabel {
+                    color: #9aa4b2;
+                    font-size: 11px;
+                }
+                QDialog#MeshReplacementAlignmentDialog QGroupBox {
+                    font-size: 12px;
+                    font-weight: 600;
+                    margin-top: 12px;
+                    padding-top: 10px;
+                }
+                QDialog#MeshReplacementAlignmentDialog QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 9px;
+                    padding: 0 4px;
+                }
+                QDialog#MeshReplacementAlignmentDialog QPushButton {
+                    font-size: 12px;
+                    padding: 3px 8px;
+                    min-height: 20px;
+                }
+                QDialog#MeshReplacementAlignmentDialog QComboBox,
+                QDialog#MeshReplacementAlignmentDialog QLineEdit,
+                QDialog#MeshReplacementAlignmentDialog QDoubleSpinBox {
+                    font-size: 12px;
+                    min-height: 21px;
+                }
+                QDialog#MeshReplacementAlignmentDialog QTreeWidget {
+                    font-size: 11px;
+                }
+                QDialog#MeshReplacementAlignmentDialog QHeaderView::section {
+                    font-size: 11px;
+                    padding: 3px 6px;
+                }
+                """
+            )
             root_layout = QVBoxLayout(dialog)
             main_splitter = QSplitter(Qt.Horizontal, dialog)
             content_scroll = QScrollArea(dialog)
@@ -16213,8 +17244,8 @@ def run_gui() -> int:
             content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             content_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
             content_scroll.setFrameShape(QFrame.NoFrame)
-            content_scroll.setMinimumWidth(360)
-            content_scroll.setMaximumWidth(620)
+            content_scroll.setMinimumWidth(320)
+            content_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
             content_container = QWidget()
             content_container.setMinimumWidth(0)
             content_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -16224,7 +17255,7 @@ def run_gui() -> int:
             content_scroll.setWidget(content_container)
             main_splitter.addWidget(content_scroll)
             preview_panel = QWidget(dialog)
-            preview_panel.setMinimumWidth(420)
+            preview_panel.setMinimumWidth(360)
             preview_panel_layout = QVBoxLayout(preview_panel)
             preview_header = QHBoxLayout()
             preview_header.addWidget(QLabel("Live Alignment Preview"))
@@ -16235,6 +17266,9 @@ def run_gui() -> int:
             preview_mode_combo.addItem("Replacement only", "replacement_only")
             preview_mode_combo.setToolTip("Side by side compares original and replacement. Overlay draws both in one view. Replacement only gives more room to inspect the imported asset.")
             preview_header.addWidget(QLabel("Preview mode"))
+            preview_mode_combo.setMinimumWidth(0)
+            preview_mode_combo.setMinimumContentsLength(12)
+            preview_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             preview_header.addWidget(preview_mode_combo)
             overlay_original_locked_checkbox = QCheckBox("Original locked")
             overlay_original_locked_checkbox.setChecked(True)
@@ -16242,14 +17276,31 @@ def run_gui() -> int:
             overlay_original_locked_checkbox.setToolTip("In Overlay mode, keep the original reference fixed and move only the replacement preview.")
             preview_header.addWidget(overlay_original_locked_checkbox)
             alignment_preview_settings_button = QPushButton("3D Preview Settings...")
-            alignment_preview_settings_button.setToolTip("Open the global 3D preview settings used by archive, material, import, and alignment previews.")
-            alignment_use_global_preview_button = QPushButton("Use Global")
+            alignment_preview_settings_button.setToolTip(
+                "Open global 3D preview settings, including render mode, tint/brightness/UV toggles, support maps, depth, shine, roughness, and final-preview behavior."
+            )
+            alignment_use_global_preview_button = QPushButton("Use Global", preview_panel)
+            alignment_use_global_preview_button.setVisible(False)
             alignment_use_global_preview_button.setToolTip("Reset the alignment preview controls to the current global 3D preview settings.")
+            final_output_preview_button = QPushButton("Final Output Preview")
+            final_output_preview_button.setToolTip(
+                "Open the authoritative rebuilt package preview, or rebuild it if current alignment or texture settings are stale."
+            )
+            final_output_preview_status_label = QLabel("Not built yet")
+            final_output_preview_status_label.setObjectName("HintLabel")
+            final_output_preview_status_label.setMinimumWidth(120)
+            final_output_preview_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            for preview_button in (alignment_preview_settings_button, alignment_use_global_preview_button, final_output_preview_button):
+                preview_button.setMinimumWidth(0)
             preview_header.addWidget(alignment_preview_settings_button)
-            preview_header.addWidget(alignment_use_global_preview_button)
+            preview_header.addWidget(final_output_preview_button)
+            preview_header.addWidget(final_output_preview_status_label)
             preview_panel_layout.addLayout(preview_header)
             preview_render_settings = self._current_model_preview_render_settings()
-            preview_render_controls = QHBoxLayout()
+            preview_render_controls_widget = QWidget(preview_panel)
+            preview_render_controls_widget.setVisible(False)
+            preview_render_controls = QHBoxLayout(preview_render_controls_widget)
+            preview_render_controls.setContentsMargins(0, 0, 0, 0)
             preview_render_controls.setSpacing(8)
             preview_visible_mode_combo = QComboBox()
             for mode in MODEL_PREVIEW_VISIBLE_TEXTURE_MODES:
@@ -16257,12 +17308,18 @@ def run_gui() -> int:
             visible_index = preview_visible_mode_combo.findData(preview_render_settings.visible_texture_mode)
             preview_visible_mode_combo.setCurrentIndex(max(0, visible_index))
             preview_visible_mode_combo.setToolTip("Texture-selection strategy for alignment preview rebuilds.")
+            preview_visible_mode_combo.setMinimumWidth(0)
+            preview_visible_mode_combo.setMinimumContentsLength(10)
+            preview_visible_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             preview_render_mode_combo = QComboBox()
             for mode in MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODES:
                 preview_render_mode_combo.addItem(MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODE_LABELS.get(mode, mode), mode)
             render_index = preview_render_mode_combo.findData(preview_render_settings.render_diagnostic_mode)
             preview_render_mode_combo.setCurrentIndex(max(0, render_index))
             preview_render_mode_combo.setToolTip("Render mode for the live alignment preview.")
+            preview_render_mode_combo.setMinimumWidth(0)
+            preview_render_mode_combo.setMinimumContentsLength(8)
+            preview_render_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             preview_disable_tint_checkbox = QCheckBox("No tint")
             preview_disable_tint_checkbox.setChecked(bool(preview_render_settings.disable_tint))
             preview_disable_tint_checkbox.setToolTip("Ignore sidecar tint in this alignment preview.")
@@ -16272,6 +17329,37 @@ def run_gui() -> int:
             preview_disable_uv_scale_checkbox = QCheckBox("No UV scale")
             preview_disable_uv_scale_checkbox.setChecked(bool(preview_render_settings.disable_uv_scale))
             preview_disable_uv_scale_checkbox.setToolTip("Ignore sidecar UV scale in this alignment preview.")
+            preview_support_maps_checkbox = QCheckBox("Support maps")
+            preview_support_maps_checkbox.setChecked(not bool(preview_render_settings.disable_all_support_maps))
+            preview_support_maps_checkbox.setToolTip("Enable resolved normal, material/mask, and height maps in the preview.")
+
+            def _rough_control_value_from_settings(settings: ModelPreviewRenderSettings) -> float:
+                try:
+                    return max(0.0, min(1.0, (float(settings.shininess_max) - 32.0) / 224.0))
+                except (TypeError, ValueError):
+                    return 0.25
+
+            preview_depth_spin = QDoubleSpinBox()
+            preview_depth_spin.setRange(0.0, 1.0)
+            preview_depth_spin.setDecimals(2)
+            preview_depth_spin.setSingleStep(0.05)
+            preview_depth_spin.setValue(float(preview_render_settings.height_effect_max))
+            preview_depth_spin.setToolTip("Height/depth contribution for Lit and Height / Depth Response preview modes.")
+            preview_depth_spin.setMaximumWidth(74)
+            preview_shine_spin = QDoubleSpinBox()
+            preview_shine_spin.setRange(0.0, 1.0)
+            preview_shine_spin.setDecimals(2)
+            preview_shine_spin.setSingleStep(0.02)
+            preview_shine_spin.setValue(float(preview_render_settings.specular_max))
+            preview_shine_spin.setToolTip("Maximum material/metal shine contribution in Lit and Metal / Shine Response modes.")
+            preview_shine_spin.setMaximumWidth(74)
+            preview_rough_spin = QDoubleSpinBox()
+            preview_rough_spin.setRange(0.0, 1.0)
+            preview_rough_spin.setDecimals(2)
+            preview_rough_spin.setSingleStep(0.05)
+            preview_rough_spin.setValue(_rough_control_value_from_settings(preview_render_settings))
+            preview_rough_spin.setToolTip("Roughness contrast for highlight sharpness and Roughness Response diagnostics.")
+            preview_rough_spin.setMaximumWidth(74)
             preview_render_controls.addWidget(QLabel("Visible"))
             preview_render_controls.addWidget(preview_visible_mode_combo, 1)
             preview_render_controls.addWidget(QLabel("Render"))
@@ -16279,14 +17367,20 @@ def run_gui() -> int:
             preview_render_controls.addWidget(preview_disable_tint_checkbox)
             preview_render_controls.addWidget(preview_disable_brightness_checkbox)
             preview_render_controls.addWidget(preview_disable_uv_scale_checkbox)
-            preview_panel_layout.addLayout(preview_render_controls)
+            preview_render_controls.addWidget(preview_support_maps_checkbox)
+            preview_render_controls.addWidget(QLabel("Depth"))
+            preview_render_controls.addWidget(preview_depth_spin)
+            preview_render_controls.addWidget(QLabel("Shine"))
+            preview_render_controls.addWidget(preview_shine_spin)
+            preview_render_controls.addWidget(QLabel("Rough"))
+            preview_render_controls.addWidget(preview_rough_spin)
             preview_splitter = QSplitter(Qt.Horizontal, preview_panel)
             original_preview_container = QWidget(preview_splitter)
             original_preview_layout = QVBoxLayout(original_preview_container)
             original_preview_layout.setContentsMargins(0, 0, 0, 0)
             original_preview_layout.addWidget(QLabel("Original Reference"))
             original_dialog_preview = ModelPreviewWidget("Original asset reference preview.", theme_key=self.current_theme_key)
-            original_dialog_preview.setMinimumSize(300, 340)
+            original_dialog_preview.setMinimumSize(220, 260)
             original_dialog_preview.set_render_settings(preview_render_settings)
             original_dialog_preview.set_use_textures(True)
             original_dialog_preview.set_high_quality_textures(True)
@@ -16295,9 +17389,9 @@ def run_gui() -> int:
             replacement_preview_container = QWidget(preview_splitter)
             replacement_preview_layout = QVBoxLayout(replacement_preview_container)
             replacement_preview_layout.setContentsMargins(0, 0, 0, 0)
-            replacement_preview_layout.addWidget(QLabel("Replacement With Current Mapping"))
+            replacement_preview_layout.addWidget(QLabel("Replacement / Final Output"))
             static_dialog_preview = ModelPreviewWidget("Select texture slots to preview.", theme_key=self.current_theme_key)
-            static_dialog_preview.setMinimumSize(340, 340)
+            static_dialog_preview.setMinimumSize(240, 260)
             static_dialog_preview.set_render_settings(preview_render_settings)
             static_dialog_preview.set_use_textures(True)
             static_dialog_preview.set_high_quality_textures(True)
@@ -16312,14 +17406,14 @@ def run_gui() -> int:
             preview_splitter.setStretchFactor(1, 2)
             preview_splitter.setSizes([420, 620])
             overlay_dialog_preview = ModelPreviewWidget("Overlay preview.", theme_key=self.current_theme_key)
-            overlay_dialog_preview.setMinimumSize(520, 380)
+            overlay_dialog_preview.setMinimumSize(300, 280)
             overlay_dialog_preview.set_render_settings(preview_render_settings)
             overlay_dialog_preview.set_use_textures(True)
             overlay_dialog_preview.set_high_quality_textures(True)
             overlay_dialog_preview.set_alignment_guides_visible(True)
             overlay_dialog_preview.set_alignment_editing_enabled(True)
             replacement_only_preview = ModelPreviewWidget("Replacement preview.", theme_key=self.current_theme_key)
-            replacement_only_preview.setMinimumSize(520, 380)
+            replacement_only_preview.setMinimumSize(300, 280)
             replacement_only_preview.set_render_settings(preview_render_settings)
             replacement_only_preview.set_use_textures(True)
             replacement_only_preview.set_high_quality_textures(True)
@@ -16327,22 +17421,22 @@ def run_gui() -> int:
             replacement_only_preview.set_alignment_editing_enabled(True)
 
             def _current_alignment_preview_render_settings() -> ModelPreviewRenderSettings:
-                return clamp_model_preview_render_settings(
-                    dataclasses.replace(
-                        preview_render_settings,
-                        visible_texture_mode=str(
-                            preview_visible_mode_combo.currentData()
-                            or preview_render_settings.visible_texture_mode
-                        ),
-                        render_diagnostic_mode=str(
-                            preview_render_mode_combo.currentData()
-                            or preview_render_settings.render_diagnostic_mode
-                        ),
-                        disable_tint=preview_disable_tint_checkbox.isChecked(),
-                        disable_brightness=preview_disable_brightness_checkbox.isChecked(),
-                        disable_uv_scale=preview_disable_uv_scale_checkbox.isChecked(),
-                    )
-                )
+                settings = clamp_model_preview_render_settings(preview_render_settings)
+                settings.visible_texture_mode = str(preview_visible_mode_combo.currentData() or settings.visible_texture_mode)
+                settings.render_diagnostic_mode = str(preview_render_mode_combo.currentData() or settings.render_diagnostic_mode)
+                settings.disable_tint = bool(preview_disable_tint_checkbox.isChecked())
+                settings.disable_brightness = bool(preview_disable_brightness_checkbox.isChecked())
+                settings.disable_uv_scale = bool(preview_disable_uv_scale_checkbox.isChecked())
+                settings.disable_all_support_maps = not bool(preview_support_maps_checkbox.isChecked())
+                settings.disable_normal_map = settings.disable_all_support_maps
+                settings.disable_material_map = settings.disable_all_support_maps
+                settings.disable_height_map = settings.disable_all_support_maps
+                settings.height_effect_max = float(preview_depth_spin.value())
+                settings.specular_max = float(preview_shine_spin.value())
+                rough_value = max(0.0, min(1.0, float(preview_rough_spin.value())))
+                settings.shininess_max = 32.0 + (rough_value * 224.0)
+                settings.shininess_min = min(settings.shininess_min, settings.shininess_max)
+                return clamp_model_preview_render_settings(settings)
 
             def _apply_alignment_preview_render_settings(*_args) -> None:
                 nonlocal preview_render_settings
@@ -16371,10 +17465,21 @@ def run_gui() -> int:
                     (preview_disable_tint_checkbox, settings.disable_tint),
                     (preview_disable_brightness_checkbox, settings.disable_brightness),
                     (preview_disable_uv_scale_checkbox, settings.disable_uv_scale),
+                    (preview_support_maps_checkbox, not settings.disable_all_support_maps),
                 ):
                     checkbox.blockSignals(True)
                     checkbox.setChecked(bool(value))
                     checkbox.blockSignals(False)
+                for spin, value in (
+                    (preview_depth_spin, settings.height_effect_max),
+                    (preview_shine_spin, settings.specular_max),
+                ):
+                    spin.blockSignals(True)
+                    spin.setValue(float(value))
+                    spin.blockSignals(False)
+                preview_rough_spin.blockSignals(True)
+                preview_rough_spin.setValue(_rough_control_value_from_settings(settings))
+                preview_rough_spin.blockSignals(False)
 
             def _use_global_alignment_preview_settings() -> None:
                 nonlocal preview_render_settings
@@ -16382,14 +17487,31 @@ def run_gui() -> int:
                 _sync_alignment_preview_controls_from_settings(preview_render_settings)
                 _apply_alignment_preview_render_settings()
 
+            def _open_alignment_preview_settings_dialog() -> None:
+                settings_dialog = self._open_modal_model_preview_settings_dialog(dialog)
+
+                def _sync_from_modal_settings(settings: Optional[object] = None) -> None:
+                    nonlocal preview_render_settings
+                    preview_render_settings = (
+                        settings
+                        if isinstance(settings, ModelPreviewRenderSettings)
+                        else self._current_model_preview_render_settings()
+                    )
+                    _sync_alignment_preview_controls_from_settings(preview_render_settings)
+                    _apply_alignment_preview_render_settings()
+
+                settings_dialog.settings_changed.connect(_sync_from_modal_settings)
+
             preview_visible_mode_combo.currentIndexChanged.connect(_apply_alignment_preview_render_settings)
             preview_render_mode_combo.currentIndexChanged.connect(_apply_alignment_preview_render_settings)
             preview_disable_tint_checkbox.toggled.connect(_apply_alignment_preview_render_settings)
             preview_disable_brightness_checkbox.toggled.connect(_apply_alignment_preview_render_settings)
             preview_disable_uv_scale_checkbox.toggled.connect(_apply_alignment_preview_render_settings)
-            alignment_preview_settings_button.clicked.connect(
-                lambda _checked=False, parent_dialog=dialog: self._open_modal_model_preview_settings_dialog(parent_dialog)
-            )
+            preview_support_maps_checkbox.toggled.connect(_apply_alignment_preview_render_settings)
+            preview_depth_spin.valueChanged.connect(_apply_alignment_preview_render_settings)
+            preview_shine_spin.valueChanged.connect(_apply_alignment_preview_render_settings)
+            preview_rough_spin.valueChanged.connect(_apply_alignment_preview_render_settings)
+            alignment_preview_settings_button.clicked.connect(lambda _checked=False: _open_alignment_preview_settings_dialog())
             alignment_use_global_preview_button.clicked.connect(_use_global_alignment_preview_settings)
             preview_stack = QStackedWidget(preview_panel)
             preview_stack.addWidget(preview_splitter)
@@ -16402,64 +17524,136 @@ def run_gui() -> int:
             preview_help.setWordWrap(True)
             preview_help.setObjectName("HintLabel")
             preview_panel_layout.addWidget(preview_help)
+            preview_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             main_splitter.addWidget(preview_panel)
             main_splitter.setCollapsible(0, False)
             main_splitter.setCollapsible(1, False)
-            main_splitter.setStretchFactor(0, 0)
+            main_splitter.setStretchFactor(0, 1)
             main_splitter.setStretchFactor(1, 1)
-            main_splitter.setSizes([560, 1180])
             root_layout.addWidget(main_splitter, 1)
 
+            def _apply_alignment_dialog_responsive_layout() -> None:
+                width = max(1, int(dialog.width()))
+                height = max(1, int(dialog.height()))
+                compact = width < 1680
+                if compact:
+                    if main_splitter.orientation() != Qt.Vertical:
+                        main_splitter.setOrientation(Qt.Vertical)
+                    content_scroll.setMaximumWidth(16777215)
+                    content_scroll.setMinimumWidth(0)
+                    preview_panel.setMinimumWidth(0)
+                    if preview_splitter.orientation() != Qt.Horizontal:
+                        preview_splitter.setOrientation(Qt.Horizontal)
+                    main_splitter.setSizes([max(360, int(height * 0.56)), max(280, int(height * 0.36))])
+                    preview_splitter.setSizes([max(220, int(width * 0.42)), max(260, int(width * 0.52))])
+                else:
+                    if main_splitter.orientation() != Qt.Horizontal:
+                        main_splitter.setOrientation(Qt.Horizontal)
+                    content_scroll.setMinimumWidth(340)
+                    content_scroll.setMaximumWidth(16777215)
+                    preview_panel.setMinimumWidth(420)
+                    if preview_splitter.orientation() != Qt.Horizontal:
+                        preview_splitter.setOrientation(Qt.Horizontal)
+                    control_width = max(620, min(1040, int(width * 0.48)))
+                    main_splitter.setSizes([control_width, max(760, width - control_width)])
+                    preview_splitter.setSizes([max(280, int((width - control_width) * 0.38)), max(360, int((width - control_width) * 0.58))])
+
+            previous_dialog_resize_event = dialog.resizeEvent
+
+            def _responsive_dialog_resize_event(event: object) -> None:
+                previous_dialog_resize_event(event)
+                QTimer.singleShot(0, _apply_alignment_dialog_responsive_layout)
+
+            dialog.resizeEvent = _responsive_dialog_resize_event  # type: ignore[method-assign]
+
             control_tabs = QTabWidget(content_container)
-            control_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+            control_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             setup_tab = QWidget(control_tabs)
             setup_layout = QVBoxLayout(setup_tab)
-            setup_layout.setContentsMargins(8, 8, 8, 8)
-            setup_layout.setSpacing(8)
+            setup_layout.setContentsMargins(7, 6, 7, 6)
+            setup_layout.setSpacing(6)
             setup_layout.setAlignment(Qt.AlignTop)
             parts_tab = QWidget(control_tabs)
             parts_layout = QVBoxLayout(parts_tab)
-            parts_layout.setContentsMargins(8, 8, 8, 8)
-            parts_layout.setSpacing(8)
+            parts_layout.setContentsMargins(7, 6, 7, 6)
+            parts_layout.setSpacing(6)
             parts_layout.setAlignment(Qt.AlignTop)
             textures_tab = QWidget(control_tabs)
             textures_layout = QVBoxLayout(textures_tab)
-            textures_layout.setContentsMargins(8, 8, 8, 8)
-            textures_layout.setSpacing(8)
+            textures_layout.setContentsMargins(7, 6, 7, 6)
+            textures_layout.setSpacing(6)
             textures_layout.setAlignment(Qt.AlignTop)
             control_tabs.addTab(setup_tab, "Setup")
-            control_tabs.addTab(parts_tab, "Parts")
+            control_tabs.addTab(parts_tab, "Geometry")
             control_tabs.addTab(textures_tab, "Textures")
             layout.addWidget(control_tabs, 0)
             intro = QLabel(
-                "Choose alignment behavior and safety options. Changes update the preview before the mesh is rebuilt."
+                "<div style='font-size:12px; line-height:1.2; padding:3px 6px; border-left:3px solid #2f81f7; background:#10233a;'>"
+                "<span style='color:#79c0ff; font-weight:700;'>Setup</span>"
+                "<span style='color:#c9d1d9;'> Alignment behavior, safety options, and export values.</span>"
+                "</div>"
             )
             intro.setWordWrap(True)
+            intro.setTextFormat(Qt.RichText)
             intro.setObjectName("HintLabel")
             setup_layout.addWidget(intro)
             if import_diagnostics:
                 import_group = QGroupBox("Import Notes")
                 import_layout = QVBoxLayout(import_group)
-                for line in list(import_diagnostics)[:8]:
-                    note = QLabel(str(line))
-                    note.setWordWrap(True)
-                    note.setObjectName("HintLabel")
-                    import_layout.addWidget(note)
+                import_layout.setContentsMargins(8, 6, 8, 6)
+                import_layout.setSpacing(3)
+                import_rows: List[Tuple[str, str]] = []
+                for raw_line in list(import_diagnostics)[:8]:
+                    line_text = str(raw_line or "").strip()
+                    if not line_text:
+                        continue
+                    if ":" in line_text:
+                        label_text, value_text = line_text.split(":", 1)
+                        import_rows.append((label_text.strip(), value_text.strip()))
+                    else:
+                        import_rows.append(("Note", line_text))
+                import_html_rows = "".join(
+                    "<tr>"
+                    f"<td style='color:#8b949e; padding:2px 14px 2px 0; white-space:nowrap;'>{escape(label_text)}</td>"
+                    f"<td style='color:#f0f6fc; padding:2px 0; word-break:break-all;'>{escape(value_text)}</td>"
+                    "</tr>"
+                    for label_text, value_text in import_rows
+                )
+                import_label = QLabel(
+                    "<div style='font-size:12px; line-height:1.22;'>"
+                    "<table cellspacing='0' cellpadding='0' style='width:100%;'>"
+                    f"{import_html_rows}"
+                    "</table>"
+                    "</div>"
+                )
+                import_label.setWordWrap(True)
+                import_label.setTextFormat(Qt.RichText)
+                import_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                import_layout.addWidget(import_label)
                 setup_layout.addWidget(import_group)
 
-            context_html, context_values = self._build_archive_static_placement_context_html(entry, obj_path)
+            _alignment_startup_step("Reading alignment summary...")
+            context_html, context_values = self._build_archive_static_placement_context_html(
+                entry,
+                obj_path,
+                original_mesh=original_mesh,
+                replacement_mesh=scene_import_result.mesh if isinstance(scene_import_result, SceneImportResult) else None,
+            )
             context_group = QGroupBox("Alignment Summary")
             context_layout = QGridLayout(context_group)
+            context_layout.setContentsMargins(8, 6, 8, 6)
+            context_layout.setHorizontalSpacing(12)
+            context_layout.setVerticalSpacing(2)
             original_axis_text = str(context_values.get("original_axis", "?") or "?")
             replacement_axis_text = str(context_values.get("replacement_axis", "?") or "?")
             auto_scale_value = float(context_values.get("auto_scale", 1.0) or 1.0)
             compact_facts = (
-                ("Original axis", original_axis_text),
-                ("Replacement axis", replacement_axis_text),
-                ("Auto length scale", self._format_static_alignment_number(auto_scale_value)),
-                ("Suggested workflow", "Start with Alignment mode: Auto and toggle Flip direction 180 if needed, then fine tune Transform."),
+                ("Original axis", original_axis_text, "#79c0ff"),
+                ("Replacement axis", replacement_axis_text, "#d2a8ff"),
+                ("Auto length scale", self._format_static_alignment_number(auto_scale_value), "#7ee787"),
+                ("Start point", "Auto alignment, Flip 180 if needed, then fine tune Transform.", "#f2cc60"),
             )
-            for fact_row, (fact_label, fact_value) in enumerate(compact_facts):
+            for fact_row, (fact_label, fact_value, fact_color) in enumerate(compact_facts):
                 label_widget = QLabel(fact_label)
                 label_widget.setObjectName("HintLabel")
                 value_widget = QLabel(fact_value)
@@ -16467,6 +17661,13 @@ def run_gui() -> int:
                 value_widget.setMinimumWidth(0)
                 value_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
                 value_widget.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value_widget.setStyleSheet(
+                    "QLabel {"
+                    f"color: {fact_color};"
+                    "font-weight: 600;"
+                    "padding: 1px 0;"
+                    "}"
+                )
                 context_layout.addWidget(label_widget, fact_row, 0)
                 context_layout.addWidget(value_widget, fact_row, 1)
             context_group.setToolTip(context_html)
@@ -16474,7 +17675,8 @@ def run_gui() -> int:
 
             suggested_mappings: List[StaticSubmeshMapping] = []
             mapping_edits: List[Tuple[int, QLineEdit]] = []
-            texture_override_rows: List[Tuple[QCheckBox, QComboBox, str, str, str, Tuple[int, ...], bool]] = []
+            texture_override_rows: List[Dict[str, Any]] = []
+            texture_sets: Dict[str, Any] = {}
             source_part_adjustments: Dict[int, StaticSourcePartAdjustment] = {}
             original_part_copies: List[StaticOriginalPartCopy] = []
             source_items_by_index: Dict[int, QTreeWidgetItem] = {}
@@ -16507,10 +17709,35 @@ def run_gui() -> int:
             texture_preview_cache: Dict[tuple[str, int, int], str] = {}
             texture_override_preview_specs: List[tuple[str, str, str, str, Tuple[int, ...], str]] = []
             texture_overrides_dirty = {"dirty": True}
+            final_output_preview_state: Dict[str, object] = {
+                "result": None,
+                "preview": None,
+                "generation": 0,
+                "dirty": True,
+                "building": False,
+                "open_when_ready": False,
+            }
             static_preview_refresh_timer = QTimer(dialog)
             static_preview_refresh_timer.setSingleShot(True)
-            static_preview_refresh_timer.setInterval(70)
+            static_preview_refresh_timer.setInterval(140)
+            final_output_preview_timer = QTimer(dialog)
+            final_output_preview_timer.setSingleShot(True)
+            final_output_preview_timer.setInterval(650)
             static_preview_geometry_cache: Dict[str, tuple[object, bool, Dict[int, int]]] = {}
+            static_replacement_vertex_limit = 65_535
+
+            def _alignment_preview_source_face_limit() -> int:
+                mesh = replacement_mesh_for_mapping or replacement_mesh_base_for_mapping
+                if mesh is None:
+                    return 0
+                total_faces = sum(len(getattr(submesh, "faces", ()) or ()) for submesh in getattr(mesh, "submeshes", ()) or ())
+                if total_faces >= 250_000:
+                    return 4_000
+                if total_faces >= 100_000:
+                    return 6_000
+                if total_faces >= 40_000:
+                    return 10_000
+                return 0
 
             def _configure_alignment_tree(
                 tree: QTreeWidget,
@@ -16518,6 +17745,7 @@ def run_gui() -> int:
                 *,
                 max_height: int = 0,
                 stretch_columns: Sequence[int] = (),
+                persist_key: str = "",
             ) -> None:
                 tree.setRootIsDecorated(False)
                 tree.setAlternatingRowColors(True)
@@ -16528,9 +17756,11 @@ def run_gui() -> int:
                 tree.setWordWrap(False)
                 tree.setMinimumWidth(0)
                 tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-                tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                tree.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
                 tree.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
                 tree.setSelectionMode(QAbstractItemView.SingleSelection)
+                tree.setStyleSheet(tree.styleSheet() + "QTreeWidget::item { padding: 1px 2px; }")
                 header = tree.header()
                 header.setSectionsClickable(True)
                 header.setMinimumSectionSize(32)
@@ -16544,8 +17774,49 @@ def run_gui() -> int:
                     else:
                         header.setSectionResizeMode(column, QHeaderView.Interactive)
                     tree.setColumnWidth(column, int(width))
+                if persist_key:
+                    make_tree_columns_persistent(
+                        tree,
+                        self.settings,
+                        f"alignment/{persist_key}",
+                        minimum_width=32,
+                        save_callback=self.schedule_settings_save,
+                    )
+                    header.setStretchLastSection(True)
                 if max_height > 0:
                     tree.setMaximumHeight(max_height)
+
+            def _configure_texture_mapping_tree(tree: QTreeWidget, *, persist_key: str = "") -> None:
+                tree.setRootIsDecorated(False)
+                tree.setAlternatingRowColors(True)
+                tree.setMouseTracking(True)
+                tree.viewport().setMouseTracking(True)
+                tree.setUniformRowHeights(True)
+                tree.setTextElideMode(Qt.ElideMiddle)
+                tree.setWordWrap(False)
+                tree.setMinimumWidth(0)
+                tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                tree.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+                tree.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                tree.setSelectionMode(QAbstractItemView.SingleSelection)
+                header = tree.header()
+                header.setSectionsClickable(True)
+                header.setStretchLastSection(False)
+                header.setMinimumSectionSize(48)
+                for column, width in enumerate((56, 170, 150, 170, 118, 240)):
+                    header.setSectionResizeMode(column, QHeaderView.Interactive)
+                    tree.setColumnWidth(column, int(width))
+                header.setSectionResizeMode(5, QHeaderView.Stretch)
+                if persist_key:
+                    make_tree_columns_persistent(
+                        tree,
+                        self.settings,
+                        f"alignment/{persist_key}",
+                        minimum_width=48,
+                        save_callback=self.schedule_settings_save,
+                    )
+                tree.setMaximumHeight(420)
 
             def _fit_alignment_tree_height_to_rows(
                 tree: QTreeWidget,
@@ -16562,9 +17833,9 @@ def run_gui() -> int:
                         visible_rows += 1
                 row_height = tree.sizeHintForRow(0)
                 if row_height <= 0:
-                    row_height = tree.fontMetrics().height() + 16
-                header_height = max(tree.header().sizeHint().height(), tree.fontMetrics().height() + 14)
-                content_height = header_height + (visible_rows * row_height) + 12
+                    row_height = tree.fontMetrics().height() + 10
+                header_height = max(tree.header().sizeHint().height(), tree.fontMetrics().height() + 10)
+                content_height = header_height + (visible_rows * row_height) + 8
                 if tree.horizontalScrollBarPolicy() != Qt.ScrollBarAlwaysOff:
                     content_height += max(16, tree.horizontalScrollBar().sizeHint().height())
                 target_height = min(screen_cap, max(minimum, content_height))
@@ -16619,12 +17890,32 @@ def run_gui() -> int:
                     meshes=meshes,
                 )
 
+            def _mark_final_output_preview_dirty(*, schedule: bool = True) -> None:
+                final_output_preview_state["generation"] = int(final_output_preview_state.get("generation", 0) or 0) + 1
+                final_output_preview_state["result"] = None
+                final_output_preview_state["preview"] = None
+                final_output_preview_state["dirty"] = True
+                if not bool(final_output_preview_state.get("building")):
+                    final_output_preview_status_label.setText("Final preview updating...")
+                    final_output_preview_status_label.setStyleSheet("color: #d29922; font-weight: 600;")
+                if schedule:
+                    final_output_preview_timer.start()
+
             def _queue_static_preview_refresh(*_args: object) -> None:
+                static_preview_refresh_timer.start()
+
+            def _queue_static_preview_rebuild(*_args: object) -> None:
+                _mark_final_output_preview_dirty(schedule=True)
                 static_preview_refresh_timer.start()
 
             def _queue_texture_preview_refresh(*_args: object) -> None:
                 texture_overrides_dirty["dirty"] = True
+                _mark_final_output_preview_dirty(schedule=True)
                 static_preview_refresh_timer.start()
+
+            def _set_final_output_preview_status(text: str, *, color: str = "") -> None:
+                final_output_preview_status_label.setText(text)
+                final_output_preview_status_label.setStyleSheet(f"color: {color}; font-weight: 600;" if color else "")
 
             def _sync_highlight_sets() -> None:
                 highlighted_source_indices.clear()
@@ -16798,7 +18089,7 @@ def run_gui() -> int:
 
             def _source_index_help_text() -> str:
                 if replacement_mesh_for_mapping is None:
-                    return "Source indexes are the row numbers in Replacement sources."
+                    return "Replacement parts used are the row numbers in Replacement sources."
                 valid_sources: List[str] = []
                 for source_index, source in enumerate(replacement_mesh_for_mapping.submeshes):
                     if _is_marker_source(source):
@@ -16808,7 +18099,7 @@ def run_gui() -> int:
                 if len(valid_sources) > 12:
                     examples += "; ..."
                 return (
-                    "Source indexes choose which Replacement sources feed this original target slot. "
+                    "Replacement parts used chooses which imported source rows feed this original target slot. "
                     "Use one number to replace the target, comma-separated numbers to merge multiple sources, "
                     "or leave blank to emit no replacement geometry for that target.\n"
                     f"Available sources: {examples or '-'}"
@@ -16880,6 +18171,10 @@ def run_gui() -> int:
                 filter_refresh = texture_filter_refresh.get("func")
                 if filter_refresh is not None:
                     filter_refresh()
+                try:
+                    _refresh_source_material_plan()
+                except NameError:
+                    pass
 
             def _source_indices_for_target_name(target_name: str) -> tuple[int, ...]:
                 if original_mesh_for_mapping is None:
@@ -16904,22 +18199,48 @@ def run_gui() -> int:
                 return ()
 
             try:
-                original_data, _decompressed, _note = read_archive_entry_data(entry)
-                original_mesh_for_mapping = parse_mesh(original_data, entry.path)
+                if original_mesh is None:
+                    _alignment_startup_step("Reading original mesh...")
+                    original_data = read_archive_entry_baseline_data(entry, read_entry_data=read_archive_entry_data).data
+                    original_mesh_for_mapping = parse_mesh(original_data, entry.path)
+                else:
+                    original_mesh_for_mapping = original_mesh
                 sidecar_bindings = ()
                 sidecar_text_values: Tuple[str, ...] = ()
+                sidecar_texts_by_normalized_path: Dict[str, Tuple[str, ...]] = {}
+                sidecar_texts_by_basename: Dict[str, Tuple[str, ...]] = {}
                 try:
-                    sidecar_bindings, _sidecar_paths, texts_by_path, _texts_by_name = _extract_archive_model_sidecar_texture_references(
+                    _alignment_startup_step("Reading material sidecar...")
+                    (
+                        sidecar_bindings,
+                        _sidecar_paths,
+                        sidecar_texts_by_normalized_path,
+                        sidecar_texts_by_basename,
+                    ) = _extract_archive_model_sidecar_texture_references(
                         entry,
-                        archive_entries_by_basename=dict(self.archive_entries_by_basename),
+                        archive_entries_by_basename=self.archive_entries_by_basename,
                     )
-                    sidecar_text_values = tuple(str(text or "") for text in texts_by_path.values() if str(text or "").strip())
+                    deduped_sidecar_texts: List[str] = []
+                    seen_sidecar_texts: set[str] = set()
+                    for sidecar_index, values in enumerate(sidecar_texts_by_normalized_path.values()):
+                        if sidecar_index and sidecar_index % 24 == 0:
+                            _alignment_startup_step("Preparing sidecar texture references...")
+                        for text in values:
+                            normalized_text = str(text or "")
+                            if not normalized_text.strip() or normalized_text in seen_sidecar_texts:
+                                continue
+                            seen_sidecar_texts.add(normalized_text)
+                            deduped_sidecar_texts.append(normalized_text)
+                    sidecar_text_values = tuple(deduped_sidecar_texts)
                 except Exception:
                     sidecar_bindings = ()
                     sidecar_text_values = ()
+                    sidecar_texts_by_normalized_path = {}
+                    sidecar_texts_by_basename = {}
+                _alignment_startup_step("Analyzing asset compatibility...")
                 asset_profile = analyze_replacement_asset(
                     entry,
-                    archive_entries_by_basename=dict(self.archive_entries_by_basename),
+                    archive_entries_by_basename=self.archive_entries_by_basename,
                     parsed_mesh=original_mesh_for_mapping,
                     sidecar_texture_bindings=sidecar_bindings,
                     sidecar_texts=sidecar_text_values,
@@ -16927,11 +18248,17 @@ def run_gui() -> int:
                 replacement_export_allowed["allowed"] = bool(asset_profile.export_supported)
                 replacement_export_allowed["reason"] = "\n".join(asset_profile.errors)
                 self._add_replacement_asset_profile_summary(setup_layout, asset_profile)
-                replacement_mesh_base_for_mapping = import_scene_mesh(obj_path)
+                _alignment_startup_step("Reading replacement mesh...")
+                replacement_mesh_base_for_mapping = (
+                    scene_import_result.mesh
+                    if isinstance(scene_import_result, SceneImportResult)
+                    else import_scene_mesh(obj_path)
+                )
                 replacement_mesh_for_mapping = dataclasses.replace(
                     replacement_mesh_base_for_mapping,
                     submeshes=list(replacement_mesh_base_for_mapping.submeshes),
                 )
+                _alignment_startup_step("Preparing preview meshes...")
                 original_reference_preview_model = parsed_mesh_to_preview_model(original_mesh_for_mapping)
                 replacement_preview_model = parsed_mesh_to_preview_model(replacement_mesh_for_mapping)
                 original_dialog_preview.set_model(original_reference_preview_model)
@@ -16940,16 +18267,23 @@ def run_gui() -> int:
                 static_dialog_preview.set_model(replacement_preview_model)
                 static_dialog_preview.set_use_textures(True)
                 static_dialog_preview.set_high_quality_textures(True)
+                _alignment_startup_step("Suggesting draw-section routing...")
                 suggested_mappings = suggest_static_submesh_mappings(original_mesh_for_mapping, replacement_mesh_for_mapping)
 
-                mapping_group = QGroupBox("Submesh / Material Mapping")
+                mapping_group = QGroupBox()
                 mapping_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
                 mapping_layout = QVBoxLayout(mapping_group)
+                mapping_layout.setContentsMargins(8, 6, 8, 6)
+                mapping_layout.setSpacing(5)
                 mapping_layout.setAlignment(Qt.AlignTop)
                 mapping_hint = QLabel(
-                    "Map replacement parts to original draw slots. Use commas to merge sources; leave blank to emit no replacement geometry for that slot."
+                    "<div style='font-size:12px; line-height:1.2; padding:3px 6px; border-left:3px solid #8b949e; background:#24292f;'>"
+                    "<span style='color:#d2a8ff; font-weight:700;'>Advanced routing</span>"
+                    "<span style='color:#c9d1d9;'> Split, merge, copy, or leave out replacement parts per original draw slot.</span>"
+                    "</div>"
                 )
                 mapping_hint.setWordWrap(True)
+                mapping_hint.setTextFormat(Qt.RichText)
                 mapping_hint.setObjectName("HintLabel")
                 mapping_layout.addWidget(mapping_hint)
 
@@ -16961,6 +18295,7 @@ def run_gui() -> int:
                     (42, 36, 120, 64, 120, 62, 96),
                     max_height=190,
                     stretch_columns=(2, 4, 6),
+                    persist_key="source_parts",
                 )
 
                 def _add_source_tree_item(source_index: int, source: object) -> None:
@@ -17000,7 +18335,7 @@ def run_gui() -> int:
                                 _load_selected_part_controls()
                             except NameError:
                                 pass
-                        _queue_static_preview_refresh()
+                        _queue_static_preview_rebuild()
 
                     source_enabled_checkbox.toggled.connect(_source_enabled_changed)
                     source_tree.setItemWidget(source_item, 0, source_enabled_checkbox)
@@ -17036,8 +18371,12 @@ def run_gui() -> int:
                     (36, 130, 68, 98, 92),
                     max_height=160,
                     stretch_columns=(1, 4),
+                    persist_key="original_parts",
                 )
+                _alignment_startup_step("Building original-part list...")
                 for original_index, original_part in enumerate(original_mesh_for_mapping.submeshes):
+                    if original_index and original_index % 25 == 0:
+                        _alignment_startup_step(f"Building original-part list... {original_index}")
                     label = getattr(original_part, "material", "") or getattr(original_part, "name", "") or f"target {original_index}"
                     role_hint = _mapping_role_hint(f"{getattr(original_part, 'name', '')} {getattr(original_part, 'material', '')}")
                     geometry_text = (
@@ -17056,10 +18395,14 @@ def run_gui() -> int:
 
                 original_copy_button = QPushButton("Copy Original As Source")
                 original_copy_assign_button = QPushButton("Copy + Assign To Target")
+                original_clear_selection_button = QPushButton("Clear Original")
                 original_copy_button.setToolTip("Copy the selected original reference part into Replacement sources, then select it for role, target, and transform edits.")
                 original_copy_assign_button.setToolTip(
                     "Copy the selected original reference part, add it to Replacement sources, and map it to the currently selected target row."
                 )
+                original_clear_selection_button.setToolTip("Clear only the original reference part selection and preview highlight.")
+                for original_button in (original_copy_button, original_copy_assign_button, original_clear_selection_button):
+                    original_button.setMinimumWidth(0)
 
                 def _copy_selected_original_part(*, assign_to_target: bool = False) -> None:
                     nonlocal replacement_preview_model
@@ -17101,7 +18444,7 @@ def run_gui() -> int:
                     original_item = original_items_by_index.get(original_index)
                     if original_item is not None:
                         previous = original_item.text(4)
-                    original_item.setText(4, str(new_source_index) if not previous else f"{previous}, {new_source_index}")
+                        original_item.setText(4, str(new_source_index) if not previous else f"{previous}, {new_source_index}")
                     _add_source_tree_item(new_source_index, copied_part)
                     _fit_alignment_tree_height_to_rows(source_tree, minimum=96, screen_margin=500)
                     replacement_preview_model = parsed_mesh_to_preview_model(replacement_mesh_for_mapping)
@@ -17119,23 +18462,29 @@ def run_gui() -> int:
                             edit.setText(", ".join(existing))
                     _refresh_source_assignment_columns()
                     _load_selected_part_controls()
-                    _queue_static_preview_refresh()
+                    _queue_static_preview_rebuild()
 
                 original_copy_button.clicked.connect(lambda _checked=False: _copy_selected_original_part(assign_to_target=False))
                 original_copy_assign_button.clicked.connect(lambda _checked=False: _copy_selected_original_part(assign_to_target=True))
                 original_hover_filter = _StaticTreeHoverFilter(original_tree, _refresh_original_reference_preview, hovered_original_highlight_indices)
                 original_tree.viewport().installEventFilter(original_hover_filter)
                 hover_filters.append(original_hover_filter)
-                mapping_layout.addWidget(QLabel("Original reference parts"))
+                original_parts_label = QLabel("<span style='color:#79c0ff; font-weight:700;'>Original reference parts</span>")
+                original_parts_label.setTextFormat(Qt.RichText)
+                mapping_layout.addWidget(original_parts_label)
                 _fit_alignment_tree_height_to_rows(original_tree, minimum=82, screen_margin=520)
                 mapping_layout.addWidget(original_tree, 0)
                 original_button_row = QHBoxLayout()
                 original_button_row.addWidget(original_copy_button)
                 original_button_row.addWidget(original_copy_assign_button)
+                original_button_row.addWidget(original_clear_selection_button)
                 original_button_row.addStretch(1)
                 mapping_layout.addLayout(original_button_row)
 
+                _alignment_startup_step("Building replacement-source list...")
                 for source_index, source in enumerate(replacement_mesh_for_mapping.submeshes):
+                    if source_index and source_index % 25 == 0:
+                        _alignment_startup_step(f"Building replacement-source list... {source_index}")
                     _add_source_tree_item(source_index, source)
                 source_hover_filter = _StaticTreeHoverFilter(
                     source_tree,
@@ -17145,27 +18494,35 @@ def run_gui() -> int:
                 )
                 source_tree.viewport().installEventFilter(source_hover_filter)
                 hover_filters.append(source_hover_filter)
-                mapping_layout.addWidget(QLabel("Replacement sources"))
+                replacement_sources_label = QLabel("<span style='color:#79c0ff; font-weight:700;'>Replacement sources</span>")
+                replacement_sources_label.setTextFormat(Qt.RichText)
+                mapping_layout.addWidget(replacement_sources_label)
                 _fit_alignment_tree_height_to_rows(source_tree, minimum=96, screen_margin=500)
                 mapping_layout.addWidget(source_tree, 0)
 
                 mapping_tree = QTreeWidget()
-                mapping_tree.setHeaderLabels(["Target slot", "Role", "Source index(es)", "Mapped sources", "Confidence"])
+                mapping_tree.setHeaderLabels(["Target draw slot", "Role", "Replacement parts used", "Mapped sources", "Confidence"])
                 mapping_tree.setMinimumHeight(260)
                 _configure_alignment_tree(
                     mapping_tree,
-                    (130, 64, 104, 130, 84),
+                    (150, 70, 126, 150, 92),
                     max_height=250,
                     stretch_columns=(0, 3, 4),
+                    persist_key="target_routing",
                 )
                 mappings_by_target = {mapping.target_submesh_index: mapping for mapping in suggested_mappings}
+                initial_mapping_text_by_target: Dict[int, str] = {}
+                _alignment_startup_step("Building target routing table...")
                 for row, target in enumerate(original_mesh_for_mapping.submeshes, start=1):
+                    if row > 1 and row % 25 == 0:
+                        _alignment_startup_step(f"Building target routing table... {row}")
                     target_label_text = getattr(target, "material", "") or getattr(target, "name", "") or f"target {row - 1}"
                     target_role_hint = _mapping_role_hint(f"{getattr(target, 'name', '')} {getattr(target, 'material', '')}")
                     edit = QLineEdit()
                     mapping = mappings_by_target.get(row - 1)
                     if mapping is not None:
                         edit.setText(", ".join(str(index) for index in mapping.source_submesh_indices))
+                    initial_mapping_text_by_target[row - 1] = edit.text()
                     confidence_label_text = "manual"
                     confidence_color = "#94a3b8"
                     if mapping is not None and mapping.source_submesh_indices:
@@ -17201,6 +18558,8 @@ def run_gui() -> int:
                     initial_hover_indices = tuple(mapping.source_submesh_indices if mapping is not None else ())
                     mapping_item.setData(0, Qt.UserRole, initial_hover_indices)
                     mapping_item.setData(0, Qt.UserRole + 1, row - 1)
+                    mapping_item.setData(0, Qt.UserRole + 2, confidence_label_text.lower())
+                    mapping_item.setData(0, Qt.UserRole + 3, not bool(edit.text().strip()))
                     for tooltip_column in range(5):
                         mapping_item.setToolTip(tooltip_column, target_details)
                     mapping_item.setForeground(4, QBrush(QColor(confidence_color)))
@@ -17235,16 +18594,49 @@ def run_gui() -> int:
                                 pass
                         hover_filter.source_indices = set(updated_indices)
                         item.setData(0, Qt.UserRole, tuple(updated_indices))
+                        item.setData(0, Qt.UserRole + 3, not bool(updated_indices))
                         _refresh_source_assignment_columns()
                         _update_mapping_status()
-                        _queue_static_preview_refresh()
+                        _apply_target_slot_filters()
+                        try:
+                            _refresh_source_material_plan()
+                        except NameError:
+                            pass
+                        _queue_static_preview_rebuild()
 
                     edit.textChanged.connect(_update_selected_source_label)
-                    edit.setPlaceholderText("blank, 0, or 0, 1")
+                    edit.setPlaceholderText("empty, 0, or 0, 1")
                     edit.setToolTip(_source_index_help_text())
                     mapping_tree.setItemWidget(mapping_item, 2, edit)
                     mapping_edits.append((row - 1, edit))
                     mapping_edits_by_target[row - 1] = edit
+                low_confidence_filter_checkbox = QCheckBox("Show low confidence only")
+                empty_targets_filter_checkbox = QCheckBox("Show empty targets only")
+
+                def _apply_target_slot_filters() -> None:
+                    show_low_only = bool(low_confidence_filter_checkbox.isChecked())
+                    show_empty_only = bool(empty_targets_filter_checkbox.isChecked())
+                    for item_index in range(mapping_tree.topLevelItemCount()):
+                        item = mapping_tree.topLevelItem(item_index)
+                        confidence_text = str(item.data(0, Qt.UserRole + 2) or "")
+                        is_empty = bool(item.data(0, Qt.UserRole + 3))
+                        is_low = "low" in confidence_text or "empty" in confidence_text or "manual" in confidence_text
+                        item.setHidden(bool((show_low_only and not is_low) or (show_empty_only and not is_empty)))
+
+                def _clear_all_mapping_guesses() -> None:
+                    for _target_index, edit in mapping_edits:
+                        edit.setText("")
+
+                def _apply_best_mapping_guesses() -> None:
+                    for target_index, edit in mapping_edits:
+                        edit.setText(initial_mapping_text_by_target.get(target_index, ""))
+
+                def _preview_selected_target_slot() -> None:
+                    item = mapping_tree.currentItem()
+                    if item is not None:
+                        _target_selection_changed(item, None)
+                    _queue_static_preview_refresh()
+
                 QTimer.singleShot(
                     0,
                     lambda: (
@@ -17256,13 +18648,39 @@ def run_gui() -> int:
                 mapping_hover_filter = _StaticTreeHoverFilter(mapping_tree, _queue_static_preview_refresh)
                 mapping_tree.viewport().installEventFilter(mapping_hover_filter)
                 hover_filters.append(mapping_hover_filter)
-                mapping_layout.addWidget(QLabel("Original draw/material mapping"))
-                mapping_explain_label = QLabel(
-                    "Each target row is an original draw/material slot. The Source indexes field contains the Replacement sources row number(s) that will be written into that target."
+                target_slots_label = QLabel(
+                    "<div style='font-size:12px; line-height:1.2; padding:3px 6px; border-left:3px solid #79c0ff; background:#10233a;'>"
+                    "<span style='color:#79c0ff; font-weight:700;'>Target draw slots</span>"
+                    "<span style='color:#8b949e;'> Original draw/material containers. Use source indexes to replace, merge, or empty; low confidence rows need review.</span>"
+                    "</div>"
                 )
-                mapping_explain_label.setWordWrap(True)
-                mapping_explain_label.setObjectName("HintLabel")
-                mapping_layout.addWidget(mapping_explain_label)
+                target_slots_label.setWordWrap(True)
+                target_slots_label.setTextFormat(Qt.RichText)
+                mapping_layout.addWidget(target_slots_label)
+                mapping_filter_row = QHBoxLayout()
+                mapping_filter_row.addWidget(low_confidence_filter_checkbox)
+                mapping_filter_row.addWidget(empty_targets_filter_checkbox)
+                mapping_filter_row.addStretch(1)
+                mapping_layout.addLayout(mapping_filter_row)
+                clear_all_guesses_button = QPushButton("Clear all guesses")
+                apply_best_guesses_button = QPushButton("Apply best guesses")
+                preview_target_button = QPushButton("Preview selected target")
+                clear_all_guesses_button.setToolTip("Empty every target slot so you can rebuild the mapping manually.")
+                apply_best_guesses_button.setToolTip("Restore the app's original best-guess target-slot mapping.")
+                preview_target_button.setToolTip("Highlight the currently selected target slot in the preview.")
+                for mapping_action_button in (clear_all_guesses_button, apply_best_guesses_button, preview_target_button):
+                    mapping_action_button.setMinimumWidth(0)
+                mapping_action_row = QHBoxLayout()
+                mapping_action_row.addWidget(clear_all_guesses_button)
+                mapping_action_row.addWidget(apply_best_guesses_button)
+                mapping_action_row.addWidget(preview_target_button)
+                mapping_action_row.addStretch(1)
+                mapping_layout.addLayout(mapping_action_row)
+                low_confidence_filter_checkbox.toggled.connect(_apply_target_slot_filters)
+                empty_targets_filter_checkbox.toggled.connect(_apply_target_slot_filters)
+                clear_all_guesses_button.clicked.connect(_clear_all_mapping_guesses)
+                apply_best_guesses_button.clicked.connect(_apply_best_mapping_guesses)
+                preview_target_button.clicked.connect(_preview_selected_target_slot)
                 _fit_alignment_tree_height_to_rows(mapping_tree, minimum=120, screen_margin=460)
                 mapping_layout.addWidget(mapping_tree, 0)
 
@@ -17275,17 +18693,25 @@ def run_gui() -> int:
                 merge_source_button = QPushButton("Add To Target")
                 remove_source_button = QPushButton("Remove From Target")
                 clear_target_button = QPushButton("Empty Target")
-                clear_selection_button = QPushButton("Clear Selection")
+                clear_replacement_selection_button = QPushButton("Clear Replacement")
+                clear_all_selection_button = QPushButton("Clear All")
                 assign_source_button.setToolTip("Set the selected target row to exactly the selected replacement source index.")
                 merge_source_button.setToolTip("Append the selected replacement source index to the selected target row.")
                 remove_source_button.setToolTip("Remove the selected replacement source index from the selected target row.")
                 clear_target_button.setToolTip("Leave the selected target slot empty in the replacement output.")
-                clear_selection_button.setToolTip("Clear source and target selection/highlighting without changing mappings.")
+                clear_replacement_selection_button.setToolTip("Clear only the replacement source selection and preview highlight without changing mappings.")
+                clear_all_selection_button.setToolTip("Clear original, replacement, and target row selections/highlighting without changing mappings.")
                 for helper_button in (assign_source_button, merge_source_button, remove_source_button, clear_target_button):
+                    helper_button.setMinimumWidth(0)
                     mapping_buttons.addWidget(helper_button)
-                mapping_buttons.addWidget(clear_selection_button)
                 mapping_buttons.addStretch(1)
                 mapping_layout.addLayout(mapping_buttons)
+                mapping_selection_buttons = QHBoxLayout()
+                for helper_button in (clear_replacement_selection_button, clear_all_selection_button):
+                    helper_button.setMinimumWidth(0)
+                    mapping_selection_buttons.addWidget(helper_button)
+                mapping_selection_buttons.addStretch(1)
+                mapping_layout.addLayout(mapping_selection_buttons)
 
                 def _selected_source_index() -> int:
                     item = source_tree.currentItem()
@@ -17324,6 +18750,34 @@ def run_gui() -> int:
                             parsed.append(value)
                     return parsed
 
+                def _mapped_target_vertex_count(source_indices: Sequence[int]) -> int:
+                    if replacement_mesh_for_mapping is None:
+                        return 0
+                    total = 0
+                    for source_index in source_indices:
+                        if source_index < 0 or source_index >= len(replacement_mesh_for_mapping.submeshes):
+                            continue
+                        source = replacement_mesh_for_mapping.submeshes[source_index]
+                        if _is_marker_source(source):
+                            continue
+                        adjustment = source_part_adjustments.get(source_index, StaticSourcePartAdjustment(source_index))
+                        if not bool(adjustment.enabled):
+                            continue
+                        total += len(getattr(source, "vertices", ()) or ())
+                    return total
+
+                def _mapping_vertex_limit_issues(mappings: Sequence[StaticSubmeshMapping]) -> List[str]:
+                    issues: List[str] = []
+                    for mapping in mappings:
+                        vertex_count = _mapped_target_vertex_count(mapping.source_submesh_indices)
+                        if vertex_count <= static_replacement_vertex_limit:
+                            continue
+                        issues.append(
+                            f"{_target_display_name(mapping.target_submesh_index)} receives {vertex_count:,} vertices "
+                            f"(limit {static_replacement_vertex_limit:,})."
+                        )
+                    return issues
+
                 def _update_mapping_status() -> None:
                     source_index = _selected_source_index()
                     target_index = _selected_target_index()
@@ -17333,9 +18787,15 @@ def run_gui() -> int:
                     edit = mapping_edits_by_target.get(target_index)
                     if edit is not None:
                         summary, ok = _selected_source_summary(edit.text())
-                        target_sources = f" Current target sources: {summary}" if ok else f" Current target has an error: {summary}"
+                        target_sources = f" | Current: {summary.replace('Selected: ', '')}" if ok else f" | Error: {summary}"
+                        vertex_count = _mapped_target_vertex_count(_parse_mapping_edit(edit))
+                        if vertex_count > static_replacement_vertex_limit:
+                            target_sources += (
+                                f" | Limit: {vertex_count:,}/{static_replacement_vertex_limit:,} vertices. "
+                                "Split, decimate, or map fewer sources into this target before continuing."
+                            )
                     mapping_status_label.setText(
-                        f"Selected source: {source_text}. Selected target: {target_text}.{target_sources}"
+                        f"Source: {source_text} | Target: {target_text}{target_sources}"
                     )
                     has_source = source_index >= 0
                     has_target = target_index >= 0
@@ -17351,7 +18811,7 @@ def run_gui() -> int:
                     edit.setText(", ".join(str(index) for index in source_indices))
                     _refresh_source_assignment_columns()
                     _update_mapping_status()
-                    _queue_static_preview_refresh()
+                    _queue_static_preview_rebuild()
 
                 def _assign_selected_source_to_target() -> None:
                     source_index = _selected_source_index()
@@ -17384,11 +18844,22 @@ def run_gui() -> int:
                     if target_index >= 0:
                         _set_mapping_indices(target_index, [])
 
-                def _clear_mapping_selection() -> None:
-                    source_tree.clearSelection()
-                    mapping_tree.clearSelection()
+                def _clear_tree_current_item(tree: QTreeWidget) -> None:
+                    tree.clearSelection()
+                    tree.setCurrentIndex(QModelIndex())
+
+                def _clear_original_selection() -> None:
+                    _clear_tree_current_item(original_tree)
+                    selected_original_part["index"] = -1
+                    selected_original_highlight_indices.clear()
+                    hovered_original_highlight_indices.clear()
+                    _sync_highlight_sets()
+                    _refresh_original_reference_preview()
+                    _queue_static_preview_refresh()
+
+                def _clear_replacement_selection() -> None:
+                    _clear_tree_current_item(source_tree)
                     selected_source_part["index"] = -1
-                    selected_target_slot["index"] = -1
                     selected_source_highlight_indices.clear()
                     hovered_source_highlight_indices.clear()
                     source_tree_hover_direct_indices.clear()
@@ -17397,14 +18868,30 @@ def run_gui() -> int:
                     _update_mapping_status()
                     _queue_static_preview_refresh()
 
+                def _clear_target_selection() -> None:
+                    _clear_tree_current_item(mapping_tree)
+                    selected_target_slot["index"] = -1
+                    _load_selected_part_controls()
+                    _update_mapping_status()
+
+                def _clear_all_part_selections() -> None:
+                    _clear_original_selection()
+                    _clear_replacement_selection()
+                    _clear_target_selection()
+
                 assign_source_button.clicked.connect(_assign_selected_source_to_target)
                 merge_source_button.clicked.connect(_merge_selected_source_into_target)
                 remove_source_button.clicked.connect(_remove_selected_source_from_target)
                 clear_target_button.clicked.connect(_clear_selected_target)
-                clear_selection_button.clicked.connect(_clear_mapping_selection)
+                original_clear_selection_button.clicked.connect(_clear_original_selection)
+                clear_replacement_selection_button.clicked.connect(_clear_replacement_selection)
+                clear_all_selection_button.clicked.connect(_clear_all_part_selections)
 
                 part_inspector = QGroupBox("Selected Replacement Source")
                 part_layout = QGridLayout(part_inspector)
+                part_layout.setContentsMargins(8, 6, 8, 6)
+                part_layout.setHorizontalSpacing(6)
+                part_layout.setVerticalSpacing(3)
                 part_name_label = QLabel("Select a replacement source part.")
                 part_name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
                 part_target_label = QLabel("-")
@@ -17421,24 +18908,30 @@ def run_gui() -> int:
                     for target_index, _target in enumerate(original_mesh_for_mapping.submeshes):
                         part_target_combo.addItem(_target_display_name(target_index), target_index)
                 part_target_combo.setToolTip("Choose the original draw/material target that this selected source should feed.")
-                part_replace_target_button = QPushButton("Replace Target With This")
-                part_add_target_button = QPushButton("Add This To Target")
-                part_remove_target_button = QPushButton("Remove This From Target")
-                part_replace_target_button.setToolTip("Set the chosen target's Source index(es) to only this selected source.")
+                part_replace_target_button = QPushButton("Replace Target")
+                part_add_target_button = QPushButton("Add To Target")
+                part_remove_target_button = QPushButton("Remove")
+                part_replace_target_button.setToolTip("Set the chosen target's replacement parts to only this selected source.")
                 part_add_target_button.setToolTip("Add this selected source to the chosen target without removing any existing source indexes.")
-                part_remove_target_button.setToolTip("Remove this selected source from the chosen target's Source index(es).")
+                part_remove_target_button.setToolTip("Remove this selected source from the chosen target's replacement parts.")
                 part_layout.addWidget(part_name_label, 0, 0, 1, 4)
                 part_layout.addWidget(part_target_label, 1, 0, 1, 4)
-                part_layout.addWidget(part_enabled_checkbox, 2, 0, 1, 4)
-                part_layout.addWidget(QLabel("Role"), 3, 0)
-                part_layout.addWidget(part_role_combo, 3, 1, 1, 3)
-                part_layout.addWidget(QLabel("Map to"), 4, 0)
-                part_layout.addWidget(part_target_combo, 4, 1, 1, 3)
+                part_top_row = QHBoxLayout()
+                part_top_row.setContentsMargins(0, 0, 0, 0)
+                part_top_row.setSpacing(6)
+                part_top_row.addWidget(part_enabled_checkbox)
+                part_top_row.addWidget(QLabel("Role"))
+                part_top_row.addWidget(part_role_combo, 1)
+                part_top_row.addWidget(QLabel("Map to"))
+                part_top_row.addWidget(part_target_combo, 1)
+                part_layout.addLayout(part_top_row, 2, 0, 1, 4)
                 part_map_button_row = QHBoxLayout()
+                part_map_button_row.setContentsMargins(0, 0, 0, 0)
+                part_map_button_row.setSpacing(4)
                 part_map_button_row.addWidget(part_replace_target_button)
                 part_map_button_row.addWidget(part_add_target_button)
                 part_map_button_row.addWidget(part_remove_target_button)
-                part_layout.addLayout(part_map_button_row, 5, 0, 1, 4)
+                part_layout.addLayout(part_map_button_row, 3, 0, 1, 4)
 
                 def _part_spin(value: float, minimum: float, maximum: float, decimals: int, step: float, suffix: str = "") -> QDoubleSpinBox:
                     spin = QDoubleSpinBox()
@@ -17472,20 +18965,23 @@ def run_gui() -> int:
                     part_scale_z_spin,
                     part_uniform_spin,
                 )
-                part_layout.addWidget(QLabel("Translate"), 6, 0)
-                part_layout.addWidget(part_offset_x_spin, 6, 1)
-                part_layout.addWidget(part_offset_y_spin, 6, 2)
-                part_layout.addWidget(part_offset_z_spin, 6, 3)
-                part_layout.addWidget(QLabel("Rotate"), 7, 0)
-                part_layout.addWidget(part_rotate_x_spin, 7, 1)
-                part_layout.addWidget(part_rotate_y_spin, 7, 2)
-                part_layout.addWidget(part_rotate_z_spin, 7, 3)
-                part_layout.addWidget(QLabel("Scale"), 8, 0)
-                part_layout.addWidget(part_scale_x_spin, 8, 1)
-                part_layout.addWidget(part_scale_y_spin, 8, 2)
-                part_layout.addWidget(part_scale_z_spin, 8, 3)
-                part_layout.addWidget(QLabel("Uniform"), 9, 0)
-                part_layout.addWidget(part_uniform_spin, 9, 1)
+                for part_spin in part_controls:
+                    part_spin.setMinimumWidth(0)
+                    part_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                part_layout.addWidget(QLabel("Translate"), 4, 0)
+                part_layout.addWidget(part_offset_x_spin, 4, 1)
+                part_layout.addWidget(part_offset_y_spin, 4, 2)
+                part_layout.addWidget(part_offset_z_spin, 4, 3)
+                part_layout.addWidget(QLabel("Rotate"), 5, 0)
+                part_layout.addWidget(part_rotate_x_spin, 5, 1)
+                part_layout.addWidget(part_rotate_y_spin, 5, 2)
+                part_layout.addWidget(part_rotate_z_spin, 5, 3)
+                part_layout.addWidget(QLabel("Scale"), 6, 0)
+                part_layout.addWidget(part_scale_x_spin, 6, 1)
+                part_layout.addWidget(part_scale_y_spin, 6, 2)
+                part_layout.addWidget(part_scale_z_spin, 6, 3)
+                part_layout.addWidget(QLabel("Uniform"), 7, 0)
+                part_layout.addWidget(part_uniform_spin, 7, 1)
                 reset_part_button = QPushButton("Reset Part")
                 fit_part_button = QPushButton("Fit Size")
                 fit_part_button.setToolTip("Match selected part size to the selected target slot. Use Translate for exact placement.")
@@ -17493,7 +18989,7 @@ def run_gui() -> int:
                 part_button_row.addWidget(reset_part_button)
                 part_button_row.addWidget(fit_part_button)
                 part_button_row.addStretch(1)
-                part_layout.addLayout(part_button_row, 10, 0, 1, 4)
+                part_layout.addLayout(part_button_row, 8, 0, 1, 4)
                 part_inspector_loading = {"active": False}
 
                 def _load_selected_part_controls() -> None:
@@ -17619,7 +19115,7 @@ def run_gui() -> int:
                             checkbox.setChecked(bool(adjustment.enabled))
                             checkbox.blockSignals(False)
                     _refresh_source_assignment_columns()
-                    _queue_static_preview_refresh()
+                    _queue_static_preview_rebuild()
 
                 def _set_selected_source_role() -> None:
                     if part_inspector_loading["active"]:
@@ -17633,7 +19129,7 @@ def run_gui() -> int:
                     else:
                         source_role_overrides.pop(source_index, None)
                     _refresh_source_assignment_columns()
-                    _queue_static_preview_refresh()
+                    _queue_static_preview_rebuild()
 
                 def _selected_part_target_index() -> int:
                     try:
@@ -17697,7 +19193,7 @@ def run_gui() -> int:
                             checkbox.blockSignals(False)
                     _load_selected_part_controls()
                     _refresh_source_assignment_columns()
-                    _queue_static_preview_refresh()
+                    _queue_static_preview_rebuild()
 
                 def _part_bbox(vertices: Sequence[tuple[float, float, float]]) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
                     if not vertices:
@@ -17732,7 +19228,7 @@ def run_gui() -> int:
                     adjustment.uniform_scale = max(0.001, min(100.0, min(ratios)))
                     adjustment.scale_xyz = (1.0, 1.0, 1.0)
                     _load_selected_part_controls()
-                    _queue_static_preview_refresh()
+                    _queue_static_preview_rebuild()
 
                 for part_spin in part_controls:
                     part_spin.valueChanged.connect(_update_selected_part_adjustment)
@@ -17790,11 +19286,54 @@ def run_gui() -> int:
                 _load_selected_part_controls()
                 _update_mapping_status()
                 mapping_layout.addWidget(part_inspector)
-                parts_layout.addWidget(mapping_group, 0)
+
+                geometry_overview_group = QGroupBox("Replacement Geometry")
+                geometry_overview_layout = QVBoxLayout(geometry_overview_group)
+                geometry_overview_layout.setAlignment(Qt.AlignTop)
+                geometry_overview_layout.setContentsMargins(9, 8, 9, 8)
+                geometry_overview_layout.setSpacing(6)
+                source_count = sum(
+                    1
+                    for source in getattr(replacement_mesh_for_mapping, "submeshes", ()) or ()
+                    if not _is_marker_source(source)
+                )
+                active_target_count = sum(
+                    1
+                    for _target_index, edit in mapping_edits
+                    if _parse_mapping_edit(edit)
+                )
+                empty_target_count = max(0, len(mapping_edits) - active_target_count)
+                geometry_summary = QLabel(
+                    "<div style='line-height:1.25; padding:4px 7px; border-left:3px solid #2f81f7; background:#10233a;'>"
+                    "<span style='color:#79c0ff; font-weight:700;'>Replacement parts</span>"
+                    f"<span style='color:#f0f6fc;'> {source_count:,}</span>"
+                    "<span style='color:#8b949e;'> | </span>"
+                    "<span style='color:#7ee787; font-weight:700;'>Active targets</span>"
+                    f"<span style='color:#f0f6fc;'> {active_target_count:,}</span>"
+                    "<span style='color:#8b949e;'> | </span>"
+                    "<span style='color:#f2cc60; font-weight:700;'>Empty targets</span>"
+                    f"<span style='color:#f0f6fc;'> {empty_target_count:,}</span>"
+                    "</div>"
+                )
+                geometry_summary.setWordWrap(True)
+                geometry_summary.setTextFormat(Qt.RichText)
+                geometry_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                geometry_overview_layout.addWidget(geometry_summary)
+                geometry_hint = QLabel(
+                    "<span style='color:#8b949e;'>Use preview + Transform for placement. Advanced routing controls original PAC draw-slot assignment.</span>"
+                )
+                geometry_hint.setWordWrap(True)
+                geometry_hint.setTextFormat(Qt.RichText)
+                geometry_hint.setObjectName("HintLabel")
+                geometry_overview_layout.addWidget(geometry_hint)
+                parts_layout.addWidget(geometry_overview_group, 0)
+                advanced_mapping_section = CollapsibleSection("Advanced: Original Draw Section Routing", expanded=False)
+                advanced_mapping_section.body_layout.addWidget(mapping_group)
+                parts_layout.addWidget(advanced_mapping_section, 0)
 
                 texture_files_for_mapping: List[Path] = []
                 seen_texture_file_keys: set[str] = set()
-                for source_path in tuple(supplemental_files or ()) + tuple(discover_scene_texture_files(obj_path, replacement_mesh_for_mapping)):
+                for source_path in tuple(supplemental_files or ()):
                     resolved_source = source_path.expanduser().resolve()
                     if not resolved_source.is_file() or resolved_source.suffix.lower() not in SCENE_TEXTURE_SOURCE_EXTENSIONS:
                         continue
@@ -17818,6 +19357,7 @@ def run_gui() -> int:
                         "helmet",
                         "hilt",
                         "plate",
+                        "spike",
                         "trim",
                     }
 
@@ -17849,6 +19389,22 @@ def run_gui() -> int:
                     target_texture_path: str = "",
                 ) -> str:
                     parameter_classification = classify_texture_binding(parameter_name, target_texture_path)
+                    parameter_subtype = str(getattr(parameter_classification, "semantic_subtype", "") or "").strip().lower()
+                    if parameter_subtype == "emissive":
+                        best_emissive_path = ""
+                        best_emissive_score = 0.0
+                        target_tokens = _semantic_tokens(target_name)
+                        for texture_file in texture_files_for_mapping:
+                            file_classification = classify_texture_binding("", texture_file.name)
+                            file_subtype = str(getattr(file_classification, "semantic_subtype", "") or "").strip().lower()
+                            file_tokens = _semantic_tokens(texture_file.stem)
+                            if file_subtype != "emissive" and not ({"emi", "emissive", "glow", "illum"} & file_tokens):
+                                continue
+                            score = 40.0 + float(len(target_tokens & file_tokens) * 8)
+                            if score > best_emissive_score:
+                                best_emissive_score = score
+                                best_emissive_path = str(texture_file)
+                        return best_emissive_path
                     source_material_tokens: set[str] = set()
                     candidates: List[Path] = []
                     for source_index in source_indices:
@@ -17864,7 +19420,15 @@ def run_gui() -> int:
                         if isinstance(source_path, Path):
                             candidates.append(source_path)
                     if len(candidates) == 1 and slot_kind in {"base", "normal", "height"}:
-                        return str(candidates[0])
+                        target_important = _important_tokens(target_name)
+                        candidate_important = _important_tokens(candidates[0].stem)
+                        if (
+                            len(tuple(source_indices or ())) == 1
+                            or not target_important
+                            or not candidate_important
+                            or bool(target_important & candidate_important)
+                        ):
+                            return str(candidates[0])
                     best_direct_path = ""
                     best_direct_score = 0.0
                     parameter_compact = re.sub(r"[^a-z0-9]+", "", str(parameter_name or "").lower())
@@ -17905,17 +19469,30 @@ def run_gui() -> int:
                     }
                     for texture_file in texture_files_for_mapping:
                         file_tokens = _semantic_tokens(texture_file.stem)
+                        file_important = _important_tokens(texture_file.stem)
                         file_compact = re.sub(r"[^a-z0-9]+", "", texture_file.stem.lower())
                         file_classification = classify_texture_binding("", texture_file.name)
+                        if slot_kind in {"base", "normal", "height"} and file_classification.slot_kind != slot_kind:
+                            continue
+                        standalone_pbr = slot_kind == "material" and _looks_like_standalone_pbr_source(texture_file)
                         score = 0.0
-                        if file_classification.slot_kind == slot_kind:
+                        if file_classification.slot_kind == slot_kind and not standalone_pbr:
                             score += 30.0
                         if file_classification.semantic_subtype == parameter_classification.semantic_subtype:
                             score += 18.0
+                        if standalone_pbr:
+                            score -= 35.0
                         if source_material_tokens and file_tokens:
-                            score += float(len(source_material_tokens & file_tokens) * 12)
+                            score += float(len(source_material_tokens & file_tokens) * 4)
+                        target_important = _important_tokens(target_name)
+                        if target_important and file_important:
+                            important_overlap = target_important & file_important
+                            if important_overlap:
+                                score += float(len(important_overlap) * 28)
+                            else:
+                                score -= 18.0
                         if target_tokens and file_tokens:
-                            score += float(len(target_tokens & file_tokens) * 6)
+                            score += float(len(target_tokens & file_tokens) * 8)
                         for term in desired_terms:
                             if term in file_compact:
                                 score += 10.0
@@ -18143,6 +19720,7 @@ def run_gui() -> int:
                             flip_target_axis=bool(flip_direction_checkbox.isChecked()),
                         ),
                         _current_source_part_adjustments(),
+                        max_source_faces_per_submesh=_alignment_preview_source_face_limit(),
                     )
                     disabled_source_indices = {
                         int(adjustment.source_submesh_index)
@@ -18279,6 +19857,7 @@ def run_gui() -> int:
                                             source_part_adjustments=_current_source_part_adjustments(),
                                             original_part_copies=list(original_part_copies),
                                         ),
+                                        max_source_faces_per_submesh=_alignment_preview_source_face_limit(),
                                     )
                                     source_model = _preview_model_in_original_frame(preview_mesh)
                                     mapped_preview = True
@@ -18293,7 +19872,18 @@ def run_gui() -> int:
                                 source_model = replacement_preview_model
                     else:
                         source_model = replacement_preview_model
-                    preview_model = _clone_preview_model(source_model)
+                    final_result_for_main = final_output_preview_state.get("result")
+                    use_final_output_model = (
+                        isinstance(final_result_for_main, FinalPackagePreviewResult)
+                        and bool(_current_alignment_preview_render_settings().alignment_use_final_output_preview)
+                        and not bool(final_output_preview_state.get("dirty"))
+                        and not bool(final_output_preview_state.get("building"))
+                    )
+                    if use_final_output_model:
+                        preview_model = _clone_preview_model(final_result_for_main.preview_model)
+                        mapped_preview = True
+                    else:
+                        preview_model = _clone_preview_model(source_model)
                     if highlighted_source_indices:
                         highlighted_target_indices: set[int] = set()
                         if mapped_preview:
@@ -18337,15 +19927,97 @@ def run_gui() -> int:
                         except Exception:
                             return str(source)
 
-                    if not use_direct_source_preview:
+                    def _texture_set_for_mapping(mapping: StaticSubmeshMapping) -> Optional[object]:
+                        if not texture_sets:
+                            return None
+                        if replacement_mesh_for_mapping is not None:
+                            matched_sets: "OrderedDict[str, object]" = OrderedDict()
+                            for source_index in tuple(mapping.source_submesh_indices or ()):
+                                if source_index < 0 or source_index >= len(replacement_mesh_for_mapping.submeshes):
+                                    continue
+                                source = replacement_mesh_for_mapping.submeshes[source_index]
+                                source_key = str(getattr(source, "material", "") or getattr(source, "name", "") or "").strip().lower()
+                                if source_key in texture_sets:
+                                    matched_sets.setdefault(source_key, texture_sets[source_key])
+                            if len(matched_sets) == 1:
+                                return next(iter(matched_sets.values()))
+                            if len(matched_sets) > 1:
+                                return None
+                        if len(texture_sets) == 1:
+                            return next(iter(texture_sets.values()))
+                        return None
+
+                    def _apply_source_material_preview(mesh: object, texture_set: object, target_name: str) -> None:
+                        slots = getattr(texture_set, "slots", {}) or {}
+                        base_slot = slots.get("base")
+                        if base_slot is not None:
+                            source_path = getattr(base_slot, "source_path", None)
+                            if isinstance(source_path, Path):
+                                mesh.preview_texture_path = _source_preview_path(str(source_path))
+                                mesh.texture_name = source_path.name
+                                mesh.preview_texture_flip_vertical = False
+                        normal_slot = slots.get("normal")
+                        if normal_slot is not None:
+                            source_path = getattr(normal_slot, "source_path", None)
+                            if isinstance(source_path, Path):
+                                mesh.preview_normal_texture_path = _source_preview_path(str(source_path))
+                                mesh.preview_normal_texture_name = source_path.name
+                                mesh.preview_normal_texture_strength = _infer_model_preview_normal_strength(
+                                    normal_texture_path=source_path.name,
+                                    material_name=target_name,
+                                    semantic_hint="normal",
+                                    prefer_stronger=True,
+                                )
+                        height_slot = slots.get("height")
+                        if height_slot is not None:
+                            source_path = getattr(height_slot, "source_path", None)
+                            if isinstance(source_path, Path):
+                                mesh.preview_height_texture_path = _source_preview_path(str(source_path))
+                                mesh.preview_height_texture_name = source_path.name
+                        material_slot = slots.get("material")
+                        if material_slot is not None:
+                            source_path = getattr(material_slot, "source_path", None)
+                            if isinstance(source_path, Path):
+                                semantic_type, semantic_subtype, _confidence, packed_channels = _resolve_model_texture_semantic_details(source_path)
+                                mesh.preview_material_texture_path = _source_preview_path(str(source_path))
+                                mesh.preview_material_texture_name = source_path.name
+                                mesh.preview_material_texture_type = semantic_type
+                                mesh.preview_material_texture_subtype = semantic_subtype
+                                mesh.preview_material_texture_packed_channels = tuple(packed_channels)
+
+                    if texture_sets and not use_direct_source_preview and not use_final_output_model:
+                        for mapping in current_mappings:
+                            texture_set = _texture_set_for_mapping(mapping)
+                            if texture_set is None:
+                                continue
+                            target_mesh_indices = _preview_target_mesh_indices(
+                                preview_model,
+                                mapping.target_submesh_name,
+                                mapping.source_submesh_indices,
+                                mapped_preview=mapped_preview,
+                                current_mappings=current_mappings,
+                            )
+                            for mesh_index in target_mesh_indices:
+                                if mesh_index < 0 or mesh_index >= len(preview_model.meshes):
+                                    continue
+                                _apply_source_material_preview(
+                                    preview_model.meshes[mesh_index],
+                                    texture_set,
+                                    mapping.target_submesh_name,
+                                )
+
+                    if not use_direct_source_preview and not use_final_output_model:
                         if texture_overrides_dirty["dirty"]:
                             updated_specs: List[tuple[str, str, str, str, Tuple[int, ...], str]] = []
-                            for checkbox, combo, _target_path, slot_kind, target_name, source_indices, visualized in texture_override_rows:
-                                source_path = str(combo.currentData() or "").strip()
-                                if not source_path:
+                            for texture_row in texture_override_rows:
+                                source_path = str(texture_row.get("source_path", "") or "").strip()
+                                if not source_path or not bool(texture_row.get("checked")):
                                     continue
-                                if not visualized:
+                                if not bool(texture_row.get("visualized")):
                                     continue
+                                target_name = str(texture_row.get("target_name", "") or "")
+                                slot_kind = str(texture_row.get("slot_kind", "") or "")
+                                source_indices = tuple(texture_row.get("source_indices", ()) or ())
                                 current_source_indices = _source_indices_for_target_name(target_name) or tuple(source_indices)
                                 updated_specs.append(
                                     (
@@ -18456,23 +20128,1593 @@ def run_gui() -> int:
                 try:
                     texconv_text = self.texconv_path_edit.text().strip()
                     if texconv_text and original_reference_preview_model is not None:
+                        texconv_path = Path(texconv_text).expanduser()
+                        normalized_visible_texture_mode = _normalize_model_visible_texture_mode(
+                            str(preview_render_settings.visible_texture_mode)
+                        )
+                        if normalized_visible_texture_mode == "mesh_base_first":
+                            _attach_model_texture_preview_paths(
+                                texconv_path,
+                                entry,
+                                original_reference_preview_model,
+                                texture_entries_by_normalized_path=dict(self.archive_entries_by_normalized_path),
+                                texture_entries_by_basename=dict(self.archive_entries_by_basename),
+                                sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                                sidecar_texts_by_basename=sidecar_texts_by_basename,
+                            )
                         _attach_model_sidecar_texture_preview_paths(
-                            Path(texconv_text).expanduser(),
+                            texconv_path,
                             entry,
                             original_reference_preview_model,
                             parsed_mesh=original_mesh_for_mapping,
                             sidecar_texture_bindings=sidecar_bindings,
-                            visible_texture_mode=str(preview_render_settings.visible_texture_mode),
+                            visible_texture_mode=normalized_visible_texture_mode,
                             texture_entries_by_normalized_path=dict(self.archive_entries_by_normalized_path),
                             texture_entries_by_basename=dict(self.archive_entries_by_basename),
+                            sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                            sidecar_texts_by_basename=sidecar_texts_by_basename,
                         )
+                        if normalized_visible_texture_mode != "mesh_base_first":
+                            _attach_model_texture_preview_paths(
+                                texconv_path,
+                                entry,
+                                original_reference_preview_model,
+                                texture_entries_by_normalized_path=dict(self.archive_entries_by_normalized_path),
+                                texture_entries_by_basename=dict(self.archive_entries_by_basename),
+                                sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                                sidecar_texts_by_basename=sidecar_texts_by_basename,
+                            )
+                        if sidecar_bindings and normalized_visible_texture_mode == "mesh_base_first":
+                            _attach_model_sidecar_texture_preview_paths(
+                                texconv_path,
+                                entry,
+                                original_reference_preview_model,
+                                parsed_mesh=original_mesh_for_mapping,
+                                sidecar_texture_bindings=sidecar_bindings,
+                                visible_texture_mode="layer_aware_visible",
+                                texture_entries_by_normalized_path=dict(self.archive_entries_by_normalized_path),
+                                texture_entries_by_basename=dict(self.archive_entries_by_basename),
+                                sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                                sidecar_texts_by_basename=sidecar_texts_by_basename,
+                                fallback_only=True,
+                            )
+                            _attach_model_texture_preview_paths(
+                                texconv_path,
+                                entry,
+                                original_reference_preview_model,
+                                texture_entries_by_normalized_path=dict(self.archive_entries_by_normalized_path),
+                                texture_entries_by_basename=dict(self.archive_entries_by_basename),
+                                sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                                sidecar_texts_by_basename=sidecar_texts_by_basename,
+                                override_existing_base=True,
+                                prefer_material_name_for_base=True,
+                            )
+                        _attach_model_support_texture_preview_paths(
+                            texconv_path,
+                            entry,
+                            original_reference_preview_model,
+                            parsed_mesh=original_mesh_for_mapping,
+                            sidecar_texture_bindings=sidecar_bindings,
+                            texture_entries_by_normalized_path=dict(self.archive_entries_by_normalized_path),
+                            texture_entries_by_basename=dict(self.archive_entries_by_basename),
+                            sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                            sidecar_texts_by_basename=sidecar_texts_by_basename,
+                        )
+                        self._attach_archive_model_preview_images(original_reference_preview_model)
                         original_dialog_preview.set_model(original_reference_preview_model)
                         original_dialog_preview.set_use_textures(True)
                         original_dialog_preview.set_high_quality_textures(True)
                 except Exception:
                     pass
 
-                if sidecar_bindings:
+                texture_sets = group_replacement_texture_sets(texture_files_for_mapping, obj_mesh=replacement_mesh_for_mapping)
+
+                def _source_material_slot_label(slot_kind: str) -> str:
+                    return {
+                        "base": "Base / Albedo",
+                        "normal": "Normal",
+                        "metallic": "Metallic (pack into mask)",
+                        "roughness": "Roughness (pack into mask)",
+                        "ao": "AO (pack into mask)",
+                        "height": "Height",
+                        "material": "Packed material",
+                    }.get(str(slot_kind or "").strip().lower(), str(slot_kind or "Texture").title())
+
+                def _source_material_slot_sort_key(slot_kind: str) -> int:
+                    return {
+                        "base": 0,
+                        "normal": 1,
+                        "metallic": 2,
+                        "roughness": 3,
+                        "ao": 4,
+                        "height": 5,
+                        "material": 6,
+                    }.get(str(slot_kind or "").strip().lower(), 99)
+
+                def _source_material_part_summary(material_name: str) -> str:
+                    material_key = str(material_name or "").strip().lower()
+                    matched_parts: List[str] = []
+                    all_parts: List[str] = []
+                    for source_index, source in enumerate(getattr(replacement_mesh_for_mapping, "submeshes", ()) or ()):
+                        if _is_marker_source(source):
+                            continue
+                        label = str(getattr(source, "material", "") or getattr(source, "name", "") or f"source {source_index}").strip()
+                        display_label = f"{source_index}: {label}"
+                        all_parts.append(display_label)
+                        source_key = str(getattr(source, "material", "") or getattr(source, "name", "") or "").strip().lower()
+                        if material_key and (source_key == material_key or material_key in source_key or source_key in material_key):
+                            matched_parts.append(display_label)
+                    if matched_parts:
+                        shown = ", ".join(matched_parts[:4])
+                        return shown + (", ..." if len(matched_parts) > 4 else "")
+                    if len(texture_sets) == 1 and all_parts:
+                        shown = ", ".join(all_parts[:4])
+                        return shown + (", ..." if len(all_parts) > 4 else "")
+                    return "No matching imported part"
+
+                def _source_material_output_path(source_path: Path) -> str:
+                    source_stem = re.sub(r"[^a-z0-9_]+", "_", source_path.stem.lower()).strip("_") or "texture"
+                    target_stem = re.sub(
+                        r"[^a-z0-9_]+",
+                        "_",
+                        PurePosixPath(str(entry.path or "").replace("\\", "/")).stem.lower(),
+                    ).strip("_") or "static_replacement"
+                    return f"character/texture/{target_stem}_{source_stem}.dds"
+
+                def _source_material_slot_auto_bound(slot_kind: str) -> bool:
+                    return str(slot_kind or "").strip().lower() in {"base", "normal", "height", "material"}
+
+                def _looks_like_standalone_pbr_source(texture_file: Path) -> bool:
+                    stem_tokens = _semantic_tokens(texture_file.stem)
+                    compact = re.sub(r"[^a-z0-9]+", "", texture_file.stem.lower())
+                    if {"orm", "rma", "mra", "arm", "material", "mask"} & stem_tokens:
+                        return False
+                    if compact.endswith(
+                        (
+                            "ma",
+                            "mg",
+                            "sp",
+                            "orm",
+                            "rma",
+                            "mra",
+                            "arm",
+                            "metallicroughness",
+                            "metalrough",
+                            "metallicrough",
+                            "roughnessmetallic",
+                            "roughmetal",
+                        )
+                    ):
+                        return False
+                    return bool(stem_tokens & {"metallic", "metalness", "roughness", "smoothness", "gloss", "ao", "occlusion"})
+
+                def _source_material_names_for_mapping(mapping: StaticSubmeshMapping) -> List[str]:
+                    material_names: "OrderedDict[str, str]" = OrderedDict()
+                    if replacement_mesh_for_mapping is None:
+                        return []
+                    for source_index in tuple(mapping.source_submesh_indices or ()):
+                        if source_index < 0 or source_index >= len(replacement_mesh_for_mapping.submeshes):
+                            continue
+                        source = replacement_mesh_for_mapping.submeshes[source_index]
+                        source_key = str(
+                            getattr(source, "material", "") or getattr(source, "name", "") or ""
+                        ).strip().lower()
+                        texture_set = texture_sets.get(source_key)
+                        if texture_set is None:
+                            continue
+                        material_name = str(getattr(texture_set, "material_name", "") or source_key).strip()
+                        if material_name:
+                            material_names.setdefault(material_name.lower(), material_name)
+                    return list(material_names.values())
+
+                def _material_routing_conflict_messages(mappings: Sequence[StaticSubmeshMapping]) -> List[str]:
+                    messages: List[str] = []
+                    for mapping in mappings:
+                        material_names = _source_material_names_for_mapping(mapping)
+                        if len(material_names) <= 1:
+                            continue
+                        target_name = str(mapping.target_submesh_name or "target").strip()
+                        messages.append(
+                            f"{target_name} receives multiple replacement materials ({', '.join(material_names)}). "
+                            "One game draw/material slot can bind one source material set; split the routing or atlas/bake textures to preserve both."
+                        )
+                    return messages
+
+                material_plan_group = QGroupBox("Replacement Texture Plan")
+                material_plan_layout = QVBoxLayout(material_plan_group)
+                material_plan_layout.setAlignment(Qt.AlignTop)
+                material_plan_layout.setContentsMargins(8, 6, 8, 6)
+                material_plan_layout.setSpacing(5)
+                material_plan_summary = QLabel()
+                material_plan_summary.setWordWrap(True)
+                material_plan_summary.setTextFormat(Qt.RichText)
+                material_plan_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                material_plan_layout.addWidget(material_plan_summary)
+                material_plan_tree = QTreeWidget()
+                material_plan_tree.setHeaderLabels(["Part", "Role", "Source", "Final Path", "Status", "What It Controls"])
+                material_plan_tree.setMinimumHeight(120)
+                material_plan_tree.setMinimumWidth(1120)
+                _configure_alignment_tree(
+                    material_plan_tree,
+                    (210, 150, 210, 230, 112, 330),
+                    max_height=300,
+                    stretch_columns=(0, 3, 5),
+                    persist_key="replacement_texture_plan",
+                )
+                material_plan_layout.addWidget(material_plan_tree)
+
+                def _texture_plan_status_color(status_label: str) -> str:
+                    if status_label == TEXTURE_PLAN_STATUS_READY:
+                        return "#3fb950"
+                    if status_label == TEXTURE_PLAN_STATUS_REVIEW:
+                        return "#d29922"
+                    if status_label == TEXTURE_PLAN_STATUS_SUPPORT_ONLY:
+                        return "#fb923c"
+                    if status_label == TEXTURE_PLAN_STATUS_LIKELY_GREY:
+                        return "#f85149"
+                    if status_label == TEXTURE_PLAN_STATUS_IGNORED_ADVANCED:
+                        return "#8b949e"
+                    return "#8b949e"
+
+                def _material_plan_summary_block(
+                    *,
+                    detected_sets: int,
+                    detected_slots: int,
+                    conflicts: Sequence[str],
+                    empty: bool = False,
+                ) -> str:
+                    if empty:
+                        return (
+                            "<div style='font-size:12px; line-height:1.22; padding:4px 7px; border-left:3px solid #d29922; background:#2b2416;'>"
+                            "<span style='color:#f2cc60; font-weight:700;'>No replacement textures</span>"
+                            "<span style='color:#c9d1d9;'> Add named Base/Normal/Height/Material maps to enable source-driven DDS output.</span>"
+                            "</div>"
+                        )
+                    rows = [
+                        (
+                            "Detected",
+                            f"{detected_sets:,} material set(s), {detected_slots:,} map(s)",
+                            "#79c0ff",
+                        ),
+                        (
+                            "Base/Color",
+                            "drives visible color; missing base/color is the grey-in-game risk.",
+                            "#7ee787",
+                        ),
+                        (
+                            "Normal/Height/Mask",
+                            "support shading only; they do not replace missing visible color.",
+                            "#ffa657",
+                        ),
+                    ]
+                    if conflicts:
+                        conflict_text = " ".join(conflicts[:2])
+                        if len(conflicts) > 2:
+                            conflict_text += f" (+{len(conflicts) - 2} more)"
+                        rows.append(
+                            (
+                                "Routing warning",
+                                conflict_text,
+                                "#f2cc60",
+                            )
+                        )
+                    row_html = "".join(
+                        "<tr>"
+                        f"<td style='color:{color}; font-weight:700; padding:1px 12px 1px 0; white-space:nowrap;'>{escape(label)}</td>"
+                        f"<td style='color:#f0f6fc; padding:1px 0; word-break:break-word;'>{escape(value)}</td>"
+                        "</tr>"
+                        for label, value, color in rows
+                    )
+                    return (
+                        "<div style='font-size:12px; line-height:1.22; padding:4px 7px; border-left:3px solid #2f81f7; background:#10233a;'>"
+                        "<table cellspacing='0' cellpadding='0' style='width:100%;'>"
+                        f"{row_html}"
+                        "</table>"
+                        "</div>"
+                    )
+
+                def _refresh_source_material_plan() -> None:
+                    nonlocal texture_sets
+                    _alignment_startup_step("Detecting replacement material maps...")
+                    texture_sets = group_replacement_texture_sets(texture_files_for_mapping, obj_mesh=replacement_mesh_for_mapping)
+                    material_plan_tree.clear()
+                    detected_slot_count = sum(
+                        len(getattr(texture_set, "slots", {}) or {})
+                        for texture_set in texture_sets.values()
+                    )
+                    if not texture_sets:
+                        material_plan_summary.setText(_material_plan_summary_block(detected_sets=0, detected_slots=0, conflicts=(), empty=True))
+                        material_plan_tree.setVisible(False)
+                        return
+                    conflict_messages = _material_routing_conflict_messages(_current_dialog_mappings_for_preview())
+                    material_plan_summary.setText(
+                        _material_plan_summary_block(
+                            detected_sets=len(texture_sets),
+                            detected_slots=detected_slot_count,
+                            conflicts=conflict_messages,
+                        )
+                    )
+                    material_plan_tree.setVisible(True)
+                    plan_rows = build_replacement_texture_plan_rows(
+                        texture_sets,
+                        final_path_for_source=_source_material_output_path,
+                        part_summary_for_material=_source_material_part_summary,
+                    )
+                    for row_index, plan_row in enumerate(plan_rows):
+                        if row_index and row_index % 24 == 0:
+                            _alignment_startup_step(f"Building texture plan... {row_index}")
+                        status_label = str(getattr(getattr(plan_row, "status", None), "label", "") or "")
+                        status_color = _texture_plan_status_color(status_label)
+                        item = QTreeWidgetItem(
+                            [
+                                plan_row.part_label or plan_row.part_material,
+                                plan_row.role,
+                                plan_row.source,
+                                plan_row.final_path,
+                                status_label,
+                                plan_row.controls,
+                            ]
+                        )
+                        for column in range(6):
+                            if column == 0:
+                                item.setToolTip(column, plan_row.full_part_material or plan_row.part_material)
+                            else:
+                                item.setToolTip(column, plan_row.controls if column in {1, 4, 5} else item.text(column))
+                        item.setForeground(4, QBrush(QColor(status_color)))
+                        item.setBackground(4, QBrush(QColor(status_color)))
+                        item.setForeground(
+                            4,
+                            QBrush(QColor("#0d1117" if status_label in {TEXTURE_PLAN_STATUS_READY, TEXTURE_PLAN_STATUS_REVIEW, TEXTURE_PLAN_STATUS_SUPPORT_ONLY} else "#ffffff")),
+                        )
+                        material_plan_tree.addTopLevelItem(item)
+                    _fit_alignment_tree_height_to_rows(material_plan_tree, minimum=100, screen_margin=500)
+
+                _refresh_source_material_plan()
+                textures_layout.addWidget(material_plan_group, 0)
+
+                sidecar_bindings_for_advanced = tuple(sidecar_bindings or ())
+                estimated_advanced_texture_work = (
+                    len(sidecar_bindings_for_advanced)
+                    * max(1, len(tuple(suggested_mappings or ())))
+                    * max(1, len(texture_files_for_mapping))
+                )
+                if sidecar_bindings_for_advanced and estimated_advanced_texture_work > 250_000:
+                    skipped_texture_group = QGroupBox("Advanced Original DDS Slot Overrides")
+                    skipped_texture_layout = QVBoxLayout(skipped_texture_group)
+                    skipped_texture_label = QLabel(
+                        "Skipped building the advanced original-DDS override table while opening the dialog because this asset/texture set is large. "
+                        "The default replacement material plan above is still active; add only the specific textures you need or use packed material maps to keep startup responsive."
+                    )
+                    skipped_texture_label.setWordWrap(True)
+                    skipped_texture_label.setObjectName("HintLabel")
+                    skipped_texture_layout.addWidget(skipped_texture_label)
+                    textures_layout.addWidget(skipped_texture_group, 0)
+                    sidecar_bindings_for_advanced = ()
+
+                if sidecar_bindings_for_advanced:
+                    texture_group = QWidget()
+                    texture_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                    texture_layout = QVBoxLayout(texture_group)
+                    texture_layout.setAlignment(Qt.AlignTop)
+                    texture_hint = QLabel(
+                        "Advanced compatibility view. These rows come from the original material sidecar and are not the default replacement workflow. Use them only when you intentionally need to override a specific original DDS slot."
+                    )
+                    texture_hint.setWordWrap(True)
+                    texture_hint.setTextFormat(Qt.RichText)
+                    texture_hint.setText(
+                        "<div style='line-height:1.35; padding:6px 8px; border-left:3px solid #8b949e; background:#24292f;'>"
+                        "<span style='color:#d2a8ff; font-weight:700;'>Compatibility/manual repair.</span>"
+                        "<span style='color:#c9d1d9;'> These rows come from the original material sidecar and are not the default replacement workflow. </span>"
+                        "<span style='color:#f2cc60;'>Use only when overriding a specific original DDS slot.</span>"
+                        "</div>"
+                    )
+                    texture_hint.setObjectName("HintLabel")
+                    texture_layout.addWidget(texture_hint)
+                    if not texture_files_for_mapping:
+                        no_sources_hint = QLabel(
+                            "Texture slots were found in the asset sidecars, but no replacement texture files were supplied."
+                        )
+                        no_sources_hint.setWordWrap(True)
+                        no_sources_hint.setObjectName("HintLabel")
+                        texture_layout.addWidget(no_sources_hint)
+
+                    texture_action_row = QHBoxLayout()
+                    apply_suggested_button = QPushButton("Apply Suggested...")
+                    clear_target_textures_button = QPushButton("Clear Target")
+                    keep_original_target_button = QPushButton("Keep Original")
+                    assign_matching_source_button = QPushButton("Assign Matching Role...")
+                    add_textures_button = QPushButton("Add textures...")
+                    add_texture_folder_button = QPushButton("Add texture folder...")
+                    apply_suggested_button.setToolTip(
+                        "Preview and apply high-confidence suggested overrides for the selected part. A confirmation explains what will change."
+                    )
+                    clear_target_textures_button.setToolTip("Disable replacement texture assignments for the selected target.")
+                    keep_original_target_button.setToolTip("Keep the original DDS bindings for this target.")
+                    assign_matching_source_button.setToolTip(
+                        "Preview and apply replacement textures whose detected role matches compatible original DDS slots for the selected part."
+                    )
+                    add_textures_button.setToolTip("Add PNG/DDS texture sources that were not included when the dialog opened.")
+                    add_texture_folder_button.setToolTip("Add a folder of PNG/DDS texture sources and rescan suggestions.")
+                    for texture_button in (
+                        apply_suggested_button,
+                        clear_target_textures_button,
+                        keep_original_target_button,
+                    ):
+                        texture_button.setMinimumWidth(0)
+                        texture_action_row.addWidget(texture_button)
+                    texture_action_row.addStretch(1)
+                    texture_layout.addLayout(texture_action_row)
+                    texture_action_row_2 = QHBoxLayout()
+                    for texture_button in (
+                        assign_matching_source_button,
+                        add_textures_button,
+                        add_texture_folder_button,
+                    ):
+                        texture_button.setMinimumWidth(0)
+                        texture_action_row_2.addWidget(texture_button)
+                    texture_action_row_2.addStretch(1)
+                    texture_layout.addLayout(texture_action_row_2)
+
+                    texture_filter_selected_checkbox = QCheckBox("Show only active mapped parts")
+                    texture_filter_selected_checkbox.setChecked(True)
+                    texture_filter_selected_checkbox.setToolTip("When a replacement source is selected, show only targets fed by that source.")
+                    texture_show_advanced_checkbox = QCheckBox("Show ambiguous/advanced slots")
+                    texture_show_advanced_checkbox.setToolTip("Show shared layers, blend/detail masks, shader-only rows, and low-confidence suggestions.")
+                    texture_filter_row = QHBoxLayout()
+                    texture_filter_row.addWidget(texture_filter_selected_checkbox)
+                    texture_filter_row.addWidget(texture_show_advanced_checkbox)
+                    texture_filter_row.addStretch(1)
+                    texture_layout.addLayout(texture_filter_row)
+
+                    texture_rows_by_target: Dict[str, List[Dict[str, Any]]] = {}
+                    texture_target_source_indices: Dict[str, Tuple[int, ...]] = {}
+                    seen_texture_rows: set[tuple[str, str, str, str]] = set()
+                    _alignment_startup_step("Preparing advanced DDS override rows...")
+                    advanced_binding_scan_count = 0
+                    for mapping_index, mapping in enumerate(list(suggested_mappings or [])):
+                        if mapping_index and mapping_index % 8 == 0:
+                            _alignment_startup_step(f"Preparing advanced DDS override rows... {mapping_index}")
+                        target_rows = texture_rows_by_target.setdefault(mapping.target_submesh_name, [])
+                        texture_target_source_indices[mapping.target_submesh_name] = tuple(mapping.source_submesh_indices)
+                        for binding in sidecar_bindings_for_advanced:
+                            advanced_binding_scan_count += 1
+                            if advanced_binding_scan_count % 150 == 0:
+                                _alignment_startup_step(f"Scanning DDS override candidates... {advanced_binding_scan_count}")
+                            target_path = str(getattr(binding, "texture_path", "") or "").replace("\\", "/").strip()
+                            if not target_path.lower().endswith(".dds"):
+                                continue
+                            if not _binding_matches_target(binding, mapping.target_submesh_name):
+                                continue
+                            parameter_name = str(getattr(binding, "parameter_name", "") or "").strip()
+                            texture_classification = classify_texture_binding(parameter_name, target_path)
+                            slot_kind = texture_classification.slot_kind
+                            row_key = (
+                                mapping.target_submesh_name.lower(),
+                                parameter_name.lower(),
+                                target_path.lower(),
+                                slot_kind,
+                            )
+                            if row_key in seen_texture_rows:
+                                continue
+                            seen_texture_rows.add(row_key)
+                            binding_part_name = str(getattr(binding, "part_name", "") or getattr(binding, "submesh_name", "") or "").strip()
+                            binding_shader_family = str(getattr(binding, "shader_family", "") or "").strip()
+                            binding_sidecar_kind = str(getattr(binding, "sidecar_kind", "") or "").strip()
+                            binding_linked_mesh = str(getattr(binding, "linked_mesh_path", "") or "").strip()
+                            suggested_source = (
+                                ""
+                                if is_shared_material_layer_texture(target_path)
+                                else _best_source_for_slot(
+                                    mapping.target_submesh_name,
+                                    mapping.source_submesh_indices,
+                                    slot_kind,
+                                    texture_sets,
+                                    parameter_name=parameter_name,
+                                    target_texture_path=target_path,
+                                )
+                            )
+                            row_state: Dict[str, Any] = {
+                                "target_name": mapping.target_submesh_name,
+                                "source_indices": tuple(mapping.source_submesh_indices),
+                                "target_path": target_path,
+                                "slot_kind": slot_kind,
+                                "original_slot_kind": slot_kind,
+                                "role_label": texture_classification.slot_label or slot_kind.title(),
+                                "original_role_label": texture_classification.slot_label or slot_kind.title(),
+                                "parameter_name": parameter_name,
+                                "part_display": binding_part_name or mapping.target_submesh_name,
+                                "shader_family": binding_shader_family,
+                                "sidecar_kind": binding_sidecar_kind,
+                                "linked_mesh": binding_linked_mesh,
+                                "classification": texture_classification,
+                                "visualized": bool(texture_classification.visualized),
+                                "suggested_source": suggested_source,
+                                "source_path": "",
+                                "checked": False,
+                                "advanced": True,
+                                "state_label": "Needs review",
+                                "confidence": "manual",
+                            }
+                            target_rows.append(row_state)
+                            texture_override_rows.append(row_state)
+
+                    def _texture_role_label_for_slot(slot_kind: str) -> str:
+                        return {
+                            "base": "Base / Color",
+                            "normal": "Normal",
+                            "height": "Height / Displacement",
+                            "material": "Material / Mask",
+                        }.get(str(slot_kind or "").strip().lower(), str(slot_kind or "Texture").title())
+
+                    def _texture_row_is_shared(row_state: Dict[str, Any]) -> bool:
+                        return is_shared_material_layer_texture(str(row_state.get("target_path", "") or ""))
+
+                    def _texture_row_can_auto_apply(row_state: Dict[str, Any], guidance: object) -> bool:
+                        if not str(row_state.get("suggested_source", "") or "").strip():
+                            return False
+                        if _texture_row_is_shared(row_state):
+                            return False
+                        slot_kind = str(row_state.get("slot_kind", "") or "").strip().lower()
+                        classification = row_state.get("classification")
+                        if bool(getattr(guidance, "checked_by_default", False)):
+                            return True
+                        if slot_kind in {"base", "normal", "height"} and bool(getattr(classification, "visualized", False)):
+                            return True
+                        if slot_kind == "material":
+                            subtype = str(getattr(classification, "semantic_subtype", "") or "").strip().lower()
+                            return subtype in {
+                                "material_mask",
+                                "material_response",
+                                "packed_mask",
+                                "orm",
+                                "rma",
+                                "mra",
+                                "arm",
+                                "roughness",
+                                "metallic",
+                                "ao",
+                                "specular",
+                                "subsurface",
+                            }
+                        return False
+
+                    def _texture_row_can_apply_suggested_for_target(row_state: Dict[str, Any], guidance: object) -> bool:
+                        if _texture_row_can_auto_apply(row_state, guidance):
+                            return True
+                        state_label = str(getattr(guidance, "state_label", "") or "").strip().lower()
+                        if "repeated" not in state_label:
+                            return False
+                        if not str(row_state.get("suggested_source", "") or "").strip():
+                            return False
+                        if _texture_row_is_shared(row_state):
+                            return False
+                        classification = row_state.get("classification")
+                        slot_kind = str(row_state.get("slot_kind", "") or "").strip().lower()
+                        subtype = str(getattr(classification, "semantic_subtype", "") or "").strip().lower()
+                        if subtype in {
+                            "color_blending_mask",
+                            "detail_mask",
+                            "emissive",
+                            "rgb_layer",
+                            "skin_detail_mask",
+                            "opacity_mask",
+                            "flow_vector",
+                            "direction_vector",
+                        }:
+                            return False
+                        return bool(getattr(classification, "visualized", False)) and slot_kind in {"base", "normal", "height"}
+
+                    suggested_counts: Dict[str, int] = {}
+                    _alignment_startup_step("Classifying advanced DDS overrides...")
+                    for row_index, row_state in enumerate(texture_override_rows):
+                        if row_index and row_index % 120 == 0:
+                            _alignment_startup_step(f"Classifying advanced DDS overrides... {row_index}")
+                        suggested_source_key = str(row_state.get("suggested_source", "") or "").strip().lower()
+                        if suggested_source_key:
+                            suggested_counts[suggested_source_key] = suggested_counts.get(suggested_source_key, 0) + 1
+                    for row_index, row_state in enumerate(texture_override_rows):
+                        if row_index and row_index % 120 == 0:
+                            _alignment_startup_step(f"Preparing advanced DDS guidance... {row_index}")
+                        suggested_source = str(row_state.get("suggested_source", "") or "").strip()
+                        guidance = classify_texture_assignment_guidance(
+                            str(row_state.get("parameter_name", "") or ""),
+                            str(row_state.get("target_path", "") or ""),
+                            suggested_source=suggested_source,
+                            repeated_suggestion_count=suggested_counts.get(suggested_source.lower(), 1) if suggested_source else 1,
+                        )
+                        row_state["guidance"] = guidance
+                        row_state["checked"] = False
+                        row_state["source_path"] = ""
+                        row_state["advanced"] = bool(guidance.advanced)
+                        row_state["state_label"] = str(guidance.state_label or "")
+                        row_state["confidence"] = str(guidance.confidence or "manual")
+                        if _texture_row_is_shared(row_state):
+                            row_state["suggested_source"] = ""
+                            row_state["advanced"] = True
+                            row_state["state_label"] = "Original shared layer"
+                            row_state["confidence"] = "manual"
+
+                    def _texture_source_label(source_path: str) -> str:
+                        source_text = str(source_path or "").strip()
+                        return Path(source_text).name if source_text else "Keep original"
+
+                    def _texture_status_text(row_state: Dict[str, Any]) -> str:
+                        if bool(row_state.get("checked")) and str(row_state.get("source_path", "") or "").strip():
+                            return f"Assigned ({str(row_state.get('confidence', 'manual')).title()})"
+                        return str(row_state.get("state_label", "") or "Keep original")
+
+                    def _texture_status_color(row_state: Dict[str, Any]) -> str:
+                        if bool(row_state.get("checked")) and str(row_state.get("source_path", "") or "").strip():
+                            return "#3fb950"
+                        state = str(row_state.get("state_label", "") or "").lower()
+                        if "source" in state or "review" in state or "repeated" in state or "shared" in state:
+                            return "#d29922"
+                        if bool(row_state.get("advanced")):
+                            return "#a371f7"
+                        return "#8b949e"
+
+                    def _diagnostics_for_target_html(target_name: str, selected_row: Optional[Dict[str, Any]] = None) -> str:
+                        rows = texture_rows_by_target.get(target_name, [])
+                        if not rows:
+                            return (
+                                "<html><body style='color:#8b949e; background:#1f1f1f; font-family:Segoe UI, sans-serif; font-size:11px;'>"
+                                "<p style='margin:8px;'>No sidecar texture rows were found for this target.</p>"
+                                "</body></html>"
+                            )
+
+                        def _path_html(path_text: object) -> str:
+                            text = str(path_text or "").strip()
+                            if not text:
+                                return "<span style='color:#8b949e;'>none</span>"
+                            return f"<span style='color:#a5d6ff; word-break:break-all;'>{escape(text)}</span>"
+
+                        def _role_color(row_state: Dict[str, Any]) -> str:
+                            slot_kind = str(row_state.get("slot_kind", "") or row_state.get("original_slot_kind", "") or "").strip().lower()
+                            return {
+                                "base": "#3fb950",
+                                "normal": "#58a6ff",
+                                "height": "#fb923c",
+                                "material": "#a371f7",
+                            }.get(slot_kind, "#8b949e")
+
+                        def _chip(label: object, background: str, *, foreground: str = "#0d1117") -> str:
+                            text = str(label or "").strip() or "Unknown"
+                            return (
+                                "<td style='padding:3px 8px; border-radius:3px; font-weight:700; "
+                                f"background:{background}; color:{foreground}; white-space:nowrap;'>{escape(text)}</td>"
+                            )
+
+                        def _kv_row(label: str, value_html: str) -> str:
+                            return (
+                                "<tr>"
+                                f"<td width='132' style='padding:3px 10px 3px 0; color:#8b949e; vertical-align:top; white-space:nowrap;'>{escape(label)}</td>"
+                                f"<td style='padding:3px 0; color:#e6edf3; vertical-align:top;'>{value_html}</td>"
+                                "</tr>"
+                            )
+
+                        selected_table_row = build_dds_override_table_row(selected_row) if selected_row is not None else None
+                        full_target = str(target_name or "Original DDS target")
+                        short_target = simplified_part_label(full_target)
+                        assigned_count = int(selected_row.get("_assigned_count", 0)) if selected_row is not None else sum(
+                            1
+                            for row_state in rows
+                            if bool(row_state.get("checked")) and str(row_state.get("source_path", "") or "").strip()
+                        )
+                        target_row_count = int(selected_row.get("_target_row_count", len(rows))) if selected_row is not None else len(rows)
+                        warnings: List[str] = []
+                        for row_state in rows:
+                            table_row = build_dds_override_table_row(row_state)
+                            role = table_row.role
+                            classification = row_state.get("classification")
+                            semantic_type = str(getattr(classification, "semantic_type", "") or "").lower()
+                            semantic_subtype = str(getattr(classification, "semantic_subtype", "") or "").lower()
+                            target_path = str(row_state.get("target_path", "") or "")
+                            if str(row_state.get("slot_kind", "") or "").strip().lower() == "base" and not bool(row_state.get("checked")):
+                                warnings.append(f"{role}: no replacement base/color is assigned. This will likely be grey if this slot is the visible color authority.")
+                            if semantic_type in {"mask", "roughness", "vector"} or "mask" in semantic_subtype:
+                                warnings.append(f"{role}: material/mask data can affect shine, metal, roughness, AO, blend, or surface response.")
+                            if not bool(getattr(classification, "visualized", False)):
+                                warnings.append(f"{role}: advanced shader slot; keep original unless you are intentionally repairing this binding.")
+                            if is_shared_material_layer_texture(target_path):
+                                warnings.append(f"{role}: shared/detail layer is intentionally not auto-enabled.")
+
+                        html_parts: List[str] = [
+                            "<html><body style='color:#e6edf3; background:#1f1f1f; font-family:Segoe UI, sans-serif; font-size:11px; margin:0;'>",
+                            "<div style='padding:9px 10px; line-height:1.35;'>",
+                            "<table width='100%' cellspacing='0' cellpadding='0' style='background:#161b22; border:1px solid #30363d;'>",
+                            "<tr><td style='padding:8px 10px;'>",
+                            f"<div style='font-size:15px; font-weight:700; color:#f0f6fc;'>{escape(short_target)} "
+                            f"<span style='color:#8b949e;'>- {assigned_count}/{target_row_count} slot(s) assigned</span></div>",
+                            f"<div style='color:#8b949e; margin-top:2px;'>Full target: {escape(full_target)}</div>",
+                            "</td></tr></table>",
+                        ]
+                        if selected_row is not None and selected_table_row is not None:
+                            status_label = selected_table_row.status.label
+                            status_color = _texture_plan_status_color(status_label)
+                            status_foreground = "#ffffff" if status_label in {TEXTURE_PLAN_STATUS_LIKELY_GREY, TEXTURE_PLAN_STATUS_IGNORED_ADVANCED} else "#0d1117"
+                            source_path = str(selected_row.get("source_path", "") or "").strip()
+                            source_color = "#238636" if source_path else "#30363d"
+                            source_foreground = "#ffffff" if source_path else "#f0f6fc"
+                            classification = selected_row.get("classification")
+                            guidance = selected_row.get("guidance")
+                            html_parts.extend(
+                                [
+                                    "<div style='height:8px;'></div>",
+                                    "<table width='100%' cellspacing='0' cellpadding='0' style='background:#10233a; border:1px solid #388bfd;'>",
+                                    "<tr><td style='padding:8px 10px;'>",
+                                    "<table cellspacing='0' cellpadding='0'><tr>",
+                                    _chip(selected_table_row.role, _role_color(selected_row)),
+                                    "<td width='6'></td>",
+                                    _chip(status_label, status_color, foreground=status_foreground),
+                                    "<td width='6'></td>",
+                                    _chip("Assigned source" if source_path else "Keep original", source_color, foreground=source_foreground),
+                                    "</tr></table>",
+                                    "<table width='100%' cellspacing='0' cellpadding='0' style='margin-top:7px;'>",
+                                    _kv_row("Parameter", escape(str(selected_row.get("parameter_name") or "(unnamed parameter)"))),
+                                    _kv_row("Original DDS", _path_html(selected_row.get("target_path"))),
+                                    _kv_row("Override source", _path_html(source_path) if source_path else "<span style='color:#c9d1d9;'>Keep original</span>"),
+                                    _kv_row("Final behavior", escape(selected_table_row.status.detail or _texture_status_text(selected_row))),
+                                    _kv_row("Controls", escape(selected_table_row.controls)),
+                                    _kv_row("Shader", escape(str(selected_row.get("shader_family") or "unknown"))),
+                                    _kv_row(
+                                        "Classification",
+                                        f"{escape(str(getattr(classification, 'semantic_type', '') or 'unknown'))} / "
+                                        f"{escape(str(getattr(classification, 'semantic_subtype', '') or 'generic'))}",
+                                    ),
+                                    _kv_row("Confidence", escape(str(selected_row.get("confidence") or "manual"))),
+                                    _kv_row("Reason", escape(str(getattr(guidance, "reason", "") or getattr(classification, "reason", "") or ""))),
+                                    "</table></td></tr></table>",
+                                ]
+                            )
+                        html_parts.extend(
+                            [
+                                "<div style='height:10px;'></div>",
+                                "<div style='font-weight:700; color:#f0f6fc; margin-bottom:5px;'>Original sidecar bindings</div>",
+                                "<table width='100%' cellspacing='0' cellpadding='4' style='border:1px solid #30363d; background:#161b22;'>",
+                                "<tr style='color:#8b949e; background:#24292f;'>"
+                                "<th align='left'>Role</th><th align='left'>Parameter</th><th align='left'>DDS</th><th align='left'>State</th></tr>",
+                            ]
+                        )
+                        for row_index, row_state in enumerate(rows):
+                            table_row = build_dds_override_table_row(row_state)
+                            status_label = table_row.status.label
+                            row_bg = "#161b22" if row_index % 2 == 0 else "#1c2128"
+                            state_text = "Assigned" if bool(row_state.get("checked")) and str(row_state.get("source_path", "") or "").strip() else "Keep original"
+                            html_parts.append(
+                                f"<tr style='background:{row_bg};'>"
+                                f"<td style='color:{_role_color(row_state)}; font-weight:700; white-space:nowrap;'>{escape(table_row.role)}</td>"
+                                f"<td style='color:#f2cc60;'>{escape(str(row_state.get('parameter_name') or '(unnamed parameter)'))}</td>"
+                                f"<td>{_path_html(row_state.get('target_path'))}</td>"
+                                f"<td style='color:{_texture_plan_status_color(status_label)}; white-space:nowrap;'>{escape(state_text)}</td>"
+                                "</tr>"
+                            )
+                        html_parts.append("</table>")
+                        if warnings:
+                            html_parts.extend(
+                                [
+                                    "<div style='height:10px;'></div>",
+                                    "<div style='font-weight:700; color:#f0f6fc; margin-bottom:5px;'>Warnings</div>",
+                                    "<table width='100%' cellspacing='0' cellpadding='6' style='border:1px solid #3d2f12; background:#2b2416;'>",
+                                ]
+                            )
+                            for warning in sorted(set(warnings)):
+                                html_parts.append(
+                                    "<tr><td width='8' style='background:#d29922;'></td>"
+                                    f"<td style='color:#f2cc60;'>{escape(warning)}</td></tr>"
+                                )
+                            html_parts.append("</table>")
+                        html_parts.append("</div></body></html>")
+                        return "".join(html_parts)
+
+                    if not texture_override_rows:
+                        texture_layout.addWidget(
+                            QLabel("No editable texture slots were found for the currently suggested replacement mapping.")
+                        )
+                    else:
+                        texture_workflow = QWidget()
+                        texture_workflow_layout = QVBoxLayout(texture_workflow)
+                        texture_workflow_layout.setContentsMargins(0, 0, 0, 0)
+                        texture_workflow_layout.setSpacing(8)
+                        texture_summary_label = QLabel()
+                        texture_summary_label.setWordWrap(True)
+                        texture_summary_label.setTextFormat(Qt.RichText)
+                        texture_summary_label.setObjectName("HintLabel")
+                        texture_workflow_layout.addWidget(texture_summary_label)
+                        texture_busy_bar = QProgressBar()
+                        texture_busy_bar.setRange(0, 0)
+                        texture_busy_bar.setTextVisible(True)
+                        texture_busy_bar.setFormat("Updating advanced DDS overrides...")
+                        texture_busy_bar.setVisible(False)
+                        texture_workflow_layout.addWidget(texture_busy_bar)
+                        texture_override_tree = QTreeWidget()
+                        texture_override_tree.setHeaderLabels(
+                            [
+                                "Part",
+                                "Role",
+                                "Original Slot",
+                                "Override Source",
+                                "Target DDS",
+                                "Status",
+                                "What It Controls",
+                            ]
+                        )
+                        texture_override_tree.setMinimumHeight(160)
+                        texture_override_tree.setMinimumSize(QSize(1260, 160))
+                        _configure_alignment_tree(
+                            texture_override_tree,
+                            (170, 150, 360, 230, 260, 140, 360),
+                            max_height=0,
+                            stretch_columns=(2, 4, 6),
+                            persist_key="advanced_dds_overrides_v2",
+                        )
+                        selected_texture_editor = QWidget()
+                        selected_texture_editor_layout = QHBoxLayout(selected_texture_editor)
+                        selected_texture_editor_layout.setContentsMargins(0, 0, 0, 0)
+                        selected_texture_editor_layout.setSpacing(8)
+                        selected_texture_editor_label = QLabel("Selected row")
+                        selected_texture_editor_label.setObjectName("HintLabel")
+                        selected_role_combo = QComboBox()
+                        selected_role_combo.setMinimumWidth(150)
+                        selected_role_combo.setToolTip("Manual repair role for the selected original DDS slot.")
+                        for role_kind in ("base", "normal", "height", "material"):
+                            selected_role_combo.addItem(_texture_role_label_for_slot(role_kind), role_kind)
+                        selected_source_combo = QComboBox()
+                        selected_source_combo.setMinimumWidth(240)
+                        selected_source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                        selected_source_combo.setToolTip("Replacement source for the selected original DDS slot. Keep original disables this manual override.")
+                        selected_apply_suggestion_button = QPushButton("Use Suggested")
+                        selected_apply_suggestion_button.setMinimumWidth(0)
+                        selected_apply_suggestion_button.setMaximumWidth(118)
+                        selected_apply_suggestion_button.setEnabled(False)
+                        selected_apply_suggestion_button.setToolTip("Apply the suggested source texture to the selected original DDS slot.")
+                        selected_texture_editor_layout.addWidget(selected_texture_editor_label)
+                        selected_texture_editor_layout.addWidget(QLabel("Role"))
+                        selected_texture_editor_layout.addWidget(selected_role_combo)
+                        selected_texture_editor_layout.addWidget(QLabel("Override source"))
+                        selected_texture_editor_layout.addWidget(selected_source_combo, 1)
+                        selected_texture_editor_layout.addWidget(selected_apply_suggestion_button)
+                        texture_workflow_layout.addWidget(selected_texture_editor)
+                        texture_detail_browser = QTextBrowser()
+                        texture_detail_browser.setReadOnly(True)
+                        texture_detail_browser.setOpenExternalLinks(False)
+                        texture_detail_browser.setMinimumHeight(190)
+                        texture_detail_browser.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                        texture_detail_browser.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                        texture_details_splitter = QSplitter(Qt.Vertical)
+                        texture_details_splitter.addWidget(texture_override_tree)
+                        texture_details_splitter.addWidget(texture_detail_browser)
+                        texture_details_splitter.setCollapsible(0, False)
+                        texture_details_splitter.setCollapsible(1, False)
+                        texture_details_splitter.setStretchFactor(0, 2)
+                        texture_details_splitter.setStretchFactor(1, 1)
+                        texture_details_splitter.setSizes([330, 240])
+                        texture_workflow_layout.addWidget(texture_details_splitter, 1)
+                        selected_texture_row: Dict[str, Optional[Dict[str, Any]]] = {"row": None}
+                        selected_texture_editor_loading = {"active": False}
+                        selected_texture_source_committing = {"active": False}
+                        selected_texture_pending_source: Dict[str, object] = {
+                            "row": None,
+                            "source_path": "",
+                            "label": "",
+                        }
+
+                        def _current_texture_row() -> Optional[Dict[str, Any]]:
+                            item = texture_override_tree.currentItem()
+                            if item is not None:
+                                row_state = item.data(0, Qt.UserRole + 1)
+                                if isinstance(row_state, dict):
+                                    return row_state
+                            return selected_texture_row.get("row")
+
+                        def _current_texture_target_name() -> str:
+                            row_state = _current_texture_row()
+                            return str(row_state.get("target_name", "") or "") if row_state is not None else ""
+
+                        def _sync_selected_texture_editor(row_state: Optional[Dict[str, Any]]) -> None:
+                            selected_texture_editor_loading["active"] = True
+                            try:
+                                has_row = row_state is not None
+                                selected_role_combo.setEnabled(has_row)
+                                selected_source_combo.setEnabled(has_row)
+                                selected_texture_editor_label.setText(
+                                    f"Selected: {simplified_part_label(row_state.get('target_name', ''))}" if has_row else "Selected row"
+                                )
+                                selected_role_combo.blockSignals(True)
+                                role_index = selected_role_combo.findData(
+                                    str(row_state.get("slot_kind", "") or "material") if has_row else "material"
+                                )
+                                selected_role_combo.setCurrentIndex(max(0, role_index))
+                                selected_role_combo.blockSignals(False)
+                                selected_source_combo.blockSignals(True)
+                                selected_source_combo.clear()
+                                selected_source_combo.addItem("Keep original", "")
+                                suggested_source_for_row = str(row_state.get("suggested_source", "") or "").strip() if has_row else ""
+                                source_path_for_row = str(row_state.get("source_path", "") or "").strip() if has_row else ""
+                                added_source_paths: set[str] = set()
+
+                                def _source_key(source_path: object) -> str:
+                                    return str(source_path or "").replace("\\", "/").strip().lower()
+
+                                def _add_source_choice(label: str, source_path: str) -> None:
+                                    normalized_source_path = str(source_path or "").strip()
+                                    if not normalized_source_path:
+                                        return
+                                    source_key = _source_key(normalized_source_path)
+                                    if source_key in added_source_paths:
+                                        return
+                                    added_source_paths.add(source_key)
+                                    selected_source_combo.addItem(label, normalized_source_path)
+
+                                if source_path_for_row:
+                                    _add_source_choice(f"Assigned: {Path(source_path_for_row).name}", source_path_for_row)
+                                if suggested_source_for_row and suggested_source_for_row != source_path_for_row:
+                                    _add_source_choice(
+                                        f"Use suggested: {Path(suggested_source_for_row).name}",
+                                        suggested_source_for_row,
+                                    )
+                                for texture_file in texture_files_for_mapping:
+                                    _add_source_choice(texture_file.name, str(texture_file))
+                                source_index = selected_source_combo.findData(
+                                    source_path_for_row if has_row else ""
+                                )
+                                if source_index < 0 and source_path_for_row:
+                                    source_key = _source_key(source_path_for_row)
+                                    for combo_index in range(selected_source_combo.count()):
+                                        if _source_key(selected_source_combo.itemData(combo_index)) == source_key:
+                                            source_index = combo_index
+                                            break
+                                selected_source_combo.setCurrentIndex(max(0, source_index))
+                                selected_source_combo.blockSignals(False)
+                                suggestion_available = bool(
+                                    has_row
+                                    and suggested_source_for_row
+                                    and suggested_source_for_row != source_path_for_row
+                                )
+                                selected_texture_pending_source["row"] = row_state if has_row else None
+                                selected_texture_pending_source["source_path"] = source_path_for_row if has_row else ""
+                                selected_texture_pending_source["label"] = (
+                                    Path(source_path_for_row).name if source_path_for_row else "Keep original"
+                                )
+                                selected_apply_suggestion_button.setText("Use Suggested")
+                                selected_apply_suggestion_button.setEnabled(suggestion_available)
+                                selected_apply_suggestion_button.setToolTip(
+                                    f"Apply suggested source:\n{suggested_source_for_row}"
+                                    if suggestion_available
+                                    else "No unapplied suggestion is available for the selected row."
+                                )
+                            finally:
+                                selected_texture_editor_loading["active"] = False
+
+                        def _texture_target_sort_key(target_name: str) -> tuple[int, str]:
+                            rows = texture_rows_by_target.get(target_name, [])
+                            unassigned = sum(
+                                1
+                                for row_state in rows
+                                if not (bool(row_state.get("checked")) and str(row_state.get("source_path", "") or "").strip())
+                            )
+                            return (-unassigned, target_name.lower())
+
+                        def _refresh_texture_details(row_state: Optional[Dict[str, Any]] = None, *, sync_editor: bool = True) -> None:
+                            if row_state is None:
+                                row_state = selected_texture_row.get("row")
+                            target_name = (
+                                str(row_state.get("target_name", "") or "")
+                                if row_state is not None
+                                else _current_texture_target_name()
+                            )
+                            if sync_editor:
+                                _sync_selected_texture_editor(row_state)
+                            if row_state is None:
+                                texture_detail_browser.setHtml(
+                                    "<html><body style='color:#8b949e; background:#1f1f1f; font-family:Segoe UI, sans-serif; font-size:12px;'>"
+                                    "Select a texture role to inspect parameter, source, original DDS, final behavior, and warnings."
+                                    "</body></html>"
+                                )
+                            else:
+                                target_rows = texture_rows_by_target.get(target_name, [])
+                                assigned_count = sum(
+                                    1
+                                    for target_row in target_rows
+                                    if bool(target_row.get("checked")) and str(target_row.get("source_path", "") or "").strip()
+                                )
+                                row_state["_assigned_count"] = assigned_count
+                                row_state["_target_row_count"] = len(target_rows)
+                                texture_detail_browser.setHtml(_diagnostics_for_target_html(target_name, row_state) if target_name else "")
+
+                        def _set_texture_row_assignment(row_state: Dict[str, Any], source_path: str, checked: bool) -> None:
+                            row_state["source_path"] = str(source_path or "").strip()
+                            row_state["checked"] = bool(checked and row_state["source_path"])
+                            texture_overrides_dirty["dirty"] = True
+
+                        def _refresh_texture_row_guidance() -> None:
+                            nonlocal texture_sets
+                            texture_sets = group_replacement_texture_sets(texture_files_for_mapping, obj_mesh=replacement_mesh_for_mapping)
+                            suggested_counts: Dict[str, int] = {}
+                            for row_state in texture_override_rows:
+                                suggested_source = (
+                                    ""
+                                    if _texture_row_is_shared(row_state)
+                                    else _best_source_for_slot(
+                                        str(row_state.get("target_name", "") or ""),
+                                        tuple(row_state.get("source_indices", ()) or ()),
+                                        str(row_state.get("slot_kind", "") or "material"),
+                                        texture_sets,
+                                        parameter_name=str(row_state.get("parameter_name", "") or ""),
+                                        target_texture_path=str(row_state.get("target_path", "") or ""),
+                                    )
+                                )
+                                row_state["suggested_source"] = suggested_source
+                                suggested_key = suggested_source.strip().lower()
+                                if suggested_key:
+                                    suggested_counts[suggested_key] = suggested_counts.get(suggested_key, 0) + 1
+                            for row_state in texture_override_rows:
+                                suggested_source = str(row_state.get("suggested_source", "") or "").strip()
+                                guidance = classify_texture_assignment_guidance(
+                                    str(row_state.get("parameter_name", "") or ""),
+                                    str(row_state.get("target_path", "") or ""),
+                                    suggested_source=suggested_source,
+                                    repeated_suggestion_count=suggested_counts.get(suggested_source.lower(), 1) if suggested_source else 1,
+                                )
+                                row_state["guidance"] = guidance
+                                row_state["advanced"] = bool(guidance.advanced)
+                                row_state["state_label"] = str(guidance.state_label or "")
+                                row_state["confidence"] = str(guidance.confidence or "manual")
+                                row_state["role_label"] = _texture_role_label_for_slot(
+                                    str(row_state.get("slot_kind", "") or "material")
+                                )
+                                if _texture_row_is_shared(row_state):
+                                    row_state["suggested_source"] = ""
+                                    row_state["advanced"] = True
+                                    row_state["state_label"] = "Original shared layer"
+                                    row_state["confidence"] = "manual"
+
+                        def _texture_override_row_sort_key(row_state: Dict[str, Any]) -> tuple[int, int, str, str, str]:
+                            role_order = {"base": 0, "normal": 1, "height": 2, "material": 3}
+                            target_name = str(row_state.get("target_name", "") or "")
+                            return (
+                                _texture_target_sort_key(target_name)[0],
+                                role_order.get(str(row_state.get("slot_kind", "") or ""), 9),
+                                target_name.lower(),
+                                str(row_state.get("parameter_name", "") or "").lower(),
+                                str(row_state.get("target_path", "") or "").lower(),
+                            )
+
+                        def _texture_row_visible(row_state: Dict[str, Any]) -> bool:
+                            if not bool(texture_show_advanced_checkbox.isChecked()) and bool(row_state.get("advanced")):
+                                return False
+                            selected_source_index = int(selected_source_part.get("index", -1))
+                            filter_selected = bool(texture_filter_selected_checkbox.isChecked())
+                            source_indices = tuple(row_state.get("source_indices", ()) or ())
+                            if filter_selected and selected_source_index >= 0 and selected_source_index not in source_indices:
+                                return False
+                            return True
+
+                        def _update_texture_summary_label(visible_count: Optional[int] = None) -> None:
+                            if visible_count is None:
+                                visible_count = sum(1 for row_state in texture_override_rows if _texture_row_visible(row_state))
+                            assigned_count = sum(
+                                1
+                                for row_state in texture_override_rows
+                                if bool(row_state.get("checked")) and str(row_state.get("source_path", "") or "").strip()
+                            )
+                            advanced_hidden = sum(
+                                1
+                                for row_state in texture_override_rows
+                                if bool(row_state.get("advanced")) and not bool(texture_show_advanced_checkbox.isChecked())
+                            )
+                            texture_summary_label.setText(
+                                "<div style='line-height:1.35;'>"
+                                "<span style='color:#79c0ff; font-weight:700;'>Visible rows</span>"
+                                f"<span style='color:#f0f6fc;'> {int(visible_count):,}</span>"
+                                "<span style='color:#8b949e;'> | </span>"
+                                "<span style='color:#7ee787; font-weight:700;'>Assigned</span>"
+                                f"<span style='color:#f0f6fc;'> {assigned_count:,}/{len(texture_override_rows):,}</span>"
+                                "<span style='color:#8b949e;'> | </span>"
+                                "<span style='color:#d2a8ff; font-weight:700;'>Advanced hidden</span>"
+                                f"<span style='color:#f0f6fc;'> {advanced_hidden:,}</span>"
+                                "</div>"
+                            )
+
+                        def _apply_texture_row_to_item(item: QTreeWidgetItem, row_state: Dict[str, Any]) -> None:
+                            table_row = build_dds_override_table_row(row_state)
+                            status_label = table_row.status.label
+                            status_color = _texture_plan_status_color(status_label)
+                            values = (
+                                table_row.part_label or table_row.part_material,
+                                table_row.role,
+                                table_row.original_slot,
+                                table_row.override_source,
+                                table_row.target_dds,
+                                status_label,
+                                table_row.controls,
+                            )
+                            for column, value in enumerate(values):
+                                item.setText(column, value)
+                            item.setData(0, Qt.UserRole, tuple(row_state.get("source_indices", ()) or ()))
+                            item.setData(0, Qt.UserRole + 1, row_state)
+                            for column in range(7):
+                                if column == 0:
+                                    item.setToolTip(column, table_row.full_part_material or table_row.part_material)
+                                elif column in {1, 2, 5, 6}:
+                                    item.setToolTip(column, table_row.controls)
+                                elif column == 3:
+                                    source_path = str(row_state.get("source_path", "") or "").strip()
+                                    item.setToolTip(column, source_path or table_row.status.detail or table_row.override_source)
+                                else:
+                                    item.setToolTip(column, item.text(column))
+                            role_color = {
+                                "base": "#7ee787",
+                                "normal": "#79c0ff",
+                                "height": "#ffa657",
+                                "material": "#d2a8ff",
+                            }.get(str(row_state.get("slot_kind", "") or "").strip().lower(), "#c9d1d9")
+                            source_color = (
+                                "#7ee787"
+                                if bool(row_state.get("checked")) and str(row_state.get("source_path", "") or "").strip()
+                                else ("#f2cc60" if str(row_state.get("suggested_source", "") or "").strip() else "#8b949e")
+                            )
+                            item.setForeground(1, QBrush(QColor(role_color)))
+                            item.setForeground(2, QBrush(QColor(role_color)))
+                            item.setForeground(3, QBrush(QColor(source_color)))
+                            item.setForeground(5, QBrush(QColor(status_color)))
+                            item.setBackground(5, QBrush(QColor(status_color)))
+                            item.setForeground(
+                                5,
+                                QBrush(
+                                    QColor(
+                                        "#0d1117"
+                                        if status_label
+                                        in {
+                                            TEXTURE_PLAN_STATUS_READY,
+                                            TEXTURE_PLAN_STATUS_REVIEW,
+                                            TEXTURE_PLAN_STATUS_SUPPORT_ONLY,
+                                        }
+                                        else "#ffffff"
+                                    )
+                                ),
+                            )
+
+                        def _texture_item_for_row(row_state: Dict[str, Any]) -> Optional[QTreeWidgetItem]:
+                            for item_index in range(texture_override_tree.topLevelItemCount()):
+                                item = texture_override_tree.topLevelItem(item_index)
+                                if item.data(0, Qt.UserRole + 1) is row_state:
+                                    return item
+                            return None
+
+                        def _refresh_texture_row_in_place(row_state: Dict[str, Any]) -> bool:
+                            item = texture_override_tree.currentItem()
+                            if item is None or item.data(0, Qt.UserRole + 1) is not row_state:
+                                item = _texture_item_for_row(row_state)
+                            if item is None:
+                                return False
+                            selected_texture_row["row"] = row_state
+                            texture_override_tree.blockSignals(True)
+                            try:
+                                texture_override_tree.setCurrentItem(item)
+                                _apply_texture_row_to_item(item, row_state)
+                            finally:
+                                texture_override_tree.blockSignals(False)
+                            _update_texture_summary_label()
+                            _refresh_texture_details(row_state, sync_editor=True)
+                            texture_override_tree.scrollToItem(item, QAbstractItemView.EnsureVisible)
+                            return True
+
+                        def _refresh_texture_table(preserve_row: Optional[Dict[str, Any]] = None) -> None:
+                            if preserve_row is None:
+                                preserve_row = selected_texture_row.get("row")
+                            previous_scroll_value = texture_override_tree.verticalScrollBar().value()
+                            texture_busy_bar.setFormat("Updating advanced DDS overrides...")
+                            texture_busy_bar.setVisible(True)
+                            QApplication.processEvents()
+                            texture_override_tree.blockSignals(True)
+                            try:
+                                texture_override_tree.clear()
+                                visible_rows = [
+                                    row_state
+                                    for row_state in sorted(texture_override_rows, key=_texture_override_row_sort_key)
+                                    if _texture_row_visible(row_state)
+                                ]
+                                _update_texture_summary_label(len(visible_rows))
+                                item_to_select: Optional[QTreeWidgetItem] = None
+                                for row_state in visible_rows:
+                                    item = QTreeWidgetItem([""] * 7)
+                                    _apply_texture_row_to_item(item, row_state)
+                                    texture_override_tree.addTopLevelItem(item)
+                                    if preserve_row is row_state:
+                                        item_to_select = item
+                                texture_override_tree.blockSignals(False)
+                                if item_to_select is not None:
+                                    texture_override_tree.setCurrentItem(item_to_select)
+                                    selected_texture_row["row"] = item_to_select.data(0, Qt.UserRole + 1)
+                                    texture_override_tree.scrollToItem(item_to_select, QAbstractItemView.EnsureVisible)
+                                elif texture_override_tree.topLevelItemCount() > 0:
+                                    texture_override_tree.setCurrentItem(texture_override_tree.topLevelItem(0))
+                                    selected_texture_row["row"] = texture_override_tree.currentItem().data(0, Qt.UserRole + 1)
+                                    texture_override_tree.verticalScrollBar().setValue(previous_scroll_value)
+                                else:
+                                    selected_texture_row["row"] = None
+                                _refresh_texture_details(selected_texture_row.get("row"))
+                                texture_override_tree.setMinimumHeight(180)
+                                texture_override_tree.setMaximumHeight(16777215)
+                            finally:
+                                texture_override_tree.blockSignals(False)
+                                texture_busy_bar.setVisible(False)
+
+                        def _texture_table_selection_changed(*_args: object) -> None:
+                            selected_texture_row["row"] = _current_texture_row()
+                            _refresh_texture_details(selected_texture_row.get("row"))
+
+                        def _selected_texture_role_changed(*_args: object) -> None:
+                            if selected_texture_editor_loading["active"]:
+                                return
+                            row_state = _current_texture_row()
+                            if row_state is None:
+                                return
+                            row_state["slot_kind"] = str(selected_role_combo.currentData() or "material")
+                            row_state["role_label"] = _texture_role_label_for_slot(str(row_state.get("slot_kind", "") or "material"))
+                            selected_texture_row["row"] = row_state
+                            _refresh_texture_row_guidance()
+                            _refresh_texture_table(row_state)
+                            _queue_texture_preview_refresh()
+
+                        def _combo_source_path_from_signal(value: object = -1) -> str:
+                            combo_index = -1
+                            if isinstance(value, str):
+                                for candidate_index in range(selected_source_combo.count()):
+                                    if selected_source_combo.itemText(candidate_index) == value:
+                                        combo_index = candidate_index
+                                        break
+                            else:
+                                try:
+                                    combo_index = int(value)
+                                except (TypeError, ValueError):
+                                    combo_index = -1
+                            if combo_index < 0 or combo_index >= selected_source_combo.count():
+                                combo_index = selected_source_combo.currentIndex()
+                            if combo_index < 0 or combo_index >= selected_source_combo.count():
+                                return ""
+                            return str(selected_source_combo.itemData(combo_index) or "").strip()
+
+                        def _stage_selected_texture_source(value: object = -1, *_args: object) -> None:
+                            if selected_texture_editor_loading["active"] or selected_texture_source_committing["active"]:
+                                return
+                            row_state = _current_texture_row()
+                            if row_state is None:
+                                return
+                            source_path = _combo_source_path_from_signal(value)
+                            current_source = str(row_state.get("source_path", "") or "").strip()
+                            selected_texture_pending_source["row"] = row_state
+                            selected_texture_pending_source["source_path"] = source_path
+                            selected_texture_pending_source["label"] = Path(source_path).name if source_path else "Keep original"
+                            if source_path != current_source:
+                                selected_apply_suggestion_button.setText("Apply Override" if source_path else "Keep Original")
+                                selected_apply_suggestion_button.setEnabled(True)
+                                selected_apply_suggestion_button.setToolTip(
+                                    f"Apply this source to the selected row:\n{source_path}"
+                                    if source_path
+                                    else "Clear the manual override for the selected row and keep the original DDS."
+                                )
+
+                        def _commit_texture_row_source(row_state: Dict[str, Any], source_path: str) -> None:
+                            if selected_texture_source_committing["active"]:
+                                return
+                            source_path = str(source_path or "").strip()
+                            current_source = str(row_state.get("source_path", "") or "").strip()
+                            current_checked = bool(row_state.get("checked"))
+                            desired_checked = bool(source_path)
+                            selected_texture_source_committing["active"] = True
+                            try:
+                                if source_path != current_source or desired_checked != current_checked:
+                                    _set_texture_row_assignment(row_state, source_path, desired_checked)
+                                selected_texture_row["row"] = row_state
+                                selected_texture_pending_source["row"] = row_state
+                                selected_texture_pending_source["source_path"] = source_path
+                                selected_texture_pending_source["label"] = Path(source_path).name if source_path else "Keep original"
+                                if not _refresh_texture_row_in_place(row_state):
+                                    _refresh_texture_table(row_state)
+                            finally:
+                                selected_texture_source_committing["active"] = False
+                            if source_path != current_source or desired_checked != current_checked:
+                                _queue_texture_preview_refresh()
+
+                        def _selected_texture_source_changed(index: int = -1, *_args: object) -> None:
+                            if selected_texture_editor_loading["active"] or selected_texture_source_committing["active"]:
+                                return
+                            row_state = _current_texture_row()
+                            if row_state is None:
+                                return
+                            source_path = _combo_source_path_from_signal(index)
+                            selected_texture_pending_source["row"] = row_state
+                            selected_texture_pending_source["source_path"] = source_path
+                            selected_texture_pending_source["label"] = Path(source_path).name if source_path else "Keep original"
+                            QTimer.singleShot(0, lambda row=row_state, path=source_path: _commit_texture_row_source(row, path))
+
+                        def _apply_selected_texture_suggestion() -> None:
+                            if selected_texture_source_committing["active"]:
+                                return
+                            row_state = _current_texture_row()
+                            if row_state is None:
+                                return
+                            pending_row = selected_texture_pending_source.get("row")
+                            pending_source = str(selected_texture_pending_source.get("source_path", "") or "").strip()
+                            current_source = str(row_state.get("source_path", "") or "").strip()
+                            if pending_row is row_state and pending_source != current_source:
+                                _commit_texture_row_source(row_state, pending_source)
+                                return
+                            suggested_source = str(row_state.get("suggested_source", "") or "").strip()
+                            if not suggested_source or suggested_source == current_source:
+                                return
+                            _commit_texture_row_source(row_state, suggested_source)
+
+                        def _apply_texture_selected_part_filter() -> None:
+                            _refresh_texture_table()
+
+                        def _texture_table_item_activated(item: Optional[QTreeWidgetItem], column: int) -> None:
+                            if item is None or int(column) != 3:
+                                return
+                            row_state = item.data(0, Qt.UserRole + 1)
+                            if not isinstance(row_state, dict):
+                                return
+                            suggested_source = str(row_state.get("suggested_source", "") or "").strip()
+                            current_source = str(row_state.get("source_path", "") or "").strip()
+                            if not suggested_source or suggested_source == current_source:
+                                return
+                            texture_override_tree.setCurrentItem(item)
+                            _apply_selected_texture_suggestion()
+
+                        def _texture_assignment_summary_html(
+                            title: str,
+                            planned_rows: Sequence[Tuple[Dict[str, Any], str, str]],
+                            *,
+                            reason: str,
+                        ) -> str:
+                            def _chip(label: object, background: str, foreground: str = "#0d1117") -> str:
+                                return (
+                                    "<span style='padding:2px 7px; font-weight:700; "
+                                    f"background:{background}; color:{foreground}; white-space:nowrap;'>"
+                                    f"{escape(str(label or '').strip() or 'Unknown')}</span>"
+                                )
+
+                            row_html: List[str] = []
+                            for row_state, source_path, decision in planned_rows[:18]:
+                                table_row = build_dds_override_table_row(
+                                    {
+                                        **row_state,
+                                        "source_path": source_path,
+                                        "checked": decision == "Apply",
+                                    }
+                                )
+                                status_label = table_row.status.label
+                                status_color = _texture_plan_status_color(status_label)
+                                status_foreground = "#ffffff" if status_label in {TEXTURE_PLAN_STATUS_LIKELY_GREY, TEXTURE_PLAN_STATUS_IGNORED_ADVANCED} else "#0d1117"
+                                role_color = {
+                                    "base": "#3fb950",
+                                    "normal": "#58a6ff",
+                                    "height": "#fb923c",
+                                    "material": "#a371f7",
+                                }.get(table_row.slot_kind, "#8b949e")
+                                row_html.append(
+                                    "<tr style='background:#161b22;'>"
+                                    f"<td style='padding:6px 7px; color:#f0f6fc; white-space:nowrap;'>{escape(table_row.part_label or table_row.part_material)}</td>"
+                                    f"<td style='padding:6px 7px;'>{_chip(table_row.role, role_color)}</td>"
+                                    f"<td style='padding:6px 7px; color:#a5d6ff; word-break:break-all;'>{escape(table_row.original_slot)}</td>"
+                                    f"<td style='padding:6px 7px; color:#e6edf3; word-break:break-all;'>{escape(Path(source_path).name if source_path else 'Keep original')}</td>"
+                                    f"<td style='padding:6px 7px;'>{_chip(status_label, status_color, status_foreground)}</td>"
+                                    f"<td style='padding:6px 7px;'>{_chip(decision, '#238636', '#ffffff')}</td>"
+                                    "</tr>"
+                                )
+                            if len(planned_rows) > 18:
+                                row_html.append(
+                                    f"<tr><td colspan='6' style='padding:7px; color:#8b949e;'>... {len(planned_rows) - 18:,} more row(s)</td></tr>"
+                                )
+                            return (
+                                "<html><body style='background:#1f1f1f; color:#e6edf3; font-family:Segoe UI, sans-serif; font-size:12px; margin:0;'>"
+                                "<div style='padding:10px 12px; line-height:1.35;'>"
+                                f"<div style='font-size:17px; font-weight:700; color:#f0f6fc;'>{escape(title)}</div>"
+                                f"<div style='margin-top:7px; color:#c9d1d9;'>{escape(reason)}</div>"
+                                "<table width='100%' cellspacing='0' cellpadding='0' style='margin-top:10px; background:#2b2416; border:1px solid #3d2f12;'>"
+                                "<tr><td width='8' style='background:#d29922;'></td>"
+                                "<td style='padding:8px 10px; color:#f2cc60;'>"
+                                "This is a convenience guess, not proof that the shader slot is perfect. "
+                                "Rows marked Apply become explicit manual overrides; all other original DDS slots stay unchanged."
+                                "</td></tr></table>"
+                                "<table width='100%' cellspacing='0' cellpadding='0' style='margin-top:12px; border:1px solid #30363d;'>"
+                                "<tr style='background:#24292f; color:#8b949e;'>"
+                                "<th align='left' style='padding:6px 7px;'>Part</th>"
+                                "<th align='left' style='padding:6px 7px;'>Role</th>"
+                                "<th align='left' style='padding:6px 7px;'>Original Slot</th>"
+                                "<th align='left' style='padding:6px 7px;'>Source</th>"
+                                "<th align='left' style='padding:6px 7px;'>Status</th>"
+                                "<th align='left' style='padding:6px 7px;'>Action</th></tr>"
+                                + "".join(row_html)
+                                + "</table></div></body></html>"
+                            )
+
+                        def _confirm_texture_assignment_action(
+                            title: str,
+                            planned_rows: Sequence[Tuple[Dict[str, Any], str, str]],
+                            *,
+                            reason: str,
+                        ) -> bool:
+                            if not planned_rows:
+                                QMessageBox.information(
+                                    dialog,
+                                    title,
+                                    "No compatible suggested texture overrides were found for the selected part.",
+                                )
+                                return False
+                            confirm_dialog = QDialog(dialog)
+                            confirm_dialog.setWindowTitle(title)
+                            confirm_dialog.setModal(True)
+                            confirm_dialog.resize(940, 540)
+                            confirm_layout = QVBoxLayout(confirm_dialog)
+                            confirm_layout.setContentsMargins(12, 12, 12, 12)
+                            confirm_layout.setSpacing(10)
+                            summary_browser = QTextBrowser()
+                            summary_browser.setReadOnly(True)
+                            summary_browser.setOpenExternalLinks(False)
+                            summary_browser.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                            summary_browser.setHtml(_texture_assignment_summary_html(title, planned_rows, reason=reason))
+                            confirm_layout.addWidget(summary_browser, 1)
+                            button_row = QHBoxLayout()
+                            button_row.addStretch(1)
+                            apply_button = QPushButton("Apply These Overrides")
+                            cancel_button = QPushButton("Cancel")
+                            cancel_button.setDefault(True)
+                            apply_button.clicked.connect(confirm_dialog.accept)
+                            cancel_button.clicked.connect(confirm_dialog.reject)
+                            button_row.addWidget(apply_button)
+                            button_row.addWidget(cancel_button)
+                            confirm_layout.addLayout(button_row)
+                            return confirm_dialog.exec() == QDialog.Accepted
+
+                        def _apply_high_confidence_for_target() -> None:
+                            target_name = _current_texture_target_name()
+                            _refresh_texture_row_guidance()
+                            planned_rows: List[Tuple[Dict[str, Any], str, str]] = []
+                            for row_state in texture_rows_by_target.get(target_name, []):
+                                suggested_source = str(row_state.get("suggested_source", "") or "").strip()
+                                guidance = row_state.get("guidance")
+                                if suggested_source and _texture_row_can_apply_suggested_for_target(row_state, guidance):
+                                    planned_rows.append((row_state, suggested_source, "Apply"))
+                            if not _confirm_texture_assignment_action(
+                                "Apply Suggested Overrides",
+                                planned_rows,
+                                reason="Apply only high-confidence suggestions for the currently selected target part.",
+                            ):
+                                return
+                            for row_state, suggested_source, _decision in planned_rows:
+                                _set_texture_row_assignment(row_state, suggested_source, True)
+                            _refresh_texture_table(selected_texture_row.get("row"))
+                            _queue_texture_preview_refresh()
+
+                        def _clear_target_texture_assignments() -> None:
+                            target_name = _current_texture_target_name()
+                            for row_state in texture_rows_by_target.get(target_name, []):
+                                _set_texture_row_assignment(row_state, "", False)
+                            _refresh_texture_table(selected_texture_row.get("row"))
+                            _queue_texture_preview_refresh()
+
+                        def _assign_selected_source_matching_roles() -> None:
+                            target_name = _current_texture_target_name()
+                            selected_index = int(selected_source_part.get("index", -1))
+                            planned_rows: List[Tuple[Dict[str, Any], str, str]] = []
+                            for row_state in texture_rows_by_target.get(target_name, []):
+                                if _texture_row_is_shared(row_state):
+                                    continue
+                                row_source_indices = tuple(row_state.get("source_indices", ()) or ())
+                                source_indices = (
+                                    (selected_index,)
+                                    if selected_index >= 0 and selected_index in row_source_indices
+                                    else row_source_indices
+                                )
+                                suggested_source = _best_source_for_slot(
+                                    target_name,
+                                    source_indices,
+                                    str(row_state.get("slot_kind", "") or "material"),
+                                    texture_sets,
+                                    parameter_name=str(row_state.get("parameter_name", "") or ""),
+                                    target_texture_path=str(row_state.get("target_path", "") or ""),
+                                )
+                                if suggested_source and _texture_row_can_apply_suggested_for_target(row_state, row_state.get("guidance")):
+                                    planned_rows.append((row_state, suggested_source, "Apply"))
+                            if not _confirm_texture_assignment_action(
+                                "Assign Matching Role Overrides",
+                                planned_rows,
+                                reason="Assign replacement textures whose detected role matches compatible original DDS slots for this target.",
+                            ):
+                                return
+                            for row_state, suggested_source, _decision in planned_rows:
+                                _set_texture_row_assignment(row_state, suggested_source, True)
+                            _refresh_texture_table(selected_texture_row.get("row"))
+                            _queue_texture_preview_refresh()
+
+                        def _add_missing_texture_sources() -> None:
+                            selected_files, _selected_filter = QFileDialog.getOpenFileNames(
+                                dialog,
+                                "Add Replacement Textures",
+                                str(obj_path.parent),
+                                "Texture files (*.png *.dds *.jpg *.jpeg *.tga *.bmp *.tif *.tiff);;All files (*.*)",
+                            )
+                            added = False
+                            for selected_file in selected_files or ():
+                                texture_path = Path(selected_file).expanduser()
+                                if not texture_path.is_file() or texture_path.suffix.lower() not in SCENE_TEXTURE_SOURCE_EXTENSIONS:
+                                    continue
+                                key = str(texture_path.resolve()).lower()
+                                if key in seen_texture_file_keys:
+                                    continue
+                                seen_texture_file_keys.add(key)
+                                texture_files_for_mapping.append(texture_path.resolve())
+                                added = True
+                            if not added:
+                                return
+                            _refresh_texture_row_guidance()
+                            _refresh_source_material_plan()
+                            try:
+                                if texture_sets and not rebuild_sidecar_checkbox.isChecked():
+                                    rebuild_sidecar_checkbox.setChecked(True)
+                            except NameError:
+                                pass
+                            _refresh_texture_table(selected_texture_row.get("row"))
+                            _queue_texture_preview_refresh()
+
+                        def _add_missing_texture_folder() -> None:
+                            selected_dir = QFileDialog.getExistingDirectory(
+                                dialog,
+                                "Add Replacement Texture Folder",
+                                str(obj_path.parent),
+                            )
+                            if not selected_dir:
+                                return
+                            added = False
+                            for candidate in sorted(Path(selected_dir).expanduser().rglob("*")):
+                                if not candidate.is_file() or candidate.suffix.lower() not in SCENE_TEXTURE_SOURCE_EXTENSIONS:
+                                    continue
+                                key = str(candidate.resolve()).lower()
+                                if key in seen_texture_file_keys:
+                                    continue
+                                seen_texture_file_keys.add(key)
+                                texture_files_for_mapping.append(candidate.resolve())
+                                added = True
+                            if not added:
+                                return
+                            _refresh_texture_row_guidance()
+                            _refresh_source_material_plan()
+                            try:
+                                if texture_sets and not rebuild_sidecar_checkbox.isChecked():
+                                    rebuild_sidecar_checkbox.setChecked(True)
+                            except NameError:
+                                pass
+                            _refresh_texture_table(selected_texture_row.get("row"))
+                            _queue_texture_preview_refresh()
+
+                        texture_filter_refresh["func"] = _apply_texture_selected_part_filter
+                        texture_override_tree.currentItemChanged.connect(_texture_table_selection_changed)
+                        texture_override_tree.itemActivated.connect(_texture_table_item_activated)
+                        selected_role_combo.currentIndexChanged.connect(_selected_texture_role_changed)
+                        selected_source_combo.currentIndexChanged.connect(_stage_selected_texture_source)
+                        selected_source_combo.activated.connect(_selected_texture_source_changed)
+                        try:
+                            selected_source_combo.textActivated.connect(_selected_texture_source_changed)
+                        except AttributeError:
+                            pass
+                        selected_apply_suggestion_button.clicked.connect(_apply_selected_texture_suggestion)
+                        texture_filter_selected_checkbox.toggled.connect(_apply_texture_selected_part_filter)
+                        texture_show_advanced_checkbox.toggled.connect(_apply_texture_selected_part_filter)
+                        apply_suggested_button.clicked.connect(_apply_high_confidence_for_target)
+                        clear_target_textures_button.clicked.connect(_clear_target_texture_assignments)
+                        keep_original_target_button.clicked.connect(_clear_target_texture_assignments)
+                        assign_matching_source_button.clicked.connect(_assign_selected_source_matching_roles)
+                        add_textures_button.clicked.connect(_add_missing_texture_sources)
+                        add_texture_folder_button.clicked.connect(_add_missing_texture_folder)
+                        texture_layout.addWidget(texture_workflow, 1)
+                        _refresh_texture_table()
+                    advanced_texture_section = CollapsibleSection("Advanced: Original DDS Slot Overrides", expanded=False)
+                    advanced_texture_section.body_layout.addWidget(texture_group)
+                    textures_layout.addWidget(advanced_texture_section, 0)
+                    _refresh_static_dialog_preview()
+                elif False and sidecar_bindings:
                     texture_group = QGroupBox("Texture Slot Mapping")
                     texture_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
                     texture_layout = QVBoxLayout(texture_group)
@@ -18497,12 +21739,7 @@ def run_gui() -> int:
                     texture_tree = QTreeWidget()
                     texture_tree.setHeaderLabels(["Use", "Part / slot", "Texture parameter", "Current DDS", "State", "Replacement source"])
                     texture_tree.setMinimumHeight(150)
-                    _configure_alignment_tree(
-                        texture_tree,
-                        (42, 122, 106, 118, 66, 130),
-                        max_height=360,
-                        stretch_columns=(1, 2, 3, 5),
-                    )
+                    _configure_texture_mapping_tree(texture_tree, persist_key="legacy_texture_slot_mapping")
                     active_mappings = list(suggested_mappings or [])
                     seen_texture_rows: set[tuple[str, str, str, str]] = set()
                     row_index = 0
@@ -18516,6 +21753,7 @@ def run_gui() -> int:
                             parameter_name = str(getattr(binding, "parameter_name", "") or "").strip()
                             texture_classification = classify_texture_binding(parameter_name, target_path)
                             slot_kind = texture_classification.slot_kind
+                            visualized = texture_classification.visualized
                             row_key = (
                                 mapping.target_submesh_name.lower(),
                                 parameter_name.lower(),
@@ -18548,12 +21786,18 @@ def run_gui() -> int:
                                 parameter_name=parameter_name,
                                 target_texture_path=target_path,
                             )
-                            if suggested_source:
+                            is_shared_texture_layer = is_shared_material_layer_texture(target_path)
+                            can_auto_assign_texture = bool(
+                                suggested_source
+                                and visualized
+                                and not is_shared_texture_layer
+                                and slot_kind in {"base", "normal", "material", "height"}
+                            )
+                            if can_auto_assign_texture:
                                 source_index = combo.findData(suggested_source)
                                 if source_index >= 0:
                                     combo.setCurrentIndex(source_index)
                                     checkbox.setChecked(True)
-                            visualized = texture_classification.visualized
                             parameter_display = parameter_name or texture_classification.slot_label or slot_kind
                             texture_item = QTreeWidgetItem(
                                 [
@@ -18610,9 +21854,13 @@ def run_gui() -> int:
                                 checkbox: QCheckBox = checkbox,
                                 combo: QComboBox = combo,
                                 visualized: bool = visualized,
+                                is_shared_texture_layer: bool = is_shared_texture_layer,
                             ) -> None:
                                 has_source = bool(str(combo.currentData() or "").strip())
-                                if not visualized:
+                                if is_shared_texture_layer and not checkbox.isChecked():
+                                    state_text = "Optional shared layer"
+                                    state_color = "#facc15"
+                                elif not visualized:
                                     state_text = "Not visualized"
                                     state_color = "#facc15"
                                 elif checkbox.isChecked() and has_source:
@@ -18677,7 +21925,6 @@ def run_gui() -> int:
                                 current_source_indices = _source_indices_for_target_name(target_name) or tuple(source_indices)
                                 item.setData(0, Qt.UserRole, tuple(current_source_indices))
                                 item.setHidden(bool(enabled and selected_index >= 0 and selected_index not in current_source_indices))
-                            _fit_alignment_tree_height_to_rows(texture_tree, minimum=150, screen_margin=300)
 
                         texture_filter_refresh["func"] = _apply_texture_selected_part_filter
                         texture_filter_selected_checkbox.toggled.connect(_apply_texture_selected_part_filter)
@@ -18708,6 +21955,9 @@ def run_gui() -> int:
 
             options_group = QGroupBox("Options")
             form = QGridLayout(options_group)
+            form.setContentsMargins(8, 6, 8, 6)
+            form.setHorizontalSpacing(10)
+            form.setVerticalSpacing(3)
             setup_layout.addWidget(options_group)
 
             alignment_mode_combo = QComboBox()
@@ -18727,24 +21977,80 @@ def run_gui() -> int:
             scale_to_length_checkbox.setToolTip(
                 "When checked, the replacement length is multiplied by the shown Auto length scale. Disable it to keep the imported model size."
             )
-            flip_direction_checkbox = QCheckBox("Flip direction 180")
-            flip_direction_checkbox.setToolTip("Use this when the replacement is positioned correctly but points the opposite way.")
-            rebuild_sidecar_checkbox = QCheckBox("Rebuild/patch material sidecar from rebuilt draw sections")
-            rebuild_sidecar_checkbox.setChecked(True)
-            rebuild_sidecar_checkbox.setToolTip(
-                "Recommended for static replacement. The app clones the original material sidecar, "
-                "patches only rebuilt draw sections with geometry, and packages the patched .pac_xml/.pami sidecar automatically."
+            flip_direction_checkbox = QCheckBox("Reverse main axis 180")
+            flip_direction_checkbox.setToolTip("Good for many swords/weapons when placement is correct but the tip points the wrong way.")
+            orientation_preset_combo = QComboBox()
+            orientation_preset_combo.addItem("Manual / no preset", None)
+            orientation_preset_combo.addItem("Weapon: reverse main axis", {"flip": True, "rotate": (0.0, 0.0, 0.0)})
+            orientation_preset_combo.addItem("Armor/helmet: rotate X +90", {"flip": False, "rotate": (90.0, 0.0, 0.0)})
+            orientation_preset_combo.addItem("Armor/helmet: rotate X -90", {"flip": False, "rotate": (-90.0, 0.0, 0.0)})
+            orientation_preset_combo.addItem("Rotate Y +90", {"flip": False, "rotate": (0.0, 90.0, 0.0)})
+            orientation_preset_combo.addItem("Rotate Y -90", {"flip": False, "rotate": (0.0, -90.0, 0.0)})
+            orientation_preset_combo.addItem("Rotate Z +90", {"flip": False, "rotate": (0.0, 0.0, 90.0)})
+            orientation_preset_combo.addItem("Rotate Z -90", {"flip": False, "rotate": (0.0, 0.0, -90.0)})
+            orientation_preset_combo.addItem("Upside down: rotate X 180", {"flip": False, "rotate": (180.0, 0.0, 0.0)})
+            orientation_preset_combo.addItem("Turn around: rotate Y 180", {"flip": False, "rotate": (0.0, 180.0, 0.0)})
+            orientation_preset_combo.addItem("Roll 180: rotate Z 180", {"flip": False, "rotate": (0.0, 0.0, 180.0)})
+            orientation_preset_combo.setToolTip(
+                "Quickly apply common orientation fixes. These presets set the manual rotation fields and the reverse-axis toggle; you can still fine tune afterward."
             )
-            inject_base_color_checkbox = QCheckBox("Risky: inject missing base/overlay color parameter")
+            orientation_preset_combo.setMinimumWidth(0)
+            orientation_preset_combo.setMinimumContentsLength(12)
+            orientation_preset_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            orientation_preset_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            apply_orientation_preset_button = QPushButton("Apply")
+            apply_orientation_preset_button.setMinimumWidth(0)
+            apply_orientation_preset_button.setMaximumWidth(78)
+            apply_orientation_preset_button.setToolTip("Apply the selected orientation preset once. Manual rotation fields remain editable afterward.")
+            rebuild_sidecar_checkbox = QCheckBox("Patch material sidecar (.pac_xml/.pami)")
+            source_material_rebuild_available = bool(texture_sets)
+            rebuild_sidecar_checkbox.setChecked(source_material_rebuild_available)
+            rebuild_sidecar_checkbox.setToolTip(
+                "When replacement material textures are detected, this keeps the original material shader wrapper and patches compatible direct DDS slots for the imported model. Disable only for diagnostic exports that intentionally reuse the original material sidecar."
+            )
+            inject_base_color_checkbox = QCheckBox("Inject missing base/color parameter (risky)")
             inject_base_color_checkbox.setChecked(False)
             inject_base_color_checkbox.setToolTip(
                 "Use this when a target material has a Base_Color PNG but the original sidecar has no base/overlay color texture slot. "
                 "This writes a patched material sidecar and can make some shaders render untextured, so leave it off unless you are testing material injection."
             )
+            sidecar_warning_label = QLabel(
+                "<span style='color:#8b949e;'>Source-driven patching keeps shader parameters and shared layers. "
+                "Standalone Metallic/Roughness/AO maps need packed material-mask routing.</span>"
+            )
+            sidecar_warning_label.setWordWrap(True)
+            sidecar_warning_label.setTextFormat(Qt.RichText)
+            sidecar_warning_label.setObjectName("HintLabel")
+            texture_output_size_combo = QComboBox()
+            texture_output_size_combo.addItem("Source image size", "source")
+            texture_output_size_combo.addItem("Original DDS size", "original")
+            texture_output_size_combo.setToolTip(
+                "Choose the dimensions for generated DDS textures. Source image size preserves imported 4K textures; "
+                "Original DDS size keeps the old template dimensions."
+            )
             form.addWidget(scale_to_length_checkbox, 1, 0, 1, 2)
             form.addWidget(flip_direction_checkbox, 2, 0, 1, 2)
-            form.addWidget(rebuild_sidecar_checkbox, 3, 0, 1, 2)
-            form.addWidget(inject_base_color_checkbox, 4, 0, 1, 2)
+            quick_orientation_row = QHBoxLayout()
+            quick_orientation_row.addWidget(orientation_preset_combo, 1)
+            quick_orientation_row.addWidget(apply_orientation_preset_button)
+            form.addWidget(QLabel("Quick orientation"), 3, 0)
+            form.addLayout(quick_orientation_row, 3, 1)
+            form.addWidget(rebuild_sidecar_checkbox, 4, 0, 1, 2)
+            form.addWidget(inject_base_color_checkbox, 5, 0, 1, 2)
+            form.addWidget(sidecar_warning_label, 6, 0, 1, 2)
+            form.addWidget(QLabel("Texture size"), 7, 0)
+            form.addWidget(texture_output_size_combo, 7, 1)
+
+            def _refresh_sidecar_option_state() -> None:
+                enabled = rebuild_sidecar_checkbox.isChecked()
+                if not enabled:
+                    inject_base_color_checkbox.setChecked(False)
+
+            rebuild_sidecar_checkbox.toggled.connect(lambda _checked: _refresh_sidecar_option_state())
+            inject_base_color_checkbox.toggled.connect(
+                lambda checked: rebuild_sidecar_checkbox.setChecked(True) if checked and not rebuild_sidecar_checkbox.isChecked() else None
+            )
+            _refresh_sidecar_option_state()
 
             def _double_spin(
                 *,
@@ -18780,63 +22086,111 @@ def run_gui() -> int:
             original_center = _mesh_center_for_ui(original_mesh_for_mapping)
             transform_group = QGroupBox("Export Values")
             transform_layout = QGridLayout(transform_group)
+            transform_layout.setContentsMargins(8, 6, 8, 6)
+            transform_layout.setHorizontalSpacing(8)
+            transform_layout.setVerticalSpacing(3)
+            transform_layout.setColumnStretch(0, 0)
+            transform_layout.setColumnStretch(1, 0)
+            transform_layout.setColumnStretch(2, 1)
+            transform_layout.setColumnMinimumWidth(0, 66)
+            transform_layout.setColumnMinimumWidth(1, 126)
             transform_layout.addWidget(QLabel("Property"), 0, 0)
-            transform_layout.addWidget(QLabel("Original reference"), 0, 1)
-            transform_layout.addWidget(QLabel("Replacement export value"), 0, 2)
-            transform_layout.addWidget(QLabel("Location X"), 1, 0)
-            transform_layout.addWidget(QLabel(f"{original_center[0]:.5f}"), 1, 1)
+            transform_layout.addWidget(QLabel("Original"), 0, 1)
+            transform_layout.addWidget(QLabel("Export values"), 0, 2)
             offset_x_spin = _double_spin(value=0.0, minimum=-10.0, maximum=10.0, decimals=5, step=0.0005)
             offset_y_spin = _double_spin(value=0.0, minimum=-10.0, maximum=10.0, decimals=5, step=0.0005)
             offset_z_spin = _double_spin(value=0.0, minimum=-10.0, maximum=10.0, decimals=5, step=0.0005)
-            transform_layout.addWidget(offset_x_spin, 1, 2)
-            transform_layout.addWidget(QLabel("Location Y"), 2, 0)
-            transform_layout.addWidget(QLabel(f"{original_center[1]:.5f}"), 2, 1)
-            transform_layout.addWidget(offset_y_spin, 2, 2)
-            transform_layout.addWidget(QLabel("Location Z"), 3, 0)
-            transform_layout.addWidget(QLabel(f"{original_center[2]:.5f}"), 3, 1)
-            transform_layout.addWidget(offset_z_spin, 3, 2)
             rotate_x_spin = _double_spin(value=0.0, minimum=-360.0, maximum=360.0, decimals=2, step=0.25, suffix=" deg")
             rotate_y_spin = _double_spin(value=0.0, minimum=-360.0, maximum=360.0, decimals=2, step=0.25, suffix=" deg")
             rotate_z_spin = _double_spin(value=0.0, minimum=-360.0, maximum=360.0, decimals=2, step=0.25, suffix=" deg")
-            transform_layout.addWidget(QLabel("Rotation X"), 4, 0)
-            transform_layout.addWidget(QLabel("0.00 deg"), 4, 1)
-            transform_layout.addWidget(rotate_x_spin, 4, 2)
-            transform_layout.addWidget(QLabel("Rotation Y"), 5, 0)
-            transform_layout.addWidget(QLabel("0.00 deg"), 5, 1)
-            transform_layout.addWidget(rotate_y_spin, 5, 2)
-            transform_layout.addWidget(QLabel("Rotation Z"), 6, 0)
-            transform_layout.addWidget(QLabel("0.00 deg"), 6, 1)
-            transform_layout.addWidget(rotate_z_spin, 6, 2)
             scale_x_spin = _double_spin(value=1.0, minimum=0.001, maximum=100.0, decimals=4, step=0.005)
             scale_y_spin = _double_spin(value=1.0, minimum=0.001, maximum=100.0, decimals=4, step=0.005)
             scale_z_spin = _double_spin(value=1.0, minimum=0.001, maximum=100.0, decimals=4, step=0.005)
-            transform_layout.addWidget(QLabel("Scale X"), 7, 0)
-            transform_layout.addWidget(QLabel("1.0000"), 7, 1)
-            transform_layout.addWidget(scale_x_spin, 7, 2)
-            transform_layout.addWidget(QLabel("Scale Y"), 8, 0)
-            transform_layout.addWidget(QLabel("1.0000"), 8, 1)
-            transform_layout.addWidget(scale_y_spin, 8, 2)
-            transform_layout.addWidget(QLabel("Scale Z"), 9, 0)
-            transform_layout.addWidget(QLabel("1.0000"), 9, 1)
-            transform_layout.addWidget(scale_z_spin, 9, 2)
+            for transform_spin in (
+                offset_x_spin,
+                offset_y_spin,
+                offset_z_spin,
+                rotate_x_spin,
+                rotate_y_spin,
+                rotate_z_spin,
+                scale_x_spin,
+                scale_y_spin,
+                scale_z_spin,
+            ):
+                transform_spin.setMinimumWidth(76)
+                transform_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+            def _add_transform_row(row_index: int, label_text: str, original_text: str, widgets: Sequence[QDoubleSpinBox]) -> None:
+                label_widget = QLabel(label_text)
+                original_widget = QLabel(original_text)
+                original_widget.setObjectName("HintLabel")
+                original_widget.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value_row = QHBoxLayout()
+                value_row.setContentsMargins(0, 0, 0, 0)
+                value_row.setSpacing(4)
+                for axis_label, widget in zip(("X", "Y", "Z"), widgets):
+                    axis = QLabel(axis_label)
+                    axis.setObjectName("HintLabel")
+                    value_row.addWidget(axis)
+                    value_row.addWidget(widget, 1)
+                transform_layout.addWidget(label_widget, row_index, 0)
+                transform_layout.addWidget(original_widget, row_index, 1)
+                transform_layout.addLayout(value_row, row_index, 2)
+
+            _add_transform_row(
+                1,
+                "Location",
+                f"{original_center[0]:.5f}, {original_center[1]:.5f}, {original_center[2]:.5f}",
+                (offset_x_spin, offset_y_spin, offset_z_spin),
+            )
+            _add_transform_row(2, "Rotation", "0.00, 0.00, 0.00 deg", (rotate_x_spin, rotate_y_spin, rotate_z_spin))
+            _add_transform_row(3, "Scale", "1.0000, 1.0000, 1.0000", (scale_x_spin, scale_y_spin, scale_z_spin))
             scale_link_checkbox = QCheckBox("Link scale axes")
             scale_link_checkbox.setChecked(True)
-            transform_layout.addWidget(scale_link_checkbox, 10, 2)
+            transform_layout.addWidget(scale_link_checkbox, 4, 2)
             reset_location_button = QPushButton("Reset Location")
             reset_rotation_button = QPushButton("Reset Rotation")
             reset_scale_button = QPushButton("Reset Scale")
+            reset_placement_button = QPushButton("Reset Placement")
+            for reset_button in (reset_location_button, reset_rotation_button, reset_scale_button, reset_placement_button):
+                reset_button.setMinimumWidth(0)
             reset_buttons = QHBoxLayout()
             reset_buttons.addWidget(reset_location_button)
             reset_buttons.addWidget(reset_rotation_button)
             reset_buttons.addWidget(reset_scale_button)
-            transform_layout.addLayout(reset_buttons, 11, 0, 1, 3)
+            reset_buttons.addWidget(reset_placement_button)
+            transform_layout.addLayout(reset_buttons, 5, 0, 1, 3)
+            tilt_step_spin = _double_spin(value=5.0, minimum=0.1, maximum=45.0, decimals=1, step=0.5, suffix=" deg")
+            tilt_step_spin.setMinimumWidth(72)
+            tilt_step_spin.setToolTip("Step used by the tilt/turn/roll buttons.")
+            tilt_button_row = QHBoxLayout()
+            tilt_button_row.addWidget(QLabel("Tilt step"))
+            tilt_button_row.addWidget(tilt_step_spin)
+            tilt_x_minus_button = QPushButton("Tilt X-")
+            tilt_x_plus_button = QPushButton("Tilt X+")
+            tilt_y_minus_button = QPushButton("Turn Y-")
+            tilt_y_plus_button = QPushButton("Turn Y+")
+            tilt_z_minus_button = QPushButton("Roll Z-")
+            tilt_z_plus_button = QPushButton("Roll Z+")
+            for tilt_button, tooltip in (
+                (tilt_x_minus_button, "Pitch the replacement backward around X."),
+                (tilt_x_plus_button, "Pitch the replacement forward around X."),
+                (tilt_y_minus_button, "Turn the replacement left/right around Y."),
+                (tilt_y_plus_button, "Turn the replacement left/right around Y."),
+                (tilt_z_minus_button, "Roll or side-tilt the replacement around Z."),
+                (tilt_z_plus_button, "Roll or side-tilt the replacement around Z."),
+            ):
+                tilt_button.setMinimumWidth(0)
+                tilt_button.setToolTip(tooltip)
+                tilt_button_row.addWidget(tilt_button)
+            transform_layout.addLayout(tilt_button_row, 6, 0, 1, 3)
             transform_hint = QLabel(
-                "These are the manual Delta Transform values exported into the rebuilt mesh. "
-                "Drag the colored axes in the preview or edit these fields directly."
+                "<span style='color:#8b949e;'>Manual export transform. Drag axes to move; Alt+drag rotates X/Y; Alt+Shift+drag rolls Z.</span>"
             )
             transform_hint.setWordWrap(True)
+            transform_hint.setTextFormat(Qt.RichText)
             transform_hint.setObjectName("HintLabel")
-            transform_layout.addWidget(transform_hint, 12, 0, 1, 3)
+            transform_layout.addWidget(transform_hint, 7, 0, 1, 3)
             transform_section = CollapsibleSection("Transform", expanded=True)
             transform_section.body_layout.addWidget(transform_group)
             setup_layout.addWidget(transform_section)
@@ -18864,24 +22218,61 @@ def run_gui() -> int:
                 scale_y_spin,
                 scale_z_spin,
             ):
-                spin.valueChanged.connect(_queue_static_preview_refresh)
+                spin.valueChanged.connect(_queue_static_preview_rebuild)
             for spin in (scale_x_spin, scale_y_spin, scale_z_spin):
                 spin.valueChanged.connect(_sync_linked_scale)
-            alignment_mode_combo.currentIndexChanged.connect(_queue_static_preview_refresh)
-            scale_to_length_checkbox.toggled.connect(_queue_static_preview_refresh)
-            flip_direction_checkbox.toggled.connect(_queue_static_preview_refresh)
+            alignment_mode_combo.currentIndexChanged.connect(_queue_static_preview_rebuild)
+            scale_to_length_checkbox.toggled.connect(_queue_static_preview_rebuild)
+            flip_direction_checkbox.toggled.connect(_queue_static_preview_rebuild)
+
+            def _apply_orientation_preset(index: int) -> None:
+                preset = orientation_preset_combo.itemData(index)
+                if not isinstance(preset, dict):
+                    return
+                rotate_values = tuple(preset.get("rotate", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0))
+                flip_value = bool(preset.get("flip", False))
+                flip_direction_checkbox.setChecked(flip_value)
+                for spin, value in zip((rotate_x_spin, rotate_y_spin, rotate_z_spin), rotate_values):
+                    spin.setValue(float(value))
+                _queue_static_preview_rebuild()
+
+            apply_orientation_preset_button.clicked.connect(
+                lambda _checked=False: _apply_orientation_preset(orientation_preset_combo.currentIndex())
+            )
 
             def _reset_location_values() -> None:
                 for spin in (offset_x_spin, offset_y_spin, offset_z_spin):
                     spin.setValue(0.0)
+                _queue_static_preview_rebuild()
 
             def _reset_rotation_values() -> None:
+                orientation_preset_combo.setCurrentIndex(0)
+                flip_direction_checkbox.setChecked(False)
                 for spin in (rotate_x_spin, rotate_y_spin, rotate_z_spin):
                     spin.setValue(0.0)
+                _queue_static_preview_rebuild()
 
             def _reset_scale_values() -> None:
+                scale_link_checkbox.setChecked(True)
                 for spin in (scale_x_spin, scale_y_spin, scale_z_spin):
                     spin.setValue(1.0)
+                _queue_static_preview_rebuild()
+
+            def _reset_placement_values() -> None:
+                alignment_mode_combo.setCurrentIndex(max(0, alignment_mode_combo.findData("auto_fit_original")))
+                scale_to_length_checkbox.setChecked(True)
+                orientation_preset_combo.setCurrentIndex(0)
+                flip_direction_checkbox.setChecked(False)
+                _reset_location_values()
+                _reset_rotation_values()
+                _reset_scale_values()
+                _queue_static_preview_rebuild()
+
+            def _nudge_rotation(spin: QDoubleSpinBox, direction: float) -> None:
+                orientation_preset_combo.blockSignals(True)
+                orientation_preset_combo.setCurrentIndex(0)
+                orientation_preset_combo.blockSignals(False)
+                spin.setValue(float(spin.value()) + (float(direction) * float(tilt_step_spin.value())))
 
             def _commit_alignment_preview_translation(dx: float, dy: float, dz: float) -> None:
                 static_preview_refresh_timer.stop()
@@ -18895,6 +22286,7 @@ def run_gui() -> int:
                         spin.setValue(float(spin.value()) + float(delta))
                         spin.blockSignals(False)
                     _update_selected_part_adjustment()
+                    _mark_final_output_preview_dirty(schedule=True)
                     _refresh_static_dialog_preview()
                     return
                 for spin, delta in (
@@ -18905,17 +22297,57 @@ def run_gui() -> int:
                     spin.blockSignals(True)
                     spin.setValue(float(spin.value()) + float(delta))
                     spin.blockSignals(False)
+                _mark_final_output_preview_dirty(schedule=True)
+                _refresh_static_dialog_preview()
+
+            def _commit_alignment_preview_rotation(dx: float, dy: float, dz: float) -> None:
+                static_preview_refresh_timer.stop()
+                if int(selected_source_part.get("index", -1)) >= 0:
+                    for spin, delta in (
+                        (part_rotate_x_spin, dx),
+                        (part_rotate_y_spin, dy),
+                        (part_rotate_z_spin, dz),
+                    ):
+                        spin.blockSignals(True)
+                        spin.setValue(float(spin.value()) + float(delta))
+                        spin.blockSignals(False)
+                    _update_selected_part_adjustment()
+                    _mark_final_output_preview_dirty(schedule=True)
+                    _refresh_static_dialog_preview()
+                    return
+                orientation_preset_combo.blockSignals(True)
+                orientation_preset_combo.setCurrentIndex(0)
+                orientation_preset_combo.blockSignals(False)
+                for spin, delta in (
+                    (rotate_x_spin, dx),
+                    (rotate_y_spin, dy),
+                    (rotate_z_spin, dz),
+                ):
+                    spin.blockSignals(True)
+                    spin.setValue(float(spin.value()) + float(delta))
+                    spin.blockSignals(False)
+                _mark_final_output_preview_dirty(schedule=True)
                 _refresh_static_dialog_preview()
 
             reset_location_button.clicked.connect(_reset_location_values)
             reset_rotation_button.clicked.connect(_reset_rotation_values)
             reset_scale_button.clicked.connect(_reset_scale_values)
+            reset_placement_button.clicked.connect(_reset_placement_values)
+            tilt_x_minus_button.clicked.connect(lambda _checked=False: _nudge_rotation(rotate_x_spin, -1.0))
+            tilt_x_plus_button.clicked.connect(lambda _checked=False: _nudge_rotation(rotate_x_spin, 1.0))
+            tilt_y_minus_button.clicked.connect(lambda _checked=False: _nudge_rotation(rotate_y_spin, -1.0))
+            tilt_y_plus_button.clicked.connect(lambda _checked=False: _nudge_rotation(rotate_y_spin, 1.0))
+            tilt_z_minus_button.clicked.connect(lambda _checked=False: _nudge_rotation(rotate_z_spin, -1.0))
+            tilt_z_plus_button.clicked.connect(lambda _checked=False: _nudge_rotation(rotate_z_spin, 1.0))
             for preview_widget in (static_dialog_preview, overlay_dialog_preview, replacement_only_preview):
                 preview_widget.set_alignment_translation_units_per_pixel(0.0005)
+                preview_widget.set_alignment_rotation_degrees_per_pixel(0.35)
                 preview_widget.alignment_drag_started.connect(static_preview_refresh_timer.stop)
                 preview_widget.alignment_drag_finished.connect(_commit_alignment_preview_translation)
+                preview_widget.alignment_rotation_finished.connect(_commit_alignment_preview_rotation)
             preview_controls_ready["ready"] = True
-            _refresh_static_dialog_preview()
+            QTimer.singleShot(0, _refresh_static_dialog_preview)
+            QTimer.singleShot(350, lambda: _mark_final_output_preview_dirty(schedule=True))
 
             buttons = QHBoxLayout()
             buttons.addStretch(1)
@@ -18933,7 +22365,8 @@ def run_gui() -> int:
             root_layout.addLayout(buttons)
             cancel_button.clicked.connect(dialog.reject)
 
-            def _accept_static_options() -> None:
+            def _build_static_options_from_dialog(*, show_messages: bool = True) -> Optional[StaticMeshReplacementOptions]:
+                parsed_mappings = list(suggested_mappings or [])
                 if mapping_edits and original_mesh_for_mapping is not None and replacement_mesh_for_mapping is not None:
                     render_source_indices = {
                         source_index
@@ -18952,19 +22385,21 @@ def run_gui() -> int:
                                 try:
                                     source_index = int(part)
                                 except ValueError:
-                                    QMessageBox.warning(
-                                        dialog,
-                                        "Invalid Submesh Mapping",
-                                        f"Target {target_index} contains a non-numeric source index: {part}",
-                                    )
-                                    return
+                                    if show_messages:
+                                        QMessageBox.warning(
+                                            dialog,
+                                            "Invalid Submesh Mapping",
+                                            f"Target {target_index} contains a non-numeric source index: {part}",
+                                        )
+                                    return None
                                 if source_index not in render_source_indices:
-                                    QMessageBox.warning(
-                                        dialog,
-                                        "Invalid Submesh Mapping",
-                                        f"Target {target_index} references source index {source_index}, but that source does not exist or is an anchor marker.",
-                                    )
-                                    return
+                                    if show_messages:
+                                        QMessageBox.warning(
+                                            dialog,
+                                            "Invalid Submesh Mapping",
+                                            f"Target {target_index} references source index {source_index}, but that source does not exist or is an anchor marker.",
+                                        )
+                                    return None
                                 if source_index not in source_indices:
                                     source_indices.append(source_index)
                         target = original_mesh_for_mapping.submeshes[target_index]
@@ -18977,10 +22412,220 @@ def run_gui() -> int:
                                 merge_sources=True,
                             )
                         )
-                    dialog._static_mappings = parsed_mappings  # type: ignore[attr-defined]
+                    vertex_limit_issues = _mapping_vertex_limit_issues(parsed_mappings)
+                    if vertex_limit_issues:
+                        displayed_issues = "\n".join(vertex_limit_issues[:8])
+                        if len(vertex_limit_issues) > 8:
+                            displayed_issues += f"\n... {len(vertex_limit_issues) - 8} more target(s)"
+                        if show_messages:
+                            QMessageBox.warning(
+                                dialog,
+                                "Mesh Replacement Too Large",
+                                "One or more target draw slots exceed the current 16-bit export limit.\n\n"
+                                f"{displayed_issues}\n\n"
+                                "Use the Parts tab to disable, split, or map fewer replacement sources into each target, "
+                                "or decimate the source mesh before importing.",
+                            )
+                        return None
+                texture_slot_overrides: List[StaticTextureSlotOverride] = []
+                for texture_row in texture_override_rows:
+                    source_path = str(texture_row.get("source_path", "") or "").strip()
+                    if not bool(texture_row.get("checked")) or not source_path:
+                        continue
+                    texture_slot_overrides.append(
+                        StaticTextureSlotOverride(
+                            target_texture_path=str(texture_row.get("target_path", "") or ""),
+                            source_path=source_path,
+                            slot_kind=str(texture_row.get("slot_kind", "") or "material"),
+                            target_material_name=str(texture_row.get("target_name", "") or ""),
+                            enabled=True,
+                        )
+                    )
+                return StaticMeshReplacementOptions(
+                    transform=StaticReplacementTransform(
+                        rotate_xyz_degrees=(
+                            float(rotate_x_spin.value()),
+                            float(rotate_y_spin.value()),
+                            float(rotate_z_spin.value()),
+                        ),
+                        scale=float(scale_x_spin.value()),
+                        scale_xyz=(
+                            float(scale_x_spin.value()),
+                            float(scale_y_spin.value()),
+                            float(scale_z_spin.value()),
+                        ),
+                        offset_xyz=(
+                            float(offset_x_spin.value()),
+                            float(offset_y_spin.value()),
+                            float(offset_z_spin.value()),
+                        ),
+                        scale_to_original_length=bool(scale_to_length_checkbox.isChecked()),
+                        alignment_mode=str(alignment_mode_combo.currentData() or "auto_fit_original"),
+                        flip_target_axis=bool(flip_direction_checkbox.isChecked()),
+                    ),
+                    submesh_mappings=list(parsed_mappings or []),
+                    rebuild_material_sidecar=bool(rebuild_sidecar_checkbox.isChecked()),
+                    enable_missing_base_color_parameters=bool(inject_base_color_checkbox.isChecked()),
+                    texture_slot_overrides=texture_slot_overrides,
+                    texture_output_size_mode=str(texture_output_size_combo.currentData() or "source"),
+                    source_part_adjustments=_current_source_part_adjustments(),
+                    original_part_copies=list(original_part_copies),
+                )
+
+            def _accept_static_options() -> None:
+                static_options = _build_static_options_from_dialog(show_messages=True)
+                if static_options is None:
+                    return
+                dialog._static_mappings = list(static_options.submesh_mappings or [])  # type: ignore[attr-defined]
+                dialog._static_options = static_options  # type: ignore[attr-defined]
                 dialog.accept()
 
             import_button.clicked.connect(_accept_static_options)
+
+            def _show_alignment_final_output_preview(final_result: FinalPackagePreviewResult) -> None:
+                preview_dialog = QDialog(dialog)
+                preview_dialog.setWindowTitle("Final Output Preview")
+                preview_dialog.resize(1040, 720)
+                preview_layout = QVBoxLayout(preview_dialog)
+                summary = QLabel("\n".join(final_result.summary_lines + list(final_result.warnings[:4])))
+                summary.setWordWrap(True)
+                summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                summary.setObjectName("HintLabel")
+                preview_layout.addWidget(summary)
+                final_model_preview = ModelPreviewWidget("Final output preview unavailable.", theme_key=self.current_theme_key)
+                final_model_preview.set_render_settings(_current_alignment_preview_render_settings())
+                final_model_preview.set_use_textures(True)
+                final_model_preview.set_high_quality_textures(True)
+                self._attach_archive_model_preview_images(final_result.preview_model)
+                final_model_preview.set_model(final_result.preview_model)
+                preview_layout.addWidget(final_model_preview, 1)
+                close_row = QHBoxLayout()
+                close_row.addStretch(1)
+                close_button = QPushButton("Close")
+                close_button.clicked.connect(preview_dialog.accept)
+                close_row.addWidget(close_button)
+                preview_layout.addLayout(close_row)
+                preview_dialog.exec()
+
+            original_dds_preview_cache: Dict[str, Optional[Path]] = {}
+            original_dds_basename_preview_cache: Dict[str, Tuple[Path, ...]] = {}
+
+            def _resolve_original_dds_preview_path(texture_path: str) -> Optional[Path]:
+                normalized = normalize_texture_reference_for_sidecar_lookup(texture_path)
+                if not normalized:
+                    return None
+                if normalized in original_dds_preview_cache:
+                    return original_dds_preview_cache[normalized]
+                resolved_path: Optional[Path] = None
+                for candidate in self.archive_entries_by_normalized_path.get(normalized, []) or []:
+                    if str(getattr(candidate, "extension", "") or "").lower() != ".dds":
+                        continue
+                    try:
+                        source_path, _note = ensure_archive_preview_source(candidate)
+                        resolved_path = source_path
+                        break
+                    except Exception:
+                        continue
+                original_dds_preview_cache[normalized] = resolved_path
+                return resolved_path
+
+            def _resolve_original_dds_basename_preview_paths(texture_basename: str) -> Sequence[Path]:
+                basename = PurePosixPath(str(texture_basename or "").replace("\\", "/")).name.lower()
+                if not basename:
+                    return ()
+                if basename in original_dds_basename_preview_cache:
+                    return original_dds_basename_preview_cache[basename]
+                paths: List[Path] = []
+                for candidate in self.archive_entries_by_basename.get(basename, []) or []:
+                    if str(getattr(candidate, "extension", "") or "").lower() != ".dds":
+                        continue
+                    try:
+                        source_path, _note = ensure_archive_preview_source(candidate)
+                        paths.append(source_path)
+                    except Exception:
+                        continue
+                original_dds_basename_preview_cache[basename] = tuple(paths)
+                return original_dds_basename_preview_cache[basename]
+
+            def _start_alignment_final_output_preview(*, auto_open: bool = True) -> None:
+                if bool(final_output_preview_state.get("building")):
+                    if auto_open:
+                        final_output_preview_state["open_when_ready"] = True
+                    _set_final_output_preview_status("Building final preview...", color="#d29922")
+                    return
+                static_options = _build_static_options_from_dialog(show_messages=auto_open)
+                if static_options is None:
+                    _set_final_output_preview_status("Final preview unavailable", color="#f85149")
+                    return
+                texconv_text = self.texconv_path_edit.text().strip()
+                generation = int(final_output_preview_state.get("generation", 0) or 0)
+                final_output_preview_state["building"] = True
+                _set_final_output_preview_status("Building final preview..." if auto_open else "Final preview updating...", color="#d29922")
+                final_output_preview_button.setEnabled(not auto_open)
+
+                def _task(log: Callable[[str], None]) -> object:
+                    log("Building final output preview from current alignment settings...")
+                    result = build_mesh_import_preview(
+                        entry,
+                        obj_path,
+                        import_mode="static_replacement",
+                        static_replacement_options=static_options,
+                        archive_entries_by_normalized_path=self.archive_entries_by_normalized_path,
+                        texconv_path=(Path(texconv_text).expanduser() if texconv_text else None),
+                        texture_entries_by_normalized_path=self.archive_entries_by_normalized_path,
+                        texture_entries_by_basename=self.archive_entries_by_basename,
+                        visible_texture_mode=_current_alignment_preview_render_settings().visible_texture_mode,
+                        supplemental_files=supplemental_files,
+                    )
+                    final_result = build_final_package_preview(
+                        result,
+                        export_options=None,
+                        texconv_path=(Path(texconv_text).expanduser() if texconv_text else None),
+                        original_dds_resolver=_resolve_original_dds_preview_path,
+                        original_dds_basename_resolver=_resolve_original_dds_basename_preview_paths,
+                    )
+                    return {"preview": result, "final": final_result}
+
+                def _handle_complete(result: object) -> None:
+                    final_output_preview_state["building"] = False
+                    final_output_preview_button.setEnabled(True)
+                    if generation != int(final_output_preview_state.get("generation", 0) or 0):
+                        if bool(final_output_preview_state.get("dirty")):
+                            final_output_preview_timer.start()
+                        return
+                    if not isinstance(result, dict) or not isinstance(result.get("final"), FinalPackagePreviewResult):
+                        _set_final_output_preview_status("Final preview unavailable", color="#f85149")
+                        return
+                    final_result = result["final"]
+                    final_output_preview_state["result"] = final_result
+                    final_output_preview_state["preview"] = result.get("preview")
+                    final_output_preview_state["dirty"] = False
+                    if final_result.likely_grey_materials:
+                        _set_final_output_preview_status("Likely grey in-game", color="#f85149")
+                    else:
+                        _set_final_output_preview_status("Ready", color="#3fb950")
+                    _refresh_static_dialog_preview()
+                    open_when_ready = bool(final_output_preview_state.pop("open_when_ready", False))
+                    final_output_preview_state["open_when_ready"] = False
+                    if auto_open or open_when_ready:
+                        _show_alignment_final_output_preview(final_result)
+
+                self._run_utility_task_when_idle(
+                    status_message="Building final output preview...",
+                    task=_task,
+                    on_complete=_handle_complete,
+                    show_archive_progress=True,
+                )
+
+            def _open_or_build_alignment_final_output_preview() -> None:
+                final_result = final_output_preview_state.get("result")
+                if isinstance(final_result, FinalPackagePreviewResult) and not bool(final_output_preview_state.get("dirty")):
+                    _show_alignment_final_output_preview(final_result)
+                    return
+                _start_alignment_final_output_preview(auto_open=True)
+
+            final_output_preview_timer.timeout.connect(lambda: _start_alignment_final_output_preview(auto_open=False))
+            final_output_preview_button.clicked.connect(_open_or_build_alignment_final_output_preview)
 
             def _fit_alignment_dialog_to_screen() -> None:
                 screen = dialog.screen() or self.screen() or QApplication.primaryScreen()
@@ -18994,56 +22639,17 @@ def run_gui() -> int:
                 frame = dialog.frameGeometry()
                 frame.moveCenter(available.center())
                 dialog.move(frame.topLeft())
+                _apply_alignment_dialog_responsive_layout()
 
+            _alignment_startup_step("Opening Mesh Replacement Alignment...")
             _fit_alignment_dialog_to_screen()
+            _finish_alignment_startup_progress()
 
             if dialog.exec() != QDialog.Accepted:
                 return None
 
-            selected_mappings = getattr(dialog, "_static_mappings", suggested_mappings)
-            texture_slot_overrides: List[StaticTextureSlotOverride] = []
-            for checkbox, combo, target_texture_path, slot_kind, target_material_name, _source_indices, _visualized in texture_override_rows:
-                source_path = str(combo.currentData() or "").strip()
-                if not checkbox.isChecked() or not source_path:
-                    continue
-                texture_slot_overrides.append(
-                    StaticTextureSlotOverride(
-                        target_texture_path=target_texture_path,
-                        source_path=source_path,
-                        slot_kind=slot_kind,
-                        target_material_name=target_material_name,
-                        enabled=True,
-                    )
-                )
-            return StaticMeshReplacementOptions(
-                transform=StaticReplacementTransform(
-                    rotate_xyz_degrees=(
-                        float(rotate_x_spin.value()),
-                        float(rotate_y_spin.value()),
-                        float(rotate_z_spin.value()),
-                    ),
-                    scale=float(scale_x_spin.value()),
-                    scale_xyz=(
-                        float(scale_x_spin.value()),
-                        float(scale_y_spin.value()),
-                        float(scale_z_spin.value()),
-                    ),
-                    offset_xyz=(
-                        float(offset_x_spin.value()),
-                        float(offset_y_spin.value()),
-                        float(offset_z_spin.value()),
-                    ),
-                    scale_to_original_length=bool(scale_to_length_checkbox.isChecked()),
-                    alignment_mode=str(alignment_mode_combo.currentData() or "auto_fit_original"),
-                    flip_target_axis=bool(flip_direction_checkbox.isChecked()),
-                ),
-                submesh_mappings=list(selected_mappings or []),
-                rebuild_material_sidecar=bool(rebuild_sidecar_checkbox.isChecked()),
-                enable_missing_base_color_parameters=bool(inject_base_color_checkbox.isChecked()),
-                texture_slot_overrides=texture_slot_overrides,
-                source_part_adjustments=_current_source_part_adjustments(),
-                original_part_copies=list(original_part_copies),
-            )
+            static_options = getattr(dialog, "_static_options", None)
+            return static_options if isinstance(static_options, StaticMeshReplacementOptions) else None
 
         def _start_archive_mesh_import_preview(self, entry: ArchiveEntry) -> None:
             scene_path, _selected = QFileDialog.getOpenFileName(
@@ -19072,7 +22678,11 @@ def run_gui() -> int:
                     entry,
                     scene_path_obj,
                     supplemental_files=supplemental_files,
-                    import_diagnostics=tuple(setup.scene_import_result.diagnostics) if setup.scene_import_result else (),
+                    import_diagnostics=(
+                        tuple(setup.preflight.detail_lines[:6]) if setup.preflight is not None else ()
+                    ),
+                    scene_import_result=setup.scene_import_result,
+                    original_mesh=setup.original_mesh,
                 )
                 if static_replacement_options is None:
                     return
@@ -19138,7 +22748,11 @@ def run_gui() -> int:
                     entry,
                     scene_path_obj,
                     supplemental_files=supplemental_files,
-                    import_diagnostics=tuple(setup.scene_import_result.diagnostics) if setup.scene_import_result else (),
+                    import_diagnostics=(
+                        tuple(setup.preflight.detail_lines[:6]) if setup.preflight is not None else ()
+                    ),
+                    scene_import_result=setup.scene_import_result,
+                    original_mesh=setup.original_mesh,
                 )
                 if static_replacement_options is None:
                     return
@@ -19154,31 +22768,24 @@ def run_gui() -> int:
             )
             if loose_export_settings is None:
                 return
+            selected_related_entries_result = self._prompt_archive_mesh_related_file_selection(
+                entry,
+                title="Include Additional Referenced Files",
+                intro_text=(
+                    "Select any original archive companion files that should be copied into the loose mod. "
+                    "Generated replacement textures and patched material sidecars are included automatically when enabled; "
+                    "original .pac_xml, .pab, .hkx, and old DDS files are unchecked by default."
+                ),
+                confirm_button_text="Continue",
+                default_checked=False,
+            )
+            if selected_related_entries_result is None:
+                return
+            selected_related_entries = selected_related_entries_result
 
             paired_entry = None
             if entry.extension == ".pam":
                 paired_entry = self._find_archive_entry_by_virtual_path(str(PurePosixPath(entry.path).with_suffix(".pamlod")))
-            try:
-                related_profile = analyze_replacement_asset(
-                    entry,
-                    archive_entries_by_basename=dict(self.archive_entries_by_basename),
-                )
-                related_entries: List[ArchiveEntry] = []
-                seen_related_paths: set[str] = set()
-                for related_file in related_profile.related_files:
-                    if related_file.role not in {"Skeleton", "Animation/physics", "Metadata", "Material sidecar"}:
-                        continue
-                    related_entry = self._find_archive_entry_by_virtual_path(related_file.path)
-                    if not isinstance(related_entry, ArchiveEntry):
-                        continue
-                    normalized_related_path = related_entry.path.replace("\\", "/").strip().lower()
-                    if not normalized_related_path or normalized_related_path in seen_related_paths:
-                        continue
-                    seen_related_paths.add(normalized_related_path)
-                    related_entries.append(related_entry)
-                selected_related_entries = tuple(related_entries)
-            except Exception:
-                selected_related_entries = ()
             texconv_text = self.texconv_path_edit.text().strip()
 
             def _preview_task(log: Callable[[str], None]) -> MeshImportPreviewResult:
@@ -19196,7 +22803,10 @@ def run_gui() -> int:
                     visible_texture_mode=preview_settings.visible_texture_mode,
                     supplemental_files=supplemental_files,
                 )
-            def _start_commit(preview_result: MeshImportPreviewResult) -> None:
+            def _start_commit(
+                preview_result: MeshImportPreviewResult,
+                final_preview_result: Optional[FinalPackagePreviewResult] = None,
+            ) -> None:
                 def _commit_task(log: Callable[[str], None]) -> object:
                     request_by_normalized_path: dict[str, ArchivePatchRequest] = {
                         entry.path.replace("\\", "/").strip().lower(): ArchivePatchRequest(
@@ -19245,6 +22855,7 @@ def run_gui() -> int:
                     return {
                         "preview": preview_result,
                         "loose": loose_result,
+                        "final_preview": final_preview_result,
                     }
 
                 def _handle_commit_complete(result: object) -> None:
@@ -19259,11 +22870,18 @@ def run_gui() -> int:
                     if not isinstance(loose_result, ArchiveLooseExportResult):
                         self.set_status_message("Mesh loose export finished with an incomplete result payload.", error=True)
                         return
+                    final_preview_payload = result.get("final_preview")
+                    final_preview_for_display = (
+                        final_preview_payload
+                        if isinstance(final_preview_payload, FinalPackagePreviewResult)
+                        else None
+                    )
                     self._show_archive_import_preview(
                         entry,
                         preview_payload,
                         patched=False,
                         loose_package_root=loose_result.package_root,
+                        final_preview_result=final_preview_for_display,
                     )
                     QMessageBox.information(
                         self,
@@ -19284,15 +22902,46 @@ def run_gui() -> int:
                     self.set_status_message("Mesh import preview finished with an unexpected result payload.", error=True)
                     return
                 self._show_archive_import_preview(entry, result, patched=False)
-                if not self._confirm_archive_mesh_import_commit(
-                    entry,
-                    result,
-                    destination=destination,
-                    source_obj_path=scene_path_obj,
-                ):
-                    self.set_status_message("Mesh import cancelled after validation review.")
-                    return
-                _start_commit(result)
+
+                def _final_preview_task(log: Callable[[str], None]) -> FinalPackagePreviewResult:
+                    if loose_export_settings is None:
+                        raise RuntimeError("Mod-ready export settings are not available.")
+                    _parent_root, _package_info, _create_no_encrypt, _include_related_files, export_options = loose_export_settings
+                    log("Building final output preview from generated sidecars and DDS payloads...")
+                    return build_final_package_preview(
+                        result,
+                        export_options=export_options,
+                        texconv_path=(Path(texconv_text).expanduser() if texconv_text else None),
+                        original_dds_resolver=_resolve_original_dds_preview_path,
+                        original_dds_basename_resolver=_resolve_original_dds_basename_preview_paths,
+                    )
+
+                def _handle_final_preview_complete(final_result: object) -> None:
+                    final_preview_result = final_result if isinstance(final_result, FinalPackagePreviewResult) else None
+                    if final_preview_result is not None:
+                        self._show_archive_import_preview(
+                            entry,
+                            result,
+                            patched=False,
+                            final_preview_result=final_preview_result,
+                        )
+                    if not self._confirm_archive_mesh_import_commit(
+                        entry,
+                        result,
+                        destination=destination,
+                        source_obj_path=scene_path_obj,
+                        final_preview_result=final_preview_result,
+                    ):
+                        self.set_status_message("Mesh import cancelled after validation review.")
+                        return
+                    _start_commit(result, final_preview_result)
+
+                self._run_utility_task_when_idle(
+                    status_message="Building final output preview...",
+                    task=_final_preview_task,
+                    on_complete=_handle_final_preview_complete,
+                    show_archive_progress=True,
+                )
 
             self._run_utility_task(
                 status_message=f"Rebuilding mesh preview for {entry.basename}...",
@@ -20462,7 +24111,7 @@ def run_gui() -> int:
                 if not isinstance(result, dict):
                     self.set_status_message("Texture policy preview returned an unexpected result.", error=True)
                     return
-                dialog = TexturePolicyPreviewDialog(theme_key=self.current_theme_key, parent=self)
+                dialog = TexturePolicyPreviewDialog(theme_key=self.current_theme_key, settings=self.settings, parent=self)
                 dialog.set_payload(result)
                 self.set_status_message("Texture policy preview is ready.")
                 dialog.exec()
@@ -20923,6 +24572,7 @@ def run_gui() -> int:
                     self.archive_scan_progress_bar.setRange(0, 1)
                     self.archive_scan_progress_bar.setValue(0)
                     self.archive_scan_progress_bar.setFormat("%v / %m")
+                    self._release_startup_splash()
                 return
             _write_crash_report(
                 "worker_error",
@@ -20938,6 +24588,7 @@ def run_gui() -> int:
                 self.archive_scan_progress_bar.setRange(0, 1)
                 self.archive_scan_progress_bar.setValue(0)
                 self.archive_scan_progress_bar.setFormat("%v / %m")
+                self._release_startup_splash()
 
         def _get_compare_zoom_state(self, side: str) -> Tuple[PreviewLabel, bool, float, QLabel]:
             if side == "original":
@@ -21393,6 +25044,7 @@ def run_gui() -> int:
                     pass
 
             self._shutting_down = True
+            self._release_startup_splash()
             self._save_detached_tool_geometries()
             self._attach_all_detached_tools(select_after=False)
             nonlocal _active_main_window
@@ -21420,6 +25072,8 @@ def run_gui() -> int:
                 self.archive_scan_worker.stop()
             if self.archive_sidecar_worker is not None:
                 self.archive_sidecar_worker.stop()
+            if self.archive_derived_cache_worker is not None:
+                self.archive_derived_cache_worker.stop()
             if self.archive_filter_worker is not None:
                 self.archive_filter_worker.stop()
             if self.build_worker is not None:
@@ -21435,6 +25089,7 @@ def run_gui() -> int:
             self.texture_editor_tab.shutdown()
             _stop_thread(self.worker_thread)
             _stop_thread(self.archive_sidecar_thread, self.archive_sidecar_worker)
+            _stop_thread(self.archive_derived_cache_thread, self.archive_derived_cache_worker)
             _stop_thread(self.compare_preview_thread, self.compare_preview_worker)
             _stop_thread(self.archive_preview_thread, self.archive_preview_worker)
             super().closeEvent(event)
@@ -21454,11 +25109,22 @@ def run_gui() -> int:
     startup_theme = str(startup_settings.value("appearance/theme", DEFAULT_UI_THEME))
     apply_app_theme(app, startup_settings, startup_theme)
 
+    startup_splash = StartupSplashDialog()
+    startup_splash.center_on_screen()
+    startup_splash.show()
+    app.processEvents()
+
     window = MainWindow()
     if not app.windowIcon().isNull():
         window.setWindowIcon(app.windowIcon())
     apply_window_data_fonts(window)
-    window.show()
+    hold_for_archive_autoload = window._startup_archive_autoload_expected()
+    window.attach_startup_splash(startup_splash, hold_main_window=hold_for_archive_autoload)
+    if hold_for_archive_autoload:
+        startup_splash.set_detail("Loading Archive Browser...")
+    else:
+        window.show()
+        window._release_startup_splash()
     return app.exec()
 
 __all__ = ["run_gui"]

@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $appName = "CrimsonDesertModWorkbench"
-$legacyAppNames = @("CrimsonForgeToolkit", "CrimsonTextureForge", "DDSRebuildApp")
+$legacyAppNames = @("DDSRebuildApp")
 $iconPath = Join-Path $PSScriptRoot "assets\cdmw.ico"
 $customHookDir = Join-Path $PSScriptRoot "pyinstaller_hooks"
 
@@ -274,9 +274,9 @@ if (Test-Path $licensePath) {
     $pyInstallerArgs += @("--add-data", "$licensePath;.")
 }
 
-$crimsonForgeLicensePath = Join-Path $scriptDir "cdmw\modding\CrimsonForge_MIT_LICENSE.txt"
-if (Test-Path $crimsonForgeLicensePath) {
-    $pyInstallerArgs += @("--add-data", "$crimsonForgeLicensePath;third_party")
+$vendoredMeshToolsLicensePath = Join-Path $scriptDir "cdmw\modding\VendoredMeshTools_MIT_LICENSE.txt"
+if (Test-Path $vendoredMeshToolsLicensePath) {
+    $pyInstallerArgs += @("--add-data", "$vendoredMeshToolsLicensePath;third_party")
 }
 
 $pyInstallerArgs += @(

@@ -1206,7 +1206,7 @@ def build_mod_package_export_options_from_config(config: AppConfig) -> ModPackag
     profile = str(getattr(config, "mod_ready_manager_profile", "universal") or "universal").strip() or "universal"
     defaults = mod_package_export_options_for_manager(profile)
     structure = str(getattr(config, "mod_ready_package_structure", "") or "").strip().lower()
-    if structure not in {"game_relative", "files_wrapper"}:
+    if structure not in {"game_relative", "files_wrapper", "custom_compact_paths"}:
         structure = defaults.structure
     conflict_mode = str(getattr(config, "mod_ready_conflict_mode", "") or "").strip().lower()
     if conflict_mode not in {"", "override"}:
@@ -2678,7 +2678,6 @@ def load_incremental_manifest(manifest_path: Path) -> Dict[str, Dict[str, object
     source_path = manifest_path
     if not source_path.exists():
         legacy_paths = (
-            manifest_path.with_name(".crimson_forge_toolkit_manifest.json"),
             manifest_path.with_name(".dds_rebuild_manifest.json"),
         )
         source_path = next((legacy_path for legacy_path in legacy_paths if legacy_path.exists()), source_path)

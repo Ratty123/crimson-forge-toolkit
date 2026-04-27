@@ -12,9 +12,11 @@ from cdmw.models import (
     MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODES,
     MODEL_PREVIEW_SAMPLER_PROBE_MODES,
     MODEL_PREVIEW_TEXTURE_PROBE_SOURCES,
+    ArchivePerformanceSettings,
     ModelPreviewData,
     ModelPreviewMesh,
     ModelPreviewRenderSettings,
+    clamp_archive_performance_settings,
     clamp_model_preview_render_settings,
 )
 from cdmw.ui.widgets import (
@@ -26,6 +28,16 @@ from cdmw.ui.widgets import (
 
 
 class ModelPreviewOverlayClipTests(unittest.TestCase):
+    def test_archive_performance_priority_requires_sidecar_indexing(self) -> None:
+        settings = clamp_archive_performance_settings(
+            ArchivePerformanceSettings(
+                enable_sidecar_indexing=False,
+                maximum_indexing_priority=True,
+            )
+        )
+
+        self.assertFalse(settings.maximum_indexing_priority)
+
     def test_keeps_visible_overlay_line_unchanged(self) -> None:
         clipped = ModelPreviewWidget._clip_preview_line(
             (-0.25, 0.0, 0.0, 1.0),
@@ -74,6 +86,10 @@ class ModelPreviewRenderSafetyTests(unittest.TestCase):
         for mode in MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODES:
             settings = clamp_model_preview_render_settings(ModelPreviewRenderSettings(render_diagnostic_mode=mode))
             self.assertEqual(mode, settings.render_diagnostic_mode)
+        for mode in ("height_depth", "material_response", "metal_shine", "roughness_response"):
+            self.assertIn(mode, MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODES)
+            settings = clamp_model_preview_render_settings(ModelPreviewRenderSettings(render_diagnostic_mode=mode))
+            self.assertEqual(mode, settings.render_diagnostic_mode)
         settings = clamp_model_preview_render_settings(
             ModelPreviewRenderSettings(
                 alpha_handling_mode=MODEL_PREVIEW_ALPHA_HANDLING_MODES[-1],
@@ -81,6 +97,7 @@ class ModelPreviewRenderSafetyTests(unittest.TestCase):
                 sampler_probe_mode=MODEL_PREVIEW_SAMPLER_PROBE_MODES[-1],
                 diffuse_swizzle_mode=MODEL_PREVIEW_DIFFUSE_SWIZZLE_MODES[-1],
                 disable_tint=True,
+                alignment_use_final_output_preview=True,
                 disable_brightness=True,
                 disable_uv_scale=True,
                 force_nearest_no_mipmaps=True,
@@ -99,6 +116,7 @@ class ModelPreviewRenderSafetyTests(unittest.TestCase):
         self.assertEqual(MODEL_PREVIEW_SAMPLER_PROBE_MODES[-1], settings.sampler_probe_mode)
         self.assertEqual(MODEL_PREVIEW_DIFFUSE_SWIZZLE_MODES[-1], settings.diffuse_swizzle_mode)
         self.assertTrue(settings.disable_tint)
+        self.assertTrue(settings.alignment_use_final_output_preview)
         self.assertTrue(settings.force_nearest_no_mipmaps)
         self.assertEqual(3, settings.solo_batch_index)
 
@@ -120,6 +138,141 @@ class ModelPreviewRenderSafetyTests(unittest.TestCase):
         self.assertEqual(defaults.sampler_probe_mode, settings.sampler_probe_mode)
         self.assertEqual(defaults.diffuse_swizzle_mode, settings.diffuse_swizzle_mode)
         self.assertEqual(-1, settings.solo_batch_index)
+
+    def test_base_texture_diagnostics_ignore_material_probe_source(self) -> None:
+        settings = clamp_model_preview_render_settings(
+            ModelPreviewRenderSettings(texture_probe_source="material")
+        )
+
+        for mode in ("base_direct", "base_no_tint", "base_alpha", "base_color", "sampler_swap_base_on_unit2"):
+            self.assertEqual(
+                "base",
+                ModelPreviewWidget._diffuse_probe_source_for_render_mode(settings, mode),
+            )
+        self.assertEqual(
+            "material",
+            ModelPreviewWidget._diffuse_probe_source_for_render_mode(settings, "sampler_swap_material_on_unit0"),
+        )
+        self.assertEqual(
+            "material",
+            ModelPreviewWidget._diffuse_probe_source_for_render_mode(settings, "texture_probe"),
+        )
+        self.assertEqual(
+            "base",
+            ModelPreviewWidget._diffuse_probe_source_for_render_mode(
+                ModelPreviewRenderSettings(texture_probe_source="not-a-slot"),
+                "texture_probe",
+            ),
+        )
+
+    def test_depth_and_shine_controls_clamp_to_safe_ranges(self) -> None:
+        settings = clamp_model_preview_render_settings(
+            ModelPreviewRenderSettings(
+                height_effect_max=99.0,
+                specular_max=99.0,
+                shininess_max=999.0,
+                specular_min=0.8,
+                shininess_min=300.0,
+            )
+        )
+
+        self.assertLessEqual(settings.height_effect_max, 1.0)
+        self.assertLessEqual(settings.specular_max, 1.0)
+        self.assertLessEqual(settings.shininess_max, 256.0)
+        self.assertLessEqual(settings.specular_min, settings.specular_max)
+        self.assertLessEqual(settings.shininess_min, settings.shininess_max)
+
+    def test_depth_shine_and_rough_settings_survive_clamping(self) -> None:
+        settings = clamp_model_preview_render_settings(
+            ModelPreviewRenderSettings(
+                height_effect_max=0.82,
+                specular_max=0.67,
+                shininess_min=18.0,
+                shininess_base=84.0,
+                shininess_max=190.0,
+                height_shininess_boost=42.0,
+            )
+        )
+
+        self.assertAlmostEqual(0.82, settings.height_effect_max)
+        self.assertAlmostEqual(0.67, settings.specular_max)
+        self.assertAlmostEqual(18.0, settings.shininess_min)
+        self.assertAlmostEqual(84.0, settings.shininess_base)
+        self.assertAlmostEqual(190.0, settings.shininess_max)
+        self.assertAlmostEqual(42.0, settings.height_shininess_boost)
+
+    def test_default_lit_settings_do_not_enable_diagnostic_modes(self) -> None:
+        defaults = clamp_model_preview_render_settings(ModelPreviewRenderSettings())
+
+        self.assertEqual("lit", defaults.render_diagnostic_mode)
+        self.assertFalse(defaults.disable_all_support_maps)
+        self.assertGreater(defaults.height_effect_max, 0.0)
+        self.assertGreater(defaults.specular_max, 0.0)
+
+    def test_black_output_triage_distinguishes_missing_base_from_support_only(self) -> None:
+        framebuffer = _FramebufferVisibilitySample(visible_pixels=100, average_luma=0.02, dark_ratio=0.95)
+        missing_base_lines = ModelPreviewWidget._black_output_triage_lines(
+            [
+                _BatchRenderDiagnostic(
+                    batch_index=0,
+                    mesh_index=0,
+                    label="Blade",
+                    texture_path_set=False,
+                    use_texture=False,
+                )
+            ],
+            framebuffer,
+        )
+        support_only_lines = ModelPreviewWidget._black_output_triage_lines(
+            [
+                _BatchRenderDiagnostic(
+                    batch_index=0,
+                    mesh_index=0,
+                    label="Blade",
+                    texture_path_set=False,
+                    use_texture=False,
+                    use_normal=True,
+                    use_height=True,
+                )
+            ],
+            framebuffer,
+        )
+
+        self.assertIn("Missing base/color", "\n".join(missing_base_lines))
+        self.assertIn("support maps cannot provide visible color", "\n".join(missing_base_lines))
+        self.assertIn("only normal/material/height support maps active", "\n".join(support_only_lines))
+
+    def test_support_map_slot_and_active_counts_are_summarized(self) -> None:
+        batches = [
+            _ModelPreviewDrawBatch(
+                mesh_index=0,
+                material_name="",
+                texture_name="",
+                first_vertex=0,
+                vertex_count=3,
+                normal_texture_key="normal.png",
+                material_texture_key="material.png",
+            ),
+            _ModelPreviewDrawBatch(
+                mesh_index=1,
+                material_name="",
+                texture_name="",
+                first_vertex=3,
+                vertex_count=3,
+                height_texture_key="height.png",
+            ),
+        ]
+        diagnostics = {
+            0: _BatchRenderDiagnostic(0, 0, "batch 0", use_normal=True),
+            1: _BatchRenderDiagnostic(1, 1, "batch 1", use_height=True),
+        }
+
+        available = ModelPreviewWidget._support_map_slot_counts_from_batches(batches)
+        active = ModelPreviewWidget._support_map_active_counts_from_diagnostics(diagnostics)
+
+        self.assertEqual({"normal": 1, "material": 1, "height": 1}, available)
+        self.assertEqual({"normal": 1, "material": 0, "height": 1}, active)
+        self.assertEqual("n:1 m:0 h:1", ModelPreviewWidget._format_support_map_counts(active))
 
     def test_vertex_blob_repairs_invalid_normals_and_preserves_uv_batch(self) -> None:
         mesh = ModelPreviewMesh(

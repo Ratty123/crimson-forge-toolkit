@@ -22,14 +22,13 @@ def list_process_ids_by_image_name(image_name: str) -> set[int]:
     if os.name != "nt":
         return set()
 
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     proc = subprocess.run(
         ["tasklist", "/fo", "csv", "/nh", "/fi", f"IMAGENAME eq {image_name}"],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        creationflags=creationflags,
+        **hidden_subprocess_kwargs(),
     )
 
     process_ids: set[int] = set()
@@ -54,14 +53,13 @@ def list_process_ids_by_image_name(image_name: str) -> set[int]:
 
 
 def kill_process_tree_windows(pid: int) -> None:
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.run(
         ["taskkill", "/PID", str(pid), "/T", "/F"],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        creationflags=creationflags,
+        **hidden_subprocess_kwargs(),
     )
 
 
@@ -381,14 +379,13 @@ def install_python_packages(
     cmd = [str(python_executable), "-m", "pip", "install", "--upgrade", *packages]
     if on_log:
         on_log(f"Running: {' '.join(cmd)}")
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     proc = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        creationflags=creationflags,
+        **hidden_subprocess_kwargs(),
     )
     if on_log:
         for line in split_log_lines(proc.stdout):

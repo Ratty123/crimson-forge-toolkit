@@ -6,9 +6,9 @@ from dataclasses import dataclass, fields as dataclass_fields
 import math
 from pathlib import PurePosixPath
 import re
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSettings, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -98,7 +99,252 @@ _GL_TEXTURE0 = 0x84C0
 _GL_MAX_TEXTURE_SIZE = 0x0D33
 _GL_NO_ERROR = 0
 
-MODEL_PREVIEW_RENDER_BUILD_ID = "2026-04-25-diffuse-probe-v2"
+MODEL_PREVIEW_RENDER_BUILD_ID = "2026-04-27-support-diagnostics-v3"
+PERSISTENT_TREE_COLUMN_WIDTHS_PREFIX = "ui/tree_column_widths"
+PERSISTENT_TREE_COLUMN_ORDER_PREFIX = "ui/tree_column_order"
+
+
+def persistent_tree_column_widths_key(storage_name: str) -> str:
+    normalized = str(storage_name or "tree").strip().strip("/")
+    return f"{PERSISTENT_TREE_COLUMN_WIDTHS_PREFIX}/{normalized or 'tree'}"
+
+
+def persistent_tree_column_order_key(storage_name: str) -> str:
+    normalized = str(storage_name or "tree").strip().strip("/")
+    return f"{PERSISTENT_TREE_COLUMN_ORDER_PREFIX}/{normalized or 'tree'}"
+
+
+def parse_persistent_tree_column_widths(
+    settings: QSettings,
+    storage_name: str,
+    column_count: int,
+    *,
+    minimum_width: int = 32,
+) -> Tuple[int, ...]:
+    if settings is None or column_count <= 0:
+        return ()
+    raw_value = settings.value(persistent_tree_column_widths_key(storage_name), "")
+    if raw_value in (None, ""):
+        return ()
+    if isinstance(raw_value, str):
+        parts = [part.strip() for part in raw_value.split(",") if part.strip()]
+    elif isinstance(raw_value, (list, tuple)):
+        parts = list(raw_value)
+    else:
+        return ()
+    widths: List[int] = []
+    for part in parts:
+        try:
+            width = int(part)
+        except (TypeError, ValueError):
+            return ()
+        widths.append(max(int(minimum_width), width))
+    if len(widths) != int(column_count):
+        return ()
+    return tuple(widths)
+
+
+def has_persistent_tree_column_widths(
+    settings: QSettings,
+    storage_name: str,
+    column_count: int,
+    *,
+    minimum_width: int = 32,
+) -> bool:
+    return bool(
+        parse_persistent_tree_column_widths(
+            settings,
+            storage_name,
+            column_count,
+            minimum_width=minimum_width,
+        )
+    )
+
+
+def parse_persistent_tree_column_order(
+    settings: QSettings,
+    storage_name: str,
+    column_count: int,
+) -> Tuple[int, ...]:
+    if settings is None or column_count <= 0:
+        return ()
+    raw_value = settings.value(persistent_tree_column_order_key(storage_name), "")
+    if raw_value in (None, ""):
+        return ()
+    if isinstance(raw_value, str):
+        parts = [part.strip() for part in raw_value.split(",") if part.strip()]
+    elif isinstance(raw_value, (list, tuple)):
+        parts = list(raw_value)
+    else:
+        return ()
+    order: List[int] = []
+    for part in parts:
+        try:
+            logical_index = int(part)
+        except (TypeError, ValueError):
+            return ()
+        order.append(logical_index)
+    if len(order) != int(column_count) or sorted(order) != list(range(int(column_count))):
+        return ()
+    return tuple(order)
+
+
+def persist_tree_column_order(
+    tree: QTreeWidget,
+    settings: QSettings,
+    storage_name: str,
+) -> None:
+    if tree is None or settings is None:
+        return
+    header = tree.header()
+    if header is None:
+        return
+    order = [str(int(header.logicalIndex(visual_index))) for visual_index in range(header.count())]
+    settings.setValue(persistent_tree_column_order_key(storage_name), ",".join(order))
+
+
+def restore_persistent_tree_column_order(
+    tree: QTreeWidget,
+    settings: QSettings,
+    storage_name: str,
+) -> bool:
+    if tree is None or settings is None:
+        return False
+    header = tree.header()
+    if header is None:
+        return False
+    order = parse_persistent_tree_column_order(settings, storage_name, header.count())
+    if not order:
+        return False
+    tree.setUpdatesEnabled(False)
+    try:
+        for visual_index, logical_index in enumerate(order):
+            current_visual = int(header.visualIndex(int(logical_index)))
+            if current_visual >= 0 and current_visual != visual_index:
+                header.moveSection(current_visual, visual_index)
+    finally:
+        tree.setUpdatesEnabled(True)
+    return True
+
+
+def persist_tree_column_widths(
+    tree: QTreeWidget,
+    settings: QSettings,
+    storage_name: str,
+    *,
+    minimum_width: int = 32,
+) -> None:
+    if tree is None or settings is None:
+        return
+    header = tree.header()
+    if header is None:
+        return
+    widths = [
+        str(max(int(minimum_width), int(header.sectionSize(column))))
+        for column in range(header.count())
+    ]
+    settings.setValue(persistent_tree_column_widths_key(storage_name), ",".join(widths))
+
+
+def restore_persistent_tree_column_widths(
+    tree: QTreeWidget,
+    settings: QSettings,
+    storage_name: str,
+    *,
+    minimum_width: int = 32,
+) -> bool:
+    if tree is None or settings is None:
+        return False
+    header = tree.header()
+    if header is None:
+        return False
+    widths = parse_persistent_tree_column_widths(
+        settings,
+        storage_name,
+        header.count(),
+        minimum_width=minimum_width,
+    )
+    if not widths:
+        return False
+    tree.setUpdatesEnabled(False)
+    try:
+        for column, width in enumerate(widths):
+            header.resizeSection(column, int(width))
+    finally:
+        tree.setUpdatesEnabled(True)
+    return True
+
+
+def make_tree_columns_persistent(
+    tree: QTreeWidget,
+    settings: QSettings,
+    storage_name: str,
+    *,
+    minimum_width: int = 32,
+    save_callback: Optional[Callable[..., None]] = None,
+    force_interactive: bool = True,
+    restore_later: bool = True,
+    persist_order: bool = True,
+    sections_movable: bool = True,
+) -> None:
+    if tree is None or settings is None:
+        return
+    header = tree.header()
+    if header is None:
+        return
+    header.setSectionsClickable(True)
+    header.setSectionsMovable(bool(sections_movable))
+    header.setMinimumSectionSize(int(minimum_width))
+    if force_interactive:
+        header.setStretchLastSection(False)
+        for column in range(header.count()):
+            header.setSectionResizeMode(column, QHeaderView.Interactive)
+    guard_property = "_cdmw_restoring_persistent_tree_columns"
+    tree.setProperty(guard_property, True)
+
+    def _restore() -> None:
+        tree.setProperty(guard_property, True)
+        try:
+            if persist_order:
+                restore_persistent_tree_column_order(
+                    tree,
+                    settings,
+                    storage_name,
+                )
+            restore_persistent_tree_column_widths(
+                tree,
+                settings,
+                storage_name,
+                minimum_width=minimum_width,
+            )
+        finally:
+            tree.setProperty(guard_property, False)
+
+    def _persist(*_args: object) -> None:
+        if bool(tree.property(guard_property)):
+            return
+        persist_tree_column_widths(
+            tree,
+            settings,
+            storage_name,
+            minimum_width=minimum_width,
+        )
+        if persist_order:
+            persist_tree_column_order(
+                tree,
+                settings,
+                storage_name,
+            )
+        if save_callback is not None:
+            save_callback()
+
+    header.sectionResized.connect(_persist)
+    if persist_order:
+        header.sectionMoved.connect(_persist)
+    if restore_later:
+        QTimer.singleShot(0, _restore)
+    else:
+        _restore()
 
 _RENDER_DIAGNOSTIC_MODE_CODES = {
     "lit": 0,
@@ -118,6 +364,11 @@ _RENDER_DIAGNOSTIC_MODE_CODES = {
     "sampler_swap_base_on_unit2": 14,
     "sampler_swap_material_on_unit0": 15,
     "base_color": 16,
+    "texture_probe": 21,
+    "height_depth": 17,
+    "material_response": 18,
+    "metal_shine": 19,
+    "roughness_response": 20,
 }
 
 _ALPHA_HANDLING_MODE_CODES = {
@@ -974,6 +1225,8 @@ class ModelPreviewWidget(QOpenGLWidget):
     alignment_drag_started = Signal()
     alignment_drag_changed = Signal(float, float, float)
     alignment_drag_finished = Signal(float, float, float)
+    alignment_rotation_changed = Signal(float, float, float)
+    alignment_rotation_finished = Signal(float, float, float)
 
     _DEFAULT_YAW = -35.0
     _DEFAULT_PITCH = 20.0
@@ -1081,6 +1334,11 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._alignment_translation_units_per_pixel = 0.001
         self._alignment_live_translation = QVector3D(0.0, 0.0, 0.0)
         self._alignment_drag_total = QVector3D(0.0, 0.0, 0.0)
+        self._alignment_rotation_degrees_per_pixel = 0.35
+        self._alignment_rotation_drag_active = False
+        self._alignment_rotation_drag_roll = False
+        self._alignment_live_rotation = QVector3D(0.0, 0.0, 0.0)
+        self._alignment_rotation_drag_total = QVector3D(0.0, 0.0, 0.0)
         self._alignment_editable_mesh_start = 0
         self._alignment_editable_mesh_count = -1
         self._alignment_editable_mesh_indices: Optional[set[int]] = None
@@ -1134,6 +1392,10 @@ class ModelPreviewWidget(QOpenGLWidget):
         if not self._alignment_editing_enabled:
             self._alignment_drag_axis = ""
             self._alignment_hover_axis = ""
+            self._alignment_rotation_drag_active = False
+            self._alignment_rotation_drag_roll = False
+            self._alignment_rotation_drag_total = QVector3D(0.0, 0.0, 0.0)
+            self._alignment_live_rotation = QVector3D(0.0, 0.0, 0.0)
         self.update()
 
     def set_alignment_translation_units_per_pixel(self, value: float) -> None:
@@ -1142,12 +1404,25 @@ class ModelPreviewWidget(QOpenGLWidget):
         except Exception:
             self._alignment_translation_units_per_pixel = 0.001
 
+    def set_alignment_rotation_degrees_per_pixel(self, value: float) -> None:
+        try:
+            self._alignment_rotation_degrees_per_pixel = max(0.001, abs(float(value)))
+        except Exception:
+            self._alignment_rotation_degrees_per_pixel = 0.35
+
     def set_alignment_live_translation(self, x: float, y: float, z: float) -> None:
         self._alignment_live_translation = QVector3D(float(x), float(y), float(z))
         self.update()
 
     def clear_alignment_live_translation(self) -> None:
         self.set_alignment_live_translation(0.0, 0.0, 0.0)
+
+    def set_alignment_live_rotation(self, x: float, y: float, z: float) -> None:
+        self._alignment_live_rotation = QVector3D(float(x), float(y), float(z))
+        self.update()
+
+    def clear_alignment_live_rotation(self) -> None:
+        self.set_alignment_live_rotation(0.0, 0.0, 0.0)
 
     def set_alignment_editable_mesh_range(self, start: int = 0, count: int = -1) -> None:
         self._alignment_editable_mesh_start = max(0, int(start))
@@ -1306,6 +1581,8 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._pan_offset = QVector3D(0.0, 0.0, 0.0)
         if not self._alignment_drag_axis:
             self._alignment_live_translation = QVector3D(0.0, 0.0, 0.0)
+        if not self._alignment_rotation_drag_active:
+            self._alignment_live_rotation = QVector3D(0.0, 0.0, 0.0)
         self._refresh_debug_overlay_lines()
         self._upload_geometry()
         self.view_state_changed.emit(self._zoom_factor, self._fit_to_view)
@@ -1457,6 +1734,42 @@ class ModelPreviewWidget(QOpenGLWidget):
         return any(
             batch.normal_texture_key or batch.material_texture_key or batch.height_texture_key
             for batch in self._mesh_batches
+        )
+
+    @staticmethod
+    def _support_map_slot_counts_from_batches(
+        batches: Sequence[_ModelPreviewDrawBatch],
+    ) -> Dict[str, int]:
+        counts = {"normal": 0, "material": 0, "height": 0}
+        for batch in batches:
+            if batch.normal_texture_key:
+                counts["normal"] += 1
+            if batch.material_texture_key:
+                counts["material"] += 1
+            if batch.height_texture_key:
+                counts["height"] += 1
+        return counts
+
+    @staticmethod
+    def _support_map_active_counts_from_diagnostics(
+        diagnostics: Mapping[int, _BatchRenderDiagnostic],
+    ) -> Dict[str, int]:
+        counts = {"normal": 0, "material": 0, "height": 0}
+        for item in diagnostics.values():
+            if item.use_normal:
+                counts["normal"] += 1
+            if item.use_material:
+                counts["material"] += 1
+            if item.use_height:
+                counts["height"] += 1
+        return counts
+
+    @staticmethod
+    def _format_support_map_counts(counts: Mapping[str, int]) -> str:
+        return (
+            f"n:{int(counts.get('normal', 0))} "
+            f"m:{int(counts.get('material', 0))} "
+            f"h:{int(counts.get('height', 0))}"
         )
 
     def base_flip_override_enabled(self) -> bool:
@@ -1911,6 +2224,18 @@ class ModelPreviewWidget(QOpenGLWidget):
         return 0
 
     @staticmethod
+    def _diffuse_probe_source_for_render_mode(settings: ModelPreviewRenderSettings, render_mode: str) -> str:
+        normalized_mode = str(render_mode or "").strip().lower()
+        if normalized_mode in {"base_direct", "base_no_tint", "base_alpha", "base_color", "sampler_swap_base_on_unit2"}:
+            return "base"
+        if normalized_mode == "texture_probe":
+            source = str(getattr(settings, "texture_probe_source", "base") or "base").strip().lower()
+            return source if source in {"base", "normal", "material", "height"} else "base"
+        if normalized_mode == "sampler_swap_material_on_unit0":
+            return "material"
+        return "base"
+
+    @staticmethod
     def _diagnostic_texture_for_source(
         source: str,
         *,
@@ -2232,6 +2557,87 @@ class ModelPreviewWidget(QOpenGLWidget):
             background_ratio=background / float(sampled),
         )
 
+    @staticmethod
+    def _black_output_triage_lines(
+        diagnostics: Sequence[_BatchRenderDiagnostic],
+        framebuffer: _FramebufferVisibilitySample,
+    ) -> Tuple[str, ...]:
+        dark_output = bool(
+            framebuffer.visible_pixels > 0
+            and framebuffer.average_luma < 0.075
+            and framebuffer.dark_ratio > 0.60
+        )
+        if not dark_output:
+            return ()
+        missing_base = sum(1 for item in diagnostics if not item.texture_path_set)
+        alpha_hidden = sum(
+            1
+            for item in diagnostics
+            if item.alpha_discard_risk and item.alpha_handling_mode == "default"
+        )
+        image_failed = sum(1 for item in diagnostics if item.failure_bucket == "image" and item.texture_path_set)
+        upload_failed = sum(1 for item in diagnostics if item.failure_bucket == "upload")
+        shader_dark = sum(
+            1
+            for item in diagnostics
+            if item.use_texture and item.sampled_luma is not None and item.sampled_luma >= 0.075
+        )
+        support_only = sum(
+            1
+            for item in diagnostics
+            if not item.use_texture and (item.use_normal or item.use_material or item.use_height)
+        )
+        support_dark = sum(
+            1
+            for item in diagnostics
+            if item.use_texture
+            and (item.use_normal or item.use_material or item.use_height)
+            and (
+                (item.material_sampled_luma is not None and item.material_sampled_luma < 0.035)
+                or (item.height_sampled_luma is not None and item.height_sampled_luma < 0.035)
+            )
+        )
+        invalid_normals = sum(1 for item in diagnostics if item.normal_repair_count > 0 or item.normal_finite_ratio < 0.80)
+
+        lines = ["Black Output Triage:"]
+        if missing_base:
+            lines.append(
+                f"- Missing base/color texture on {missing_base:,} batch(es). Assign a Base / Color map; support maps cannot provide visible color."
+            )
+        if alpha_hidden:
+            lines.append(
+                f"- Alpha/discard can hide {alpha_hidden:,} batch(es). Try Force Opaque or Show Alpha to verify the source texture."
+            )
+        if image_failed:
+            lines.append(
+                f"- Base texture decode failed on {image_failed:,} batch(es). Check DDS conversion/cache output for those paths."
+            )
+        if upload_failed:
+            lines.append(
+                f"- Texture upload failed on {upload_failed:,} batch(es). Try a smaller preview texture limit or nearest/no-mipmap diagnostics."
+            )
+        if support_only:
+            lines.append(
+                f"- {support_only:,} batch(es) have only normal/material/height support maps active. Add a Base / Color map to avoid grey or black output."
+            )
+        if support_dark:
+            lines.append(
+                f"- Support-map samples are very dark on {support_dark:,} batch(es). Disable Material/Height maps or inspect Material Mask/Height diagnostics."
+            )
+        if invalid_normals:
+            lines.append(
+                f"- Normal data was repaired or appears invalid on {invalid_normals:,} batch(es). Inspect Normal mode before trusting lighting."
+            )
+        if shader_dark and not any((missing_base, alpha_hidden, image_failed, upload_failed, support_only, support_dark)):
+            lines.append(
+                "- Base texture samples are visible but shaded output is dark. Use Base Color Guarded, Material Mask Response, and Metal / Shine Response modes to isolate shader response."
+            )
+        if len(lines) == 1:
+            lines.append(
+                "- No single texture failure was obvious. Compare Lit against Base Texture Raw, Base Color Guarded, and UV diagnostics."
+            )
+        return tuple(lines)
+
     def _render_sampling_diagnostic_lines(self) -> Tuple[str, ...]:
         if not self._mesh_batches:
             return ()
@@ -2273,6 +2679,9 @@ class ModelPreviewWidget(QOpenGLWidget):
                 f"nearest_no_mips={self._yes_no(settings.force_nearest_no_mipmaps)}, "
                 f"disable_lighting={self._yes_no(settings.disable_lighting)}, "
                 f"disable_depth={self._yes_no(settings.disable_depth_test)}, "
+                f"depth_strength={float(settings.height_effect_max):.2f}, "
+                f"material_shine={float(settings.specular_max):.2f}, "
+                f"roughness_contrast={float(settings.shininess_max):.0f}, "
                 f"solo_batch={settings.solo_batch_index}"
             ),
             f"Sampled base textures: {sampled:,} / {len(diagnostics):,}",
@@ -2291,6 +2700,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                 f"background_px={framebuffer.background_ratio:.0%}"
             ),
         ]
+        lines.extend(self._black_output_triage_lines(diagnostics, framebuffer))
         for item in diagnostics:
             luma_text = ""
             if item.sampled_luma is not None:
@@ -2442,6 +2852,27 @@ class ModelPreviewWidget(QOpenGLWidget):
             override_labels.append("Flip Base V")
         if self.support_maps_disabled():
             override_labels.append("Support Maps Off")
+        support_available_counts = self._support_map_slot_counts_from_batches(self._mesh_batches)
+        support_active_counts = self._support_map_active_counts_from_diagnostics(self._batch_render_diagnostics)
+        settings = self.render_settings()
+        support_gate_reasons: List[str] = []
+        if sum(support_available_counts.values()) <= 0:
+            support_gate_reasons.append("no support maps resolved")
+        if not self._high_quality_textures:
+            support_gate_reasons.append("high-quality shading off")
+        if bool(getattr(settings, "disable_all_support_maps", False)) or self.support_maps_disabled():
+            support_gate_reasons.append("support maps disabled")
+        disabled_slots = [
+            label
+            for enabled, label in (
+                (getattr(settings, "disable_normal_map", False), "normal"),
+                (getattr(settings, "disable_material_map", False), "material"),
+                (getattr(settings, "disable_height_map", False), "height"),
+            )
+            if bool(enabled)
+        ]
+        if disabled_slots:
+            support_gate_reasons.append("disabled slots: " + "/".join(disabled_slots))
         self._debug_overlay_lines = (
             f"Visible Mode: {self._visible_texture_mode_label()}",
         )
@@ -2453,6 +2884,12 @@ class ModelPreviewWidget(QOpenGLWidget):
             f"Material: {self._summarize_overlay_values(material_names)}",
             f"Material Decode: {self._summarize_overlay_values(material_interpretations)}",
             f"Height: {self._summarize_overlay_values(height_names)}",
+            (
+                "Support Maps: "
+                f"available {self._format_support_map_counts(support_available_counts)}; "
+                f"active {self._format_support_map_counts(support_active_counts)}"
+                f"{'; ' + ', '.join(support_gate_reasons) if support_gate_reasons else ''}"
+            ),
             f"Base Source: {self._summarize_overlay_values(base_sources)}",
             (
                 f"Preview Approximation: {sidecar_approximation_count:,} sidecar material parameter set(s)"
@@ -2618,6 +3055,24 @@ class ModelPreviewWidget(QOpenGLWidget):
             float(self._alignment_live_translation.z()) * scale,
         )
 
+    def _apply_alignment_live_transform(
+        self,
+        base_model: QMatrix4x4,
+        live_translation: QVector3D,
+        live_rotation: QVector3D,
+        rotation_origin: tuple[float, float, float],
+    ) -> QMatrix4x4:
+        matrix = QMatrix4x4(base_model)
+        if live_translation.lengthSquared() > 1e-12:
+            matrix.translate(live_translation)
+        if live_rotation.lengthSquared() > 1e-12:
+            matrix.translate(float(rotation_origin[0]), float(rotation_origin[1]), float(rotation_origin[2]))
+            matrix.rotate(float(live_rotation.x()), 1.0, 0.0, 0.0)
+            matrix.rotate(float(live_rotation.y()), 0.0, 1.0, 0.0)
+            matrix.rotate(float(live_rotation.z()), 0.0, 0.0, 1.0)
+            matrix.translate(-float(rotation_origin[0]), -float(rotation_origin[1]), -float(rotation_origin[2]))
+        return matrix
+
     def _alignment_batch_is_editable(self, batch_index: int) -> bool:
         if self._alignment_editable_mesh_indices is not None:
             return int(batch_index) in self._alignment_editable_mesh_indices
@@ -2766,6 +3221,18 @@ class ModelPreviewWidget(QOpenGLWidget):
             }
             float wrapped_lambert(vec3 surface_normal, vec3 light_vector, float wrap_bias) {
                 return clamp((dot(surface_normal, light_vector) + wrap_bias) / (1.0 + wrap_bias), 0.0, 1.0);
+            }
+            float color_saturation(vec3 value) {
+                float high = max(max(value.r, value.g), value.b);
+                float low = min(min(value.r, value.g), value.b);
+                return max(high - low, 0.0);
+            }
+            vec3 luma_preserving_colorize(vec3 base, vec3 hint, float amount) {
+                float base_luma = dot(base, vec3(0.2126, 0.7152, 0.0722));
+                float hint_luma = max(dot(hint, vec3(0.2126, 0.7152, 0.0722)), 0.08);
+                vec3 hue = clamp(hint / hint_luma, vec3(0.35), vec3(1.85));
+                vec3 colored = clamp(max(base * 0.72, hue * max(base_luma, 0.10)), 0.0, 1.35);
+                return mix(base, colored, clamp(amount, 0.0, 1.0));
             }
             void decode_material_sample(
                 vec4 sample_value,
@@ -2929,7 +3396,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                         gl_FragColor = vec4(vec3(base_color.a), 1.0);
                         return;
                     }
-                    if (render_diagnostic_mode == 8 || render_diagnostic_mode == 14 || render_diagnostic_mode == 15) {
+                    if (render_diagnostic_mode == 8 || render_diagnostic_mode == 14 || render_diagnostic_mode == 15 || render_diagnostic_mode == 21) {
                         gl_FragColor = vec4(clamp(base_color.rgb, 0.0, 1.0), 1.0);
                         return;
                     }
@@ -2951,7 +3418,21 @@ class ModelPreviewWidget(QOpenGLWidget):
                         base_color.rgb = max(base_color.rgb, average_visibility_floor);
                         sampled_base_luma = dot(base_color.rgb, vec3(0.2126, 0.7152, 0.0722));
                     }
-                } else if (render_diagnostic_mode == 8 || render_diagnostic_mode == 9 || render_diagnostic_mode == 10 || render_diagnostic_mode == 14 || render_diagnostic_mode == 15) {
+                    float material_hint_luma = dot(fallback_vertex_color, vec3(0.2126, 0.7152, 0.0722));
+                    float material_hint_sat = color_saturation(fallback_vertex_color);
+                    float base_sat = color_saturation(base_color.rgb);
+                    if (
+                        (render_diagnostic_mode == 0 || render_diagnostic_mode == 16)
+                        && material_hint_luma > 0.055
+                        && material_hint_sat > 0.075
+                        && sampled_base_luma > 0.045
+                        && base_sat < material_hint_sat * 0.65
+                    ) {
+                        float colorize_amount = clamp((material_hint_sat - base_sat) * 1.25, 0.0, 0.48);
+                        base_color.rgb = luma_preserving_colorize(base_color.rgb, fallback_vertex_color, colorize_amount);
+                        sampled_base_luma = dot(base_color.rgb, vec3(0.2126, 0.7152, 0.0722));
+                    }
+                } else if (render_diagnostic_mode == 8 || render_diagnostic_mode == 9 || render_diagnostic_mode == 10 || render_diagnostic_mode == 14 || render_diagnostic_mode == 15 || render_diagnostic_mode == 21) {
                     gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
                     return;
                 }
@@ -3012,10 +3493,24 @@ class ModelPreviewWidget(QOpenGLWidget):
                     if (material_decode_mode == 12) {
                         base_color.a *= material_opacity;
                         if (base_color.a <= 0.01) {
-                            discard;
+                            if (alpha_handling_mode == 0 && render_diagnostic_mode == 0) {
+                                base_color.a = 1.0;
+                            } else {
+                                discard;
+                            }
                         }
                     }
                 }
+                float material_channel_variance = max(
+                    max(abs(material_sample.r - material_sample.g), abs(material_sample.g - material_sample.b)),
+                    abs(material_sample.r - material_sample.b)
+                );
+                float material_raw_metal_hint = use_material_texture != 0
+                    ? clamp(max(material_metallic, max(material_sample.b * 0.72, material_sample.r * 0.28)), 0.0, 1.0)
+                    : material_metallic;
+                float material_raw_specular_hint = use_material_texture != 0
+                    ? clamp(max(material_specular, (material_sample.a * 0.26) + (material_sample.b * 0.22) + (material_channel_variance * 0.40)), 0.0, 1.0)
+                    : material_specular;
 
                 float height_value = 0.5;
                 if (use_height_texture != 0) {
@@ -3023,6 +3518,69 @@ class ModelPreviewWidget(QOpenGLWidget):
                 }
                 float relief = clamp((height_value - 0.5) * 2.0, -1.0, 1.0);
                 float height_effect = clamp(abs(relief) * height_effect_max, 0.0, height_effect_max);
+                float support_depth_drive = clamp(height_effect_max, 0.0, 1.0);
+                float support_shine_drive = clamp(specular_max, 0.0, 1.0);
+                float support_rough_drive = clamp((shininess_max - 32.0) / 224.0, 0.0, 1.0);
+                float height_edge = 0.0;
+                float height_ridge = 0.5;
+                if (use_height_texture != 0) {
+                    vec2 height_gradient = vec2(dFdx(height_value), dFdy(height_value));
+                    height_edge = clamp(length(height_gradient) * mix(20.0, 115.0, support_depth_drive), 0.0, 1.0);
+                    height_ridge = clamp(0.5 + (relief * mix(0.32, 1.95, support_depth_drive)), 0.0, 1.0);
+                }
+
+                if (render_diagnostic_mode == 17) {
+                    float depth_drive = mix(0.12, 1.0, support_depth_drive);
+                    float relief_drive = use_height_texture != 0 ? relief : ((sampled_base_luma - 0.5) * 0.45);
+                    float ridge = use_height_texture != 0
+                        ? height_ridge
+                        : clamp(0.5 + (relief_drive * mix(0.22, 2.10, depth_drive)), 0.0, 1.0);
+                    float relief_edge = max(
+                        height_edge,
+                        clamp(abs(relief_drive) * mix(0.65, 8.0, depth_drive), 0.0, 1.0)
+                    );
+                    vec3 depth_low = mix(vec3(0.26, 0.30, 0.36), vec3(0.05, 0.10, 0.20), depth_drive);
+                    vec3 depth_high = mix(vec3(0.52, 0.55, 0.58), vec3(1.00, 0.78, 0.18), depth_drive);
+                    vec3 depth_color = mix(depth_low, depth_high, ridge);
+                    gl_FragColor = vec4(clamp(depth_color + vec3(relief_edge * mix(0.05, 0.36, depth_drive)), 0.0, 1.0), 1.0);
+                    return;
+                }
+                if (render_diagnostic_mode == 18) {
+                    float rough_contrast = support_rough_drive;
+                    float rough_signal = clamp(mix(material_roughness, material_sample.g, use_material_texture != 0 ? 0.55 : 0.0), 0.0, 1.0);
+                    float metal_signal = clamp(max(material_raw_metal_hint, max(material_sample.b, material_sample.r * 0.42)), 0.0, 1.0);
+                    float shine_signal = clamp(material_raw_specular_hint * (0.90 + support_shine_drive * 2.40), 0.0, 1.0);
+                    float cavity_signal = clamp(min(material_ao, material_cavity) - (material_channel_variance * 0.18), 0.0, 1.0);
+                    vec3 raw_mask_color = use_material_texture != 0
+                        ? clamp(vec3(material_sample.r, material_sample.g, material_sample.b), 0.0, 1.0)
+                        : vec3(0.28, 0.30, 0.34);
+                    vec3 decoded_color = vec3(
+                        mix(0.16, cavity_signal, 0.72),
+                        mix(0.18, 1.0 - rough_signal, 0.60 + (rough_contrast * 0.26)),
+                        clamp((metal_signal * (0.58 + support_shine_drive * 0.92)) + (shine_signal * 0.58), 0.0, 1.0)
+                    );
+                    vec3 response_color = mix(decoded_color, raw_mask_color, use_material_texture != 0 ? 0.52 : 0.0);
+                    response_color += vec3(material_channel_variance * (0.16 + rough_contrast * 0.42));
+                    response_color.r += metal_signal * 0.16;
+                    response_color.b += shine_signal * 0.14;
+                    gl_FragColor = vec4(clamp(response_color, 0.0, 1.0), 1.0);
+                    return;
+                }
+                if (render_diagnostic_mode == 20) {
+                    float rough_contrast = support_rough_drive;
+                    float raw_rough_hint = use_material_texture != 0
+                        ? clamp(mix(material_roughness, material_sample.g, 0.60) + ((material_channel_variance - 0.10) * 0.82), 0.0, 1.0)
+                        : material_roughness;
+                    float centered_rough = (raw_rough_hint - 0.5) * mix(0.95, 4.80, rough_contrast);
+                    float rough_response = smoothstep(0.0, 1.0, clamp(0.5 + centered_rough, 0.0, 1.0));
+                    float rough_detail = clamp(material_channel_variance * mix(0.28, 1.20, rough_contrast), 0.0, 1.0);
+                    vec3 rough_low = mix(vec3(0.20, 0.24, 0.30), vec3(0.05, 0.14, 0.45), rough_contrast);
+                    vec3 rough_high = mix(vec3(0.62, 0.62, 0.56), vec3(1.00, 0.84, 0.22), rough_contrast);
+                    vec3 rough_color = mix(rough_low, rough_high, rough_response);
+                    rough_color += vec3(rough_detail * 0.18, rough_detail * 0.14, rough_detail * 0.05);
+                    gl_FragColor = vec4(clamp(rough_color, 0.0, 1.0), 1.0);
+                    return;
+                }
 
                 if (use_high_quality != 0 && use_normal_texture != 0) {
                     vec3 tangent = safe_normalize(frag_tangent, vec3(1.0, 0.0, 0.0));
@@ -3035,12 +3593,12 @@ class ModelPreviewWidget(QOpenGLWidget):
                         normal_strength_cap
                     );
                     float strength_ratio = clamp(mapped_strength / max(normal_strength_cap, 0.001), 0.0, 1.0);
-                    sampled_normal.xy *= mix(0.65, 1.05, strength_ratio);
+                    sampled_normal.xy *= mix(0.75, 1.35, strength_ratio);
                     sampled_normal.xy *= mapped_strength;
                     sampled_normal = safe_normalize(sampled_normal, vec3(0.0, 0.0, 1.0));
                     mat3 tbn = mat3(tangent, bitangent, surface_normal);
                     vec3 mapped_normal = safe_normalize(tbn * sampled_normal, surface_normal);
-                    surface_normal = safe_normalize(mix(surface_normal, mapped_normal, clamp(mapped_strength * 0.78, 0.0, 0.82)), surface_normal);
+                    surface_normal = safe_normalize(mix(surface_normal, mapped_normal, clamp(mapped_strength * 0.92, 0.0, 0.94)), surface_normal);
                 }
 
                 vec3 main_light = safe_normalize(light_direction, vec3(0.20, 0.45, 1.0));
@@ -3059,7 +3617,7 @@ class ModelPreviewWidget(QOpenGLWidget):
 
                 if (use_high_quality != 0) {
                     float occlusion_drive = clamp(
-                        mix(material_ao, min(material_ao, material_cavity), 0.45) - (abs(relief) * 0.10),
+                        mix(material_ao, min(material_ao, material_cavity), 0.45) - (abs(relief) * (0.10 + (height_effect_max * 0.16))),
                         0.0,
                         1.0
                     );
@@ -3068,8 +3626,9 @@ class ModelPreviewWidget(QOpenGLWidget):
                         cavity_clamp_min,
                         cavity_clamp_max
                     );
-                    lighting *= mix(1.0, cavity_scale, (use_material_texture != 0 || use_height_texture != 0) ? 0.22 : 0.08);
-                    lighting += height_effect * 0.22;
+                    lighting *= mix(1.0, cavity_scale, (use_material_texture != 0 || use_height_texture != 0) ? 0.22 : 0.06);
+                    lighting += height_effect * (0.24 + (primary_diffuse * 0.18));
+                    lighting += height_edge * (0.05 + (support_depth_drive * 0.22));
                 }
                 if (disable_lighting != 0) {
                     gl_FragColor = vec4(clamp(base_color.rgb, 0.0, 1.0), base_color.a);
@@ -3083,8 +3642,9 @@ class ModelPreviewWidget(QOpenGLWidget):
                 float rim_specular = 0.0;
                 vec3 specular_color = vec3(1.0);
                 if (use_high_quality != 0) {
+                    float material_shine = max(max(material_specular, material_metallic * 0.78), (1.0 - material_roughness) * 0.34);
                     float specular_mask = clamp(
-                        mix(specular_base, specular_max, material_specular),
+                        mix(specular_base, specular_max, material_shine),
                         specular_min,
                         specular_max
                     );
@@ -3101,11 +3661,65 @@ class ModelPreviewWidget(QOpenGLWidget):
                         material_metallic * 0.68
                     );
                     specular = pow(max(dot(surface_normal, half_dir), 0.0), shininess) * specular_mask;
-                    specular += fresnel * (0.03 + (material_specular * 0.18) + (material_metallic * 0.12));
-                    rim_specular = rim_response * (0.02 + (material_specular * 0.07));
+                    specular += fresnel * (0.035 + (material_specular * 0.22) + (material_metallic * 0.18));
+                    specular += pow(max(dot(surface_normal, view_dir), 0.0), max(4.0, shininess * 0.35)) * material_metallic * specular_mask * 0.24;
+                    rim_specular = rim_response * (0.025 + (material_specular * 0.08) + (material_metallic * 0.05));
+                }
+                if (render_diagnostic_mode == 19) {
+                    float shine_drive = support_shine_drive;
+                    vec3 shine_base = clamp((base_color.rgb * 0.46) + vec3(0.28, 0.31, 0.36), 0.0, 1.0);
+                    vec3 shine_color = mix(vec3(0.24, 0.28, 0.34), shine_base, 0.70 + (material_raw_metal_hint * (0.20 + shine_drive * 0.24)));
+                    float material_response = clamp(
+                        (material_raw_specular_hint * (0.62 + shine_drive * 2.20))
+                        + (material_raw_metal_hint * (0.36 + shine_drive * 1.35))
+                        + ((1.0 - material_roughness) * shine_drive * 0.55),
+                        0.0,
+                        1.0
+                    );
+                    float shine_response = clamp(
+                        ((specular + rim_specular) * (0.30 + (shine_drive * 4.80)))
+                        + (material_raw_specular_hint * shine_drive * 1.55)
+                        + (material_raw_metal_hint * shine_drive * 0.95)
+                        + (material_channel_variance * shine_drive * 0.62)
+                        + (height_edge * shine_drive * 0.22),
+                        0.0,
+                        1.0
+                    );
+                    shine_response = max(shine_response, material_response);
+                    float floor_light = mix(0.58, 0.76, shine_drive);
+                    gl_FragColor = vec4(
+                        clamp(
+                            (shine_color * (floor_light + (shine_response * 0.92)))
+                            + vec3(shine_response * mix(0.22, 0.96, shine_drive)),
+                            0.0,
+                            1.0
+                        ),
+                        1.0
+                    );
+                    return;
                 }
 
+                float smoothness = clamp(1.0 - material_roughness, 0.0, 1.0);
+                float broad_sheen = 0.0;
+                if (use_high_quality != 0) {
+                    broad_sheen = clamp(
+                        (material_raw_specular_hint * 0.42)
+                        + (material_raw_metal_hint * 0.46)
+                        + (smoothness * 0.26)
+                        + (material_channel_variance * 0.18),
+                        0.0,
+                        1.0
+                    ) * (0.22 + (support_shine_drive * 1.20));
+                    broad_sheen = clamp(broad_sheen, 0.0, 1.0);
+                }
                 vec3 final_rgb = base_color.rgb * clamp(lighting, 0.72, 1.58);
+                if (use_high_quality != 0) {
+                    float relief_tone = (height_ridge - 0.5) * support_depth_drive;
+                    final_rgb *= clamp(1.0 + (relief_tone * 0.26) + ((smoothness - 0.5) * support_rough_drive * 0.12), 0.72, 1.30);
+                    final_rgb += vec3(height_edge * support_depth_drive * 0.075);
+                    final_rgb += specular_color * broad_sheen * (0.030 + (primary_diffuse * 0.035) + (pow(1.0 - view_facing, 1.55) * 0.18));
+                    final_rgb = mix(final_rgb, luma_preserving_colorize(final_rgb, specular_color, broad_sheen * material_metallic * 0.22), support_shine_drive);
+                }
                 final_rgb += specular_color * specular;
                 final_rgb += specular_color * rim_specular;
                 if (use_texture != 0 && sampled_base_luma > 0.025) {
@@ -3246,6 +3860,9 @@ class ModelPreviewWidget(QOpenGLWidget):
         base_mvp = projection * view * base_model
         live_translation = self._alignment_translation_display_vector()
         has_live_translation = live_translation.lengthSquared() > 1e-12
+        live_rotation = QVector3D(self._alignment_live_rotation)
+        has_live_rotation = live_rotation.lengthSquared() > 1e-12
+        rotation_origin = self._alignment_handle_origin(include_live_translation=False) if has_live_rotation else (0.0, 0.0, 0.0)
 
         self._program.bind()
         self._program.setUniformValue(self._camera_uniform_location, QVector3D(0.0, 0.0, self._distance))
@@ -3276,23 +3893,22 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._program.setUniformValue(self._render_build_marker_uniform_location, 0.4252)
         self._gl_error_text()
         self._vertex_array.bind()
-        active_translated_state: Optional[bool] = None
+        active_transformed_state: Optional[bool] = None
         current_meshes = getattr(getattr(self, "_current_model", None), "meshes", None) or []
         runtime_diagnostics: Dict[int, _BatchRenderDiagnostic] = {}
         solo_batch_index = int(getattr(settings, "solo_batch_index", -1) or -1)
         for batch_index, batch in enumerate(self._mesh_batches):
             if solo_batch_index >= 0 and batch_index != solo_batch_index:
                 continue
-            translated_batch = bool(has_live_translation and self._alignment_batch_is_editable(batch_index))
-            if translated_batch:
-                batch_model = QMatrix4x4(base_model)
-                batch_model.translate(live_translation)
+            transformed_batch = bool((has_live_translation or has_live_rotation) and self._alignment_batch_is_editable(batch_index))
+            if transformed_batch:
+                batch_model = self._apply_alignment_live_transform(base_model, live_translation, live_rotation, rotation_origin)
             else:
                 batch_model = base_model
-            if active_translated_state is None or translated_batch != active_translated_state:
+            if active_transformed_state is None or transformed_batch != active_transformed_state:
                 self._program.setUniformValue(self._model_uniform_location, batch_model)
-                self._program.setUniformValue(self._mvp_uniform_location, projection * view * batch_model if translated_batch else base_mvp)
-                active_translated_state = translated_batch
+                self._program.setUniformValue(self._mvp_uniform_location, projection * view * batch_model if transformed_batch else base_mvp)
+                active_transformed_state = transformed_batch
             diffuse_texture = self._texture_objects.get(
                 (batch.texture_key, batch.texture_wrap_repeat, batch.texture_flip_vertical)
             )
@@ -3305,7 +3921,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             height_texture = self._texture_objects.get(
                 (batch.height_texture_key, batch.texture_wrap_repeat, batch.texture_flip_vertical)
             )
-            diagnostic_source = str(getattr(settings, "texture_probe_source", "base") or "base").strip().lower()
+            diagnostic_source = self._diffuse_probe_source_for_render_mode(settings, render_mode)
             diagnostic_texture = self._diagnostic_texture_for_source(
                 diagnostic_source,
                 base=diffuse_texture,
@@ -3313,10 +3929,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                 material=material_texture,
                 height=height_texture,
             )
-            if render_mode == "sampler_swap_material_on_unit0":
-                diagnostic_texture = material_texture
-                diagnostic_source = "material"
-            diffuse_draw_texture = diagnostic_texture if render_mode_code in {8, 9, 10, 14, 15} else diffuse_texture
+            diffuse_draw_texture = diagnostic_texture if render_mode_code in {14, 15, 21} else diffuse_texture
             diffuse_unit = self._forced_sampler_unit(settings, render_mode)
             use_texture = int(
                 bool(
@@ -3742,6 +4355,35 @@ class ModelPreviewWidget(QOpenGLWidget):
         painter.setPen(QPen(color, width))
         painter.drawLine(start_point, end_point)
 
+    def _clamped_overlay_point(self, point: QPointF, *, margin: float = 12.0) -> QPointF:
+        return QPointF(
+            min(max(float(point.x()), margin), max(margin, float(self.width()) - margin)),
+            min(max(float(point.y()), margin), max(margin, float(self.height()) - margin)),
+        )
+
+    def _draw_alignment_corner_axis_gizmo(self, painter: QPainter) -> None:
+        if self.width() < 120 or self.height() < 120:
+            return
+        anchor = QPointF(float(self.width()) - 58.0, float(self.height()) - 54.0)
+        endpoints = {
+            "X": (QPointF(anchor.x() + 34.0, anchor.y() + 8.0), QColor(239, 68, 68, 210)),
+            "Y": (QPointF(anchor.x() + 2.0, anchor.y() - 34.0), QColor(59, 130, 246, 210)),
+            "Z": (QPointF(anchor.x() - 29.0, anchor.y() + 22.0), QColor(34, 197, 94, 210)),
+        }
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 70)))
+        painter.drawRoundedRect(QRect(int(anchor.x()) - 40, int(anchor.y()) - 44, 88, 78), 6, 6)
+        for label, (endpoint, color) in endpoints.items():
+            painter.setPen(QPen(color, 2.0))
+            painter.drawLine(anchor, endpoint)
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(endpoint, 3.3, 3.3)
+            painter.setPen(color)
+            painter.drawText(QRect(int(endpoint.x()) + 4, int(endpoint.y()) - 9, 18, 18), Qt.AlignLeft | Qt.AlignVCenter, label)
+        painter.restore()
+
     def _draw_alignment_guides(self, painter: QPainter) -> None:
         if self._vertex_count <= 0 or not (self._show_grid_overlay or self._show_origin_overlay):
             return
@@ -3769,7 +4411,12 @@ class ModelPreviewWidget(QOpenGLWidget):
             ("Z", (0.0, 0.0, axis_extent), QColor(34, 197, 94, 150)),
         ):
             label_point = self._project_preview_point(mvp, point)
+            if label_point is None:
+                line_points = self._project_preview_line(mvp, (0.0, 0.0, 0.0), point)
+                if line_points is not None:
+                    label_point = line_points[1]
             if label_point is not None:
+                label_point = self._clamped_overlay_point(label_point, margin=18.0)
                 painter.setPen(color)
                 painter.drawText(QRect(int(label_point.x()) + 4, int(label_point.y()) + 4, 18, 18), Qt.AlignLeft, label)
 
@@ -3789,8 +4436,9 @@ class ModelPreviewWidget(QOpenGLWidget):
             painter.drawLine(QPointF(center.x(), center.y() - 12.0), QPointF(center.x(), center.y() + 12.0))
             painter.setPen(QPen(QColor(255, 255, 255, 105), 1.0))
             painter.drawEllipse(center, 2.0, 2.0)
+        self._draw_alignment_corner_axis_gizmo(painter)
 
-    def _alignment_handle_origin(self) -> tuple[float, float, float]:
+    def _alignment_handle_origin(self, *, include_live_translation: bool = True) -> tuple[float, float, float]:
         positions = []
         for mesh_index, mesh in enumerate(getattr(self._current_model, "meshes", None) or []):
             if not self._alignment_batch_is_editable(mesh_index):
@@ -3798,7 +4446,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             positions.extend(getattr(mesh, "positions", None) or [])
         if not positions:
             return (0.0, 0.0, 0.0)
-        live_translation = self._alignment_translation_display_vector()
+        live_translation = self._alignment_translation_display_vector() if include_live_translation else QVector3D(0.0, 0.0, 0.0)
         min_x = min(float(position[0]) for position in positions)
         min_y = min(float(position[1]) for position in positions)
         min_z = min(float(position[2]) for position in positions)
@@ -3817,8 +4465,6 @@ class ModelPreviewWidget(QOpenGLWidget):
         mvp = self._preview_mvp_matrix()
         origin_world = self._alignment_handle_origin()
         origin = self._project_preview_point(mvp, origin_world)
-        if origin is None:
-            return {}
         axis_extent = 0.72
         points: Dict[str, Tuple[QPointF, QPointF]] = {}
         for axis_name, endpoint in (
@@ -3827,8 +4473,12 @@ class ModelPreviewWidget(QOpenGLWidget):
             ("z", (origin_world[0], origin_world[1], origin_world[2] + axis_extent)),
         ):
             projected = self._project_preview_point(mvp, endpoint)
-            if projected is not None:
+            if origin is not None and projected is not None:
                 points[axis_name] = (origin, projected)
+                continue
+            clipped = self._project_preview_line(mvp, origin_world, endpoint)
+            if clipped is not None:
+                points[axis_name] = clipped
         return points
 
     @staticmethod
@@ -3877,7 +4527,8 @@ class ModelPreviewWidget(QOpenGLWidget):
             painter.drawLine(start, end)
             painter.setPen(QPen(color, 1.2))
             painter.drawEllipse(end, 7.0 if active else 5.5, 7.0 if active else 5.5)
-            painter.drawText(QRect(int(end.x()) + 8, int(end.y()) - 9, 18, 18), Qt.AlignLeft | Qt.AlignVCenter, labels[axis_name])
+            label_point = self._clamped_overlay_point(end, margin=18.0)
+            painter.drawText(QRect(int(label_point.x()) + 8, int(label_point.y()) - 9, 18, 18), Qt.AlignLeft | Qt.AlignVCenter, labels[axis_name])
 
     def _draw_texture_debug_strip(self, painter: QPainter) -> None:
         settings = self.render_settings()
@@ -3921,7 +4572,7 @@ class ModelPreviewWidget(QOpenGLWidget):
         else:
             help_text = "Drag: orbit | Middle/Right-drag or Shift+Drag: pan | Wheel: zoom | Double-click: reset"
             if self._alignment_editing_enabled:
-                help_text = "Drag axes: move Location | Shift fine | Ctrl coarse | Empty drag: orbit | Wheel: zoom"
+                help_text = "Drag axes: move (Shift fine/Ctrl coarse) | Alt+Drag: rotate X/Y | Alt+Shift: roll | Wheel: zoom"
             painter.drawText(
                 QRect(12, 10, max(120, self.width() - 24), 22),
                 Qt.AlignLeft | Qt.AlignVCenter,
@@ -3943,6 +4594,23 @@ class ModelPreviewWidget(QOpenGLWidget):
         painter.end()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            self._alignment_editing_enabled
+            and self._vertex_count > 0
+            and event.button() == Qt.LeftButton
+            and bool(event.modifiers() & Qt.AltModifier)
+        ):
+            self._alignment_rotation_drag_active = True
+            self._alignment_rotation_drag_roll = bool(event.modifiers() & Qt.ShiftModifier)
+            self._alignment_rotation_drag_total = QVector3D(0.0, 0.0, 0.0)
+            self.clear_alignment_live_rotation()
+            self._last_mouse_pos = event.position()
+            self.setCursor(Qt.ClosedHandCursor)
+            self.grabMouse()
+            self.update()
+            self.alignment_drag_started.emit()
+            event.accept()
+            return
         if self._alignment_editing_enabled and self._vertex_count > 0 and event.button() == Qt.LeftButton:
             axis = self._alignment_axis_at(event.position())
             if axis:
@@ -3983,6 +4651,33 @@ class ModelPreviewWidget(QOpenGLWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._alignment_rotation_drag_active:
+            current_pos = event.position()
+            delta = current_pos - self._last_mouse_pos
+            self._last_mouse_pos = current_pos
+            degrees_per_pixel = float(self._alignment_rotation_degrees_per_pixel)
+            if bool(event.modifiers() & Qt.ControlModifier):
+                degrees_per_pixel *= 4.0
+            elif bool(event.modifiers() & Qt.ShiftModifier) and not self._alignment_rotation_drag_roll:
+                degrees_per_pixel *= 0.25
+            if self._alignment_rotation_drag_roll:
+                rotation_delta = QVector3D(0.0, 0.0, float(delta.x()) * degrees_per_pixel)
+            else:
+                rotation_delta = QVector3D(float(delta.y()) * degrees_per_pixel, float(delta.x()) * degrees_per_pixel, 0.0)
+            if rotation_delta.lengthSquared() > 1e-12:
+                self._alignment_rotation_drag_total = self._alignment_rotation_drag_total + rotation_delta
+                self.set_alignment_live_rotation(
+                    float(self._alignment_rotation_drag_total.x()),
+                    float(self._alignment_rotation_drag_total.y()),
+                    float(self._alignment_rotation_drag_total.z()),
+                )
+                self.alignment_rotation_changed.emit(
+                    float(self._alignment_rotation_drag_total.x()),
+                    float(self._alignment_rotation_drag_total.y()),
+                    float(self._alignment_rotation_drag_total.z()),
+                )
+            event.accept()
+            return
         if self._alignment_drag_axis:
             current_pos = event.position()
             delta = current_pos - self._last_mouse_pos
@@ -4049,6 +4744,18 @@ class ModelPreviewWidget(QOpenGLWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self._alignment_rotation_drag_active and event.button() == Qt.LeftButton:
+            total = QVector3D(self._alignment_rotation_drag_total)
+            self._alignment_rotation_drag_active = False
+            self._alignment_rotation_drag_roll = False
+            self._alignment_rotation_drag_total = QVector3D(0.0, 0.0, 0.0)
+            self.releaseMouse()
+            self.unsetCursor()
+            self.alignment_rotation_finished.emit(float(total.x()), float(total.y()), float(total.z()))
+            self.clear_alignment_live_rotation()
+            self.update()
+            event.accept()
+            return
         if self._alignment_drag_axis and event.button() == Qt.LeftButton:
             total = QVector3D(self._alignment_drag_total)
             self._alignment_drag_axis = ""
@@ -4086,6 +4793,10 @@ class ModelPreviewWidget(QOpenGLWidget):
             self._pan_drag_button = Qt.NoButton
             self._pan_poll_timer.stop()
             self._pan_offset = QVector3D(0.0, 0.0, 0.0)
+            self._alignment_rotation_drag_active = False
+            self._alignment_rotation_drag_roll = False
+            self._alignment_rotation_drag_total = QVector3D(0.0, 0.0, 0.0)
+            self._alignment_live_rotation = QVector3D(0.0, 0.0, 0.0)
             self.view_state_changed.emit(self._zoom_factor, self._fit_to_view)
             self.update()
             event.accept()

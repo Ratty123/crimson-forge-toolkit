@@ -21,7 +21,7 @@ from cdmw.modding.mesh_parser import ParsedMesh
 SUPPORTED_MESH_FORMATS = {".pam", ".pamlod", ".pac"}
 MATERIAL_SIDECAR_EXTENSIONS = {".pami", ".pac_xml", ".pam_xml", ".pamlod_xml"}
 RIG_EXTENSIONS = {".pab", ".pabc", ".hkx"}
-METADATA_EXTENSIONS = {".meshinfo", ".xml", ".prefabdata_xml"}
+METADATA_EXTENSIONS = {".meshinfo", ".xml", ".app_xml", ".prefabdata_xml"}
 
 
 @dataclass(slots=True, frozen=True)
@@ -455,7 +455,7 @@ def _find_related_files(
             candidates.append((normalized, confidence))
 
     if source_stem:
-        for suffix in (".xml", ".meshinfo", ".hkx"):
+        for suffix in (".xml", ".meshinfo", ".hkx", ".app_xml", ".app.xml", ".prefabdata.xml", ".prefabdata_xml", ".sockets.xml"):
             add(f"{source_stem}{suffix}")
         if source_extension == ".pam":
             for suffix in (".pamlod", ".pami", ".pam_xml", ".pamlod_xml"):
@@ -464,7 +464,7 @@ def _find_related_files(
             for suffix in (".pam", ".pami", ".pamlod_xml", ".pam_xml"):
                 add(f"{source_stem}{suffix}")
         elif source_extension == ".pac":
-            for suffix in (".pab", ".pabc", ".pac_xml", ".prefabdata.xml", ".prefabdata_xml"):
+            for suffix in (".pab", ".pabc", ".pac_xml", ".pac.xml", ".app_xml", ".app.xml", ".prefabdata.xml", ".prefabdata_xml", ".sockets.xml"):
                 add(f"{source_stem}{suffix}")
             for skeleton_stem in _probable_pab_family_stems(source_path):
                 add(f"{skeleton_stem}.pab", "family-skeleton")
@@ -474,7 +474,7 @@ def _find_related_files(
                 add(f"{source_stem}{suffix}", "sidecar-linked")
         elif source_extension == ".pac_xml":
             add(f"{source_stem}.pac", "sidecar-linked")
-            for suffix in (".pab", ".pabc", ".meshinfo", ".hkx"):
+            for suffix in (".pab", ".pabc", ".meshinfo", ".hkx", ".app_xml", ".app.xml", ".prefabdata.xml", ".prefabdata_xml", ".sockets.xml"):
                 add(f"{source_stem}{suffix}", "sidecar-linked")
             for skeleton_stem in _probable_pab_family_stems(source_path):
                 add(f"{skeleton_stem}.pab", "family-skeleton")
@@ -516,7 +516,7 @@ def _related_role(extension: str) -> str:
         return "Skeleton"
     if normalized == ".hkx":
         return "Animation/physics"
-    if normalized in METADATA_EXTENSIONS:
+    if normalized in METADATA_EXTENSIONS or normalized == ".app_xml":
         return "Metadata"
     return "Related"
 

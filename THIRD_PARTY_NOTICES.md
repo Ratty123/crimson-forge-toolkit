@@ -71,7 +71,7 @@ This file is a practical notice list for repository and release packaging. For a
 - Purpose: selectively adapted mesh parsing/export/import and archive-modding reference code
 - Upstream: https://github.com/hzeemr/crimsonforge
 - License: MIT
-- Notes: selected components are vendored under `cdmw/modding/` with the upstream MIT license text included in `CrimsonForge_MIT_LICENSE.txt`
+- Notes: selected components are vendored under `cdmw/modding/` with the upstream MIT license text included in `VendoredMeshTools_MIT_LICENSE.txt`
 
 ## Redistribution Notes
  

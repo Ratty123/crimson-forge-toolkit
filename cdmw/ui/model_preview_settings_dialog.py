@@ -164,6 +164,11 @@ class ModelPreviewSettingsDialog(QDialog):
         general_form.setVerticalSpacing(10)
         self.use_textures_checkbox = QCheckBox("Use textures when available")
         self.high_quality_checkbox = QCheckBox("Enable high-quality shading")
+        self.alignment_final_preview_checkbox = QCheckBox("Use Final Output Preview in Mesh Replacement Alignment")
+        self.alignment_final_preview_checkbox.setToolTip(
+            "When enabled, the replacement pane stays on the authoritative rebuilt package preview after it is ready. "
+            "When disabled, the pane stays on the faster live mapping preview and the Final Output Preview button opens the final view."
+        )
         self.visible_texture_mode_combo = QComboBox()
         for mode in MODEL_PREVIEW_VISIBLE_TEXTURE_MODES:
             self.visible_texture_mode_combo.addItem(
@@ -178,6 +183,7 @@ class ModelPreviewSettingsDialog(QDialog):
             )
         general_form.addRow("", self.use_textures_checkbox)
         general_form.addRow("", self.high_quality_checkbox)
+        general_form.addRow("", self.alignment_final_preview_checkbox)
         general_form.addRow("Visible texture mode", self.visible_texture_mode_combo)
         general_form.addRow("Diagnostic render mode", self.render_diagnostic_mode_combo)
         general_layout.addLayout(general_form)
@@ -199,6 +205,9 @@ class ModelPreviewSettingsDialog(QDialog):
         self.texture_probe_source_combo = QComboBox()
         for source in MODEL_PREVIEW_TEXTURE_PROBE_SOURCES:
             self.texture_probe_source_combo.addItem(MODEL_PREVIEW_TEXTURE_PROBE_SOURCE_LABELS.get(source, source), source)
+        self.texture_probe_source_combo.setToolTip(
+            "Selects the texture shown by Selected Texture Probe. Changing this value switches the diagnostic render mode to Selected Texture Probe."
+        )
         self.sampler_probe_combo = QComboBox()
         for mode in MODEL_PREVIEW_SAMPLER_PROBE_MODES:
             self.sampler_probe_combo.addItem(MODEL_PREVIEW_SAMPLER_PROBE_LABELS.get(mode, mode), mode)
@@ -206,7 +215,7 @@ class ModelPreviewSettingsDialog(QDialog):
         for mode in MODEL_PREVIEW_DIFFUSE_SWIZZLE_MODES:
             self.diffuse_swizzle_combo.addItem(MODEL_PREVIEW_DIFFUSE_SWIZZLE_LABELS.get(mode, mode), mode)
         diagnostics_form.addRow("Alpha handling", self.alpha_handling_combo)
-        diagnostics_form.addRow("Texture source probe", self.texture_probe_source_combo)
+        diagnostics_form.addRow("Probe texture", self.texture_probe_source_combo)
         diagnostics_form.addRow("Sampler probe", self.sampler_probe_combo)
         diagnostics_form.addRow("Diffuse swizzle", self.diffuse_swizzle_combo)
         self.disable_tint_checkbox = QCheckBox("Disable base tint")
@@ -241,7 +250,7 @@ class ModelPreviewSettingsDialog(QDialog):
         diagnostics_form.addRow("Solo batch index", self.solo_batch_spin)
         diagnostics_layout.addLayout(diagnostics_form)
         diagnostics_hint = QLabel(
-            "Use these controls to isolate renderer state. Defaults preserve normal preview behavior; diagnostic modes and probes apply globally to every 3D preview window."
+            "Use Selected Texture Probe with Probe texture to inspect Base, Normal, Material, or Height bindings directly. Base Texture Raw always samples the base/color binding. Normal, material, and height toggles only change previews with resolved support-map slots."
         )
         diagnostics_hint.setObjectName("HintLabel")
         diagnostics_hint.setWordWrap(True)
@@ -265,6 +274,27 @@ class ModelPreviewSettingsDialog(QDialog):
             "pan_sensitivity",
             step=0.05,
             decimals=2,
+        )
+        self._add_slider_row(
+            controls_form,
+            "Depth strength",
+            "height_effect_max",
+            step=0.01,
+            decimals=2,
+        )
+        self._add_slider_row(
+            controls_form,
+            "Material shine",
+            "specular_max",
+            step=0.01,
+            decimals=2,
+        )
+        self._add_slider_row(
+            controls_form,
+            "Roughness contrast",
+            "shininess_max",
+            step=1.0,
+            decimals=0,
         )
         invert_widget = QWidget()
         invert_layout = QVBoxLayout(invert_widget)
@@ -359,6 +389,7 @@ class ModelPreviewSettingsDialog(QDialog):
         for checkbox in (
             self.use_textures_checkbox,
             self.high_quality_checkbox,
+            self.alignment_final_preview_checkbox,
             self.invert_orbit_x_checkbox,
             self.invert_orbit_y_checkbox,
             self.invert_pan_x_checkbox,
@@ -366,14 +397,14 @@ class ModelPreviewSettingsDialog(QDialog):
         ):
             checkbox.toggled.connect(self._emit_settings_changed)
         self.visible_texture_mode_combo.currentIndexChanged.connect(self._emit_settings_changed)
-        self.render_diagnostic_mode_combo.currentIndexChanged.connect(self._emit_settings_changed)
+        self.render_diagnostic_mode_combo.currentIndexChanged.connect(self._handle_render_diagnostic_mode_changed)
         for combo in (
             self.alpha_handling_combo,
-            self.texture_probe_source_combo,
             self.sampler_probe_combo,
             self.diffuse_swizzle_combo,
         ):
             combo.currentIndexChanged.connect(self._emit_settings_changed)
+        self.texture_probe_source_combo.currentIndexChanged.connect(self._handle_texture_probe_source_changed)
         for checkbox in (
             self.disable_tint_checkbox,
             self.disable_brightness_checkbox,
@@ -440,6 +471,7 @@ class ModelPreviewSettingsDialog(QDialog):
         current = clamp_model_preview_render_settings(self._base_settings)
         current.use_textures_by_default = self.use_textures_checkbox.isChecked()
         current.high_quality_by_default = self.high_quality_checkbox.isChecked()
+        current.alignment_use_final_output_preview = self.alignment_final_preview_checkbox.isChecked()
         current.visible_texture_mode = str(self.visible_texture_mode_combo.currentData() or current.visible_texture_mode)
         current.render_diagnostic_mode = str(
             self.render_diagnostic_mode_combo.currentData() or current.render_diagnostic_mode
@@ -466,6 +498,9 @@ class ModelPreviewSettingsDialog(QDialog):
         current.invert_orbit_y = self.invert_orbit_y_checkbox.isChecked()
         current.invert_pan_x = self.invert_pan_x_checkbox.isChecked()
         current.invert_pan_y = self.invert_pan_y_checkbox.isChecked()
+        for key, control in self._slider_controls.items():
+            if hasattr(current, key):
+                setattr(current, key, control.value())
         return clamp_model_preview_render_settings(current)
 
     def current_archive_performance_settings(self) -> ArchivePerformanceSettings:
@@ -487,6 +522,7 @@ class ModelPreviewSettingsDialog(QDialog):
         try:
             self.use_textures_checkbox.setChecked(clamped.use_textures_by_default)
             self.high_quality_checkbox.setChecked(clamped.high_quality_by_default)
+            self.alignment_final_preview_checkbox.setChecked(clamped.alignment_use_final_output_preview)
             visible_texture_mode_index = self.visible_texture_mode_combo.findData(clamped.visible_texture_mode)
             self.visible_texture_mode_combo.setCurrentIndex(max(0, visible_texture_mode_index))
             render_diagnostic_mode_index = self.render_diagnostic_mode_combo.findData(clamped.render_diagnostic_mode)
@@ -519,6 +555,7 @@ class ModelPreviewSettingsDialog(QDialog):
                 control.set_value(float(getattr(clamped, key)))
         finally:
             self._applying_settings = False
+        self._sync_probe_controls_enabled()
 
     def set_archive_performance_settings(self, settings: Optional[ArchivePerformanceSettings]) -> None:
         clamped = clamp_archive_performance_settings(settings)
@@ -534,7 +571,9 @@ class ModelPreviewSettingsDialog(QDialog):
             self.maximum_indexing_priority_checkbox.setEnabled(worker_controls_enabled)
             self.preview_cache_limit_spin.setValue(clamped.preview_cache_limit)
             self.quick_then_full_checkbox.setChecked(clamped.quick_then_full_preview)
-            self.maximum_indexing_priority_checkbox.setChecked(clamped.maximum_indexing_priority)
+            self.maximum_indexing_priority_checkbox.setChecked(
+                clamped.enable_sidecar_indexing and clamped.maximum_indexing_priority
+            )
         finally:
             self._applying_settings = False
 
@@ -543,9 +582,43 @@ class ModelPreviewSettingsDialog(QDialog):
             return
         self.settings_changed.emit(self.current_settings())
 
+    def _handle_render_diagnostic_mode_changed(self, *_args) -> None:
+        self._sync_probe_controls_enabled()
+        self._emit_settings_changed()
+
+    def _handle_texture_probe_source_changed(self, *_args) -> None:
+        if self._applying_settings:
+            return
+        if str(self.render_diagnostic_mode_combo.currentData() or "").strip().lower() != "texture_probe":
+            texture_probe_index = self.render_diagnostic_mode_combo.findData("texture_probe")
+            if texture_probe_index >= 0:
+                self.render_diagnostic_mode_combo.blockSignals(True)
+                try:
+                    self.render_diagnostic_mode_combo.setCurrentIndex(texture_probe_index)
+                finally:
+                    self.render_diagnostic_mode_combo.blockSignals(False)
+        self._sync_probe_controls_enabled()
+        self._emit_settings_changed()
+
+    def _sync_probe_controls_enabled(self) -> None:
+        mode = str(self.render_diagnostic_mode_combo.currentData() or "").strip().lower()
+        self.texture_probe_source_combo.setEnabled(True)
+        if mode == "texture_probe":
+            self.texture_probe_source_combo.setToolTip(
+                "Selects which resolved texture slot is drawn directly: Base, Normal, Material, or Height."
+            )
+        else:
+            self.texture_probe_source_combo.setToolTip(
+                "Selecting a value switches Diagnostic render mode to Selected Texture Probe, where this control directly changes the preview."
+            )
+
     def _handle_archive_performance_changed(self, *_args) -> None:
         manual = int(self.sidecar_worker_mode_combo.currentData() or 0) == 1
         enabled = self.sidecar_indexing_enabled_checkbox.isChecked()
+        if not enabled and self.maximum_indexing_priority_checkbox.isChecked():
+            self.maximum_indexing_priority_checkbox.blockSignals(True)
+            self.maximum_indexing_priority_checkbox.setChecked(False)
+            self.maximum_indexing_priority_checkbox.blockSignals(False)
         self.sidecar_worker_mode_combo.setEnabled(enabled)
         self.sidecar_worker_spin.setEnabled(enabled and manual)
         self.maximum_indexing_priority_checkbox.setEnabled(enabled)

@@ -4,10 +4,11 @@ import dataclasses
 import json
 import re
 import shutil
+import textwrap
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from cdmw.constants import (
     APP_REPOSITORY_URL,
@@ -67,6 +68,10 @@ class ModPackageExportOptions:
     conflict_mode: str = ""
     target_language: str = ""
     files_dir: str = "files"
+
+
+MOD_PACKAGE_STRUCTURES = frozenset({"game_relative", "files_wrapper", "custom_compact_paths"})
+MOD_PACKAGE_FILES_WRAPPER_STRUCTURES = frozenset({"files_wrapper", "custom_compact_paths"})
 
 
 @dataclasses.dataclass(slots=True)
@@ -142,6 +147,16 @@ MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY = {info.key: info for info in MOD_PACKAGE_
 MOD_PACKAGE_METADATA_ARTIFACTS_BY_FILENAME = {
     info.filename: info for info in MOD_PACKAGE_METADATA_ARTIFACTS if info.filename not in {"Ready .zip"}
 }
+
+_README_WIDTH = 78
+_README_LABEL_WIDTH = 18
+_README_LOGO_LINES = (
+    r"   ____ ____  __  ____        __",
+    r"  / ___|  _ \|  \/  \ \      / /",
+    r" | |   | | | | |\/| |\ \ /\ / / ",
+    r" | |___| |_| | |  | | \ V  V /  ",
+    r"  \____|____/|_|  |_|  \_/\_/   ",
+)
 
 
 def mod_package_profile_uses_manager_metadata(profile: str) -> bool:
@@ -353,6 +368,7 @@ def _common_mod_package_fields(
             "nexus_url": (package_info.nexus_url or "").strip(),
             "generator": APP_TITLE,
             "files_dir": files_dir_value,
+            "files_root": files_dir_value if files_dir_value != "." else "",
             "manager_targets": list(manager_targets),
             "manager_target_labels": [_MOD_MANAGER_PROFILE_LABELS.get(target, target) for target in manager_targets],
             "new_paths": list(new_path_prefixes),
@@ -449,7 +465,41 @@ def _move_payloads_to_files_dir(root: Path, payload_paths: Sequence[str | Path],
             target_path.unlink()
         shutil.move(str(source_path), str(target_path))
         moved.append(rel_text)
+    _remove_empty_moved_payload_dirs(root, moved, files_dir_name)
     return moved
+
+
+def _remove_empty_moved_payload_dirs(root: Path, moved_paths: Sequence[str], files_dir_name: str) -> None:
+    if not moved_paths:
+        return
+    try:
+        resolved_root = root.expanduser().resolve()
+        resolved_files_root = (root / files_dir_name).expanduser().resolve()
+    except OSError:
+        return
+
+    candidates: dict[str, Path] = {}
+    for moved_path in moved_paths:
+        relative_parts = PurePosixPath(_payload_path_text(moved_path)).parts
+        if not relative_parts:
+            continue
+        parent = root.joinpath(*relative_parts).parent
+        while True:
+            try:
+                resolved_parent = parent.expanduser().resolve()
+                resolved_parent.relative_to(resolved_root)
+            except (OSError, ValueError):
+                break
+            if resolved_parent in {resolved_root, resolved_files_root}:
+                break
+            candidates[str(resolved_parent).lower()] = parent
+            parent = parent.parent
+
+    for directory in sorted(candidates.values(), key=lambda item: len(item.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            continue
 
 
 def _write_package_zip(root: Path) -> Path:
@@ -464,6 +514,92 @@ def _write_package_zip(root: Path) -> Path:
     return zip_path
 
 
+def _readme_box_line(text: str = "") -> str:
+    content_width = _README_WIDTH - 4
+    normalized = str(text or "").rstrip()
+    if len(normalized) > content_width:
+        normalized = normalized[: content_width - 3].rstrip() + "..."
+    return f"| {normalized:<{content_width}} |"
+
+
+def _readme_banner_lines(title: str) -> list[str]:
+    border = "+" + "-" * (_README_WIDTH - 2) + "+"
+    lines = [border]
+    lines.extend(_readme_box_line(line) for line in _README_LOGO_LINES)
+    lines.append(_readme_box_line())
+    lines.append(_readme_box_line("Crimson Desert Mod Workbench"))
+    lines.append(_readme_box_line("Generated Loose Mod Package"))
+    if title:
+        lines.append(_readme_box_line(title))
+    lines.append(border)
+    return lines
+
+
+def _readme_add_blank_line(lines: list[str]) -> None:
+    if lines and lines[-1] != "":
+        lines.append("")
+
+
+def _readme_add_section(lines: list[str], title: str) -> None:
+    _readme_add_blank_line(lines)
+    normalized = str(title or "").strip().upper()
+    lines.append(normalized)
+    lines.append("-" * len(normalized))
+
+
+def _readme_append_wrapped(
+    lines: list[str],
+    text: str,
+    *,
+    indent: str = "",
+    subsequent_indent: str | None = None,
+) -> None:
+    paragraphs = str(text or "").splitlines() or [""]
+    continuation_indent = indent if subsequent_indent is None else subsequent_indent
+    for index, paragraph in enumerate(paragraphs):
+        stripped = paragraph.strip()
+        if not stripped:
+            lines.append("")
+            continue
+        if index:
+            _readme_add_blank_line(lines)
+        lines.extend(
+            textwrap.wrap(
+                stripped,
+                width=_README_WIDTH,
+                initial_indent=indent,
+                subsequent_indent=continuation_indent,
+                break_long_words=False,
+            )
+        )
+
+
+def _readme_append_field(lines: list[str], label: str, value: str) -> None:
+    prefix = f"  {str(label or '').strip():<{_README_LABEL_WIDTH}} "
+    wrapped = textwrap.wrap(
+        str(value or "").strip() or "-",
+        width=_README_WIDTH,
+        initial_indent=prefix,
+        subsequent_indent=" " * len(prefix),
+        break_long_words=False,
+    )
+    lines.extend(wrapped or [prefix.rstrip()])
+
+
+def _readme_append_labeled_description(lines: list[str], label: str, description: str) -> None:
+    clean_label = str(label or "").strip()
+    if len(clean_label) > _README_LABEL_WIDTH:
+        lines.append(f"  {clean_label}")
+        _readme_append_wrapped(lines, description, indent="      ")
+        return
+    _readme_append_field(lines, clean_label, description)
+
+
+def _readme_append_step(lines: list[str], number: int, text: str) -> None:
+    prefix = f"{number}. "
+    _readme_append_wrapped(lines, text, indent=prefix, subsequent_indent=" " * len(prefix))
+
+
 def _metadata_package_file_lines(paths: Sequence[Path]) -> list[str]:
     lines: list[str] = []
     seen: set[str] = set()
@@ -475,7 +611,7 @@ def _metadata_package_file_lines(paths: Sequence[Path]) -> list[str]:
         artifact = MOD_PACKAGE_METADATA_ARTIFACTS_BY_FILENAME.get(name)
         if artifact is None:
             continue
-        lines.append(f"{name:<14} {artifact.description}")
+        _readme_append_labeled_description(lines, name, artifact.description)
     return lines
 
 
@@ -494,10 +630,13 @@ def finalize_mod_package_export(
     resolved_options = options or ModPackageExportOptions()
     files_dir_name = _safe_files_dir(resolved_options.files_dir)
     normalized_structure = str(resolved_options.structure or "game_relative").strip().lower()
-    files_dir_value = files_dir_name if normalized_structure == "files_wrapper" else "."
-    payload_root = root / files_dir_name if normalized_structure == "files_wrapper" else root
+    if normalized_structure not in MOD_PACKAGE_STRUCTURES:
+        normalized_structure = "game_relative"
+    uses_files_wrapper = normalized_structure in MOD_PACKAGE_FILES_WRAPPER_STRUCTURES
+    files_dir_value = files_dir_name if uses_files_wrapper else "."
+    payload_root = root / files_dir_name if uses_files_wrapper else root
 
-    if normalized_structure == "files_wrapper" and payload_paths:
+    if uses_files_wrapper and payload_paths:
         _move_payloads_to_files_dir(root, payload_paths, files_dir_name)
 
     new_path_prefixes = normalize_mod_package_new_path_prefixes(
@@ -523,12 +662,13 @@ def finalize_mod_package_export(
 
     manifest_payload = _compact_nested_value(
         {
-            "format": "crimson_browser_mod_v1" if normalized_structure == "files_wrapper" else "v1",
+            "format": "v1",
             "schema_version": 1,
             "kind": kind,
             "id": sanitize_mod_package_folder_name(str(modinfo.get("name") or root.name)),
             **common_fields,
             "created_utc": created,
+            "structure": normalized_structure,
             **dict(extra_fields or {}),
         }
     )
@@ -582,70 +722,82 @@ def write_mod_package_readme(
     metadata_files: Sequence[Path] = (),
     ready_zip_path: Path | None = None,
 ) -> Path:
-    def _add_blank_line(lines: list[str]) -> None:
-        if lines and lines[-1] != "":
-            lines.append("")
-
-    def _add_section(lines: list[str], title: str) -> None:
-        _add_blank_line(lines)
-        lines.append(title)
-        lines.append("=" * len(title))
-
-    def _append_field(lines: list[str], label: str, value: str) -> None:
-        lines.append(f"{label:<16}: {value}")
-
     title = (package_info.title or "").strip() or "Crimson Desert Mod Workbench Mod"
     version = (package_info.version or "").strip() or "1.0"
     author = (package_info.author or "").strip() or "-"
     description = (package_info.description or "").strip()
+    metadata_names = {path.name for path in metadata_files}
 
-    lines: list[str] = [
-        title,
-        "=" * len(title),
-        "",
-    ]
-    _append_field(lines, "Author", author)
-    _append_field(lines, "Version", version)
-    _append_field(lines, "Generated (UTC)", created_utc)
-    _append_field(lines, "Generator", APP_TITLE)
-    _append_field(lines, "Repository", APP_REPOSITORY_URL)
+    lines = _readme_banner_lines(title)
+
+    _readme_add_section(lines, "Package")
+    _readme_append_field(lines, "Title", title)
+    _readme_append_field(lines, "Author", author)
+    _readme_append_field(lines, "Version", version)
+    _readme_append_field(lines, "Generated UTC", created_utc)
+    _readme_append_field(lines, "Generator", APP_TITLE)
+    _readme_append_field(lines, "Repository", APP_REPOSITORY_URL)
 
     if description:
-        _add_section(lines, "Description")
-        lines.append(description)
+        _readme_add_section(lines, "Description")
+        _readme_append_wrapped(lines, description, indent="  ")
 
-    _add_section(lines, "Overview")
-    lines.append(overview)
+    _readme_add_section(lines, "Overview")
+    _readme_append_wrapped(lines, overview, indent="  ")
 
-    _add_section(lines, "Package Summary")
-    _append_field(lines, "Loose file count", str(loose_file_count))
+    _readme_add_section(lines, "Package Summary")
+    _readme_append_field(lines, "Loose files", str(loose_file_count))
     if asset_count is not None:
-        _append_field(lines, "Asset count", str(asset_count))
+        _readme_append_field(lines, "Assets", str(asset_count))
     if include_paired_lod is not None:
-        _append_field(lines, "Paired LOD", "Yes" if include_paired_lod else "No")
+        _readme_append_field(lines, "Paired LOD", "Yes" if include_paired_lod else "No")
 
-    _add_section(lines, "Included Package Files")
+    _readme_add_section(lines, "Included Package Files")
     metadata_lines = _metadata_package_file_lines(metadata_files)
     if metadata_lines:
         lines.extend(metadata_lines)
     else:
-        lines.append(f"manifest.json  {manifest_label}")
+        _readme_append_labeled_description(lines, "manifest.json", manifest_label)
         if create_no_encrypt_file:
-            lines.append(".no_encrypt    Marks the package for non-encrypted handling")
+            artifact = MOD_PACKAGE_METADATA_ARTIFACTS_BY_FILENAME.get(".no_encrypt")
+            description_text = (
+                artifact.description if artifact is not None else "Marks the package for non-encrypted handling."
+            )
+            _readme_append_labeled_description(lines, ".no_encrypt", description_text)
     if ready_zip_path is not None:
-        lines.append(f"{ready_zip_path.name:<14} Ready-to-import zip written beside this folder.")
+        _readme_append_labeled_description(
+            lines,
+            ready_zip_path.name,
+            "Ready-to-import zip written beside this folder with the same generated package contents.",
+        )
 
-    _add_section(lines, "Installation")
-    lines.append("1. Copy or import the contents of the folder into your Crimson Desert mod manager.")
-    lines.append("2. Deploy or enable the mod through your preferred mod manager.")
-    lines.append("3. Verify that the updated mesh loads correctly in game.")
+    _readme_add_section(lines, "Installation")
+    _readme_append_step(lines, 1, "Copy or import the contents of the folder into your Crimson Desert mod manager.")
+    _readme_append_step(lines, 2, "Deploy or enable the mod through your preferred mod manager.")
+    _readme_append_step(lines, 3, "Verify that the replaced assets load correctly in game.")
     lines.append("")
-    lines.append("Preferred mod manager:")
-    lines.append(PREFERRED_CRIMSON_DESERT_MOD_MANAGER_URL)
+    _readme_append_field(lines, "Preferred manager", PREFERRED_CRIMSON_DESERT_MOD_MANAGER_URL)
 
-    _add_section(lines, "Notes")
-    lines.append("This package was generated automatically by Crimson Desert Mod Workbench.")
-    lines.append("Use manifest.json for structured metadata and validation.")
+    _readme_add_section(lines, "Notes")
+    _readme_append_wrapped(
+        lines,
+        "Generated automatically by Crimson Desert Mod Workbench.",
+        indent="  - ",
+        subsequent_indent="    ",
+    )
+    if "manifest.json" in metadata_names or not metadata_files:
+        _readme_append_wrapped(
+            lines,
+            "Keep manifest.json with the payload for validation and manager compatibility.",
+            indent="  - ",
+            subsequent_indent="    ",
+        )
+    _readme_append_wrapped(
+        lines,
+        "Keep generated metadata files with the package when sharing or archiving it.",
+        indent="  - ",
+        subsequent_indent="    ",
+    )
 
     readme_path = root / "README.txt"
     readme_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -668,13 +820,11 @@ def write_mod_package_manifest(
         create_no_encrypt_file=create_no_encrypt_file,
     )
     effective_payload_paths: Sequence[str | Path] = all_payload_paths or _discover_payload_paths_under_root(root)
-    normalized_structure = (
-        resolved_export_options.structure
-        if resolved_export_options.structure in {"game_relative", "files_wrapper"}
-        else "game_relative"
-    )
+    normalized_structure = str(resolved_export_options.structure or "game_relative").strip().lower()
+    if normalized_structure not in MOD_PACKAGE_STRUCTURES:
+        normalized_structure = "game_relative"
     files_dir_name = _safe_files_dir(resolved_export_options.files_dir)
-    files_dir_value = files_dir_name if normalized_structure == "files_wrapper" else "."
+    files_dir_value = files_dir_name if normalized_structure in MOD_PACKAGE_FILES_WRAPPER_STRUCTURES else "."
     manager_targets = _normalize_manager_targets(resolved_export_options.manager_targets)
     new_path_prefixes = normalize_mod_package_new_path_prefixes(
         new_file_paths,
@@ -690,7 +840,7 @@ def write_mod_package_manifest(
     created_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     payload = _compact_mapping(
         {
-            "format": "crimson_browser_mod_v1" if normalized_structure == "files_wrapper" else "v1",
+            "format": "v1",
             "schema_version": 1,
             "kind": kind,
             **common_fields,
@@ -720,12 +870,14 @@ def write_mod_package_manifest(
     )
     ready_zip_path = root.with_suffix(".zip") if resolved_export_options.create_zip else None
     metadata_files = [manifest_path, *[path for path in finalized.metadata_files if path.name != "manifest.json"]]
+    payload_file_count = payload.get("file_count")
+    loose_file_count = len(effective_payload_paths) if payload_file_count is None else int(payload_file_count or 0)
     write_mod_package_readme(
         root,
         package_info,
         created_utc=created_utc,
         overview="This package contains loose file replacements generated by Crimson Desert Mod Workbench.",
-        loose_file_count=int(payload.get("file_count", 0) or 0),
+        loose_file_count=loose_file_count,
         create_no_encrypt_file=create_no_encrypt_file,
         manifest_label="Structured package metadata",
         metadata_files=metadata_files,
@@ -746,19 +898,18 @@ def write_mesh_loose_mod_package_metadata(
     export_options: ModPackageExportOptions | None = None,
     create_no_encrypt_file: bool = True,
     game_build: str = "",
+    game_metadata: Mapping[str, object] | None = None,
 ) -> list[Path]:
     created_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     resolved_export_options = export_options or ModPackageExportOptions(
         create_no_encrypt_file=create_no_encrypt_file,
     )
     normalized_game_build = (game_build or "").strip()
-    normalized_structure = (
-        resolved_export_options.structure
-        if resolved_export_options.structure in {"game_relative", "files_wrapper"}
-        else "game_relative"
-    )
+    normalized_structure = str(resolved_export_options.structure or "game_relative").strip().lower()
+    if normalized_structure not in MOD_PACKAGE_STRUCTURES:
+        normalized_structure = "game_relative"
     files_dir_name = _safe_files_dir(resolved_export_options.files_dir)
-    files_dir_value = files_dir_name if normalized_structure == "files_wrapper" else "."
+    files_dir_value = files_dir_name if normalized_structure in MOD_PACKAGE_FILES_WRAPPER_STRUCTURES else "."
     manager_targets = _normalize_manager_targets(resolved_export_options.manager_targets)
     file_paths = [file_info.path for file_info in files]
     new_path_prefixes = normalize_mod_package_new_path_prefixes(
@@ -797,15 +948,18 @@ def write_mesh_loose_mod_package_metadata(
             return result
         return value
 
+    normalized_game_metadata = _compact_value(dict(game_metadata or {})) if game_metadata else {}
+
     manifest_payload = _compact_value(
         {
-            "format": "crimson_browser_mod_v1" if normalized_structure == "files_wrapper" else "v1",
+            "format": "v1",
             "schema_version": 1,
             "kind": "mesh_loose_mod",
             **common_fields,
             "created_utc": created_utc,
             "structure": normalized_structure,
             "game_build": normalized_game_build,
+            "game_metadata": normalized_game_metadata,
             "include_paired_lod": bool(include_paired_lod),
             "asset_count": len(assets),
             "file_count": len(files),

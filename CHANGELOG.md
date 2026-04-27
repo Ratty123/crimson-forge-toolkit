@@ -96,7 +96,7 @@ The format is intentionally simple:
 ### Docs
 - Updated the README for `0.7.0-beta.1` so the front page now reflects archive patching, mesh preview/modding, media preview, and the broader archive-browser scope instead of describing the app as read-only.
 - Added and refreshed `docs/archive_extension_preview_matrix.csv` to capture current extension coverage, what the app can actually preview today, and where future investment is still worthwhile.
-- Expanded third-party notices and release metadata to cover vendored MIT-licensed CrimsonForge-derived mesh tooling, bundled `vgmstream` usage, and the newer packaging/build workflow.
+- Expanded third-party notices and release metadata to cover vendored MIT-licensed mesh tooling, bundled `vgmstream` usage, and the newer packaging/build workflow.
 
 ## [0.6.5] - 2026-04-18
 
@@ -133,7 +133,7 @@ The format is intentionally simple:
 - Fixed starter workflow profile defaults that could previously force unsafe per-profile NCNN scales or generic visible-path handling for technical maps, which could lead to broken mixed-batch results or black/flat rebuilt DDS output.
 
 ### Docs
-- Updated the README for `0.6.5`, refreshed the feature summary and screenshots, and replaced the old `docs/screenshots` set with current captures from the renamed and polished `Crimson Forge Toolkit` UI.
+- Updated the README for `0.6.5`, refreshed the feature summary and screenshots, and replaced the old `docs/screenshots` set with current captures from the renamed and polished app UI.
 - Expanded `Quick Start` and the in-app documentation for `0.6.5` so the shipped help now covers the current workflow/profile system, planner-path and planner-profile meanings, all major tabs, backend behavior, review flow, and troubleshooting.
 
 ## [0.6.0] - 2026-04-16
@@ -145,7 +145,7 @@ The format is intentionally simple:
 ### Changed
 - `0.6.0` now represents the stabilized release line after the `0.6.0-beta.x` cycle, so the editor, replacement, DDS preview, research, and packaging workflows described in the current README are now part of the main release instead of being gated behind a prerelease note.
 - The app now behaves better during heavier editing/review sessions, with lighter shutdown waits, incremental large-tree population in `Text Search` / `Research`, and additional Texture Editor UI polish around guides, rulers, and atlas controls.
-- The shipped `0.6.0` release build is now branded as `Crimson Forge Toolkit`, including the app title, package defaults, docs/help text, build output name, and portable config/profile filenames, while still migrating legacy `CrimsonTextureForge.cfg` and `DDSRebuildApp.cfg` files automatically.
+- The shipped `0.6.0` release build now uses the updated app branding, including the app title, package defaults, docs/help text, build output name, and portable config/profile filenames, while still migrating legacy `DDSRebuildApp.cfg` files automatically.
 - `Texture Workflow` handoff is now more predictable: `DDS To Workflow` and `Texture Editor -> To Workflow` make their root-clear decisions at handoff time instead of later at `Start`, and editor exports now stage through a dedicated `png_texture_editor` override root instead of mixing with normal upscaled PNG output.
 
 ### Fixed
@@ -158,7 +158,7 @@ The format is intentionally simple:
 
 ### Docs
 - Updated the README and release notes for the final `0.6.0` release and kept the beta changelog history intact underneath for users following the development cycle.
-- Updated `Quick Start`, `About`, README, release notes, and related docs/help text to use the new `Crimson Forge Toolkit` name and reflect the corrected workflow, Replace Assistant, and review behavior in the current `0.6.0` build.
+- Updated `Quick Start`, `About`, README, release notes, and related docs/help text to use the current app name and reflect the corrected workflow, Replace Assistant, and review behavior in the current `0.6.0` build.
 
 ## [0.6.0-beta.4] - 2026-04-16
 
@@ -473,7 +473,7 @@ The format is intentionally simple:
 ## [0.2.1] - 2026-04-08
 
 ### Changed
-- Windows build output now uses a versioned release-style filename pattern such as `CrimsonForgeToolkit-<version>-windows-portable.exe`.
+- Windows build output now uses a versioned release-style filename pattern for the portable executable.
 
 ## [0.2.0] - 2026-04-08
 
@@ -498,7 +498,7 @@ The format is intentionally simple:
 ## [0.1.0] - 2026-04-07
 
 ### Added
-- Initial public release of Crimson Forge Toolkit.
+- Initial public release.
 - Read-only `.pamt` / `.paz` archive browser with selective DDS extraction.
 - Archive cache for faster repeated archive scans.
 - Loose DDS scan/filter workflow.

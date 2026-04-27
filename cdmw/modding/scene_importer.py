@@ -46,6 +46,7 @@ _GLTF_IMAGE_MIME_EXTENSIONS = {
     "image/bmp": ".bmp",
     "image/tiff": ".tif",
 }
+_SCENE_TEXTURE_DISCOVERY_MAX_FILES = 5000
 
 
 @dataclass(slots=True)
@@ -257,15 +258,30 @@ def discover_scene_texture_files(path: str | Path, mesh: Optional[ParsedMesh] = 
         if str(submesh.material or submesh.name or "").strip()
     }
     search_roots = [scene_path.parent, scene_path.parent / "textures", scene_path.parent.parent / "textures"]
+    scanned_files = 0
+    search_limited = False
     for root in search_roots:
         if not root.is_dir():
             continue
         for candidate in root.rglob("*"):
+            scanned_files += 1
+            if scanned_files > _SCENE_TEXTURE_DISCOVERY_MAX_FILES:
+                search_limited = True
+                break
             if not candidate.is_file() or candidate.suffix.lower() not in SCENE_TEXTURE_SOURCE_EXTENSIONS:
                 continue
             stem = candidate.stem.lower()
             if any(stem.startswith(material_name) for material_name in material_names):
                 discovered.append(candidate)
+        if search_limited:
+            break
+    if search_limited:
+        logger.info(
+            "Stopped scene texture discovery for %s after scanning %d filesystem entries. "
+            "Add additional textures through Supplemental Files if needed.",
+            scene_path,
+            _SCENE_TEXTURE_DISCOVERY_MAX_FILES,
+        )
     unique: dict[str, Path] = {}
     for candidate in discovered:
         if candidate.is_file():

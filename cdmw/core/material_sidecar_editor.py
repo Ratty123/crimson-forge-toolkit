@@ -563,6 +563,107 @@ def discover_material_sidecar_preview_overrides(sidecar_text: str) -> tuple[Mate
     return tuple(unique_overrides)
 
 
+def discover_material_sidecar_preview_overrides_for_edits(
+    sidecar_text: str,
+    edited_values: Mapping[str, str],
+) -> tuple[MaterialSidecarPreviewOverride, ...]:
+    if not edited_values:
+        return ()
+    try:
+        root = _parse_wrapped_fragment(sidecar_text)
+    except ET.ParseError:
+        return ()
+    indexes = _element_indexes(root)
+    grouped: dict[str, dict[str, object]] = {}
+
+    def group_state(group_label: str) -> dict[str, object]:
+        return grouped.setdefault(
+            group_label,
+            {
+                "colors": [],
+                "reasons": [],
+                "brightness": 1.0,
+                "uv_scale": 1.0,
+                "has_brightness": False,
+                "has_uv_scale": False,
+            },
+        )
+
+    def walk(element: ET.Element, stack: tuple[ET.Element, ...] = ()) -> None:
+        tag_name = _strip_namespace(element.tag)
+        element_index = indexes.get(id(element), 0)
+        group_label = _group_label_for(element, stack)
+        if tag_name in MATERIAL_SIDECAR_COLOR_TAGS or tag_name in MATERIAL_SIDECAR_COLOR_PARAMETER_TAGS:
+            parameter = tag_name if tag_name in MATERIAL_SIDECAR_COLOR_TAGS else (_parameter_name(element) or tag_name)
+            _values, attrs, _mode = _color_target(element)
+            if not attrs:
+                for child in element:
+                    walk(child, (*stack, element))
+                return
+            row_id = _row_id("color", element_index, parameter, ",".join(attrs))
+            if row_id in edited_values:
+                parsed_color = _parse_color_edit(str(edited_values.get(row_id) or ""))
+                if parsed_color is not None:
+                    weight, reason = _preview_color_weight(parameter)
+                    if weight <= 0:
+                        weight = 1.0
+                        reason = "edited color parameter"
+                    state = group_state(group_label)
+                    colors = state["colors"]
+                    reasons = state["reasons"]
+                    if isinstance(colors, list):
+                        colors.append((parsed_color, weight))
+                    if isinstance(reasons, list):
+                        reasons.append(reason)
+        elif tag_name == "MaterialParameterFloat":
+            parameter_name = _parameter_name(element) or tag_name
+            target_attr = next((attr for attr in _VALUE_ATTRS if _parse_float(str(element.attrib.get(attr) or "")) is not None), "")
+            if target_attr:
+                row_id = _row_id("float", element_index, parameter_name, target_attr)
+                if row_id in edited_values:
+                    parsed_float = _parse_float(str(edited_values.get(row_id) or ""))
+                    if parsed_float is not None:
+                        parameter = re.sub(r"[^a-z0-9]+", "", parameter_name.strip().lower())
+                        state = group_state(group_label)
+                        reasons = state["reasons"]
+                        if parameter in {"_brightness", "brightness"}:
+                            state["brightness"] = max(0.1, min(3.0, float(parsed_float)))
+                            state["has_brightness"] = True
+                            if isinstance(reasons, list):
+                                reasons.append("edited brightness parameter")
+                        elif parameter in {"_uvscale", "uvscale"}:
+                            state["uv_scale"] = max(0.05, min(64.0, float(parsed_float)))
+                            state["has_uv_scale"] = True
+                            if isinstance(reasons, list):
+                                reasons.append("edited UV scale parameter")
+        for child in element:
+            walk(child, (*stack, element))
+
+    walk(root)
+
+    overrides: list[MaterialSidecarPreviewOverride] = []
+    for group_label, state in grouped.items():
+        colors = state.get("colors")
+        reasons = state.get("reasons")
+        tint_color = _weighted_average_color(colors if isinstance(colors, list) else [])
+        has_brightness = bool(state.get("has_brightness"))
+        has_uv_scale = bool(state.get("has_uv_scale"))
+        if not tint_color and not has_brightness and not has_uv_scale:
+            continue
+        unique_reasons = tuple(dict.fromkeys(reason for reason in (reasons if isinstance(reasons, list) else []) if reason))
+        overrides.append(
+            MaterialSidecarPreviewOverride(
+                group_label=group_label,
+                tint_color=tint_color,
+                brightness=float(state.get("brightness") or 1.0),
+                uv_scale=float(state.get("uv_scale") or 1.0),
+                confidence="edited",
+                reason=", ".join(unique_reasons) if unique_reasons else "edited material preview parameter",
+            )
+        )
+    return tuple(overrides)
+
+
 def apply_material_sidecar_edits(
     sidecar_text: str,
     edited_values: Mapping[str, str],

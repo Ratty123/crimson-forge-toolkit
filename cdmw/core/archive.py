@@ -68,11 +68,20 @@ _ARCHIVE_SCAN_CACHE_MAGIC = b"CTFARCH1"
 _ARCHIVE_SCAN_CACHE_VERSION = 2
 _ARCHIVE_SCAN_CACHE_LEGACY_DIRNAMES: Tuple[str, ...] = ("cache", "archive_scan_cache")
 _ARCHIVE_SIDECAR_CACHE_MAGIC = b"CTFSIDE1"
-_ARCHIVE_SIDECAR_CACHE_VERSION = 8
-# Keep model textures closer to their source resolution in the 3D preview.
-# This only affects the PNG preview cache used for model shading; low-quality
-# mode still downsamples at upload time inside the OpenGL widget.
-_MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION = clamp_model_preview_render_settings().preview_texture_max_dimension
+_ARCHIVE_SIDECAR_CACHE_VERSION = 9
+_ARCHIVE_SIDECAR_ENTRY_SIGNATURE_FORMAT = 1
+_ARCHIVE_DERIVED_INDEX_CACHE_MAGIC = b"CTFDERI1"
+_ARCHIVE_DERIVED_INDEX_CACHE_VERSION = 2
+_ARCHIVE_DERIVED_INDEX_CACHE_MAX_SAFE_BYTES = 64 * 1024 * 1024
+_INITIAL_MODEL_PREVIEW_RENDER_SETTINGS = clamp_model_preview_render_settings()
+# Keep visible base textures closer to their source resolution in the 3D preview.
+# Support maps are only sampled for lighting/material approximation, so they are
+# capped harder to avoid long archive-preview workers on 4K normal/height/mask maps.
+_MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION = _INITIAL_MODEL_PREVIEW_RENDER_SETTINGS.preview_texture_max_dimension
+_MODEL_SUPPORT_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION = min(
+    1024,
+    max(256, int(_INITIAL_MODEL_PREVIEW_RENDER_SETTINGS.low_quality_texture_max_dimension)),
+)
 _MODEL_TEXTURE_VISIBLE_FAMILY_SUFFIXES: Tuple[str, ...] = (
     "",
     "_ct",
@@ -173,12 +182,27 @@ _MODEL_TEXTURE_SUPPORT_FAMILY_SUFFIXES: Dict[str, Tuple[str, ...]] = {
 }
 
 
-def set_model_texture_display_preview_max_dimension(value: int) -> None:
-    global _MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION
+def set_model_texture_display_preview_max_dimension(
+    value: int,
+    *,
+    low_quality_value: Optional[int] = None,
+) -> None:
+    global _MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION, _MODEL_SUPPORT_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION
     settings = clamp_model_preview_render_settings(
-        ModelPreviewRenderSettings(preview_texture_max_dimension=int(value))
+        ModelPreviewRenderSettings(
+            preview_texture_max_dimension=int(value),
+            low_quality_texture_max_dimension=(
+                int(low_quality_value)
+                if low_quality_value is not None
+                else ModelPreviewRenderSettings().low_quality_texture_max_dimension
+            ),
+        )
     )
     _MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION = int(settings.preview_texture_max_dimension)
+    _MODEL_SUPPORT_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION = min(
+        1024,
+        max(256, int(settings.low_quality_texture_max_dimension)),
+    )
 _ARCHIVE_TEXTURE_FAMILY_SUFFIXES: Tuple[str, ...] = (
     "",
     "_ct",
@@ -221,6 +245,36 @@ _ARCHIVE_TEXTURE_FAMILY_SUFFIXES: Tuple[str, ...] = (
     "_material",
     "_mat",
 )
+_ARCHIVE_MODEL_FAMILY_VARIANT_SUFFIXES: Tuple[str, ...] = (
+    "_l",
+    "_r",
+    "_u",
+    "_s",
+    "_t",
+    "_c",
+    "_d",
+    "_index01",
+    "_index02",
+    "_index03",
+    "_index01_l",
+    "_index01_r",
+    "_index02_l",
+    "_index02_r",
+    "_index03_l",
+    "_index03_r",
+    "_sub01",
+    "_sub02",
+    "_sub03",
+)
+_ARCHIVE_NUMBERED_MODEL_FAMILY_VARIANT_RE = re.compile(r"_(?:index|sub)\d{2}$", re.IGNORECASE)
+_ARCHIVE_PREFAB_HELM_DESCRIPTOR_RE = re.compile(
+    r"^(?P<prefix>cd_)phm_(?P<variant>\d{2})_hel_(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+_ARCHIVE_PLATE_HELM_MODEL_RE = re.compile(
+    r"^(?P<prefix>cd_)ptm_(?P<variant>\d{2})_hel_(?P<rest>.+)$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -257,7 +311,15 @@ _MODEL_SIDECAR_PARSE_CACHE: OrderedDict[
     Tuple[object, ...],
     Tuple[Tuple["_ArchiveModelSidecarTextureBinding", ...], Tuple[str, ...], Dict[str, Tuple[str, ...]], Dict[str, Tuple[str, ...]]],
 ] = OrderedDict()
+_MODEL_SIDECAR_REFERENCE_CACHE_LIMIT = 256
+_MODEL_SIDECAR_REFERENCE_CACHE: OrderedDict[
+    Tuple[object, ...],
+    Tuple[Tuple["_ArchiveModelSidecarTextureBinding", ...], Tuple[str, ...], Dict[str, Tuple[str, ...]], Dict[str, Tuple[str, ...]]],
+] = OrderedDict()
 _MODEL_SIDECAR_PARSE_CACHE_LOCK = threading.Lock()
+_MODEL_TEXTURE_PREVIEW_PATH_CACHE_LIMIT = 2048
+_MODEL_TEXTURE_PREVIEW_PATH_CACHE: OrderedDict[Tuple[object, ...], str] = OrderedDict()
+_MODEL_TEXTURE_PREVIEW_PATH_CACHE_LOCK = threading.Lock()
 
 _COMMON_TECHNICAL_DDS_EXCLUDE_PATTERNS: Tuple[str, ...] = (
     "*_n.dds",
@@ -372,7 +434,8 @@ _ARCHIVE_STRUCTURED_BINARY_PREVIEW_EXTENSIONS: Tuple[str, ...] = (
     ".wem",
 )
 _ARCHIVE_SCAN_CACHE_SUPPORTED_VERSIONS = {1, 2}
-_ARCHIVE_SIDECAR_CACHE_SUPPORTED_VERSIONS = {8}
+_ARCHIVE_SIDECAR_CACHE_SUPPORTED_VERSIONS = {8, 9}
+_ARCHIVE_DERIVED_INDEX_CACHE_SUPPORTED_VERSIONS = {2}
 CHACHA20_HASH_INITVAL = 0x000C5EDE
 CHACHA20_IV_XOR = 0x60616263
 CHACHA20_XOR_DELTAS = (
@@ -387,7 +450,7 @@ CHACHA20_XOR_DELTAS = (
 )
 
 _ARCHIVE_MATERIAL_SIDECAR_EXTENSIONS: frozenset[str] = frozenset({".pami", ".pac_xml", ".pam_xml", ".pamlod_xml"})
-_ARCHIVE_METADATA_XML_EXTENSIONS: frozenset[str] = frozenset({".xml", ".prefabdata_xml"})
+_ARCHIVE_METADATA_XML_EXTENSIONS: frozenset[str] = frozenset({".xml", ".app_xml", ".prefabdata_xml"})
 _ARCHIVE_XML_LIKE_EXTENSIONS: frozenset[str] = _ARCHIVE_MATERIAL_SIDECAR_EXTENSIONS | _ARCHIVE_METADATA_XML_EXTENSIONS
 _ARCHIVE_SCAN_IGNORED_TOP_LEVEL_DIRS: frozenset[str] = frozenset({"cdmods", "_jmm_backups"})
 _ARCHIVE_SIDECAR_TEXTURE_ATTR_RE = re.compile(
@@ -683,6 +746,15 @@ def resolve_archive_sidecar_cache_metadata_path(package_root: Path, cache_root: 
     return resolve_archive_sidecar_cache_path(package_root, cache_root).with_suffix(".meta.json")
 
 
+def resolve_archive_derived_index_cache_path(package_root: Path, cache_root: Path) -> Path:
+    try:
+        resolved_root = package_root.expanduser().resolve()
+    except OSError:
+        resolved_root = package_root.expanduser()
+    digest = hashlib.sha256(str(resolved_root).lower().encode("utf-8", errors="replace")).hexdigest()[:24]
+    return cache_root / f"archive_derived_indexes_{digest}.bin"
+
+
 def resolve_crimson_desert_executable(package_root: Path) -> Optional[Path]:
     base_dir = _archive_base_dir(package_root)
     candidate_roots: List[Path] = []
@@ -737,6 +809,7 @@ def invalidate_archive_browser_cache(
             resolve_archive_scan_cache_path(package_root, candidate_root),
             resolve_archive_sidecar_cache_path(package_root, candidate_root),
             resolve_archive_sidecar_cache_metadata_path(package_root, candidate_root),
+            resolve_archive_derived_index_cache_path(package_root, candidate_root),
         ):
             normalized_path = str(candidate_path).strip().lower()
             if not normalized_path or normalized_path in seen:
@@ -939,11 +1012,27 @@ def _deserialize_archive_scan_cache_payload(blob: bytes) -> dict:
     )
 
 
+def _deserialize_archive_scan_cache_payload_from_path(cache_path: Path) -> dict:
+    return _deserialize_cache_payload_from_path(
+        cache_path,
+        magic=_ARCHIVE_SCAN_CACHE_MAGIC,
+        invalid_message="Archive cache header is not recognized.",
+    )
+
+
 def _deserialize_archive_sidecar_cache_payload(blob: bytes) -> dict:
     return _deserialize_cache_payload(
         blob,
         magic=_ARCHIVE_SIDECAR_CACHE_MAGIC,
         invalid_message="Texture sidecar cache header is not recognized.",
+    )
+
+
+def _deserialize_archive_derived_index_cache_payload_from_path(cache_path: Path) -> dict:
+    return _deserialize_cache_payload_from_path(
+        cache_path,
+        magic=_ARCHIVE_DERIVED_INDEX_CACHE_MAGIC,
+        invalid_message="Archive derived index cache header is not recognized.",
     )
 
 
@@ -1004,6 +1093,38 @@ def _build_archive_entry_cache_signatures(
     entries: Sequence[ArchiveEntry],
 ) -> Tuple[Tuple[object, ...], ...]:
     return tuple(_archive_entry_cache_signature(package_root, entry) for entry in entries)
+
+
+def _describe_archive_cache_metadata_mismatch(
+    cached_sources: Optional[Sequence[Tuple[str, int, int]]],
+    current_sources: Sequence[Tuple[str, int, int]],
+    cached_entry_count: int,
+    current_entry_count: int,
+) -> List[str]:
+    reasons: List[str] = []
+    if cached_entry_count >= 0 and cached_entry_count != current_entry_count:
+        reasons.append(f"entry count changed {cached_entry_count:,}->{current_entry_count:,}")
+    if cached_sources is None:
+        reasons.append("source metadata missing or invalid")
+        return reasons
+    if len(cached_sources) != len(current_sources):
+        reasons.append(f"source count changed {len(cached_sources):,}->{len(current_sources):,}")
+    cached_by_path = {str(row[0]): row for row in cached_sources}
+    current_by_path = {str(row[0]): row for row in current_sources}
+    added = sorted(set(current_by_path) - set(cached_by_path))
+    removed = sorted(set(cached_by_path) - set(current_by_path))
+    changed = [
+        path
+        for path in sorted(set(cached_by_path) & set(current_by_path))
+        if cached_by_path[path] != current_by_path[path]
+    ]
+    if added:
+        reasons.append("sources added: " + ", ".join(added[:3]) + (" ..." if len(added) > 3 else ""))
+    if removed:
+        reasons.append("sources removed: " + ", ".join(removed[:3]) + (" ..." if len(removed) > 3 else ""))
+    if changed:
+        reasons.append("source stamps changed: " + ", ".join(changed[:3]) + (" ..." if len(changed) > 3 else ""))
+    return reasons
 
 
 def _record_timing(
@@ -1075,7 +1196,7 @@ def save_archive_scan_cache(
     temp_path.write_bytes(blob)
     temp_path.replace(cache_path)
     if on_progress:
-        on_progress(1, 1, "Archive cache is ready.")
+        on_progress(1, 1, "Archive index cache written; preparing browser indexes...")
     if on_log:
         on_log(f"Archive cache updated: {cache_path}")
     _record_timing(timings, "cache_write_s", started_at)
@@ -1120,7 +1241,7 @@ def load_archive_scan_cache(
             on_log(f"Trying {cache_label}: {cache_path.name}")
 
         try:
-            data = _deserialize_archive_scan_cache_payload(cache_path.read_bytes())
+            data = _deserialize_archive_scan_cache_payload_from_path(cache_path)
         except Exception as exc:
             last_failure_message = f"{cache_label.capitalize()} could not be read; will try another cache or rescan: {exc}"
             if on_log:
@@ -1437,7 +1558,6 @@ def discover_non_steam_archive_package_roots(
         "CDMW_PACKAGE_ROOT",
         "CRIMSON_DESERT_PACKAGE_ROOT",
         "cdmw_PACKAGE_ROOT",
-        "crimson_forge_toolkit_PACKAGE_ROOT",
     )
     candidates: set[Path] = set()
 
@@ -1918,14 +2038,21 @@ def _split_archive_filter_patterns(text: str) -> Tuple[str, ...]:
 def _archive_entry_item_alias_text(entry: ArchiveEntry, item_search_aliases: Optional[Mapping[str, str]]) -> str:
     if not item_search_aliases:
         return ""
+    if not _archive_entry_supports_item_alias_search(entry):
+        return ""
     stem = PurePosixPath(entry.basename.replace("\\", "/")).stem.lower()
     if not stem:
         return ""
     keys = [stem]
-    for suffix in ("_l", "_r", "_u", "_s", "_t", "_index01", "_index02", "_index03"):
-        if stem.endswith(suffix):
-            keys.append(stem[: -len(suffix)])
-            break
+    grouped_stem = derive_texture_group_key(entry.basename).strip().lower()
+    if grouped_stem and grouped_stem not in keys:
+        keys.append(grouped_stem)
+    family_stem = _strip_archive_model_family_variant_suffix(stem)
+    if family_stem and family_stem not in keys:
+        keys.append(family_stem)
+    for alias_stem in iter_archive_equipment_model_alias_stems(stem):
+        if alias_stem not in keys:
+            keys.append(alias_stem)
     aliases: List[str] = []
     seen: set[str] = set()
     for key in keys:
@@ -1934,6 +2061,35 @@ def _archive_entry_item_alias_text(entry: ArchiveEntry, item_search_aliases: Opt
             aliases.append(alias)
             seen.add(alias)
     return " ".join(aliases)
+
+
+def _archive_entry_supports_item_alias_search(entry: ArchiveEntry) -> bool:
+    extension = str(entry.extension or "").strip().lower()
+    basename = PurePosixPath(entry.path.replace("\\", "/")).name.lower()
+    if extension in ARCHIVE_IMAGE_EXTENSIONS:
+        return True
+    if extension in {".pac", ".pam", ".pamlod", ".prefab", ".meshinfo", ".pab", ".hkx"}:
+        return True
+    return extension in _ARCHIVE_XML_LIKE_EXTENSIONS or _is_material_sidecar_extension(extension, basename)
+
+
+def _archive_entry_has_item_alias_key(entry: ArchiveEntry, alias_keys: set[str]) -> bool:
+    if not alias_keys:
+        return False
+    if not _archive_entry_supports_item_alias_search(entry):
+        return False
+    stem = PurePosixPath(entry.basename.replace("\\", "/")).stem.lower()
+    if not stem:
+        return False
+    if stem in alias_keys:
+        return True
+    grouped_stem = derive_texture_group_key(entry.basename).strip().lower()
+    if grouped_stem and grouped_stem in alias_keys:
+        return True
+    family_stem = _strip_archive_model_family_variant_suffix(stem)
+    if family_stem and family_stem in alias_keys:
+        return True
+    return any(alias_stem in alias_keys for alias_stem in iter_archive_equipment_model_alias_stems(stem))
 
 
 def _archive_entry_matches_text_pattern(path_lower: str, basename_lower: str, pattern: str, alias_lower: str = "") -> bool:
@@ -1946,6 +2102,110 @@ def _archive_entry_matches_text_pattern(path_lower: str, basename_lower: str, pa
             or bool(alias_lower and fnmatch.fnmatch(alias_lower, pattern))
         )
     return pattern in path_lower or pattern in basename_lower or bool(alias_lower and pattern in alias_lower)
+
+
+def _archive_entry_is_item_alias_expansion_source(entry: ArchiveEntry) -> bool:
+    extension = str(entry.extension or "").strip().lower()
+    basename = PurePosixPath(entry.path.replace("\\", "/")).name.lower()
+    if extension in {".pac", ".pam", ".pamlod", ".prefab", ".meshinfo", ".pab", ".hkx"}:
+        return True
+    if extension in _ARCHIVE_XML_LIKE_EXTENSIONS or _is_material_sidecar_extension(extension, basename):
+        return True
+    return False
+
+
+def _read_archive_entry_text_or_binary_for_reference_expansion(
+    entry: ArchiveEntry,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[str, bytes]:
+    extension = str(entry.extension or "").strip().lower()
+    if extension not in _STRUCTURED_BINARY_ASSET_REFERENCE_EXTENSIONS and extension not in ARCHIVE_TEXT_EXTENSIONS:
+        return "", b""
+    try:
+        raw_data, _decompressed, _note = read_archive_entry_data(entry, stop_event=stop_event)
+    except Exception:
+        return "", b""
+    text = try_decode_text_like_archive_data(raw_data)
+    if text is not None:
+        return text, b""
+    return "", raw_data
+
+
+def _expand_archive_filter_item_alias_related_entries(
+    entries: Sequence[ArchiveEntry],
+    filtered: List[ArchiveEntry],
+    alias_matched_entries: Sequence[ArchiveEntry],
+    *,
+    archive_entries_by_basename: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    archive_entries_by_normalized_path: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> List[ArchiveEntry]:
+    expansion_sources: List[ArchiveEntry] = []
+    seen_source_paths: set[str] = set()
+    for entry in alias_matched_entries:
+        normalized_path = _normalize_model_texture_reference(entry.path)
+        if not normalized_path or normalized_path in seen_source_paths:
+            continue
+        if not _archive_entry_is_item_alias_expansion_source(entry):
+            continue
+        seen_source_paths.add(normalized_path)
+        expansion_sources.append(entry)
+        if len(expansion_sources) >= 32:
+            break
+    if not expansion_sources:
+        return filtered
+
+    basename_index = archive_entries_by_basename or build_archive_entry_basename_index(entries)
+    normalized_path_index = archive_entries_by_normalized_path or build_archive_entry_path_index(entries)
+    expanded_entries: List[ArchiveEntry] = list(filtered)
+    seen_filtered_paths = {
+        _normalize_model_texture_reference(entry.path)
+        for entry in expanded_entries
+        if _normalize_model_texture_reference(entry.path)
+    }
+
+    def add_entry(candidate: Optional[ArchiveEntry]) -> bool:
+        if not isinstance(candidate, ArchiveEntry):
+            return False
+        normalized_candidate = _normalize_model_texture_reference(candidate.path)
+        if not normalized_candidate or normalized_candidate in seen_filtered_paths:
+            return False
+        seen_filtered_paths.add(normalized_candidate)
+        expanded_entries.append(candidate)
+        return True
+
+    def add_related_for_source(source_entry: ArchiveEntry, *, include_sidecar_children: bool) -> None:
+        raise_if_cancelled(stop_event)
+        companion_entries = _find_archive_model_related_entries(source_entry, basename_index)
+        text, binary_data = _read_archive_entry_text_or_binary_for_reference_expansion(
+            source_entry,
+            stop_event=stop_event,
+        )
+        references = build_archive_entry_related_references(
+            source_entry,
+            text=text,
+            binary_data=binary_data,
+            companion_entries=companion_entries,
+            archive_entries_by_normalized_path=normalized_path_index,
+            archive_entries_by_basename=basename_index,
+        )
+        sidecar_children: List[ArchiveEntry] = []
+        for reference in references:
+            related_entry = getattr(reference, "resolved_entry", None)
+            if add_entry(related_entry):
+                extension = str(getattr(related_entry, "extension", "") or "").strip().lower()
+                basename = PurePosixPath(str(getattr(related_entry, "path", "") or "").replace("\\", "/")).name.lower()
+                if include_sidecar_children and _is_material_sidecar_extension(extension, basename):
+                    sidecar_children.append(related_entry)
+        if include_sidecar_children:
+            for sidecar_entry in sidecar_children[:12]:
+                add_related_for_source(sidecar_entry, include_sidecar_children=False)
+
+    for source in expansion_sources:
+        add_related_for_source(source, include_sidecar_children=True)
+
+    return expanded_entries
 
 
 def filter_archive_entries(
@@ -1961,6 +2221,8 @@ def filter_archive_entries(
     min_size_kb: int,
     previewable_only: bool,
     item_search_aliases: Optional[Mapping[str, str]] = None,
+    archive_entries_by_basename: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    archive_entries_by_normalized_path: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> List[ArchiveEntry]:
@@ -1969,6 +2231,13 @@ def filter_archive_entries(
     include_patterns = _split_archive_filter_patterns(text)
     wildcard_pattern = include_patterns[0] if include_patterns else ""
     wildcard_filter = len(include_patterns) == 1 and any(char in include_patterns[0] for char in "*?[]")
+    simple_alias_match_keys: set[str] = set()
+    if text and item_search_aliases and len(include_patterns) == 1 and not wildcard_filter:
+        simple_alias_match_keys = {
+            str(key).strip().lower()
+            for key, alias in item_search_aliases.items()
+            if str(key).strip() and text in str(alias or "").strip().lower()
+        }
     exclude_patterns = list(_split_archive_filter_patterns(exclude_filter_text))
     if exclude_common_technical_suffixes:
         exclude_patterns.extend(_COMMON_TECHNICAL_DDS_EXCLUDE_PATTERNS)
@@ -1985,6 +2254,7 @@ def filter_archive_entries(
         on_progress(0 if total_entries > 0 else 1, progress_total, f"Applying archive filters... 0 / {total_entries:,} entries")
 
     filtered: List[ArchiveEntry] = []
+    alias_matched_entries: List[ArchiveEntry] = []
     for index, entry in enumerate(entries, start=1):
         if stop_event is not None and (index == 1 or index % 2048 == 0):
             raise_if_cancelled(stop_event)
@@ -1996,34 +2266,69 @@ def filter_archive_entries(
         if matched and text:
             path_lower = entry.path.lower()
             basename_lower = entry.basename.lower()
-            alias_lower = _archive_entry_item_alias_text(entry, item_search_aliases)
+            alias_matched = False
             if len(include_patterns) > 1:
-                matched = any(
-                    _archive_entry_matches_text_pattern(path_lower, basename_lower, pattern, alias_lower)
-                    for pattern in include_patterns
-                )
+                matched = False
+                for pattern in include_patterns:
+                    path_matched = _archive_entry_matches_text_pattern(path_lower, basename_lower, pattern)
+                    if path_matched:
+                        matched = True
+                        break
+                    alias_lower = _archive_entry_item_alias_text(entry, item_search_aliases)
+                    if alias_lower and _archive_entry_matches_text_pattern("", "", pattern, alias_lower):
+                        matched = True
+                        alias_matched = True
+                        break
             elif wildcard_filter:
-                matched = (
-                    fnmatch.fnmatch(path_lower, wildcard_pattern)
-                    or fnmatch.fnmatch(basename_lower, wildcard_pattern)
-                    or bool(alias_lower and fnmatch.fnmatch(alias_lower, wildcard_pattern))
-                )
+                path_matched = fnmatch.fnmatch(path_lower, wildcard_pattern) or fnmatch.fnmatch(basename_lower, wildcard_pattern)
+                if path_matched:
+                    matched = True
+                else:
+                    alias_lower = _archive_entry_item_alias_text(entry, item_search_aliases)
+                    alias_matched = bool(alias_lower and fnmatch.fnmatch(alias_lower, wildcard_pattern))
+                    matched = alias_matched
             else:
-                matched = text in path_lower or text in basename_lower or bool(alias_lower and text in alias_lower)
+                path_matched = text in path_lower or text in basename_lower
+                if path_matched:
+                    matched = True
+                elif simple_alias_match_keys:
+                    alias_matched = _archive_entry_has_item_alias_key(entry, simple_alias_match_keys)
+                    matched = alias_matched
+                else:
+                    alias_lower = _archive_entry_item_alias_text(entry, item_search_aliases)
+                    alias_matched = bool(alias_lower and text in alias_lower)
+                    matched = alias_matched
+
+            if matched and alias_matched:
+                alias_matched_entries.append(entry)
 
             if matched and exclude_patterns:
+                alias_lower = ""
                 matched = not any(
-                    _archive_entry_matches_text_pattern(path_lower, basename_lower, pattern, alias_lower)
+                    _archive_entry_matches_text_pattern(path_lower, basename_lower, pattern)
                     for pattern in exclude_patterns
                 )
+                if matched and item_search_aliases:
+                    alias_lower = _archive_entry_item_alias_text(entry, item_search_aliases)
+                    if alias_lower:
+                        matched = not any(
+                            _archive_entry_matches_text_pattern("", "", pattern, alias_lower)
+                            for pattern in exclude_patterns
+                        )
         elif matched and exclude_patterns:
             path_lower = entry.path.lower()
             basename_lower = entry.basename.lower()
-            alias_lower = _archive_entry_item_alias_text(entry, item_search_aliases)
             matched = not any(
-                _archive_entry_matches_text_pattern(path_lower, basename_lower, pattern, alias_lower)
+                _archive_entry_matches_text_pattern(path_lower, basename_lower, pattern)
                 for pattern in exclude_patterns
             )
+            if matched and item_search_aliases:
+                alias_lower = _archive_entry_item_alias_text(entry, item_search_aliases)
+                if alias_lower:
+                    matched = not any(
+                        _archive_entry_matches_text_pattern("", "", pattern, alias_lower)
+                        for pattern in exclude_patterns
+                    )
 
         if matched and package_filter:
             package_label_lower = entry.package_label.lower()
@@ -2051,6 +2356,16 @@ def filter_archive_entries(
 
         if on_progress and (index == 1 or index % update_every == 0 or index == total_entries):
             on_progress(index, progress_total, f"Applying archive filters... {index:,} / {total_entries:,} entries")
+
+    if text and item_search_aliases and alias_matched_entries:
+        filtered = _expand_archive_filter_item_alias_related_entries(
+            entries,
+            filtered,
+            alias_matched_entries,
+            archive_entries_by_basename=archive_entries_by_basename,
+            archive_entries_by_normalized_path=archive_entries_by_normalized_path,
+            stop_event=stop_event,
+        )
 
     return filtered
 
@@ -2121,6 +2436,122 @@ def build_archive_entry_extension_index(entries: Sequence[ArchiveEntry]) -> Dict
             continue
         index.setdefault(extension, []).append(archive_entry)
     return index
+
+
+def save_archive_derived_index_cache(
+    package_root: Path,
+    cache_root: Path,
+    entries: Sequence[ArchiveEntry],
+    *,
+    item_search_aliases: Optional[Mapping[str, str]] = None,
+    item_display_names: Optional[Mapping[str, str]] = None,
+    path_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    basename_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    extension_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+    timings: Optional[Dict[str, float]] = None,
+) -> Path:
+    started_at = time.perf_counter()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_path = resolve_archive_derived_index_cache_path(package_root, cache_root)
+    _base_dir, sources = _collect_archive_scan_sources_from_entries(package_root, entries)
+    payload = {
+        "version": _ARCHIVE_DERIVED_INDEX_CACHE_VERSION,
+        "created_at": time.time(),
+        "sources": sources,
+        "entry_count": len(entries),
+        "item_search_aliases": dict(item_search_aliases or {}),
+        "item_display_names": dict(item_display_names or {}),
+    }
+    _write_raw_pickle_cache_payload_to_path(
+        cache_path,
+        magic=_ARCHIVE_DERIVED_INDEX_CACHE_MAGIC,
+        payload=payload,
+    )
+    if on_log is not None:
+        on_log(f"Archive derived index cache updated: {cache_path}")
+    _record_timing(timings, "derived_cache_write_s", started_at)
+    return cache_path
+
+
+def load_archive_derived_index_cache(
+    package_root: Path,
+    cache_root: Path,
+    entries: Sequence[ArchiveEntry],
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+    timings: Optional[Dict[str, float]] = None,
+) -> Optional[Dict[str, object]]:
+    check_started_at = time.perf_counter()
+    cache_path = resolve_archive_derived_index_cache_path(package_root, cache_root)
+    if not cache_path.exists():
+        if timings is not None:
+            timings.setdefault("derived_cache_check_s", max(0.0, float(time.perf_counter() - check_started_at)))
+            timings.setdefault("derived_cache_load_s", 0.0)
+        return None
+    try:
+        try:
+            cache_size = int(cache_path.stat().st_size)
+        except OSError:
+            cache_size = 0
+        if cache_size > _ARCHIVE_DERIVED_INDEX_CACHE_MAX_SAFE_BYTES:
+            try:
+                cache_path.unlink()
+            except OSError:
+                pass
+            if on_log is not None:
+                on_log("Archive derived index cache format changed; rebuilding lightweight cache.")
+            if timings is not None:
+                timings["derived_cache_check_s"] = max(0.0, float(time.perf_counter() - check_started_at))
+                timings.setdefault("derived_cache_load_s", 0.0)
+            return None
+        _base_dir, current_sources = _collect_archive_scan_sources_from_entries(package_root, entries)
+        if timings is not None:
+            timings["derived_cache_check_s"] = max(0.0, float(time.perf_counter() - check_started_at))
+        load_started_at = time.perf_counter()
+        data = _deserialize_archive_derived_index_cache_payload_from_path(cache_path)
+        if int(data.get("version", 0)) not in _ARCHIVE_DERIVED_INDEX_CACHE_SUPPORTED_VERSIONS:
+            if on_log is not None:
+                on_log("Archive derived index cache format changed; rebuilding lightweight cache.")
+            try:
+                cache_path.unlink()
+            except OSError:
+                pass
+            return None
+        cached_sources = _normalize_archive_source_rows(data.get("sources"))
+        cached_entry_count = int(data.get("entry_count", -1))
+        if cached_sources != current_sources or cached_entry_count != len(entries):
+            if on_log is not None:
+                reasons = _describe_archive_cache_metadata_mismatch(
+                    cached_sources,
+                    current_sources,
+                    cached_entry_count,
+                    len(entries),
+                )
+                on_log("Archive derived index cache is out of date: " + "; ".join(reasons or ["metadata changed"]))
+            return None
+        payload = {
+            "item_search_aliases": {
+                str(key): str(value)
+                for key, value in (data.get("item_search_aliases", {}) or {}).items()
+            },
+            "item_display_names": {
+                str(key): str(value)
+                for key, value in (data.get("item_display_names", {}) or {}).items()
+            },
+            "cache_path": str(cache_path),
+        }
+        _record_timing(timings, "derived_cache_load_s", load_started_at)
+        if on_log is not None:
+            on_log("Loaded archive derived indexes from cache.")
+        return payload
+    except Exception as exc:
+        if on_log is not None:
+            on_log(f"Archive derived index cache could not be used; rebuilding derived indexes: {exc}")
+        if timings is not None:
+            timings.setdefault("derived_cache_check_s", max(0.0, float(time.perf_counter() - check_started_at)))
+            timings.setdefault("derived_cache_load_s", 0.0)
+        return None
 
 
 def _extract_archive_sidecar_texture_lookup_paths(sidecar_text: str) -> Tuple[str, ...]:
@@ -2637,6 +3068,8 @@ def save_archive_texture_sidecar_cache(
         "created_at": time.time(),
         "sources": sources,
         "entry_count": len(entries),
+        "entry_signature_format": _ARCHIVE_SIDECAR_ENTRY_SIGNATURE_FORMAT,
+        "entry_signatures": _build_archive_entry_cache_signatures(package_root, entries),
         "path_rows": path_rows,
         "basename_rows": basename_rows,
     }
@@ -2695,7 +3128,7 @@ def load_archive_texture_sidecar_cache_rows(
         return None
 
     metadata_payload: Optional[dict] = None
-    metadata_matches_current_archives = True
+    metadata_mismatch_reasons: List[str] = []
     if metadata_path.exists():
         try:
             metadata_payload = _read_archive_sidecar_cache_metadata(metadata_path)
@@ -2710,18 +3143,20 @@ def load_archive_texture_sidecar_cache_rows(
                 on_log("Texture sidecar cache metadata format changed; rebuilding it now.")
             return None
         cached_sources = _normalize_archive_source_rows(metadata_payload.get("sources"))
-        if cached_sources is None or cached_sources != current_sources:
-            metadata_matches_current_archives = False
         cached_entry_count = int(metadata_payload.get("entry_count", -1))
-        if cached_entry_count != len(entries):
-            metadata_matches_current_archives = False
-        if not metadata_matches_current_archives:
+        if cached_sources != current_sources or cached_entry_count != len(entries):
+            metadata_mismatch_reasons = _describe_archive_cache_metadata_mismatch(
+                cached_sources,
+                current_sources,
+                cached_entry_count,
+                len(entries),
+            )
             if on_log is not None:
-                on_log("Texture sidecar cache is out of date; rebuilding it now.")
-            if timings is not None:
-                timings["cache_check_s"] = max(0.0, float(time.perf_counter() - check_started_at))
-                timings.setdefault("cache_load_s", 0.0)
-            return None
+                on_log(
+                    "Texture sidecar cache metadata changed: "
+                    + "; ".join(metadata_mismatch_reasons or ["metadata changed"])
+                    + ". Checking cache payload for reuse."
+                )
 
     if on_progress is not None:
         on_progress(0, 0, "Loading texture sidecar cache...")
@@ -2744,18 +3179,6 @@ def load_archive_texture_sidecar_cache_rows(
             on_log("Texture sidecar cache format changed; rebuilding it now.")
         return None
 
-    if metadata_payload is None:
-        cached_sources = _normalize_archive_source_rows(data.get("sources"))
-        if cached_sources is None or cached_sources != current_sources:
-            if on_log is not None:
-                on_log("Texture sidecar cache archive stamps changed; rebuilding it now.")
-            return None
-        cached_entry_count = int(data.get("entry_count", -1))
-        if cached_entry_count != len(entries):
-            if on_log is not None:
-                on_log("Texture sidecar cache entry count changed; rebuilding it now.")
-            return None
-
     try:
         raise_if_cancelled(stop_event)
         raw_path_rows = {
@@ -2763,6 +3186,65 @@ def load_archive_texture_sidecar_cache_rows(
             for key, value in (data.get("path_rows", {}) or {}).items()
             if isinstance(value, (list, tuple)) and str(key or "").strip()
         }
+        cached_sources = _normalize_archive_source_rows(data.get("sources"))
+        cached_entry_count = int(data.get("entry_count", -1))
+        payload_matches_current_archives = cached_sources == current_sources and cached_entry_count == len(entries)
+        if timings is not None and "cache_load_s" not in timings:
+            timings["cache_load_s"] = max(0.0, float(time.perf_counter() - load_started_at))
+        if not payload_matches_current_archives:
+            payload_mismatch_reasons = _describe_archive_cache_metadata_mismatch(
+                cached_sources,
+                current_sources,
+                cached_entry_count,
+                len(entries),
+            )
+            if on_log is not None:
+                on_log(
+                    "Texture sidecar cache payload is out of date: "
+                    + "; ".join(payload_mismatch_reasons or ["archive metadata changed"])
+                )
+            cache_version = int(data.get("version", 0))
+            signature_format = int(data.get("entry_signature_format", 0) or 0)
+            if cache_version >= 9 and signature_format == _ARCHIVE_SIDECAR_ENTRY_SIGNATURE_FORMAT:
+                incremental_started_at = time.perf_counter()
+                updated_path_rows = _incremental_archive_texture_sidecar_path_rows(
+                    package_root,
+                    entries,
+                    raw_path_rows,
+                    data.get("entry_signatures"),
+                    worker_count=worker_count,
+                    stop_event=stop_event,
+                    on_log=on_log,
+                    on_progress=on_progress,
+                    timings=timings,
+                )
+                _record_timing(timings, "incremental_update_s", incremental_started_at)
+                if updated_path_rows is not None:
+                    updated_basename_rows = _build_archive_sidecar_basename_rows_from_path_rows(updated_path_rows)
+                    try:
+                        save_archive_texture_sidecar_cache(
+                            package_root,
+                            cache_root,
+                            entries,
+                            path_rows=updated_path_rows,
+                            basename_rows=updated_basename_rows,
+                            on_log=on_log,
+                            on_progress=on_progress,
+                            stop_event=stop_event,
+                            timings=timings,
+                        )
+                    except Exception as exc:
+                        if on_log is not None:
+                            on_log(f"Warning: incrementally updated texture sidecar cache could not be written: {exc}")
+                    if on_progress is not None:
+                        on_progress(1, 1, "Texture sidecar cache loaded.")
+                    return updated_path_rows, updated_basename_rows
+                if on_log is not None:
+                    on_log("Texture sidecar cache could not be updated incrementally; rebuilding it now.")
+            elif on_log is not None:
+                on_log("Texture sidecar cache is stale and does not contain v9 entry signatures; rebuilding it now.")
+            return None
+
         raw_basename_rows = data.get("basename_rows")
         if isinstance(raw_basename_rows, dict):
             basename_rows = {
@@ -2778,7 +3260,28 @@ def load_archive_texture_sidecar_cache_rows(
             on_log(f"Texture sidecar cache could not be applied; rebuilding it now: {exc}")
         return None
 
-    if metadata_payload is None:
+    metadata_refreshed_by_cache_write = False
+    if int(data.get("version", 0)) < _ARCHIVE_SIDECAR_CACHE_VERSION:
+        try:
+            save_archive_texture_sidecar_cache(
+                package_root,
+                cache_root,
+                entries,
+                path_rows=raw_path_rows,
+                basename_rows=basename_rows,
+                on_log=on_log,
+                on_progress=None,
+                stop_event=stop_event,
+                timings=timings,
+            )
+            metadata_refreshed_by_cache_write = True
+            if on_log is not None:
+                on_log("Texture sidecar cache upgraded to the current metadata format without rescanning.")
+        except Exception as exc:
+            if on_log is not None:
+                on_log(f"Warning: texture sidecar cache could not be upgraded after loading: {exc}")
+
+    if not metadata_refreshed_by_cache_write and (metadata_payload is None or metadata_mismatch_reasons):
         try:
             _write_archive_sidecar_cache_metadata(
                 metadata_path,
@@ -2786,6 +3289,8 @@ def load_archive_texture_sidecar_cache_rows(
                 sources=current_sources,
                 entry_count=len(entries),
             )
+            if metadata_mismatch_reasons and on_log is not None:
+                on_log("Texture sidecar cache metadata was stale, but payload matched current archives; metadata refreshed without rescanning.")
         except Exception:
             pass
 
@@ -3043,6 +3548,8 @@ def prepare_archive_browser_state(
     min_size_kb: int,
     previewable_only: bool,
     item_search_aliases: Optional[Mapping[str, str]] = None,
+    archive_entries_by_basename: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    archive_entries_by_normalized_path: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
     build_structure_children: bool = True,
     build_tree_index: bool = True,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
@@ -3074,6 +3581,8 @@ def prepare_archive_browser_state(
         min_size_kb=min_size_kb,
         previewable_only=previewable_only,
         item_search_aliases=item_search_aliases,
+        archive_entries_by_basename=archive_entries_by_basename,
+        archive_entries_by_normalized_path=archive_entries_by_normalized_path,
         on_progress=on_progress,
         stop_event=stop_event,
     )
@@ -3854,12 +4363,11 @@ def _background_delete_directory(path: Path) -> None:
     if not path.exists():
         return
     if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         subprocess.Popen(
             ["cmd.exe", "/d", "/c", "rmdir", "/s", "/q", str(path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
+            **hidden_subprocess_kwargs(),
         )
         return
     shutil.rmtree(path, ignore_errors=True)
@@ -4484,8 +4992,6 @@ def _classify_model_sidecar_visible_binding(semantic_hint: str, texture_path: st
         "overlaycolor",
         "base",
     )
-    if "overlaycolor" in normalized_hint:
-        return "visible_generic"
     if any(token in normalized_hint for token in primary_tokens):
         return "primary_visible"
 
@@ -4614,7 +5120,7 @@ def _score_model_sidecar_entry_candidate(source_entry: ArchiveEntry, candidate: 
         extension_priority = 1
     else:
         extension_priority = 0
-    return score_value, -len(candidate.path), extension_priority
+    return score_value, extension_priority, -len(candidate.path)
 
 
 def _score_model_related_entry_candidate(source_entry: ArchiveEntry, candidate: ArchiveEntry) -> Tuple[int, int, int]:
@@ -4665,6 +5171,19 @@ def _score_model_related_entry_candidate(source_entry: ArchiveEntry, candidate: 
             extension_priority = 4
         elif candidate_extension == ".hkx":
             extension_priority = 3
+    elif source_extension == ".prefab":
+        if candidate_extension == ".pac":
+            extension_priority = 7
+        elif candidate_extension == ".pac_xml":
+            extension_priority = 6
+        elif candidate_extension in {".pab", ".meshinfo"}:
+            extension_priority = 5
+        elif candidate_extension in _ARCHIVE_XML_LIKE_EXTENSIONS:
+            extension_priority = 4
+        elif candidate_extension == ".hkx":
+            extension_priority = 3
+        elif candidate_extension == ".dds":
+            extension_priority = 2
     elif source_extension == ".meshinfo":
         if candidate_extension in {".pam", ".pamlod", ".pac"}:
             extension_priority = 7
@@ -4752,7 +5271,7 @@ def _score_model_related_entry_candidate(source_entry: ArchiveEntry, candidate: 
             extension_priority = 4
     elif candidate_extension in _ARCHIVE_XML_LIKE_EXTENSIONS | {".meshinfo", ".hkx"}:
         extension_priority = 2
-    return score_value, -len(candidate.path), extension_priority
+    return score_value, extension_priority, -len(candidate.path)
 
 
 def _extend_archive_related_target_basenames(
@@ -4766,6 +5285,11 @@ def _extend_archive_related_target_basenames(
     add_target(f"{stem}.xml")
     add_target(f"{stem}.hkx")
     add_target(f"{stem}.meshinfo")
+    add_target(f"{stem}.app_xml")
+    add_target(f"{stem}.app.xml")
+    add_target(f"{stem}.prefabdata.xml")
+    add_target(f"{stem}.prefabdata_xml")
+    add_target(f"{stem}.sockets.xml")
     if source_extension in {".pam", ".pamlod"}:
         add_target(f"{stem}.pami")
         add_target(f"{stem}.pam_xml")
@@ -4778,9 +5302,8 @@ def _extend_archive_related_target_basenames(
         add_target(f"{stem}.pam")
     elif source_extension == ".pac":
         add_target(f"{stem}.pab")
-        add_target(f"{stem}.prefabdata.xml")
         add_target(f"{stem}.pac_xml")
-        add_target(f"{stem}.prefabdata_xml")
+        add_target(f"{stem}.pac.xml")
     elif source_extension == ".meshinfo":
         add_target(f"{stem}.pam")
         add_target(f"{stem}.pamlod")
@@ -4797,6 +5320,10 @@ def _extend_archive_related_target_basenames(
             add_target(f"{stem}.pab")
             add_target(f"{stem}.hkx")
             add_target(f"{stem}.meshinfo")
+            add_target(f"{stem}.app_xml")
+            add_target(f"{stem}.app.xml")
+            add_target(f"{stem}.prefabdata.xml")
+            add_target(f"{stem}.prefabdata_xml")
         elif source_extension == ".pam_xml":
             add_target(f"{stem}.pam")
             add_target(f"{stem}.pamlod")
@@ -4856,10 +5383,91 @@ def _collect_same_stem_related_target_basenames(source_entry: ArchiveEntry) -> s
     return targets
 
 
+def _strip_archive_model_family_variant_suffix(stem: str) -> str:
+    normalized = str(stem or "").strip().lower()
+    if not normalized:
+        return ""
+    while True:
+        before = normalized
+        for suffix in sorted(_ARCHIVE_MODEL_FAMILY_VARIANT_SUFFIXES, key=len, reverse=True):
+            if normalized.endswith(suffix) and len(normalized) > len(suffix):
+                normalized = normalized[: -len(suffix)]
+                break
+        if normalized != before:
+            continue
+        stripped = _ARCHIVE_NUMBERED_MODEL_FAMILY_VARIANT_RE.sub("", normalized).strip()
+        if stripped and stripped != normalized:
+            normalized = stripped
+            continue
+        stripped = re.sub(r"(?<=\d)[a-z]$", "", normalized).strip()
+        if stripped and stripped != normalized:
+            normalized = stripped
+            continue
+        return normalized or before
+
+
+def _iter_archive_prefab_equipment_family_stems(stem: str) -> Tuple[str, ...]:
+    normalized = str(stem or "").strip().lower()
+    if not normalized:
+        return ()
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        candidate = str(value or "").strip().lower()
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+
+    add(normalized)
+    add(_strip_archive_model_family_variant_suffix(normalized))
+    for candidate in tuple(candidates):
+        if "_set_" in candidate:
+            add(candidate.replace("_set_", "_", 1))
+
+    for candidate in tuple(candidates):
+        match = _ARCHIVE_PREFAB_HELM_DESCRIPTOR_RE.match(candidate)
+        if not match:
+            continue
+        rest = match.group("rest")
+        for model_variant in ("00", "01"):
+            add(f"{match.group('prefix')}ptm_{model_variant}_hel_{rest}")
+    return tuple(candidates)
+
+
+def iter_archive_equipment_model_alias_stems(stem: str) -> Tuple[str, ...]:
+    normalized = str(stem or "").strip().lower()
+    if not normalized:
+        return ()
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        candidate = str(value or "").strip().lower()
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+
+    source_stems = [normalized, _strip_archive_model_family_variant_suffix(normalized)]
+    for source_stem in source_stems:
+        match = _ARCHIVE_PLATE_HELM_MODEL_RE.match(source_stem)
+        if not match:
+            continue
+        rest = match.group("rest")
+        descriptor_stem = f"{match.group('prefix')}phm_00_hel_{rest}"
+        add(descriptor_stem)
+        add(f"{descriptor_stem}_c")
+        if rest.isdigit():
+            set_descriptor_stem = f"{match.group('prefix')}phm_00_hel_set_{rest}"
+            add(set_descriptor_stem)
+            add(f"{set_descriptor_stem}_c")
+    return tuple(candidates)
+
+
 def _collect_family_heuristic_target_basenames(source_entry: ArchiveEntry) -> set[str]:
     normalized_path = source_entry.path.replace("\\", "/").strip().lower()
     source_extension = str(source_entry.extension or "").strip().lower()
-    if source_extension not in {".pac", ".pab", ".hkx", ".meshinfo", ".xml", ".pac_xml", ".prefabdata_xml"}:
+    if source_extension not in {".pac", ".pab", ".hkx", ".meshinfo", ".xml", ".pac_xml", ".app_xml", ".prefabdata_xml", ".prefab"}:
         return set()
     targets: set[str] = set()
     for pab_basename in iter_pab_candidate_basenames(normalized_path):
@@ -4870,8 +5478,24 @@ def _collect_family_heuristic_target_basenames(source_entry: ArchiveEntry) -> se
         family_stem = PurePosixPath(normalized_pab).stem
         if not family_stem:
             continue
-        for extension in (".pac", ".pab", ".hkx", ".meshinfo", ".prefabdata.xml", ".pac_xml", ".prefabdata_xml"):
+        for extension in (".pac", ".pab", ".hkx", ".meshinfo", ".app_xml", ".app.xml", ".prefabdata.xml", ".pac_xml", ".prefabdata_xml"):
             targets.add(f"{family_stem}{extension}")
+    if source_extension == ".prefab":
+        source_stem = PurePosixPath(normalized_path).stem.strip().lower()
+        for family_stem in _iter_archive_prefab_equipment_family_stems(source_stem):
+            for extension in (
+                ".pac",
+                ".pab",
+                ".hkx",
+                ".meshinfo",
+                ".prefabdata.xml",
+                ".pac_xml",
+                ".prefabdata_xml",
+                ".sockets.xml",
+            ):
+                targets.add(f"{family_stem}{extension}")
+            for texture_suffix in _ARCHIVE_TEXTURE_FAMILY_SUFFIXES:
+                targets.add(f"{family_stem}{texture_suffix}.dds")
     return targets
 
 
@@ -4900,7 +5524,7 @@ def _relation_kind_for_entry(candidate_entry: Optional[ArchiveEntry], reference_
         return RelationKind.MATERIAL_SIDECAR.value
     if extension == ".xml":
         return RelationKind.METADATA.value
-    if extension == ".prefabdata_xml":
+    if extension in {".app_xml", ".prefabdata_xml"}:
         return RelationKind.METADATA.value
     if extension in {".pab", ".pabc"}:
         return RelationKind.SKELETON.value
@@ -5195,6 +5819,37 @@ def _archive_entry_identity_signature(entry: ArchiveEntry) -> Tuple[object, ...]
     )
 
 
+def _archive_entry_pathc_identity_signature(entry: ArchiveEntry) -> Tuple[object, ...]:
+    if str(getattr(entry, "extension", "") or "").lower() != ".dds" or int(getattr(entry, "compression_type", 0) or 0) != 1:
+        return ()
+    try:
+        pathc_path = resolve_archive_pathc_path(entry)
+        pathc_stat = pathc_path.stat()
+        return (
+            str(pathc_path),
+            int(pathc_stat.st_size),
+            int(getattr(pathc_stat, "st_mtime_ns", int(pathc_stat.st_mtime * 1_000_000_000))),
+        )
+    except OSError:
+        return ("missing_pathc",)
+
+
+def _texconv_identity_signature(texconv_path: Path) -> Tuple[object, ...]:
+    try:
+        resolved_path = texconv_path.expanduser().resolve()
+    except OSError:
+        resolved_path = texconv_path.expanduser()
+    try:
+        texconv_stat = resolved_path.stat()
+        return (
+            str(resolved_path),
+            int(texconv_stat.st_size),
+            int(getattr(texconv_stat, "st_mtime_ns", int(texconv_stat.st_mtime * 1_000_000_000))),
+        )
+    except OSError:
+        return (str(resolved_path), 0, 0)
+
+
 def _extract_model_sidecar_entry_bindings_cached(
     sidecar_entry: ArchiveEntry,
     *,
@@ -5224,9 +5879,10 @@ def _extract_model_sidecar_entry_bindings_cached(
             normalized_texture_path = normalize_texture_reference_for_sidecar_lookup(binding.texture_path)
             if not normalized_texture_path:
                 continue
-            sidecar_texts_by_normalized_path[normalized_texture_path].append(text)
+            if text not in sidecar_texts_by_normalized_path[normalized_texture_path]:
+                sidecar_texts_by_normalized_path[normalized_texture_path].append(text)
             texture_basename = PurePosixPath(normalized_texture_path).name
-            if texture_basename:
+            if texture_basename and text not in sidecar_texts_by_basename[texture_basename]:
                 sidecar_texts_by_basename[texture_basename].append(text)
         parsed_result = (
             tuple(parsed_bindings),
@@ -5254,18 +5910,46 @@ def _extract_archive_model_sidecar_texture_references(
     Dict[str, Tuple[str, ...]],
     Dict[str, Tuple[str, ...]],
 ]:
+    raise_if_cancelled(stop_event)
+    sidecar_entries = _find_archive_model_sidecar_entries(source_entry, archive_entries_by_basename)
+    cache_key: Tuple[object, ...] = (
+        _archive_entry_identity_signature(source_entry),
+        tuple(_archive_entry_identity_signature(sidecar_entry) for sidecar_entry in sidecar_entries),
+    )
+    with _MODEL_SIDECAR_PARSE_CACHE_LOCK:
+        cached = _MODEL_SIDECAR_REFERENCE_CACHE.get(cache_key)
+        if cached is not None:
+            _MODEL_SIDECAR_REFERENCE_CACHE.move_to_end(cache_key)
+            return cached
+
     bindings: List[_ArchiveModelSidecarTextureBinding] = []
     sidecar_paths: List[str] = []
     seen_binding_keys: set[Tuple[str, str, str]] = set()
     sidecar_texts_by_normalized_path: Dict[str, List[str]] = defaultdict(list)
     sidecar_texts_by_basename: Dict[str, List[str]] = defaultdict(list)
-    for sidecar_entry in _find_archive_model_sidecar_entries(source_entry, archive_entries_by_basename):
+    had_sidecar_error = False
+
+    def append_unique_texts(target: Dict[str, List[str]], key: str, values: Sequence[str]) -> None:
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            return
+        bucket = target[normalized_key]
+        for value in values:
+            text = str(value or "")
+            if not text.strip() or text in bucket:
+                continue
+            bucket.append(text)
+
+    for sidecar_entry in sidecar_entries:
         raise_if_cancelled(stop_event)
         try:
             parsed_bindings, parsed_paths, parsed_texts_by_path, parsed_texts_by_basename = (
                 _extract_model_sidecar_entry_bindings_cached(sidecar_entry, stop_event=stop_event)
             )
+        except RunCancelled:
+            raise
         except Exception:
+            had_sidecar_error = True
             continue
         if not parsed_bindings:
             continue
@@ -5273,9 +5957,9 @@ def _extract_archive_model_sidecar_texture_references(
             if parsed_path not in sidecar_paths:
                 sidecar_paths.append(parsed_path)
         for key, values in parsed_texts_by_path.items():
-            sidecar_texts_by_normalized_path[key].extend(values)
+            append_unique_texts(sidecar_texts_by_normalized_path, key, values)
         for key, values in parsed_texts_by_basename.items():
-            sidecar_texts_by_basename[key].extend(values)
+            append_unique_texts(sidecar_texts_by_basename, key, values)
         for binding in parsed_bindings:
             normalized_texture_path = normalize_texture_reference_for_sidecar_lookup(binding.texture_path)
             key = (
@@ -5287,12 +5971,20 @@ def _extract_archive_model_sidecar_texture_references(
                 continue
             seen_binding_keys.add(key)
             bindings.append(binding)
-    return (
+    result = (
         tuple(bindings),
         tuple(sidecar_paths),
         {key: tuple(values) for key, values in sidecar_texts_by_normalized_path.items()},
         {key: tuple(values) for key, values in sidecar_texts_by_basename.items()},
     )
+    raise_if_cancelled(stop_event)
+    if not had_sidecar_error:
+        with _MODEL_SIDECAR_PARSE_CACHE_LOCK:
+            _MODEL_SIDECAR_REFERENCE_CACHE[cache_key] = result
+            _MODEL_SIDECAR_REFERENCE_CACHE.move_to_end(cache_key)
+            while len(_MODEL_SIDECAR_REFERENCE_CACHE) > _MODEL_SIDECAR_REFERENCE_CACHE_LIMIT:
+                _MODEL_SIDECAR_REFERENCE_CACHE.popitem(last=False)
+    return result
 
 
 def _iter_parsed_model_submeshes(parsed_mesh: Optional[object]) -> List[object]:
@@ -5336,6 +6028,9 @@ def _iter_model_sidecar_binding_submesh_keys(binding: _ArchiveModelSidecarTextur
         str(getattr(binding, "part_name", "") or ""),
         str(getattr(binding, "material_name", "") or ""),
     ]
+    explicit_keys = _iter_model_submesh_reference_candidates(*values)
+    if explicit_keys:
+        return explicit_keys
     linked_mesh_path = str(getattr(binding, "linked_mesh_path", "") or "").replace("\\", "/").strip()
     if linked_mesh_path:
         linked_mesh = PurePosixPath(linked_mesh_path)
@@ -6001,8 +6696,32 @@ def _ensure_archive_model_texture_preview_path(
     resolved_texconv_path: Path,
     texture_entry: ArchiveEntry,
     *,
+    max_dimension: Optional[int] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> str:
+    resolved_max_dimension = (
+        int(max_dimension)
+        if max_dimension is not None
+        else int(_MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION)
+    )
+    cache_key: Tuple[object, ...] = (
+        _archive_entry_identity_signature(texture_entry),
+        _archive_entry_pathc_identity_signature(texture_entry),
+        _texconv_identity_signature(resolved_texconv_path),
+        resolved_max_dimension,
+    )
+    with _MODEL_TEXTURE_PREVIEW_PATH_CACHE_LOCK:
+        cached_preview_path = _MODEL_TEXTURE_PREVIEW_PATH_CACHE.get(cache_key)
+        if cached_preview_path:
+            cached_path = Path(cached_preview_path)
+            try:
+                if cached_path.is_file() and cached_path.stat().st_size > 0:
+                    _MODEL_TEXTURE_PREVIEW_PATH_CACHE.move_to_end(cache_key)
+                    return cached_preview_path
+            except OSError:
+                pass
+            _MODEL_TEXTURE_PREVIEW_PATH_CACHE.pop(cache_key, None)
+
     texture_source_path, _texture_note = ensure_archive_preview_source(
         texture_entry,
         stop_event=stop_event,
@@ -6016,10 +6735,16 @@ def _ensure_archive_model_texture_preview_path(
         resolved_texconv_path,
         texture_source_path.resolve(),
         dds_info=dds_info,
-        max_dimension=_MODEL_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION,
+        max_dimension=resolved_max_dimension,
         stop_event=stop_event,
     )
-    return str(preview_path)
+    preview_path_text = str(preview_path)
+    with _MODEL_TEXTURE_PREVIEW_PATH_CACHE_LOCK:
+        _MODEL_TEXTURE_PREVIEW_PATH_CACHE[cache_key] = preview_path_text
+        _MODEL_TEXTURE_PREVIEW_PATH_CACHE.move_to_end(cache_key)
+        while len(_MODEL_TEXTURE_PREVIEW_PATH_CACHE) > _MODEL_TEXTURE_PREVIEW_PATH_CACHE_LIMIT:
+            _MODEL_TEXTURE_PREVIEW_PATH_CACHE.popitem(last=False)
+    return preview_path_text
 
 
 def _model_preview_sidecar_tint(binding: _ArchiveModelSidecarTextureBinding) -> Tuple[float, float, float]:
@@ -6044,6 +6769,38 @@ def _model_preview_sidecar_uv_scale(binding: _ArchiveModelSidecarTextureBinding)
     if abs(uv_scale - 1.0) <= 1e-6:
         return ()
     return (uv_scale, uv_scale)
+
+
+def _model_preview_sidecar_material_color(binding: _ArchiveModelSidecarTextureBinding) -> Tuple[float, float, float]:
+    color = _model_preview_sidecar_tint(binding)
+    if len(color) < 3:
+        return ()
+    try:
+        red = max(0.0, min(1.0, float(color[0])))
+        green = max(0.0, min(1.0, float(color[1])))
+        blue = max(0.0, min(1.0, float(color[2])))
+    except (TypeError, ValueError):
+        return ()
+    luma = (red * 0.2126) + (green * 0.7152) + (blue * 0.0722)
+    saturation = max(red, green, blue) - min(red, green, blue)
+    if luma <= 0.018 and saturation <= 0.035:
+        return ()
+    return (red, green, blue)
+
+
+def _is_low_authority_model_base_texture(texture_path: str) -> bool:
+    normalized = _normalize_model_texture_reference(texture_path)
+    if not normalized:
+        return False
+    basename = PurePosixPath(normalized).name.lower()
+    stem = PurePosixPath(normalized).stem.lower()
+    if "common_default" in stem and "overlay" in stem:
+        return True
+    if stem in {"cd_common_default_overlay", "cd_common_default_overlay_old"}:
+        return True
+    if stem.endswith("_o") or "_overlay" in stem:
+        return True
+    return False
 
 
 def _mesh_existing_base_is_sidecar_identity(
@@ -6103,12 +6860,20 @@ def _apply_model_sidecar_base_preview(
         mesh.preview_texture_brightness = 1.0
     mesh.preview_texture_tint = _model_preview_sidecar_tint(binding)
     mesh.preview_texture_uv_scale = _model_preview_sidecar_uv_scale(binding)
+    material_color = _model_preview_sidecar_material_color(binding)
+    low_authority_base = _is_low_authority_model_base_texture(texture_entry.path)
+    if material_color:
+        mesh.preview_color = material_color
     if (
         mesh.preview_texture_tint
         or mesh.preview_texture_uv_scale
         or abs(float(mesh.preview_texture_brightness or 1.0) - 1.0) > 1e-6
     ):
         mesh.preview_texture_approximation_note = "Sidecar tint, brightness, and UV scale are preview approximations."
+    if low_authority_base and material_color:
+        mesh.preview_texture_approximation_note = (
+            "Sidecar material color drives visible preview color; the resolved DDS is a low-detail overlay/default layer."
+        )
 
 
 def _attach_model_sidecar_texture_preview_paths(
@@ -6138,15 +6903,60 @@ def _attach_model_sidecar_texture_preview_paths(
     fallback_visible_bindings: List[
         Tuple[Tuple[int, int, int, int, int], ArchiveEntry, str, str, _ArchiveModelSidecarTextureBinding]
     ] = []
+    material_color_by_submesh: Dict[
+        str,
+        Tuple[Tuple[int, int, int, int], Tuple[float, float, float], _ArchiveModelSidecarTextureBinding],
+    ] = {}
+    global_material_colors: List[Tuple[Tuple[int, int, int, int], Tuple[float, float, float], _ArchiveModelSidecarTextureBinding]] = []
     seen_fallback_binding_keys: set[Tuple[str, str, str]] = set()
     seen_global_binding_keys: set[Tuple[str, str]] = set()
+    seen_global_color_keys: set[Tuple[float, float, float, str, str]] = set()
     sidecar_paths: List[str] = []
     promoted_anonymous_fallback = False
     force_unflipped_preview = str(getattr(source_entry, "extension", "") or "").lower() == ".pac"
+    preview_cache: Dict[str, str] = {}
+
+    def _preview_path_for_entry(texture_entry: ArchiveEntry) -> str:
+        cache_key = _normalize_model_texture_reference(texture_entry.path)
+        preview_path_text = preview_cache.get(cache_key, "")
+        if preview_path_text:
+            return preview_path_text
+        preview_path_text = _ensure_archive_model_texture_preview_path(
+            resolved_texconv_path,
+            texture_entry,
+            stop_event=stop_event,
+        )
+        preview_cache[cache_key] = preview_path_text
+        return preview_path_text
 
     for binding in sidecar_texture_bindings:
         raise_if_cancelled(stop_event)
         submesh_keys = _iter_model_sidecar_binding_submesh_keys(binding)
+        color_binding_class = _classify_model_sidecar_visible_binding(binding.parameter_name, binding.texture_path)
+        material_color = _model_preview_sidecar_material_color(binding)
+        if material_color:
+            color_priority = (
+                _model_sidecar_visible_class_priority(color_binding_class),
+                1 if color_binding_class != "technical" else 0,
+                1 if str(getattr(binding, "tint_color", "") or "") else 0,
+                -len(str(getattr(binding, "texture_path", "") or "")),
+            )
+            if submesh_keys:
+                for submesh_key in submesh_keys:
+                    existing_color = material_color_by_submesh.get(submesh_key)
+                    if existing_color is None or color_priority > existing_color[0]:
+                        material_color_by_submesh[submesh_key] = (color_priority, material_color, binding)
+            else:
+                global_color_key = (
+                    material_color[0],
+                    material_color[1],
+                    material_color[2],
+                    str(getattr(binding, "material_name", "") or "").strip().lower(),
+                    str(getattr(binding, "part_name", "") or "").strip().lower(),
+                )
+                if global_color_key not in seen_global_color_keys:
+                    seen_global_color_keys.add(global_color_key)
+                    global_material_colors.append((color_priority, material_color, binding))
         texture_entry, resolution_status = _resolve_model_texture_archive_entry(
             source_entry,
             binding.texture_path,
@@ -6232,6 +7042,8 @@ def _attach_model_sidecar_texture_preview_paths(
     assigned_count = 0
     identity_override_count = 0
     unresolved_meshes: List[ModelPreviewMesh] = []
+    unresolved_mesh_indices_by_id: Dict[int, int] = {}
+    ordered_anonymous_fallback_count = 0
     for mesh_index, mesh in enumerate(model_preview.meshes):
         raise_if_cancelled(stop_event)
         existing_preview_path = str(getattr(mesh, "preview_texture_path", "") or "").strip()
@@ -6253,16 +7065,16 @@ def _attach_model_sidecar_texture_preview_paths(
         if best_match is None:
             if not existing_preview_path:
                 unresolved_meshes.append(mesh)
+                unresolved_mesh_indices_by_id[id(mesh)] = mesh_index
             continue
         _candidate_key, texture_entry, _parameter_name, submesh_name, binding = best_match
-        if existing_preview_path and not _mesh_existing_base_is_sidecar_identity(mesh, parsed_submesh, binding):
-            continue
+        if existing_preview_path:
+            if fallback_only:
+                continue
+            if not _mesh_existing_base_is_sidecar_identity(mesh, parsed_submesh, binding):
+                continue
         try:
-            preview_path_text = _ensure_archive_model_texture_preview_path(
-                resolved_texconv_path,
-                texture_entry,
-                stop_event=stop_event,
-            )
+            preview_path_text = _preview_path_for_entry(texture_entry)
             _apply_model_sidecar_base_preview(
                 mesh,
                 texture_entry=texture_entry,
@@ -6279,17 +7091,77 @@ def _attach_model_sidecar_texture_preview_paths(
         except Exception:
             continue
 
+    if unresolved_meshes and fallback_visible_bindings:
+        ordered_keys: Dict[str, int] = {}
+        best_fallback_by_key: Dict[
+            str,
+            Tuple[Tuple[int, int, int, int, int], ArchiveEntry, str, str, _ArchiveModelSidecarTextureBinding],
+        ] = {}
+        for fallback_item in fallback_visible_bindings:
+            binding = fallback_item[4]
+            sidecar_key = ""
+            for raw_value in (
+                str(getattr(binding, "submesh_name", "") or ""),
+                str(getattr(binding, "part_name", "") or ""),
+                str(getattr(binding, "material_name", "") or ""),
+            ):
+                sidecar_key = _normalize_model_submesh_reference(raw_value)
+                if sidecar_key:
+                    break
+            if not sidecar_key:
+                continue
+            ordered_keys.setdefault(sidecar_key, len(ordered_keys))
+            existing = best_fallback_by_key.get(sidecar_key)
+            if existing is None or fallback_item[0] > existing[0]:
+                best_fallback_by_key[sidecar_key] = fallback_item
+        ordered_fallbacks = [
+            best_fallback_by_key[key]
+            for key, _order in sorted(ordered_keys.items(), key=lambda item: item[1])
+            if key in best_fallback_by_key
+        ]
+        if len(ordered_fallbacks) > 1:
+            for mesh in unresolved_meshes:
+                raise_if_cancelled(stop_event)
+                if str(getattr(mesh, "preview_texture_path", "") or "").strip():
+                    continue
+                mesh_index = unresolved_mesh_indices_by_id.get(id(mesh), -1)
+                if mesh_index < 0 or mesh_index >= len(ordered_fallbacks):
+                    continue
+                _candidate_key, texture_entry, _parameter_name, _submesh_name, binding = ordered_fallbacks[mesh_index]
+                try:
+                    preview_path_text = _preview_path_for_entry(texture_entry)
+                    _apply_model_sidecar_base_preview(
+                        mesh,
+                        texture_entry=texture_entry,
+                        preview_path_text=preview_path_text,
+                        binding=binding,
+                        force_unflipped_preview=force_unflipped_preview,
+                        set_texture_name=False,
+                    )
+                    assigned_count += 1
+                    ordered_anonymous_fallback_count += 1
+                except RunCancelled:
+                    raise
+                except Exception:
+                    continue
+
     if not global_visible_bindings and unresolved_meshes and fallback_visible_bindings:
         unique_named_sidecar_submeshes = {
             _normalize_model_submesh_reference(submesh_name)
             for _candidate_key, _texture_entry, _parameter_name, submesh_name, _binding in fallback_visible_bindings
             if _normalize_model_submesh_reference(submesh_name)
         }
+        unique_named_sidecar_submeshes_all = {
+            sidecar_key
+            for binding in sidecar_texture_bindings
+            for sidecar_key in _iter_model_sidecar_binding_submesh_keys(binding)[:1]
+            if sidecar_key
+        }
         should_promote_fallback = (
             len(unresolved_meshes) == 1
             or len(model_preview.meshes) == 1
             or len(parsed_submeshes) <= 1
-            or len(unique_named_sidecar_submeshes) == 1
+            or (len(unique_named_sidecar_submeshes) == 1 and len(unique_named_sidecar_submeshes_all) <= 1)
         )
         if should_promote_fallback:
             fallback_visible_bindings.sort(key=lambda item: item[0], reverse=True)
@@ -6305,11 +7177,7 @@ def _attach_model_sidecar_texture_preview_paths(
                 if str(getattr(mesh, "preview_texture_path", "") or "").strip():
                     continue
                 try:
-                    preview_path_text = _ensure_archive_model_texture_preview_path(
-                        resolved_texconv_path,
-                        texture_entry,
-                        stop_event=stop_event,
-                    )
+                    preview_path_text = _preview_path_for_entry(texture_entry)
                     _apply_model_sidecar_base_preview(
                         mesh,
                         texture_entry=texture_entry,
@@ -6334,11 +7202,7 @@ def _attach_model_sidecar_texture_preview_paths(
                 texture_entry, _parameter_name, submesh_name, binding = global_visible_bindings[binding_index]
                 binding_index += 1
                 try:
-                    preview_path_text = _ensure_archive_model_texture_preview_path(
-                        resolved_texconv_path,
-                        texture_entry,
-                        stop_event=stop_event,
-                    )
+                    preview_path_text = _preview_path_for_entry(texture_entry)
                     _apply_model_sidecar_base_preview(
                         mesh,
                         texture_entry=texture_entry,
@@ -6353,8 +7217,61 @@ def _attach_model_sidecar_texture_preview_paths(
                 except Exception:
                     continue
 
+    material_color_fallback_count = 0
+    if material_color_by_submesh or global_material_colors:
+        sorted_global_material_colors = [
+            item for item in sorted(global_material_colors, key=lambda item: item[0], reverse=True)
+        ]
+        global_color_index = 0
+        for mesh_index, mesh in enumerate(model_preview.meshes):
+            raise_if_cancelled(stop_event)
+            existing_preview_color = tuple(getattr(mesh, "preview_color", ()) or ())
+            existing_preview_path = str(getattr(mesh, "preview_texture_path", "") or "").strip()
+            parsed_submesh = parsed_submeshes[mesh_index] if mesh_index < len(parsed_submeshes) else None
+            candidate_keys = _iter_model_submesh_reference_candidates(
+                str(getattr(parsed_submesh, "name", "") or ""),
+                str(getattr(parsed_submesh, "material", "") or ""),
+                str(getattr(parsed_submesh, "texture", "") or ""),
+                str(getattr(mesh, "material_name", "") or ""),
+                str(getattr(mesh, "texture_name", "") or ""),
+            )
+            best_color: Optional[
+                Tuple[Tuple[int, int, int, int], Tuple[float, float, float], _ArchiveModelSidecarTextureBinding]
+            ] = None
+            for candidate_key_text in candidate_keys:
+                color_item = material_color_by_submesh.get(candidate_key_text)
+                if color_item is not None and (best_color is None or color_item[0] > best_color[0]):
+                    best_color = color_item
+            if best_color is None and sorted_global_material_colors:
+                if len(sorted_global_material_colors) == 1:
+                    best_color = sorted_global_material_colors[0]
+                elif not existing_preview_path and global_color_index < len(sorted_global_material_colors):
+                    best_color = sorted_global_material_colors[global_color_index]
+                    global_color_index += 1
+            if best_color is None:
+                continue
+            _color_priority, material_color, _binding = best_color
+            should_assign_color = (
+                len(existing_preview_color) < 3
+                or not existing_preview_path
+                or _is_low_authority_model_base_texture(str(getattr(mesh, "texture_name", "") or ""))
+            )
+            if not should_assign_color:
+                continue
+            if tuple(existing_preview_color[:3]) != tuple(material_color):
+                mesh.preview_color = material_color
+                material_color_fallback_count += 1
+                if not existing_preview_path:
+                    mesh.preview_texture_approximation_note = (
+                        "Sidecar material color is used because no exact visible base DDS preview was resolved."
+                    )
+
     if assigned_count <= 0:
-        return []
+        if material_color_fallback_count <= 0:
+            return []
+        return [
+            f"Applied {material_color_fallback_count:,} sidecar material color fallback(s) for meshes without a reliable visible base DDS."
+        ]
     sidecar_suffix = f" from {', '.join(sidecar_paths[:2])}" if sidecar_paths else ""
     if len(sidecar_paths) > 2:
         sidecar_suffix += " ..."
@@ -6369,9 +7286,17 @@ def _attach_model_sidecar_texture_preview_paths(
         info_lines.append(
             "Used a sidecar texture fallback because the recovered mesh preview did not preserve a reliable submesh/material name match."
         )
+    if ordered_anonymous_fallback_count > 0:
+        info_lines.append(
+            f"Matched {ordered_anonymous_fallback_count:,} anonymous mesh texture preview(s) to ordered sidecar material wrapper(s)."
+        )
     if identity_override_count > 0:
         info_lines.append(
             f"Selected {identity_override_count:,} sidecar base texture preview(s) over embedded material primitive/identity name(s)."
+        )
+    if material_color_fallback_count > 0:
+        info_lines.append(
+            f"Applied {material_color_fallback_count:,} sidecar material color fallback(s) where the visible base DDS was missing or low confidence."
         )
     return info_lines
 
@@ -6539,6 +7464,7 @@ def _attach_model_support_texture_preview_paths(
     texture_entries_by_basename: Optional[Dict[str, Sequence[ArchiveEntry]]] = None,
     sidecar_texts_by_normalized_path: Optional[Dict[str, Tuple[str, ...]]] = None,
     sidecar_texts_by_basename: Optional[Dict[str, Tuple[str, ...]]] = None,
+    support_slots: Sequence[str] = ("normal", "material", "height"),
     stop_event: Optional[threading.Event] = None,
 ) -> List[str]:
     if texconv_path is None or model_preview is None or not model_preview.meshes:
@@ -6547,7 +7473,17 @@ def _attach_model_support_texture_preview_paths(
     parsed_submeshes = _iter_parsed_model_submeshes(parsed_mesh)
     resolved_texconv_path = texconv_path.expanduser().resolve()
     preview_cache: Dict[str, str] = {}
-    support_slots = ("normal", "material", "height")
+    requested_support_slots = {
+        str(slot or "").strip().lower()
+        for slot in (support_slots or ())
+    }
+    support_slots = tuple(
+        slot
+        for slot in ("normal", "material", "height")
+        if slot in requested_support_slots
+    )
+    if not support_slots:
+        return []
     slot_labels = {
         "normal": "normal-map",
         "material": "material-mask",
@@ -6564,6 +7500,8 @@ def _attach_model_support_texture_preview_paths(
         ("material", "material"),
         ("height", "height"),
     )
+    ordered_support_keys_by_slot: Dict[str, Dict[str, int]] = {slot: {} for slot in support_slots}
+    ordered_anonymous_assigned_by_slot: Dict[str, int] = {slot: 0 for slot in support_slots}
 
     def _lookup_sidecar_texts(texture_path: str) -> Tuple[str, ...]:
         normalized_path = normalize_texture_reference_for_sidecar_lookup(texture_path)
@@ -6585,6 +7523,7 @@ def _attach_model_support_texture_preview_paths(
         preview_path_text = _ensure_archive_model_texture_preview_path(
             resolved_texconv_path,
             texture_entry,
+            max_dimension=_MODEL_SUPPORT_TEXTURE_DISPLAY_PREVIEW_MAX_DIMENSION,
             stop_event=stop_event,
         )
         preview_cache[cache_key] = preview_path_text
@@ -6686,6 +7625,12 @@ def _attach_model_support_texture_preview_paths(
             -len(texture_entry.path),
         )
         if submesh_keys:
+            primary_sidecar_key = submesh_keys[0]
+            if primary_sidecar_key:
+                ordered_support_keys_by_slot.setdefault(slot_name, {}).setdefault(
+                    primary_sidecar_key,
+                    len(ordered_support_keys_by_slot.setdefault(slot_name, {})),
+                )
             for submesh_key in submesh_keys:
                 resolved_key = (slot_name, submesh_key)
                 existing = exact_resolved_by_submesh.get(resolved_key)
@@ -6742,6 +7687,35 @@ def _attach_model_support_texture_preview_paths(
             try:
                 if _assign_support_slot(mesh, slot_name, texture_entry, semantic_hint=parameter_name):
                     exact_assigned_by_slot[slot_name] += 1
+                    _record_slot_example(exact_examples, slot_name, texture_entry.path)
+            except RunCancelled:
+                raise
+            except Exception:
+                continue
+
+    for slot_name in support_slots:
+        ordered_keys = ordered_support_keys_by_slot.get(slot_name, {})
+        if len(ordered_keys) <= 1:
+            continue
+        ordered_bindings = [
+            exact_resolved_by_submesh.get((slot_name, key))
+            for key, _order in sorted(ordered_keys.items(), key=lambda item: item[1])
+        ]
+        if not any(ordered_bindings):
+            continue
+        for mesh_index, mesh in enumerate(model_preview.meshes):
+            raise_if_cancelled(stop_event)
+            existing_preview_path = str(getattr(mesh, f"preview_{slot_name}_texture_path", "") or "").strip()
+            if existing_preview_path or mesh_index >= len(ordered_bindings):
+                continue
+            ordered_binding = ordered_bindings[mesh_index]
+            if ordered_binding is None:
+                continue
+            _candidate_key, texture_entry, parameter_name, _submesh_name = ordered_binding
+            try:
+                if _assign_support_slot(mesh, slot_name, texture_entry, semantic_hint=parameter_name):
+                    exact_assigned_by_slot[slot_name] += 1
+                    ordered_anonymous_assigned_by_slot[slot_name] += 1
                     _record_slot_example(exact_examples, slot_name, texture_entry.path)
             except RunCancelled:
                 raise
@@ -6840,6 +7814,18 @@ def _attach_model_support_texture_preview_paths(
             info_lines.append(
                 f"Exact sidecar {slot_labels[slot_name]} bindings: {count:,}.{suffix}"
             )
+    ordered_total = sum(ordered_anonymous_assigned_by_slot.values())
+    if ordered_total > 0:
+        ordered_parts = [
+            f"{slot_name[0]}:{ordered_anonymous_assigned_by_slot[slot_name]:,}"
+            for slot_name in support_slots
+            if ordered_anonymous_assigned_by_slot[slot_name] > 0
+        ]
+        info_lines.append(
+            "Matched "
+            f"{ordered_total:,} anonymous support-map binding(s) to ordered sidecar material wrapper(s)"
+            + (f" ({', '.join(ordered_parts)})." if ordered_parts else ".")
+        )
     if fallback_total > 0:
         info_lines.append(
             f"Applied {fallback_total:,} semantic sibling high-quality support-map binding(s) using slot-correct family fallback."
@@ -7387,13 +8373,7 @@ def _decode_wem_with_vgmstream(
         "stderr": subprocess.PIPE,
         "text": True,
     }
-    if os.name == "nt":
-        creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if creation_flags:
-            popen_kwargs["creationflags"] = creation_flags
-        startup_info = subprocess.STARTUPINFO()
-        startup_info.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
-        popen_kwargs["startupinfo"] = startup_info
+    popen_kwargs.update(hidden_subprocess_kwargs())
     process = subprocess.Popen(
         command,
         **popen_kwargs,
@@ -8868,6 +9848,7 @@ def build_archive_preview_result(
     include_loose_preview_assets: bool = True,
     semantic_sidecar_texts: Sequence[str] = (),
     visible_texture_mode: str = "mesh_base_first",
+    support_texture_slots: Sequence[str] = ("normal", "material", "height"),
     stop_event: Optional[threading.Event] = None,
 ) -> ArchivePreviewResult:
     if entry is None:
@@ -8882,6 +9863,11 @@ def build_archive_preview_result(
     metadata_summary = build_archive_entry_metadata_summary(entry)
     extension = entry.extension
     normalized_visible_texture_mode = _normalize_model_visible_texture_mode(visible_texture_mode)
+    timings: Dict[str, float] = {}
+
+    def add_timing(key: str, started_at: float) -> None:
+        timings[key] = timings.get(key, 0.0) + max(0.0, float(time.perf_counter() - started_at))
+
     loose_file_path = ""
     loose_preview_image_path = ""
     loose_preview_media_path = ""
@@ -9144,7 +10130,9 @@ def build_archive_preview_result(
                 loose_preview_detail_text=loose_preview_detail_text,
             )
 
+        entry_read_started_at = time.perf_counter()
         data, _decompressed, note = read_archive_entry_data(entry, stop_event=stop_event)
+        add_timing("entry_read_s", entry_read_started_at)
         note_flags = parse_archive_note_flags(note)
 
         if extension == ".bnk":
@@ -9438,7 +10426,10 @@ def build_archive_preview_result(
         sidecar_texts_by_normalized_path: Dict[str, Tuple[str, ...]] = {}
         sidecar_texts_by_basename: Dict[str, Tuple[str, ...]] = {}
         if extension in ARCHIVE_MODEL_EXTENSIONS:
+            binary_refs_started_at = time.perf_counter()
             binary_texture_references = tuple(extract_binary_dds_references(data))
+            add_timing("model_binary_ref_scan_s", binary_refs_started_at)
+            sidecar_refs_started_at = time.perf_counter()
             (
                 sidecar_texture_references,
                 sidecar_reference_paths,
@@ -9449,6 +10440,7 @@ def build_archive_preview_result(
                 archive_entries_by_basename=texture_entries_by_basename,
                 stop_event=stop_event,
             )
+            add_timing("model_sidecar_refs_s", sidecar_refs_started_at)
             if sidecar_texture_references:
                 sidecar_count = len(sidecar_texture_references)
                 sidecar_suffix = f" from {', '.join(sidecar_reference_paths[:2])}" if sidecar_reference_paths else ""
@@ -9462,6 +10454,7 @@ def build_archive_preview_result(
                         "Companion sidecar data only describes material and texture bindings. Geometry preview still depends on recovering a renderable mesh layout from the selected payload or its mesh companion."
                     )
         if extension == ".pam":
+            geometry_started_at = time.perf_counter()
             try:
                 model_preview, model_info = _build_pam_model_preview_with_fallback(
                     entry,
@@ -9498,7 +10491,9 @@ def build_archive_preview_result(
             except Exception as exc:
                 model_preview_error = str(exc)
                 info_extra_parts.append(f"Visual model preview failed to recover geometry: {exc}")
+            add_timing("model_geometry_s", geometry_started_at)
         elif extension == ".pamlod":
+            geometry_started_at = time.perf_counter()
             try:
                 model_preview, model_info = _build_pamlod_model_preview_with_fallback(
                     entry,
@@ -9536,6 +10531,7 @@ def build_archive_preview_result(
                 model_preview_error = str(exc)
                 info_extra_parts.append(f"Visual model preview failed to recover geometry: {exc}")
         elif extension == ".pac":
+            geometry_started_at = time.perf_counter()
             try:
                 model_preview, parsed_mesh, model_info = _build_pac_model_preview_with_fallback(
                     entry,
@@ -9591,6 +10587,8 @@ def build_archive_preview_result(
             except Exception as exc:
                 model_preview_error = str(exc)
                 info_extra_parts.append(f"Visual model preview failed to recover geometry: {exc}")
+            add_timing("model_geometry_s", geometry_started_at)
+            add_timing("model_geometry_s", geometry_started_at)
         elif extension in ARCHIVE_MODEL_EXTENSIONS:
             info_extra_parts.append("Visual preview is not available for this model format yet.")
         if (
@@ -9618,6 +10616,7 @@ def build_archive_preview_result(
                     )
             else:
                 if normalized_visible_texture_mode == "mesh_base_first":
+                    attach_started_at = time.perf_counter()
                     info_extra_parts.extend(
                         _attach_model_texture_preview_paths(
                             texconv_path,
@@ -9630,7 +10629,9 @@ def build_archive_preview_result(
                             stop_event=stop_event,
                         )
                     )
+                    add_timing("model_base_texture_attach_s", attach_started_at)
                 if sidecar_texture_references:
+                    attach_started_at = time.perf_counter()
                     info_extra_parts.extend(
                         _attach_model_sidecar_texture_preview_paths(
                             texconv_path,
@@ -9646,7 +10647,9 @@ def build_archive_preview_result(
                             stop_event=stop_event,
                         )
                     )
+                    add_timing("model_sidecar_texture_attach_s", attach_started_at)
                 if normalized_visible_texture_mode != "mesh_base_first":
+                    attach_started_at = time.perf_counter()
                     info_extra_parts.extend(
                         _attach_model_texture_preview_paths(
                             texconv_path,
@@ -9659,7 +10662,9 @@ def build_archive_preview_result(
                             stop_event=stop_event,
                         )
                     )
+                    add_timing("model_base_texture_attach_s", attach_started_at)
                 if sidecar_texture_references and normalized_visible_texture_mode == "mesh_base_first":
+                    attach_started_at = time.perf_counter()
                     info_extra_parts.extend(
                         _attach_model_sidecar_texture_preview_paths(
                             texconv_path,
@@ -9676,6 +10681,8 @@ def build_archive_preview_result(
                             stop_event=stop_event,
                         )
                     )
+                    add_timing("model_sidecar_fallback_attach_s", attach_started_at)
+                    attach_started_at = time.perf_counter()
                     info_extra_parts.extend(
                         _attach_model_texture_preview_paths(
                             texconv_path,
@@ -9690,20 +10697,34 @@ def build_archive_preview_result(
                             stop_event=stop_event,
                         )
                     )
-                info_extra_parts.extend(
-                    _attach_model_support_texture_preview_paths(
-                        texconv_path,
-                        entry,
-                        model_preview,
-                        parsed_mesh=parsed_mesh_for_references,
-                        sidecar_texture_bindings=sidecar_texture_references,
-                        texture_entries_by_normalized_path=texture_entries_by_normalized_path,
-                        texture_entries_by_basename=texture_entries_by_basename,
-                        sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
-                        sidecar_texts_by_basename=sidecar_texts_by_basename,
-                        stop_event=stop_event,
-                    )
+                    add_timing("model_base_texture_attach_s", attach_started_at)
+                requested_support_texture_slots = {
+                    str(value or "").strip().lower()
+                    for value in (support_texture_slots or ())
+                }
+                normalized_support_texture_slots = tuple(
+                    slot
+                    for slot in ("normal", "material", "height")
+                    if slot in requested_support_texture_slots
                 )
+                if normalized_support_texture_slots:
+                    attach_started_at = time.perf_counter()
+                    info_extra_parts.extend(
+                        _attach_model_support_texture_preview_paths(
+                            texconv_path,
+                            entry,
+                            model_preview,
+                            parsed_mesh=parsed_mesh_for_references,
+                            sidecar_texture_bindings=sidecar_texture_references,
+                            texture_entries_by_normalized_path=texture_entries_by_normalized_path,
+                            texture_entries_by_basename=texture_entries_by_basename,
+                            sidecar_texts_by_normalized_path=sidecar_texts_by_normalized_path,
+                            sidecar_texts_by_basename=sidecar_texts_by_basename,
+                            support_slots=normalized_support_texture_slots,
+                            stop_event=stop_event,
+                        )
+                    )
+                    add_timing("model_support_texture_attach_s", attach_started_at)
         if extension in ARCHIVE_MODEL_EXTENSIONS and parsed_mesh_for_references is None:
             try:
                 from cdmw.modding.mesh_parser import parse_mesh
@@ -9714,6 +10735,7 @@ def build_archive_preview_result(
             except Exception:
                 parsed_mesh_for_references = None
         if model_preview is not None or parsed_mesh_for_references is not None or binary_texture_references or sidecar_texture_references:
+            references_started_at = time.perf_counter()
             model_texture_references = tuple(
                 build_archive_model_texture_references(
                     entry,
@@ -9727,6 +10749,8 @@ def build_archive_preview_result(
                     sidecar_texts_by_basename=sidecar_texts_by_basename,
                 )
             )
+            add_timing("model_texture_references_s", references_started_at)
+        binary_preview_started_at = time.perf_counter()
         preferred_view, preview_text, info_extra = build_archive_binary_preview_payload(
             entry,
             data,
@@ -9737,11 +10761,13 @@ def build_archive_preview_result(
             entry,
             "\n\n".join(part for part in [info_extra, f"Binary header preview:\n{header_preview}"] if part).strip(),
         )
+        add_timing("binary_preview_s", binary_preview_started_at)
         return ArchivePreviewResult(
             status="ok",
             title=entry.basename,
             metadata_summary=metadata_summary,
             detail_text=detail_text,
+            timings=timings,
             preview_text=preview_text,
             preview_model=model_preview,
             model_texture_references=model_texture_references,

@@ -5,7 +5,7 @@ import re
 import struct
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from cdmw.core.archive import hashlittle, read_archive_entry_data
 from cdmw.core.common import raise_if_cancelled
@@ -20,6 +20,7 @@ class ArchiveItemRecord:
     display_name: str = ""
     localized_names: tuple[str, ...] = ()
     prefab_hashes: List[int] = field(default_factory=list)
+    model_stems: List[str] = field(default_factory=list)
     pac_files: List[str] = field(default_factory=list)
 
 
@@ -35,12 +36,36 @@ class ArchiveItemSearchIndex:
 class _ArchiveItemIndexSources:
     localization_entries: Dict[str, ArchiveEntry] = field(default_factory=dict)
     iteminfo_entry: Optional[ArchiveEntry] = None
+    stringinfo_entry: Optional[ArchiveEntry] = None
     model_entries: List[ArchiveEntry] = field(default_factory=list)
 
 
 _ITEMINFO_MARKER = b"\x00\x01\x00\x00\x00\x00\x00\x00\x00\x07\x70\x00\x00\x00"
 _ITEM_INTERNAL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
-_MODEL_HASH_SUFFIXES = ("", "_l", "_r", "_u", "_s", "_t", "_index01", "_index02", "_index03")
+_MODEL_HASH_SUFFIXES = (
+    "",
+    "_l",
+    "_r",
+    "_u",
+    "_s",
+    "_t",
+    "_c",
+    "_d",
+    "_index01",
+    "_index02",
+    "_index03",
+    "_index01_l",
+    "_index01_r",
+    "_index02_l",
+    "_index02_r",
+    "_index03_l",
+    "_index03_r",
+    "_sub01",
+    "_sub02",
+    "_sub03",
+)
+_MODEL_TRAILING_LETTER_VARIANT_RE = re.compile(r"(?<=\d)[a-z]$", re.IGNORECASE)
+_MODEL_NUMBERED_FAMILY_VARIANT_RE = re.compile(r"_(?:index|sub)\d{2}$", re.IGNORECASE)
 _LOCALIZATION_TABLES = (
     ("kor", "localizationstring_kor"),
     ("eng", "localizationstring_eng"),
@@ -58,6 +83,69 @@ _LOCALIZATION_TABLES = (
     ("zho-cn", "localizationstring_zho-cn"),
 )
 _LOCALIZATION_TABLE_BY_NAME = {table_name: language_code for language_code, table_name in _LOCALIZATION_TABLES}
+_ITEM_ICON_PREFAB_PREFIX = "itemicon_prefab_"
+_ITEM_ICON_MODEL_COMPATIBILITY_TOKENS: Tuple[Tuple[str, str], ...] = (
+    ("onehandsword", "01_sword"),
+    ("twohandsword", "02_sword"),
+    ("twohandspear", "02_spear"),
+    ("halberd", "02_alebard"),
+    ("alebard", "02_alebard"),
+    ("hammer", "02_hammer"),
+    ("spear", "spear"),
+    ("shield", "03_shield"),
+    ("backpack", "bag"),
+    ("ring", "ring"),
+    ("earring", "earring"),
+    ("necklace", "necklace"),
+    ("helm", "hel"),
+    ("helmet", "hel"),
+    ("armor", "ub"),
+    ("cloak", "cloak"),
+    ("glove", "hand"),
+    ("boots", "foot"),
+    ("saddle", "horse_ub"),
+)
+
+
+def _strip_archive_model_variant_suffix(stem: str) -> str:
+    normalized = str(stem or "").strip().lower()
+    if not normalized:
+        return ""
+    while True:
+        before = normalized
+        for suffix in sorted(_MODEL_HASH_SUFFIXES[1:], key=len, reverse=True):
+            if normalized.endswith(suffix) and len(normalized) > len(suffix):
+                normalized = normalized[: -len(suffix)]
+                break
+        if normalized != before:
+            continue
+        stripped = _MODEL_NUMBERED_FAMILY_VARIANT_RE.sub("", normalized).strip()
+        if stripped and stripped != normalized:
+            normalized = stripped
+            continue
+        stripped = _MODEL_TRAILING_LETTER_VARIANT_RE.sub("", normalized).strip()
+        if stripped and stripped != normalized:
+            normalized = stripped
+            continue
+        return normalized or before
+
+
+def _iter_archive_model_hash_candidate_bases(stem: str) -> Tuple[str, ...]:
+    normalized = str(stem or "").strip().lower()
+    if not normalized:
+        return ()
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        value = str(value or "").strip().lower()
+        if value and value not in seen:
+            candidates.append(value)
+            seen.add(value)
+
+    add(normalized)
+    add(_strip_archive_model_variant_suffix(normalized))
+    return tuple(candidates)
 
 
 def _entry_package_group(entry: ArchiveEntry) -> str:
@@ -92,8 +180,9 @@ def _collect_archive_item_index_sources(
         lower_path = entry.path.lower()
         wants_localization = "localizationstring_" in lower_path
         wants_iteminfo = "iteminfo.pabgb" in lower_path
+        wants_stringinfo = os.path.basename(lower_path) == "stringinfo.pabgb"
         wants_model_hash = lower_path.endswith((".prefab", ".pac", ".pact"))
-        if not (wants_localization or wants_iteminfo or wants_model_hash):
+        if not (wants_localization or wants_iteminfo or wants_stringinfo or wants_model_hash):
             continue
         group = _entry_package_group(entry)
         if wants_localization and group == "0020":
@@ -103,6 +192,8 @@ def _collect_archive_item_index_sources(
                     break
         elif wants_iteminfo and group == "0008" and sources.iteminfo_entry is None:
             sources.iteminfo_entry = entry
+        elif wants_stringinfo and group == "0008" and sources.stringinfo_entry is None:
+            sources.stringinfo_entry = entry
         elif wants_model_hash and group == "0009":
             sources.model_entries.append(entry)
     return sources
@@ -205,13 +296,67 @@ def parse_archive_localization_tables(
     )
 
 
-def _parse_archive_iteminfo_entry(
-    item_entry: ArchiveEntry,
-    loc_tables: Mapping[str, Mapping[str, str]],
+def _normalize_item_icon_model_stem(value: str) -> str:
+    normalized = str(value or "").strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if normalized.endswith((".pac", ".prefab", ".pact")):
+        normalized = os.path.splitext(normalized)[0]
+    return normalized
+
+
+def _parse_stringinfo_model_icon_hashes_from_data(data: bytes) -> Dict[int, str]:
+    icon_hashes: Dict[int, str] = {}
+    pos = 0
+    while pos + 8 < len(data):
+        slen = struct.unpack_from("<I", data, pos)[0]
+        if 3 <= slen <= 180 and pos + 4 + slen + 4 <= len(data):
+            raw = data[pos + 4 : pos + 4 + slen].rstrip(b"\x00")
+            try:
+                text = raw.decode("ascii")
+            except UnicodeDecodeError:
+                text = ""
+            lower_text = text.lower()
+            if lower_text.startswith(_ITEM_ICON_PREFAB_PREFIX):
+                model_stem = _normalize_item_icon_model_stem(text[len(_ITEM_ICON_PREFAB_PREFIX) :])
+                if model_stem.startswith("cd_"):
+                    stored_hash = struct.unpack_from("<I", data, pos + 4 + slen)[0]
+                    icon_hashes[stored_hash] = model_stem
+                    icon_hashes[hashlittle(raw, 0xC5EDE)] = model_stem
+                    icon_hashes[hashlittle(model_stem.encode("ascii", errors="ignore"), 0xC5EDE)] = model_stem
+            pos += 4 + slen + 8
+            continue
+        pos += 1
+    return icon_hashes
+
+
+def _parse_archive_stringinfo_model_icon_hashes(
+    stringinfo_entry: Optional[ArchiveEntry],
     *,
     stop_event: Optional[threading.Event] = None,
+) -> Dict[int, str]:
+    if stringinfo_entry is None:
+        return {}
+    data, _decompressed, _note = read_archive_entry_data(stringinfo_entry, stop_event=stop_event)
+    return _parse_stringinfo_model_icon_hashes_from_data(data)
+
+
+def _item_icon_model_reference_is_compatible(internal_name: str, model_stem: str) -> bool:
+    normalized_internal = str(internal_name or "").strip().lower()
+    normalized_model = str(model_stem or "").strip().lower()
+    if not normalized_internal or not normalized_model:
+        return False
+    return any(
+        internal_token in normalized_internal and model_token in normalized_model
+        for internal_token, model_token in _ITEM_ICON_MODEL_COMPATIBILITY_TOKENS
+    )
+
+
+def _parse_archive_iteminfo_data(
+    data: bytes,
+    loc_tables: Mapping[str, Mapping[str, str]],
+    *,
+    icon_model_hashes: Optional[Mapping[int, str]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> List[ArchiveItemRecord]:
-    data, _decompressed, _note = read_archive_entry_data(item_entry, stop_event=stop_event)
     items: List[ArchiveItemRecord] = []
     seen_ids: set[int] = set()
     idx = 0
@@ -270,6 +415,24 @@ def _parse_archive_iteminfo_entry(
             if prefab_hashes:
                 break
 
+        model_stems: List[str] = []
+        if icon_model_hashes:
+            next_record_pos = data.find(_ITEMINFO_MARKER, idx)
+            icon_search_end = min(
+                len(data),
+                next_record_pos if next_record_pos != -1 else pos + 2500,
+                pos + 2500,
+            )
+            for scan in range(pos, max(pos, icon_search_end - 3)):
+                value = struct.unpack_from("<I", data, scan)[0]
+                model_stem = _normalize_item_icon_model_stem(icon_model_hashes.get(value, ""))
+                if (
+                    model_stem
+                    and model_stem not in model_stems
+                    and _item_icon_model_reference_is_compatible(name, model_stem)
+                ):
+                    model_stems.append(model_stem)
+
         localized_names: List[str] = []
         seen_names: set[str] = set()
         if loc_id:
@@ -292,10 +455,27 @@ def _parse_archive_iteminfo_entry(
                 display_name=display_name,
                 localized_names=tuple(localized_names),
                 prefab_hashes=prefab_hashes,
+                model_stems=model_stems,
             )
         )
 
     return items
+
+
+def _parse_archive_iteminfo_entry(
+    item_entry: ArchiveEntry,
+    loc_tables: Mapping[str, Mapping[str, str]],
+    *,
+    icon_model_hashes: Optional[Mapping[int, str]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> List[ArchiveItemRecord]:
+    data, _decompressed, _note = read_archive_entry_data(item_entry, stop_event=stop_event)
+    return _parse_archive_iteminfo_data(
+        data,
+        loc_tables,
+        icon_model_hashes=icon_model_hashes,
+        stop_event=stop_event,
+    )
 
 
 def parse_archive_iteminfo(
@@ -321,9 +501,10 @@ def _build_archive_model_hash_table_from_entries(entries: Sequence[ArchiveEntry]
         if not lower_path.endswith((".prefab", ".pac", ".pact")):
             continue
         base = os.path.splitext(os.path.basename(lower_path))[0]
-        for suffix in _MODEL_HASH_SUFFIXES:
-            name = base + suffix
-            hash_to_name[hashlittle(name.encode("ascii"), 0xC5EDE)] = name
+        for candidate_base in _iter_archive_model_hash_candidate_bases(base):
+            for suffix in _MODEL_HASH_SUFFIXES:
+                name = candidate_base + suffix
+                hash_to_name.setdefault(hashlittle(name.encode("ascii"), 0xC5EDE), name)
     return hash_to_name
 
 
@@ -353,9 +534,16 @@ def build_archive_item_search_index(
                 on_log("Item-name search: iteminfo.pabgb was not found in package 0008.")
             items = []
         else:
+            icon_model_hashes = _parse_archive_stringinfo_model_icon_hashes(
+                sources.stringinfo_entry,
+                stop_event=stop_event,
+            )
+            if on_log is not None and icon_model_hashes:
+                on_log(f"Item-name search: indexed {len(icon_model_hashes):,} item icon model reference hash(es).")
             items = _parse_archive_iteminfo_entry(
                 sources.iteminfo_entry,
                 loc_tables,
+                icon_model_hashes=icon_model_hashes,
                 stop_event=stop_event,
             )
         if on_log is not None:
@@ -372,15 +560,20 @@ def build_archive_item_search_index(
     items_with_models: List[ArchiveItemRecord] = []
 
     for item in items:
+        resolved_model_names: List[str] = []
         for prefab_hash in item.prefab_hashes:
             resolved = hash_table.get(prefab_hash)
             if not resolved:
                 continue
-            base = resolved
-            for suffix in _MODEL_HASH_SUFFIXES[1:]:
-                if base.endswith(suffix):
-                    base = base[: -len(suffix)]
-                    break
+            if resolved not in resolved_model_names:
+                resolved_model_names.append(resolved)
+        for model_stem in item.model_stems:
+            normalized_model_stem = _normalize_item_icon_model_stem(model_stem)
+            if normalized_model_stem and normalized_model_stem not in resolved_model_names:
+                resolved_model_names.append(normalized_model_stem)
+
+        for resolved in resolved_model_names:
+            base = _strip_archive_model_variant_suffix(resolved)
             pac_name = base + ".pac"
             if pac_name not in item.pac_files:
                 item.pac_files.append(pac_name)
@@ -393,6 +586,7 @@ def build_archive_item_search_index(
                     item.internal_name.lower(),
                     base.lower(),
                     pac_name.lower(),
+                    resolved.lower(),
                 )
                 if token
             )
@@ -400,7 +594,7 @@ def build_archive_item_search_index(
                 continue
             existing = model_base_aliases.get(base, "")
             model_base_aliases[base] = f"{existing} {terms}".strip() if existing else terms
-            display_name = item.display_name.strip() or item.internal_name.strip()
+            display_name = item.display_name.strip()
             if display_name:
                 existing_display = model_base_display_names.get(base, "")
                 if not existing_display:

@@ -21,7 +21,8 @@ except Exception:  # pragma: no cover - optional dependency
     lz4_block = None  # type: ignore[assignment]
 
 from cdmw.constants import APP_NAME
-from cdmw.core.common import raise_if_cancelled, run_process_with_cancellation
+from cdmw.core.common import hidden_subprocess_kwargs, raise_if_cancelled, run_process_with_cancellation
+from cdmw.core.mesh_baseline import read_archive_entry_baseline_data
 from cdmw.core.model_preview import _build_lod_summary, _build_model_preview
 from cdmw.models import (
     ArchiveEntry,
@@ -67,7 +68,15 @@ ARCHIVE_MESH_EXTENSIONS = {".pam", ".pamlod", ".pac"}
 ARCHIVE_AUDIO_PATCH_EXTENSIONS = {".wem", ".wav"}
 ARCHIVE_AUDIO_EXPORT_EXTENSIONS = {".wem", ".wav", ".ogg", ".mp3", ".bnk"}
 ARCHIVE_PATCH_BACKUP_ROOT = Path(tempfile.gettempdir()) / APP_NAME / "archive_patch_backups"
-MESH_IMPORT_SIDECAR_EXTENSIONS = {".xml", ".pami", ".pac_xml", ".pam_xml", ".pamlod_xml"}
+MESH_IMPORT_SIDECAR_EXTENSIONS = {
+    ".xml",
+    ".pami",
+    ".pac_xml",
+    ".pam_xml",
+    ".pamlod_xml",
+    ".app_xml",
+    ".prefabdata_xml",
+}
 
 
 @dataclass(slots=True)
@@ -142,6 +151,23 @@ def _summarize_import_values(values: Sequence[str], *, limit: int = 3) -> str:
     if len(compact_values) <= limit:
         return ", ".join(compact_values)
     return ", ".join(compact_values[:limit]) + f" (+{len(compact_values) - limit} more)"
+
+
+def _mesh_loose_export_payload_path(path_value: str | Path, export_options: Optional["ModPackageExportOptions"]) -> str:
+    from cdmw.core.mod_package import normalize_mod_package_payload_path
+
+    normalized_path = normalize_mod_package_payload_path(path_value).as_posix()
+    structure = str(getattr(export_options, "structure", "") or "").strip().lower()
+    if structure != "custom_compact_paths":
+        return normalized_path
+    pure_path = PurePosixPath(normalized_path)
+    parts = tuple(part for part in pure_path.parts if part)
+    if not parts or parts[0].lower() != "character" or len(parts) <= 2:
+        return normalized_path
+    suffix = pure_path.suffix.lower()
+    if suffix in ARCHIVE_MESH_EXTENSIONS or suffix in MESH_IMPORT_SIDECAR_EXTENSIONS:
+        return PurePosixPath("character", pure_path.name).as_posix()
+    return normalized_path
 
 
 def _describe_sidecar_binding_locator(record: Mapping[str, str]) -> str:
@@ -1597,6 +1623,47 @@ def _resolve_papgt_path(entry: ArchiveEntry) -> Path:
     return papgt_path
 
 
+def _read_printable_build_text(path: Path, *, limit: int = 4096) -> str:
+    try:
+        raw = path.read_bytes()[:limit]
+    except OSError:
+        return ""
+    text = raw.decode("utf-8", errors="ignore")
+    text = "".join(ch if ch.isprintable() or ch in "\r\n\t" else " " for ch in text)
+    return " ".join(text.split())[:240]
+
+
+def _detect_archive_game_metadata(entry: ArchiveEntry) -> Dict[str, object]:
+    metadata: Dict[str, object] = {
+        "primary_package_group": str(getattr(entry.pamt_path.parent, "name", "") or ""),
+    }
+    root = _package_root_from_entry(entry)
+    paver_path = root / "meta" / "0.paver"
+    paver_text = _read_printable_build_text(paver_path)
+    if paver_text:
+        metadata["game_build"] = paver_text
+    try:
+        papgt_path = _resolve_papgt_path(entry)
+        papgt_data = papgt_path.read_bytes()
+        payload = papgt_data[12:] if len(papgt_data) >= 12 else papgt_data
+        metadata["papgt_crc"] = f"0x{_calculate_pa_checksum(payload):08X}"
+        metadata["papgt_size"] = len(papgt_data)
+        metadata["papgt_sha256"] = hashlib.sha256(papgt_data).hexdigest()
+    except Exception:
+        pass
+    try:
+        pamt_data = entry.pamt_path.read_bytes()
+        payload = pamt_data[12:] if len(pamt_data) >= 12 else pamt_data
+        metadata["pamt_crc"] = f"0x{_calculate_pa_checksum(payload):08X}"
+        metadata["pamt_size"] = len(pamt_data)
+        metadata["pamt_sha256"] = hashlib.sha256(pamt_data).hexdigest()
+    except Exception:
+        pass
+    if "game_build" not in metadata and "papgt_crc" in metadata:
+        metadata["game_build"] = f"0.papgt {metadata['papgt_crc']}"
+    return metadata
+
+
 def _package_group_sort_order(package_root: Path) -> List[str]:
     groups: List[str] = []
     for child in sorted(package_root.iterdir()):
@@ -1918,24 +1985,29 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
     source_obj_display = source_obj_path.expanduser().resolve().as_posix()
     paired_lod_path = (preview_result.paired_lod_path or "").strip().replace("\\", "/")
     primary_path = primary_entry.path.replace("\\", "/")
+    primary_manifest_path = _mesh_loose_export_payload_path(primary_path, export_options)
     written_virtual_paths: set[str] = set()
     for request in requests:
         normalized_request_path = normalize_mod_package_payload_path(request.entry.path).as_posix()
+        output_request_path = _mesh_loose_export_payload_path(normalized_request_path, export_options)
         relative_parts = PurePosixPath(normalized_request_path).parts
         if not relative_parts:
             raise ValueError(f"Archive path is invalid: {request.entry.path}")
-        target_path = package_root.joinpath(*relative_parts)
+        output_relative_parts = PurePosixPath(output_request_path).parts
+        if not output_relative_parts:
+            raise ValueError(f"Archive path is invalid: {request.entry.path}")
+        target_path = package_root.joinpath(*output_relative_parts)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         _safe_log(on_log, f"Writing loose mesh payload: {target_path.relative_to(package_root).as_posix()}")
         target_path.write_bytes(request.payload_data)
         written_files.append(target_path)
         note = ""
-        written_virtual_paths.add(normalized_request_path.lower())
+        written_virtual_paths.add(output_request_path.lower())
         if paired_lod_path and normalized_request_path == paired_lod_path and normalized_request_path != primary_path:
             note = f"Auto-generated paired LOD for {primary_entry.path}"
         file_rows.append(
             MeshLooseModFile(
-                path=normalized_request_path,
+                path=output_request_path,
                 package_group=request.entry.pamt_path.parent.name,
                 format=request.entry.extension.lstrip(".").lower(),
                 is_new=False,
@@ -1958,21 +2030,22 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
                 f"Skipping selected supplemental file without a mapped loose target: {spec.source_path.name}",
             )
             continue
-        relative_parts = PurePosixPath(normalized_target_path).parts
-        if not relative_parts:
+        output_target_path = _mesh_loose_export_payload_path(normalized_target_path, export_options)
+        output_relative_parts = PurePosixPath(output_target_path).parts
+        if not output_relative_parts:
             _safe_log(
                 on_log,
                 f"Skipping selected supplemental file with an invalid target path: {spec.source_path.name}",
             )
             continue
-        normalized_target_key = normalized_target_path.lower()
+        normalized_target_key = output_target_path.lower()
         if normalized_target_key in written_virtual_paths:
             _safe_log(
                 on_log,
-                f"Skipping selected supplemental file already written in this package: {normalized_target_path}",
+                f"Skipping selected supplemental file already written in this package: {output_target_path}",
             )
             continue
-        target_path = package_root.joinpath(*relative_parts)
+        target_path = package_root.joinpath(*output_relative_parts)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if spec.payload_data:
             _safe_log(
@@ -2007,7 +2080,7 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
             package_group = spec.target_entry.pamt_path.parent.name
         file_rows.append(
             MeshLooseModFile(
-                path=normalized_target_path,
+                path=output_target_path,
                 package_group=package_group,
                 format=PurePosixPath(normalized_target_path).suffix.lstrip(".").lower()
                 or spec.source_path.suffix.lstrip(".").lower(),
@@ -2029,25 +2102,26 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
     if related_entries:
         for related_entry in related_entries:
             normalized_related_path = normalize_mod_package_payload_path(related_entry.path).as_posix()
-            if normalized_related_path.lower() in written_virtual_paths:
+            output_related_path = _mesh_loose_export_payload_path(normalized_related_path, export_options)
+            if output_related_path.lower() in written_virtual_paths:
                 continue
-            relative_parts = PurePosixPath(normalized_related_path).parts
-            if not relative_parts:
+            output_relative_parts = PurePosixPath(output_related_path).parts
+            if not output_relative_parts:
                 continue
-            target_path = package_root.joinpath(*relative_parts)
+            target_path = package_root.joinpath(*output_relative_parts)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 _safe_log(on_log, f"Copying related file: {target_path.relative_to(package_root).as_posix()}")
                 extract_archive_entry(related_entry, target_path)
                 written_files.append(target_path)
-                written_virtual_paths.add(normalized_related_path.lower())
-                if related_entry.extension in MESH_IMPORT_SIDECAR_EXTENSIONS or related_entry.extension == ".json":
-                    note = f"Related companion file copied from archive for {primary_entry.path}"
-                else:
+                written_virtual_paths.add(output_related_path.lower())
+                if related_entry.extension == ".dds":
                     note = f"Referenced texture copied from archive for {primary_entry.path}"
+                else:
+                    note = f"Selected archive related file copied for {primary_entry.path}"
                 file_rows.append(
                     MeshLooseModFile(
-                        path=normalized_related_path,
+                        path=output_related_path,
                         package_group=related_entry.pamt_path.parent.name,
                         format=related_entry.extension.lstrip(".").lower(),
                         is_new=False,
@@ -2063,7 +2137,7 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
 
     asset_rows = [
         MeshLooseModAsset(
-            entry_path=primary_path,
+            entry_path=primary_manifest_path,
             package_group=primary_entry.pamt_path.parent.name,
             format=primary_entry.extension.lstrip(".").lower(),
             obj_path=source_obj_display,
@@ -2076,6 +2150,7 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
     duplicate_row_count = len(file_rows) - len(deduped_file_rows)
     if duplicate_row_count > 0:
         _safe_log(on_log, f"Removed {duplicate_row_count:,} duplicate file metadata row(s) before writing manifest.json.")
+    game_metadata = _detect_archive_game_metadata(primary_entry)
 
     metadata_files = write_mesh_loose_mod_package_metadata(
         package_root,
@@ -2085,6 +2160,8 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
         include_paired_lod=bool(paired_lod_path),
         export_options=export_options if isinstance(export_options, ModPackageExportOptions) else None,
         create_no_encrypt_file=create_no_encrypt_file,
+        game_build=str(game_metadata.get("game_build", "") or ""),
+        game_metadata=game_metadata,
     )
     _safe_log(
         on_log,
@@ -2702,6 +2779,16 @@ def _build_selected_sidecar_texture_bindings(
     seen_binding_keys: set[Tuple[str, str, str]] = set()
     sidecar_texts_by_normalized_path: Dict[str, List[str]] = defaultdict(list)
     sidecar_texts_by_basename: Dict[str, List[str]] = defaultdict(list)
+
+    def append_unique_text(target: Dict[str, List[str]], key: str, text: str) -> None:
+        normalized_key = str(key or "").strip()
+        normalized_text = str(text or "")
+        if not normalized_key or not normalized_text.strip():
+            return
+        bucket = target[normalized_key]
+        if normalized_text not in bucket:
+            bucket.append(normalized_text)
+
     for supplemental_path in supplemental_files:
         if supplemental_path.suffix.lower() not in MESH_IMPORT_SIDECAR_EXTENSIONS:
             continue
@@ -2734,10 +2821,10 @@ def _build_selected_sidecar_texture_bindings(
                 str(binding.parameter_name or "").strip().lower(),
             )
             if normalized_texture_path:
-                sidecar_texts_by_normalized_path[normalized_texture_path].append(text)
+                append_unique_text(sidecar_texts_by_normalized_path, normalized_texture_path, text)
                 basename = PurePosixPath(normalized_texture_path).name
                 if basename:
-                    sidecar_texts_by_basename[basename].append(text)
+                    append_unique_text(sidecar_texts_by_basename, basename, text)
             if key in seen_binding_keys:
                 continue
             seen_binding_keys.add(key)
@@ -3144,7 +3231,8 @@ def build_mesh_import_preview(
     imported_mesh.path = entry.path
     imported_mesh.format = entry.extension.lstrip(".").lower()
     manifest_payload = _load_obj_roundtrip_sidecar(str(obj_path)) if obj_path.suffix.lower() == ".obj" else None
-    original_data, _decompressed, _note = read_archive_entry_data(entry)
+    original_baseline = read_archive_entry_baseline_data(entry, read_entry_data=read_archive_entry_data)
+    original_data = original_baseline.data
     original_mesh = parse_mesh(original_data, entry.path)
     normalized_import_mode = str(import_mode or "roundtrip").strip().lower()
     static_mappings = []
@@ -3191,6 +3279,8 @@ def build_mesh_import_preview(
         f"Submeshes: {len(parsed_mesh.submeshes):,}",
         f"Rebuilt size: {len(rebuilt_data):,} bytes",
     ]
+    if original_baseline.message:
+        summary_lines.append(f"Original mesh donor: {original_baseline.message}")
     if scene_import_result.diagnostics:
         summary_lines.append("Scene import notes:")
         summary_lines.extend(f"  {line}" for line in scene_import_result.diagnostics)
@@ -3443,6 +3533,9 @@ def build_mesh_import_preview(
                     texture_slot_overrides=tuple(
                         getattr(static_replacement_options, "texture_slot_overrides", ()) or ()
                     ),
+                    texture_output_size_mode=str(
+                        getattr(static_replacement_options, "texture_output_size_mode", "source") or "source"
+                    ),
                     pac_driven_sidecar=bool(
                         getattr(static_replacement_options, "rebuild_material_sidecar", True)
                     ),
@@ -3527,7 +3620,8 @@ def build_mesh_import_preview(
         paired_candidates = archive_entries_by_normalized_path.get(_normalize_virtual_path(paired_path), ())
         if paired_candidates:
             paired_entry = paired_candidates[0]
-            paired_original, _paired_decompressed, _paired_note = read_archive_entry_data(paired_entry)
+            paired_baseline = read_archive_entry_baseline_data(paired_entry, read_entry_data=read_archive_entry_data)
+            paired_original = paired_baseline.data
             paired_source_mesh = parsed_mesh if normalized_import_mode == "static_replacement" else imported_mesh
             try:
                 paired_mesh = transfer_pam_edit_to_pamlod_mesh(
@@ -3539,6 +3633,8 @@ def build_mesh_import_preview(
                 paired_lod_data = build_mesh(paired_mesh, paired_original)
                 paired_lod_path = paired_entry.path
                 summary_lines.append(f"Paired PAMLOD rebuild prepared: {paired_entry.path}")
+                if paired_baseline.message:
+                    summary_lines.append(f"Paired LOD donor: {paired_baseline.message}")
             except Exception as exc:
                 summary_lines.append(f"Paired PAMLOD rebuild could not be prepared: {exc}")
 
@@ -3605,13 +3701,7 @@ def _run_hidden_process(command: Sequence[str], *, timeout: int = 120) -> subpro
         "text": True,
         "timeout": timeout,
     }
-    if os.name == "nt":
-        creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if creation_flags:
-            popen_kwargs["creationflags"] = creation_flags
-        startup_info = subprocess.STARTUPINFO()
-        startup_info.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
-        popen_kwargs["startupinfo"] = startup_info
+    popen_kwargs.update(hidden_subprocess_kwargs())
     return subprocess.run(list(command), **popen_kwargs)
 
 

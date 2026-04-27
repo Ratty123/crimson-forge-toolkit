@@ -8,8 +8,11 @@ from pathlib import Path
 
 from cdmw.core.mod_package import (
     MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY,
+    MeshLooseModAsset,
+    MeshLooseModFile,
     ModPackageExportOptions,
     finalize_mod_package_export,
+    write_mesh_loose_mod_package_metadata,
     write_mod_package_manifest,
 )
 from cdmw.models import ModPackageInfo
@@ -41,6 +44,7 @@ class ModPackageExportTests(unittest.TestCase):
                 self.assertEqual(manifest.get(key), modinfo.get(key), key)
                 self.assertEqual(manifest.get(key), mod_json.get(key), key)
             self.assertEqual(manifest.get("files_dir"), ".")
+            self.assertNotIn("files_root", manifest)
             self.assertNotIn("new_paths", manifest)
             self.assertTrue((root / ".no_encrypt").exists())
 
@@ -63,9 +67,35 @@ class ModPackageExportTests(unittest.TestCase):
             manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
             self.assertFalse(payload.exists())
             self.assertTrue((root / "files" / "object" / "texture" / "new.dds").exists())
+            self.assertFalse((root / "object").exists())
+            self.assertEqual(manifest.get("format"), "v1")
             self.assertEqual(manifest.get("files_dir"), "files")
+            self.assertEqual(manifest.get("files_root"), "files")
             self.assertEqual(manifest.get("new_paths"), ["object/texture/new.dds"])
             self.assertEqual(manifest.get("manager_targets"), ["cdumm"])
+
+    def test_custom_compact_paths_uses_files_wrapper_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "CompactMod"
+            payload = root / "character" / "sample.pac"
+            payload.parent.mkdir(parents=True)
+            payload.write_bytes(b"PAC ")
+
+            finalize_mod_package_export(
+                root,
+                ModPackageInfo(title="Compact"),
+                kind="mesh_loose_mod",
+                payload_paths=("character/sample.pac",),
+                options=ModPackageExportOptions(structure="custom_compact_paths"),
+            )
+
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse(payload.exists())
+            self.assertTrue((root / "files" / "character" / "sample.pac").exists())
+            self.assertFalse((root / "character").exists())
+            self.assertEqual(manifest.get("structure"), "custom_compact_paths")
+            self.assertEqual(manifest.get("files_dir"), "files")
+            self.assertEqual(manifest.get("files_root"), "files")
 
     def test_no_encrypt_toggle_and_ready_zip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -98,6 +128,45 @@ class ModPackageExportTests(unittest.TestCase):
             self.assertTrue(MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY[key].label)
             self.assertTrue(MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY[key].description)
 
+    def test_mesh_manifest_records_game_index_fingerprints(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "MeshMod"
+
+            write_mesh_loose_mod_package_metadata(
+                root,
+                ModPackageInfo(title="Mesh"),
+                assets=(
+                    MeshLooseModAsset(
+                        entry_path="character/example.pac",
+                        package_group="0009",
+                        format="pac",
+                        obj_path="source.obj",
+                        vertices=3,
+                        faces=1,
+                        submeshes=1,
+                    ),
+                ),
+                files=(
+                    MeshLooseModFile(
+                        path="character/example.pac",
+                        package_group="0009",
+                        format="pac",
+                    ),
+                ),
+                include_paired_lod=False,
+                game_build="0.papgt 0x12345678",
+                game_metadata={
+                    "game_build": "0.papgt 0x12345678",
+                    "papgt_crc": "0x12345678",
+                    "pamt_crc": "0xABCDEF01",
+                },
+            )
+
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["game_build"], "0.papgt 0x12345678")
+            self.assertEqual(manifest["game_metadata"]["papgt_crc"], "0x12345678")
+            self.assertEqual(manifest["game_metadata"]["pamt_crc"], "0xABCDEF01")
+
     def test_high_level_manifest_writer_readme_lists_generated_metadata_and_zip_contains_readme(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "ReadmeMod"
@@ -114,6 +183,9 @@ class ModPackageExportTests(unittest.TestCase):
             )
 
             readme_text = (root / "README.txt").read_text(encoding="utf-8")
+            self.assertIn("Crimson Desert Mod Workbench", readme_text)
+            self.assertIn("Generated Loose Mod Package", readme_text)
+            self.assertIn("Loose files        1", readme_text)
             for expected in ("manifest.json", "mod.json", "modinfo.json", "info.json", ".no_encrypt", "ReadmeMod.zip"):
                 self.assertIn(expected, readme_text)
             with zipfile.ZipFile(root.with_suffix(".zip")) as archive:

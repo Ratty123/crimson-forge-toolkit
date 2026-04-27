@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Mapping, Optional, Sequence
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QDialog,
@@ -19,16 +19,24 @@ from PySide6.QtWidgets import (
 
 from cdmw.constants import DEFAULT_UI_THEME
 from cdmw.ui.themes import build_app_stylesheet, get_theme
+from cdmw.ui.widgets import make_tree_columns_persistent
 
 
 class TexturePolicyPreviewDialog(QDialog):
-    def __init__(self, *, theme_key: str = DEFAULT_UI_THEME, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        *,
+        theme_key: str = DEFAULT_UI_THEME,
+        settings: Optional[QSettings] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("TexturePolicyPreviewDialog")
         self.setWindowTitle("Texture Policy Preview")
         self.resize(1260, 780)
         self.setMinimumSize(980, 640)
         self._theme_key = theme_key or DEFAULT_UI_THEME
+        self._settings = settings
         self._build_ui()
         self.set_theme(self._theme_key)
 
@@ -80,6 +88,13 @@ class TexturePolicyPreviewDialog(QDialog):
         self.tree.header().resizeSection(5, 240)
         self.tree.header().resizeSection(6, 110)
         self.tree.header().resizeSection(7, 150)
+        if self._settings is not None:
+            make_tree_columns_persistent(
+                self.tree,
+                self._settings,
+                "dialog/texture_policy_preview",
+                minimum_width=56,
+            )
         list_layout.addWidget(self.tree, stretch=1)
         content_row.addWidget(list_group, stretch=3)
 

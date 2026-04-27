@@ -10,6 +10,7 @@ from cdmw.core.material_sidecar_editor import (
     detect_material_sidecar_related_files,
     detect_material_sidecar_preview_model_candidates,
     discover_material_sidecar_preview_overrides,
+    discover_material_sidecar_preview_overrides_for_edits,
     discover_material_sidecar_values,
     export_material_sidecar_mod_package,
 )
@@ -226,6 +227,28 @@ class MaterialSidecarEditorTests(unittest.TestCase):
         self.assertLess(overrides[0].tint_color[0], 0.06)
         self.assertIn("dye", overrides[0].reason.lower())
         self.assertLess(bindings[0].tint_color[0], 0.06)
+
+    def test_preview_overrides_for_edits_ignore_unedited_dark_sidecar_colors(self) -> None:
+        text = """
+        <SkinnedMeshMaterialWrapper _subMeshName="cloak">
+          <MaterialParameterColor _name="_tintColorR" _value="#050505ff" />
+          <MaterialParameterColor _name="_tintColorG" _value="#050505ff" />
+          <MaterialParameterColor _name="_tintColorB" _value="#050505ff" />
+          <MaterialParameterColor _name="_dyeingColorMaskG" _value="#1111114c" />
+        </SkinnedMeshMaterialWrapper>
+        """
+        rows = {row.parameter_name: row for row in discover_material_sidecar_values(text)}
+        overrides = discover_material_sidecar_preview_overrides_for_edits(
+            text,
+            {rows["_tintColorR"].row_id: "#ff0000"},
+        )
+
+        self.assertEqual(1, len(overrides))
+        self.assertEqual("cloak", overrides[0].group_label)
+        self.assertAlmostEqual(1.0, overrides[0].tint_color[0])
+        self.assertAlmostEqual(0.0, overrides[0].tint_color[1])
+        self.assertAlmostEqual(0.0, overrides[0].tint_color[2])
+        self.assertIn("edited", overrides[0].confidence)
 
     def test_exports_edited_sidecar_and_related_files_with_manifest_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

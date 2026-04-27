@@ -97,6 +97,8 @@ from cdmw.ui.widgets import (
     PreviewScrollArea,
     clamp_splitter_sizes,
     build_responsive_splitter_sizes,
+    has_persistent_tree_column_widths,
+    make_tree_columns_persistent,
     responsive_sidebar_bounds,
     set_sidebar_width_policy,
 )
@@ -943,6 +945,13 @@ class ReplaceAssistantTab(QWidget):
         queue_header.resizeSection(2, 90)
         queue_header.resizeSection(3, 70)
         queue_header.resizeSection(4, 220)
+        make_tree_columns_persistent(
+            self.queue_tree,
+            self.settings,
+            "replace_assistant/queue",
+            minimum_width=72,
+            save_callback=self.schedule_settings_save,
+        )
         self.queue_tree.setToolTip(
             "Columns can be resized or reordered. Use the horizontal scrollbar when the queue is narrower than the full column set."
         )
@@ -1081,6 +1090,7 @@ class ReplaceAssistantTab(QWidget):
         self.package_structure_combo = QComboBox()
         self.package_structure_combo.addItem("Game-relative folders", "game_relative")
         self.package_structure_combo.addItem("files/ wrapper", "files_wrapper")
+        self.package_structure_combo.addItem("Custom compact paths", "custom_compact_paths")
         self.package_manifest_checkbox = QCheckBox(MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY["manifest_json"].label)
         self.package_manifest_checkbox.setChecked(True)
         self.package_mod_json_checkbox = QCheckBox(MOD_PACKAGE_METADATA_ARTIFACTS_BY_KEY["mod_json"].label)
@@ -1110,7 +1120,7 @@ class ReplaceAssistantTab(QWidget):
         package_layout.addWidget(_make_help_button("Choose the metadata/layout profile to target. Universal writes broadly compatible metadata; individual profiles bias the folder structure for that manager."), 5, 2)
         package_layout.addWidget(QLabel("Structure"), 6, 0)
         package_layout.addWidget(self.package_structure_combo, 6, 1)
-        package_layout.addWidget(_make_help_button("Game-relative folders write files directly under paths such as object/... . The files/ wrapper places payload files under files/ and points metadata at that folder."), 6, 2)
+        package_layout.addWidget(_make_help_button("Game-relative folders write files directly under paths such as object/... . The files/ wrapper places payload files under files/ and points metadata at that folder. Custom compact paths writes character model and sidecar payloads as character/<name> while keeping textures under character/texture/."), 6, 2)
         metadata_grid = QGridLayout()
         metadata_grid.setContentsMargins(0, 0, 0, 0)
         metadata_grid.setHorizontalSpacing(18)
@@ -1384,6 +1394,8 @@ class ReplaceAssistantTab(QWidget):
     def auto_fit_columns(self) -> None:
         header = self.queue_tree.header()
         if header is None or self.queue_tree.columnCount() <= 0:
+            return
+        if has_persistent_tree_column_widths(self.settings, "replace_assistant/queue", self.queue_tree.columnCount(), minimum_width=72):
             return
         viewport_width = max(self.queue_tree.viewport().width(), self.queue_tree.width() - 24, 0)
         if viewport_width <= 0:
