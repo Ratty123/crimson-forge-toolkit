@@ -21281,7 +21281,7 @@ def run_gui() -> int:
                                     return item
                             return None
 
-                        def _refresh_texture_row_in_place(row_state: Dict[str, Any]) -> bool:
+                        def _refresh_texture_row_in_place(row_state: Dict[str, Any], *, sync_editor: bool = True) -> bool:
                             item = texture_override_tree.currentItem()
                             if item is None or item.data(0, Qt.UserRole + 1) is not row_state:
                                 item = _texture_item_for_row(row_state)
@@ -21295,7 +21295,7 @@ def run_gui() -> int:
                             finally:
                                 texture_override_tree.blockSignals(False)
                             _update_texture_summary_label()
-                            _refresh_texture_details(row_state, sync_editor=True)
+                            _refresh_texture_details(row_state, sync_editor=sync_editor)
                             texture_override_tree.scrollToItem(item, QAbstractItemView.EnsureVisible)
                             return True
 
@@ -21394,8 +21394,19 @@ def run_gui() -> int:
                                     if source_path
                                     else "Clear the manual override for the selected row and keep the original DDS."
                                 )
+                                QTimer.singleShot(0, lambda row=row_state, path=source_path: _commit_texture_row_source(row, path, sync_editor=False))
+                            else:
+                                suggested_source = str(row_state.get("suggested_source", "") or "").strip()
+                                suggestion_available = bool(suggested_source and suggested_source != current_source)
+                                selected_apply_suggestion_button.setText("Use Suggested")
+                                selected_apply_suggestion_button.setEnabled(suggestion_available)
+                                selected_apply_suggestion_button.setToolTip(
+                                    f"Apply suggested source:\n{suggested_source}"
+                                    if suggestion_available
+                                    else "No unapplied suggestion is available for the selected row."
+                                )
 
-                        def _commit_texture_row_source(row_state: Dict[str, Any], source_path: str) -> None:
+                        def _commit_texture_row_source(row_state: Dict[str, Any], source_path: str, *, sync_editor: bool = True) -> None:
                             if selected_texture_source_committing["active"]:
                                 return
                             source_path = str(source_path or "").strip()
@@ -21410,24 +21421,22 @@ def run_gui() -> int:
                                 selected_texture_pending_source["row"] = row_state
                                 selected_texture_pending_source["source_path"] = source_path
                                 selected_texture_pending_source["label"] = Path(source_path).name if source_path else "Keep original"
-                                if not _refresh_texture_row_in_place(row_state):
+                                if not _refresh_texture_row_in_place(row_state, sync_editor=sync_editor):
                                     _refresh_texture_table(row_state)
+                                if not sync_editor:
+                                    suggested_source = str(row_state.get("suggested_source", "") or "").strip()
+                                    suggestion_available = bool(suggested_source and suggested_source != source_path)
+                                    selected_apply_suggestion_button.setText("Use Suggested")
+                                    selected_apply_suggestion_button.setEnabled(suggestion_available)
+                                    selected_apply_suggestion_button.setToolTip(
+                                        f"Apply suggested source:\n{suggested_source}"
+                                        if suggestion_available
+                                        else "No unapplied suggestion is available for the selected row."
+                                    )
                             finally:
                                 selected_texture_source_committing["active"] = False
                             if source_path != current_source or desired_checked != current_checked:
                                 _queue_texture_preview_refresh()
-
-                        def _selected_texture_source_changed(index: int = -1, *_args: object) -> None:
-                            if selected_texture_editor_loading["active"] or selected_texture_source_committing["active"]:
-                                return
-                            row_state = _current_texture_row()
-                            if row_state is None:
-                                return
-                            source_path = _combo_source_path_from_signal(index)
-                            selected_texture_pending_source["row"] = row_state
-                            selected_texture_pending_source["source_path"] = source_path
-                            selected_texture_pending_source["label"] = Path(source_path).name if source_path else "Keep original"
-                            QTimer.singleShot(0, lambda row=row_state, path=source_path: _commit_texture_row_source(row, path))
 
                         def _apply_selected_texture_suggestion() -> None:
                             if selected_texture_source_committing["active"]:
@@ -21693,12 +21702,9 @@ def run_gui() -> int:
                         texture_override_tree.currentItemChanged.connect(_texture_table_selection_changed)
                         texture_override_tree.itemActivated.connect(_texture_table_item_activated)
                         selected_role_combo.currentIndexChanged.connect(_selected_texture_role_changed)
+                        # Keep a single source-selection commit path. activated/textActivated can arrive after
+                        # the combo is rebuilt by the commit refresh and resolve back to "Keep original".
                         selected_source_combo.currentIndexChanged.connect(_stage_selected_texture_source)
-                        selected_source_combo.activated.connect(_selected_texture_source_changed)
-                        try:
-                            selected_source_combo.textActivated.connect(_selected_texture_source_changed)
-                        except AttributeError:
-                            pass
                         selected_apply_suggestion_button.clicked.connect(_apply_selected_texture_suggestion)
                         texture_filter_selected_checkbox.toggled.connect(_apply_texture_selected_part_filter)
                         texture_show_advanced_checkbox.toggled.connect(_apply_texture_selected_part_filter)
