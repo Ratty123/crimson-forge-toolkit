@@ -137,6 +137,33 @@ class FinalPackagePreviewTests(unittest.TestCase):
             self.assertEqual([], result.likely_grey_materials)
             self.assertIn("blade_base.dds", result.preview_model.meshes[0].preview_texture_path)
 
+    def test_original_archive_dds_preview_does_not_require_texconv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            original = root / "blade_base.dds"
+            original.write_bytes(b"DDS original")
+            preview = _preview()
+            specs = (
+                MeshImportSupplementalFileSpec(
+                    source_path=root / "test_weapon.pac_xml",
+                    target_path="character/modelproperty/test_weapon.pac_xml",
+                    kind="sidecar_generated",
+                    payload_data=_sidecar("character/texture/blade_base.dds"),
+                ),
+            )
+
+            result = build_final_package_preview(
+                preview,
+                supplemental_file_specs=specs,
+                texconv_path=None,
+                original_dds_resolver=lambda path: original if path == "character/texture/blade_base.dds" else None,
+            )
+
+            self.assertEqual(FINAL_PREVIEW_READY, result.binding_rows[0].status)
+            self.assertEqual(FINAL_PREVIEW_BINDING_ORIGINAL, result.binding_rows[0].binding_source)
+            self.assertIn("blade_base.dds", result.preview_model.meshes[0].preview_texture_path)
+            self.assertNotIn("could not be decoded", "\n".join(result.warnings))
+
     def test_basename_fallback_is_diagnostic_not_exact_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

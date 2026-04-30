@@ -6,6 +6,7 @@ from dataclasses import dataclass, fields as dataclass_fields
 import math
 from pathlib import PurePosixPath
 import re
+import time
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSettings, QSize, Qt, QTimer, QUrl, Signal
@@ -99,7 +100,7 @@ _GL_TEXTURE0 = 0x84C0
 _GL_MAX_TEXTURE_SIZE = 0x0D33
 _GL_NO_ERROR = 0
 
-MODEL_PREVIEW_RENDER_BUILD_ID = "2026-04-27-support-diagnostics-v3"
+MODEL_PREVIEW_RENDER_BUILD_ID = "2026-04-29-radical-relief-v7"
 PERSISTENT_TREE_COLUMN_WIDTHS_PREFIX = "ui/tree_column_widths"
 PERSISTENT_TREE_COLUMN_ORDER_PREFIX = "ui/tree_column_order"
 
@@ -348,6 +349,7 @@ def make_tree_columns_persistent(
 
 _RENDER_DIAGNOSTIC_MODE_CODES = {
     "lit": 0,
+    "rich_lit": 22,
     "white_uniform": 1,
     "shader_marker": 2,
     "fragcoord_checker": 3,
@@ -361,6 +363,8 @@ _RENDER_DIAGNOSTIC_MODE_CODES = {
     "normal_raw": 11,
     "material_raw": 12,
     "height_raw": 13,
+    "height_calibrated": 23,
+    "relief_control_test": 24,
     "sampler_swap_base_on_unit2": 14,
     "sampler_swap_material_on_unit0": 15,
     "base_color": 16,
@@ -388,6 +392,13 @@ _DIFFUSE_SWIZZLE_MODE_CODES = {
     "alpha_forced_opaque": 6,
 }
 
+_BASE_TEXTURE_QUALITY_CODES = {
+    "": 0,
+    "resolved_base": 0,
+    "low_authority_overlay": 1,
+    "material_color_fallback": 2,
+}
+
 
 @dataclass(slots=True)
 class _ModelPreviewDrawBatch:
@@ -409,6 +420,7 @@ class _ModelPreviewDrawBatch:
     has_texture_coordinates: bool = False
     texture_wrap_repeat: bool = False
     texture_flip_vertical: bool = True
+    base_texture_quality: str = ""
     texture_brightness: float = 1.0
     texture_tint: Tuple[float, float, float] = ()
     texture_uv_scale: Tuple[float, float] = ()
@@ -419,6 +431,7 @@ class _ModelPreviewDrawBatch:
     tangent_finite_ratio: float = 1.0
     bitangent_finite_ratio: float = 1.0
     uv_finite_ratio: float = 1.0
+    smooth_normal_ratio: float = 0.0
 
 
 @dataclass(slots=True)
@@ -456,6 +469,7 @@ class _BatchRenderDiagnostic:
     normal_texture_id: int = 0
     material_texture_id: int = 0
     height_texture_id: int = 0
+    relief_texture_id: int = 0
     diffuse_unit: int = 0
     diffuse_sampler_location: int = -1
     render_mode_code: int = 0
@@ -463,6 +477,9 @@ class _BatchRenderDiagnostic:
     texture_probe_source: str = "base"
     sampler_probe_mode: str = "normal"
     diffuse_swizzle_mode: str = "rgba"
+    base_texture_quality: str = ""
+    material_decode_mode: int = 0
+    rich_material_response: bool = False
     prepared_image_size: str = "-"
     gl_error: str = ""
     alpha_discard_risk: bool = False
@@ -470,6 +487,7 @@ class _BatchRenderDiagnostic:
     use_normal: bool = False
     use_material: bool = False
     use_height: bool = False
+    use_relief: bool = False
     normal_uploaded: bool = False
     material_uploaded: bool = False
     height_uploaded: bool = False
@@ -484,6 +502,16 @@ class _BatchRenderDiagnostic:
     height_sampled_luma: Optional[float] = None
     height_sampled_dark_ratio: Optional[float] = None
     height_sampled_alpha: Optional[float] = None
+    height_sampled_min_luma: Optional[float] = None
+    height_sampled_max_luma: Optional[float] = None
+    height_sampled_contrast: Optional[float] = None
+    derived_relief_sampled_luma: Optional[float] = None
+    derived_relief_sampled_min_luma: Optional[float] = None
+    derived_relief_sampled_max_luma: Optional[float] = None
+    derived_relief_sampled_contrast: Optional[float] = None
+    enhanced_relief_state: str = ""
+    enhanced_relief_reason: str = ""
+    relief_source: str = ""
     normal_average_strength: Optional[float] = None
     source_average_color: Tuple[float, float, float] = ()
     normal_finite_ratio: float = 1.0
@@ -491,6 +519,7 @@ class _BatchRenderDiagnostic:
     tangent_finite_ratio: float = 1.0
     bitangent_finite_ratio: float = 1.0
     uv_finite_ratio: float = 1.0
+    smooth_normal_ratio: float = 0.0
     texture_flip_vertical: bool = True
     texture_wrap_repeat: bool = False
     texture_brightness: float = 1.0
@@ -508,6 +537,9 @@ class _TextureVisibilitySample:
     average_alpha: float = 1.0
     alpha_dark_ratio: float = 0.0
     alpha_weighted_luma: float = 0.0
+    min_luma: float = 0.0
+    max_luma: float = 0.0
+    luma_contrast: float = 0.0
 
 
 @dataclass(slots=True)
@@ -1283,6 +1315,7 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._normal_texture_sampler_uniform_location = -1
         self._material_texture_sampler_uniform_location = -1
         self._height_texture_sampler_uniform_location = -1
+        self._relief_texture_sampler_uniform_location = -1
         self._use_texture_uniform_location = -1
         self._render_diagnostic_mode_uniform_location = -1
         self._alpha_handling_mode_uniform_location = -1
@@ -1297,17 +1330,24 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._base_texture_uv_scale_uniform_location = -1
         self._base_texture_average_color_uniform_location = -1
         self._base_texture_average_luma_uniform_location = -1
+        self._base_texture_quality_uniform_location = -1
         self._use_high_quality_uniform_location = -1
         self._use_normal_texture_uniform_location = -1
         self._normal_texture_strength_uniform_location = -1
         self._use_material_texture_uniform_location = -1
         self._material_decode_mode_uniform_location = -1
         self._use_height_texture_uniform_location = -1
+        self._use_relief_texture_uniform_location = -1
         self._diffuse_wrap_bias_uniform_location = -1
         self._diffuse_light_scale_uniform_location = -1
         self._normal_strength_cap_uniform_location = -1
         self._normal_strength_floor_uniform_location = -1
         self._height_effect_max_uniform_location = -1
+        self._height_sample_min_uniform_location = -1
+        self._height_sample_max_uniform_location = -1
+        self._height_sample_contrast_uniform_location = -1
+        self._height_relief_usable_uniform_location = -1
+        self._relief_source_code_uniform_location = -1
         self._cavity_clamp_min_uniform_location = -1
         self._cavity_clamp_max_uniform_location = -1
         self._specular_base_uniform_location = -1
@@ -1350,8 +1390,11 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._batch_luma_diagnostics: Dict[int, _TextureVisibilitySample] = {}
         self._batch_material_luma_diagnostics: Dict[int, _TextureVisibilitySample] = {}
         self._batch_height_luma_diagnostics: Dict[int, _TextureVisibilitySample] = {}
+        self._batch_derived_relief_luma_diagnostics: Dict[int, _TextureVisibilitySample] = {}
+        self._batch_derived_relief_keys: Dict[int, str] = {}
         self._batch_normal_strength_diagnostics: Dict[int, float] = {}
         self._framebuffer_visibility_diagnostic = _FramebufferVisibilitySample()
+        self._framebuffer_visibility_sampled_at = 0.0
         self._use_textures = False
         self._high_quality_textures = True
         self._show_grid_overlay = False
@@ -1495,6 +1538,8 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._batch_luma_diagnostics.clear()
         self._batch_material_luma_diagnostics.clear()
         self._batch_height_luma_diagnostics.clear()
+        self._batch_derived_relief_luma_diagnostics.clear()
+        self._batch_derived_relief_keys.clear()
         self._batch_normal_strength_diagnostics.clear()
         self._framebuffer_visibility_diagnostic = _FramebufferVisibilitySample()
         self._drag_active = False
@@ -1557,6 +1602,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                             if batch.preview_texture_flip_vertical is None
                             else bool(batch.preview_texture_flip_vertical)
                         ),
+                        base_texture_quality=str(batch.preview_base_texture_quality or "").strip().lower(),
                         texture_brightness=float(batch.preview_texture_brightness or 1.0),
                         texture_tint=tuple(batch.preview_texture_tint or ()),
                         texture_uv_scale=tuple(batch.preview_texture_uv_scale or ()),
@@ -1607,7 +1653,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                 cls._initialize_mesh_preview_slot_defaults(mesh)
         vertex_blob, vertex_count, mesh_batches = cls._build_vertex_blob(cloned_model)
         prepared_batches: List[PreparedModelPreviewBatch] = []
-        floats_per_vertex = 17
+        floats_per_vertex = 20
         bytes_per_vertex = floats_per_vertex * 4
         for mesh, batch in zip(getattr(cloned_model, "meshes", ()) or (), mesh_batches):
             if stop_event is not None and stop_event.is_set():
@@ -1621,6 +1667,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                     vertex_blob=vertex_blob[start:end],
                     index_count=int(batch.vertex_count),
                     preview_texture_path=batch.texture_key,
+                    preview_base_texture_quality=batch.base_texture_quality,
                     preview_normal_texture_path=batch.normal_texture_key,
                     preview_material_texture_path=batch.material_texture_key,
                     preview_height_texture_path=batch.height_texture_key,
@@ -1727,7 +1774,19 @@ class ModelPreviewWidget(QOpenGLWidget):
                 self._initialize_mesh_preview_slot_defaults(mesh)
 
     def set_use_textures(self, use_textures: bool) -> None:
+        previous = bool(self._use_textures)
         self._use_textures = bool(use_textures)
+        if (
+            previous != self._use_textures
+            and self._use_textures
+            and self._render_mode_uses_derived_relief(self._render_settings)
+            and self._gl_ready
+            and self.context() is not None
+        ):
+            self.makeCurrent()
+            self._clear_gl_textures()
+            self._rebuild_gl_textures()
+            self.doneCurrent()
         self.update()
 
     def support_maps_available(self) -> bool:
@@ -2320,6 +2379,8 @@ class ModelPreviewWidget(QOpenGLWidget):
         alpha_total = 0.0
         luma_total = 0.0
         alpha_weighted_luma_total = 0.0
+        min_luma = 1.0
+        max_luma = 0.0
         dark_count = 0
         alpha_dark_count = 0
         sample_count = 0
@@ -2349,6 +2410,8 @@ class ModelPreviewWidget(QOpenGLWidget):
             alpha_total += alpha
             luma_total += luma
             alpha_weighted_luma_total += luma * alpha
+            min_luma = min(min_luma, luma)
+            max_luma = max(max_luma, luma)
             if luma < 0.035:
                 dark_count += 1
             if alpha <= 0.01:
@@ -2366,6 +2429,9 @@ class ModelPreviewWidget(QOpenGLWidget):
             average_alpha=alpha_total / divisor,
             alpha_dark_ratio=alpha_dark_count / divisor,
             alpha_weighted_luma=alpha_weighted_luma_total / divisor,
+            min_luma=min_luma,
+            max_luma=max_luma,
+            luma_contrast=max_luma - min_luma,
         )
 
     @staticmethod
@@ -2411,6 +2477,147 @@ class ModelPreviewWidget(QOpenGLWidget):
             return None
         return total / float(count)
 
+    @staticmethod
+    def _derived_relief_texture_key(batch_index: int, batch: _ModelPreviewDrawBatch) -> str:
+        texture_key = str(batch.texture_key or "").strip()
+        if not texture_key:
+            return ""
+        return (
+            f"derived_relief:{int(batch_index)}:"
+            f"{'repeat' if batch.texture_wrap_repeat else 'clamp'}:"
+            f"{'flip' if batch.texture_flip_vertical else 'noflip'}:"
+            f"{texture_key}"
+        )
+
+    @staticmethod
+    def _derive_relief_image_from_base(texture_image: QImage, *, max_dimension: int = 512) -> Optional[QImage]:
+        if texture_image.isNull():
+            return None
+        image = texture_image.convertToFormat(QImage.Format_RGBA8888)
+        if image.isNull():
+            return None
+        width = int(image.width())
+        height = int(image.height())
+        if width <= 1 or height <= 1:
+            return None
+        longest = max(width, height)
+        if longest > max_dimension:
+            target = image.size().scaled(int(max_dimension), int(max_dimension), Qt.KeepAspectRatio)
+            if target.width() > 1 and target.height() > 1:
+                image = image.scaled(target, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                width = int(image.width())
+                height = int(image.height())
+        luma_values: List[float] = []
+        luma_grid: List[List[float]] = []
+        for y in range(height):
+            row: List[float] = []
+            for x in range(width):
+                color = image.pixelColor(x, y)
+                luma = (0.2126 * float(color.redF())) + (0.7152 * float(color.greenF())) + (0.0722 * float(color.blueF()))
+                row.append(luma)
+                luma_values.append(luma)
+            luma_grid.append(row)
+        if not luma_values:
+            return None
+        sorted_luma = sorted(luma_values)
+        low = sorted_luma[int(max(0, min(len(sorted_luma) - 1, round((len(sorted_luma) - 1) * 0.05))))]
+        high = sorted_luma[int(max(0, min(len(sorted_luma) - 1, round((len(sorted_luma) - 1) * 0.95))))]
+        contrast = max(high - low, 0.0)
+        if contrast < 0.018:
+            return None
+        relief = QImage(width, height, QImage.Format_RGBA8888)
+        contrast_gain = max(1.0, min(4.0, 0.42 / max(contrast, 0.001)))
+        for y in range(height):
+            ym = max(0, y - 1)
+            yp = min(height - 1, y + 1)
+            for x in range(width):
+                xm = max(0, x - 1)
+                xp = min(width - 1, x + 1)
+                center = luma_grid[y][x]
+                local_average = (
+                    luma_grid[ym][xm] + luma_grid[ym][x] + luma_grid[ym][xp]
+                    + luma_grid[y][xm] + center + luma_grid[y][xp]
+                    + luma_grid[yp][xm] + luma_grid[yp][x] + luma_grid[yp][xp]
+                ) / 9.0
+                sobel_x = (
+                    -luma_grid[ym][xm] + luma_grid[ym][xp]
+                    - (2.0 * luma_grid[y][xm]) + (2.0 * luma_grid[y][xp])
+                    - luma_grid[yp][xm] + luma_grid[yp][xp]
+                )
+                sobel_y = (
+                    -luma_grid[ym][xm] - (2.0 * luma_grid[ym][x]) - luma_grid[ym][xp]
+                    + luma_grid[yp][xm] + (2.0 * luma_grid[yp][x]) + luma_grid[yp][xp]
+                )
+                edge = min(1.0, math.sqrt((sobel_x * sobel_x) + (sobel_y * sobel_y)) * 1.35)
+                normalized = ((center - low) / max(contrast, 0.001)) - 0.5
+                local_detail = (center - local_average) * 2.5
+                relief_value = 0.5 + (normalized * 0.42 * contrast_gain) + (local_detail * 0.28) + ((edge - 0.20) * 0.16)
+                grey = max(0, min(255, int(round(max(0.0, min(1.0, relief_value)) * 255.0))))
+                relief.setPixelColor(x, y, QColor(grey, grey, grey, 255))
+        return relief
+
+    @staticmethod
+    def _enhanced_relief_status(
+        *,
+        render_mode_code: int,
+        high_quality_enabled: bool,
+        support_maps_enabled: bool,
+        support_maps_disabled: bool,
+        height_key: str,
+        height_texture_available: bool,
+        height_luma: Optional[_TextureVisibilitySample],
+        derived_relief_key: str = "",
+        derived_relief_texture_available: bool = False,
+        derived_relief_luma: Optional[_TextureVisibilitySample] = None,
+        height_map_disabled: bool,
+        height_effect_max: float,
+    ) -> Tuple[str, str, bool, str]:
+        if render_mode_code == 24:
+            return "control-test", "Relief Control Test is visualizing slider values directly.", False, "control-test"
+        if render_mode_code not in {22, 23}:
+            return "inactive", "Enhanced Relief Preview mode is not selected.", False, "inactive"
+        if not high_quality_enabled:
+            return "inactive", "Support-map preview shading is disabled.", False, "inactive"
+        if float(height_effect_max) <= 0.001:
+            return "inactive", "Relief depth is set to zero.", False, "inactive"
+        true_height_usable = bool(
+            support_maps_enabled
+            and not support_maps_disabled
+            and not height_map_disabled
+            and str(height_key or "").strip()
+            and height_texture_available
+            and height_luma is not None
+            and float(height_luma.luma_contrast) >= 0.010
+        )
+        derived_usable = bool(
+            str(derived_relief_key or "").strip()
+            and derived_relief_texture_available
+            and derived_relief_luma is not None
+            and float(derived_relief_luma.luma_contrast) >= 0.018
+        )
+        if true_height_usable and derived_usable:
+            source = "height+derived-detail"
+            reason = "Calibrated height relief with derived base micro-detail is active."
+        elif true_height_usable:
+            source = "height-map"
+            reason = "Calibrated height relief is active."
+        elif derived_usable:
+            source = "derived-base"
+            reason = "Derived base-texture relief is active."
+        else:
+            if str(height_key or "").strip() and not height_texture_available and not derived_usable:
+                reason = "Height texture is not uploaded and no usable base-derived relief was generated."
+            elif height_luma is not None and float(height_luma.luma_contrast) < 0.010 and not derived_usable:
+                reason = "Height texture is nearly flat and base-derived relief is unavailable."
+            elif not str(derived_relief_key or "").strip():
+                reason = "No base texture is available for derived relief."
+            else:
+                reason = "No usable height or base-derived relief texture is available."
+            return "inactive", reason, False, "inactive"
+        if render_mode_code == 22:
+            return "active", reason, True, source
+        return "inactive", "Relief texture diagnostic is selected.", True, source
+
     def _diagnostic_for_unpainted_batch(
         self,
         batch_index: int,
@@ -2437,6 +2644,38 @@ class ModelPreviewWidget(QOpenGLWidget):
         luma = self._batch_luma_diagnostics.get(batch_index)
         material_luma = self._batch_material_luma_diagnostics.get(batch_index)
         height_luma = self._batch_height_luma_diagnostics.get(batch_index)
+        settings = self.render_settings()
+        derived_relief_key = self._batch_derived_relief_keys.get(batch_index, "")
+        if not derived_relief_key and self._render_mode_uses_derived_relief(settings):
+            derived_relief_key = self._derived_relief_texture_key(batch_index, batch)
+        derived_relief_luma = self._batch_derived_relief_luma_diagnostics.get(batch_index)
+        texture_objects = getattr(self, "_texture_objects", {}) or {}
+        height_available = bool(
+            texture_objects.get((batch.height_texture_key, bool(batch.texture_wrap_repeat), bool(batch.texture_flip_vertical)))
+        )
+        derived_relief_available = bool(
+            texture_objects.get((derived_relief_key, bool(batch.texture_wrap_repeat), bool(batch.texture_flip_vertical)))
+        )
+        render_mode_code = int(_RENDER_DIAGNOSTIC_MODE_CODES.get(str(getattr(settings, "render_diagnostic_mode", "lit")), 0))
+        enhanced_state, enhanced_reason, enhanced_usable, relief_source = self._enhanced_relief_status(
+            render_mode_code=render_mode_code,
+            high_quality_enabled=bool(self._high_quality_textures and batch.has_texture_coordinates),
+            support_maps_enabled=bool(
+                self._high_quality_textures
+                and batch.has_texture_coordinates
+                and not batch.support_maps_disabled
+                and not bool(getattr(settings, "disable_all_support_maps", False))
+            ),
+            support_maps_disabled=bool(batch.support_maps_disabled),
+            height_key=str(batch.height_texture_key or ""),
+            height_texture_available=height_available,
+            height_luma=height_luma,
+            derived_relief_key=derived_relief_key,
+            derived_relief_texture_available=derived_relief_available,
+            derived_relief_luma=derived_relief_luma,
+            height_map_disabled=bool(getattr(settings, "disable_height_map", False)),
+            height_effect_max=float(getattr(settings, "height_effect_max", 0.0) or 0.0),
+        )
         diagnostic = _BatchRenderDiagnostic(
             batch_index=batch_index,
             mesh_index=batch.mesh_index,
@@ -2451,11 +2690,17 @@ class ModelPreviewWidget(QOpenGLWidget):
             texture_uploaded=uploaded,
             texture_id=int(upload_diagnostic.texture_id if upload_diagnostic else 0),
             diffuse_sampler_location=int(getattr(self, "_texture_sampler_uniform_location", -1)),
-            render_mode_code=int(_RENDER_DIAGNOSTIC_MODE_CODES.get(str(getattr(self.render_settings(), "render_diagnostic_mode", "lit")), 0)),
-            alpha_handling_mode=str(getattr(self.render_settings(), "alpha_handling_mode", "default")),
-            texture_probe_source=str(getattr(self.render_settings(), "texture_probe_source", "base")),
-            sampler_probe_mode=str(getattr(self.render_settings(), "sampler_probe_mode", "normal")),
-            diffuse_swizzle_mode=str(getattr(self.render_settings(), "diffuse_swizzle_mode", "rgba")),
+            render_mode_code=render_mode_code,
+            alpha_handling_mode=str(getattr(settings, "alpha_handling_mode", "default")),
+            texture_probe_source=str(getattr(settings, "texture_probe_source", "base")),
+            sampler_probe_mode=str(getattr(settings, "sampler_probe_mode", "normal")),
+            diffuse_swizzle_mode=str(getattr(settings, "diffuse_swizzle_mode", "rgba")),
+            base_texture_quality=str(getattr(batch, "base_texture_quality", "") or ""),
+            material_decode_mode=int(getattr(batch, "material_decode_mode", 0) or 0),
+            rich_material_response=bool(
+                str(getattr(settings, "render_diagnostic_mode", "lit") or "").strip().lower()
+                == "rich_lit"
+            ),
             prepared_image_size=prepared_size,
             gl_error=str(upload_diagnostic.gl_error if upload_diagnostic else ""),
             alpha_discard_risk=bool(luma and luma.alpha_dark_ratio >= 0.50),
@@ -2463,6 +2708,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             use_normal=False,
             use_material=False,
             use_height=False,
+            use_relief=bool(enhanced_usable),
             sampled_luma=luma.average_luma if luma else None,
             sampled_dark_ratio=luma.dark_ratio if luma else None,
             sampled_alpha=luma.average_alpha if luma else None,
@@ -2472,6 +2718,16 @@ class ModelPreviewWidget(QOpenGLWidget):
             height_sampled_luma=height_luma.average_luma if height_luma else None,
             height_sampled_dark_ratio=height_luma.dark_ratio if height_luma else None,
             height_sampled_alpha=height_luma.average_alpha if height_luma else None,
+            height_sampled_min_luma=height_luma.min_luma if height_luma else None,
+            height_sampled_max_luma=height_luma.max_luma if height_luma else None,
+            height_sampled_contrast=height_luma.luma_contrast if height_luma else None,
+            derived_relief_sampled_luma=derived_relief_luma.average_luma if derived_relief_luma else None,
+            derived_relief_sampled_min_luma=derived_relief_luma.min_luma if derived_relief_luma else None,
+            derived_relief_sampled_max_luma=derived_relief_luma.max_luma if derived_relief_luma else None,
+            derived_relief_sampled_contrast=derived_relief_luma.luma_contrast if derived_relief_luma else None,
+            enhanced_relief_state=enhanced_state,
+            enhanced_relief_reason=enhanced_reason,
+            relief_source=relief_source,
             normal_average_strength=self._batch_normal_strength_diagnostics.get(batch_index),
             source_average_color=luma.average_color if luma else (),
             normal_finite_ratio=float(batch.normal_finite_ratio),
@@ -2479,6 +2735,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             tangent_finite_ratio=float(batch.tangent_finite_ratio),
             bitangent_finite_ratio=float(batch.bitangent_finite_ratio),
             uv_finite_ratio=float(batch.uv_finite_ratio),
+            smooth_normal_ratio=float(getattr(batch, "smooth_normal_ratio", 0.0) or 0.0),
             texture_flip_vertical=bool(batch.texture_flip_vertical),
             texture_wrap_repeat=bool(batch.texture_wrap_repeat),
             texture_brightness=float(batch.texture_brightness or 1.0),
@@ -2645,6 +2902,12 @@ class ModelPreviewWidget(QOpenGLWidget):
             self._batch_render_diagnostics.get(index) or self._diagnostic_for_unpainted_batch(index, batch)
             for index, batch in enumerate(self._mesh_batches)
         ]
+        current_mode_code = int(_RENDER_DIAGNOSTIC_MODE_CODES.get(str(self.render_settings().render_diagnostic_mode), 0))
+        stale_mode_count = sum(
+            1
+            for item in diagnostics
+            if int(getattr(item, "render_mode_code", current_mode_code)) != current_mode_code
+        )
         sampled = sum(1 for item in diagnostics if item.use_texture)
         blocked_image = sum(1 for item in diagnostics if item.failure_bucket == "image")
         blocked_uv = sum(1 for item in diagnostics if item.failure_bucket == "uv")
@@ -2660,6 +2923,16 @@ class ModelPreviewWidget(QOpenGLWidget):
             for item in diagnostics
             if item.use_texture and item.texture_uploaded and item.uv_valid and item.image_loaded
         )
+        relief_active = sum(1 for item in diagnostics if item.enhanced_relief_state == "active")
+        relief_reasons = sorted(
+            {
+                item.enhanced_relief_reason
+                for item in diagnostics
+                if item.enhanced_relief_state != "active" and item.enhanced_relief_reason
+            }
+        )
+        relief_sources = sorted({item.relief_source for item in diagnostics if item.relief_source})
+        relief_reason_text = relief_reasons[0] if relief_reasons else "All eligible batches have calibrated relief."
         framebuffer = self._framebuffer_visibility_diagnostic
         dark_output = bool(framebuffer.visible_pixels > 0 and framebuffer.average_luma < 0.075 and framebuffer.dark_ratio > 0.60)
         settings = self.render_settings()
@@ -2670,7 +2943,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             f"Diagnostic Render Mode: {self._render_diagnostic_mode_label()}",
             (
                 "Render Settings Snapshot: "
-                f"mode_code={_RENDER_DIAGNOSTIC_MODE_CODES.get(str(settings.render_diagnostic_mode), 0)}, "
+                f"mode_code={current_mode_code}, "
                 f"alpha={settings.alpha_handling_mode}, source={settings.texture_probe_source}, "
                 f"sampler={settings.sampler_probe_mode}, swizzle={settings.diffuse_swizzle_mode}, "
                 f"disable_tint={self._yes_no(settings.disable_tint)}, "
@@ -2679,10 +2952,12 @@ class ModelPreviewWidget(QOpenGLWidget):
                 f"nearest_no_mips={self._yes_no(settings.force_nearest_no_mipmaps)}, "
                 f"disable_lighting={self._yes_no(settings.disable_lighting)}, "
                 f"disable_depth={self._yes_no(settings.disable_depth_test)}, "
-                f"depth_strength={float(settings.height_effect_max):.2f}, "
-                f"material_shine={float(settings.specular_max):.2f}, "
-                f"roughness_contrast={float(settings.shininess_max):.0f}, "
-                f"solo_batch={settings.solo_batch_index}"
+                f"enhanced_relief_mode={self._yes_no(str(settings.render_diagnostic_mode) == 'rich_lit')}, "
+                f"relief_depth={float(settings.height_effect_max):.2f}, "
+                f"specular_response={float(settings.specular_max):.2f}, "
+                f"surface_contrast={float(settings.shininess_max):.0f}, "
+                f"solo_batch={settings.solo_batch_index}, "
+                f"shader_mode_uniform_loc={int(getattr(self, '_render_diagnostic_mode_uniform_location', -1))}"
             ),
             f"Sampled base textures: {sampled:,} / {len(diagnostics):,}",
             f"Blocked by image load: {blocked_image:,}",
@@ -2692,6 +2967,21 @@ class ModelPreviewWidget(QOpenGLWidget):
             f"Shader sampled but source luma is very dark: {shader_dark:,}",
             f"Shader/material luma guard eligible: {shader_guarded:,}",
             "Shader/material guard: preserves visible base color when texture sampling is enabled",
+            (
+                f"Diagnostics pending repaint: {stale_mode_count:,} stale batch mode(s)"
+                if stale_mode_count
+                else "Diagnostics pending repaint: no"
+            ),
+            (
+                "Relief Capability: "
+                f"enhanced_relief={'active' if relief_active else 'inactive'} "
+                f"({relief_active:,}/{len(diagnostics):,} batch(es)); "
+                f"source={','.join(relief_sources) if relief_sources else 'inactive'}; "
+                f"reason={relief_reason_text}; "
+                f"relief_depth={float(settings.height_effect_max):.2f}, "
+                f"specular_response={float(settings.specular_max):.2f}, "
+                f"surface_contrast={float(settings.shininess_max):.0f}"
+            ),
             (
                 "Framebuffer probe: "
                 f"visible_px={framebuffer.visible_pixels:,}, "
@@ -2734,6 +3024,20 @@ class ModelPreviewWidget(QOpenGLWidget):
                     support_parts.append(
                         f"height_luma={item.height_sampled_luma:.3f}/dark={item.height_sampled_dark_ratio or 0.0:.0%}"
                     )
+                    if item.height_sampled_min_luma is not None and item.height_sampled_max_luma is not None:
+                        support_parts.append(
+                            f"height_range={item.height_sampled_min_luma:.3f}-{item.height_sampled_max_luma:.3f}"
+                        )
+                if item.height_sampled_contrast is not None:
+                    support_parts.append(f"height_contrast={item.height_sampled_contrast:.3f}")
+                if item.derived_relief_sampled_contrast is not None:
+                    support_parts.append(
+                        f"derived_relief_luma={item.derived_relief_sampled_luma or 0.0:.3f}"
+                    )
+                    support_parts.append(
+                        f"derived_relief_range={item.derived_relief_sampled_min_luma or 0.0:.3f}-{item.derived_relief_sampled_max_luma or 0.0:.3f}"
+                    )
+                    support_parts.append(f"derived_relief_contrast={item.derived_relief_sampled_contrast:.3f}")
                 support_text = f", support_samples={' '.join(support_parts)}"
             final_bucket = item.final_bucket
             if item.alpha_discard_risk and item.alpha_handling_mode == "default":
@@ -2756,17 +3060,22 @@ class ModelPreviewWidget(QOpenGLWidget):
                 f"prepared={item.prepared_image_size}, "
                 f"uv={self._yes_no(item.uv_valid)} {item.uv_count:,}/{item.position_count:,}, "
                 f"upload={self._yes_no(item.texture_uploaded)} tex_id={item.texture_id}, "
-                f"support_tex_ids=n:{item.normal_texture_id} m:{item.material_texture_id} h:{item.height_texture_id}, "
+                f"support_tex_ids=n:{item.normal_texture_id} m:{item.material_texture_id} h:{item.height_texture_id} r:{item.relief_texture_id}, "
                 f"diffuse_unit={item.diffuse_unit}, sampler_loc={item.diffuse_sampler_location}, "
                 f"mode_code={item.render_mode_code}, alpha_mode={item.alpha_handling_mode}, "
+                f"base_quality={item.base_texture_quality or '-'}, material_decode={item.material_decode_mode}, "
+                f"rich_material={self._yes_no(item.rich_material_response)}, "
+                f"enhanced_relief={item.enhanced_relief_state or '-'}, relief_source={item.relief_source or '-'}, "
                 f"probe_source={item.texture_probe_source}, sampler_probe={item.sampler_probe_mode}, "
                 f"swizzle={item.diffuse_swizzle_mode}, "
                 f"use_texture={self._yes_no(item.use_texture)}, "
                 f"support_maps=n:{self._yes_no(item.use_normal)} "
-                f"m:{self._yes_no(item.use_material)} h:{self._yes_no(item.use_height)}, "
+                f"m:{self._yes_no(item.use_material)} h:{self._yes_no(item.use_height)} "
+                f"r:{self._yes_no(item.use_relief)}, "
                 f"support_uploads=n:{self._yes_no(item.normal_uploaded)} "
                 f"m:{self._yes_no(item.material_uploaded)} h:{self._yes_no(item.height_uploaded)}, "
                 f"normals={item.normal_finite_ratio:.0%} repaired={item.normal_repair_count:,}, "
+                f"smooth_normals={item.smooth_normal_ratio:.0%}, "
                 f"tangent={item.tangent_finite_ratio:.0%}, bitangent={item.bitangent_finite_ratio:.0%}, "
                 f"uv_finite={item.uv_finite_ratio:.0%}, flip_v={self._yes_no(item.texture_flip_vertical)}, "
                 f"wrap={self._yes_no(item.texture_wrap_repeat)}, brightness={item.texture_brightness:.2f}, "
@@ -2776,6 +3085,8 @@ class ModelPreviewWidget(QOpenGLWidget):
             )
             if final_bucket:
                 line = f"{line}, final_bucket={final_bucket}"
+            if item.enhanced_relief_reason:
+                line = f"{line}, relief_reason={item.enhanced_relief_reason}"
             if item.gl_error:
                 line = f"{line}, gl_error={item.gl_error}"
             if item.failure_bucket:
@@ -2796,6 +3107,7 @@ class ModelPreviewWidget(QOpenGLWidget):
         material_interpretations: List[str] = []
         height_names: List[str] = []
         base_sources: List[str] = []
+        base_qualities: List[str] = []
         sidecar_approximation_count = 0
         for mesh in meshes:
             base_names.append(
@@ -2825,6 +3137,9 @@ class ModelPreviewWidget(QOpenGLWidget):
             base_source = str(getattr(mesh, "preview_base_texture_source", "") or "").strip()
             if base_source:
                 base_sources.append(base_source)
+            base_quality = str(getattr(mesh, "preview_base_texture_quality", "") or "").strip()
+            if base_quality:
+                base_qualities.append(base_quality.replace("_", " ").title())
             if str(getattr(mesh, "preview_texture_approximation_note", "") or "").strip():
                 sidecar_approximation_count += 1
             if str(getattr(mesh, "preview_material_texture_path", "") or "").strip() or getattr(
@@ -2859,7 +3174,7 @@ class ModelPreviewWidget(QOpenGLWidget):
         if sum(support_available_counts.values()) <= 0:
             support_gate_reasons.append("no support maps resolved")
         if not self._high_quality_textures:
-            support_gate_reasons.append("high-quality shading off")
+            support_gate_reasons.append("support-map preview shading off")
         if bool(getattr(settings, "disable_all_support_maps", False)) or self.support_maps_disabled():
             support_gate_reasons.append("support maps disabled")
         disabled_slots = [
@@ -2891,6 +3206,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                 f"{'; ' + ', '.join(support_gate_reasons) if support_gate_reasons else ''}"
             ),
             f"Base Source: {self._summarize_overlay_values(base_sources)}",
+            f"Base Quality: {self._summarize_overlay_values(base_qualities)}",
             (
                 f"Preview Approximation: {sidecar_approximation_count:,} sidecar material parameter set(s)"
                 if sidecar_approximation_count
@@ -2911,6 +3227,11 @@ class ModelPreviewWidget(QOpenGLWidget):
         mode = str(getattr(settings, "render_diagnostic_mode", "") or "").strip().lower()
         return MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODE_LABELS.get(mode, mode.replace("_", " ").title() or "Lit")
 
+    @staticmethod
+    def _render_mode_uses_derived_relief(settings: Optional[ModelPreviewRenderSettings]) -> bool:
+        mode = str(getattr(settings, "render_diagnostic_mode", "lit") or "lit").strip().lower()
+        return mode in {"rich_lit", "height_calibrated"}
+
     def render_settings(self) -> ModelPreviewRenderSettings:
         return clamp_model_preview_render_settings(self._render_settings)
 
@@ -2921,16 +3242,27 @@ class ModelPreviewWidget(QOpenGLWidget):
         clamped = clamp_model_preview_render_settings(settings)
         previous = self._render_settings
         self._render_settings = clamped
+        render_response_changed = (
+            previous.render_diagnostic_mode != clamped.render_diagnostic_mode
+            or previous.height_effect_max != clamped.height_effect_max
+            or previous.specular_max != clamped.specular_max
+            or previous.shininess_max != clamped.shininess_max
+        )
+        derived_relief_need_changed = (
+            self._render_mode_uses_derived_relief(previous)
+            != self._render_mode_uses_derived_relief(clamped)
+        )
         textures_changed = (
             previous.preview_texture_max_dimension != clamped.preview_texture_max_dimension
             or previous.low_quality_texture_max_dimension != clamped.low_quality_texture_max_dimension
             or previous.max_anisotropy != clamped.max_anisotropy
             or previous.force_nearest_no_mipmaps != clamped.force_nearest_no_mipmaps
+            or derived_relief_need_changed
         )
-        if (
-            previous.visible_texture_mode != clamped.visible_texture_mode
-            or previous.render_diagnostic_mode != clamped.render_diagnostic_mode
-        ):
+        if render_response_changed:
+            self._batch_render_diagnostics = {}
+            self._framebuffer_visibility_diagnostic = _FramebufferVisibilitySample()
+        if previous.visible_texture_mode != clamped.visible_texture_mode or render_response_changed:
             self._refresh_debug_overlay_lines()
         if textures_changed and self._gl_ready and self.context() is not None:
             self.makeCurrent()
@@ -3109,10 +3441,12 @@ class ModelPreviewWidget(QOpenGLWidget):
             attribute vec2 texcoord;
             attribute vec3 tangent;
             attribute vec3 bitangent;
+            attribute vec3 smooth_normal;
             uniform mat4 mvp_matrix;
             uniform mat4 model_matrix;
             varying vec3 frag_position;
             varying vec3 frag_normal;
+            varying vec3 frag_smooth_normal;
             varying vec3 frag_color;
             varying vec2 frag_texcoord;
             varying vec3 frag_tangent;
@@ -3131,6 +3465,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             void main() {
                 frag_position = (model_matrix * vec4(position, 1.0)).xyz;
                 frag_normal = safe_normalize((model_matrix * vec4(normal, 0.0)).xyz, vec3(0.0, 0.0, 1.0));
+                frag_smooth_normal = safe_normalize((model_matrix * vec4(smooth_normal, 0.0)).xyz, frag_normal);
                 frag_tangent = safe_normalize((model_matrix * vec4(tangent, 0.0)).xyz, vec3(1.0, 0.0, 0.0));
                 frag_bitangent = safe_normalize((model_matrix * vec4(bitangent, 0.0)).xyz, vec3(0.0, 1.0, 0.0));
                 frag_color = color;
@@ -3146,6 +3481,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             #version 120
             varying vec3 frag_position;
             varying vec3 frag_normal;
+            varying vec3 frag_smooth_normal;
             varying vec3 frag_color;
             varying vec2 frag_texcoord;
             varying vec3 frag_tangent;
@@ -3167,16 +3503,23 @@ class ModelPreviewWidget(QOpenGLWidget):
             uniform vec2 base_texture_uv_scale;
             uniform vec3 base_texture_average_color;
             uniform float base_texture_average_luma;
+            uniform int base_texture_quality;
             uniform int use_high_quality;
             uniform int use_normal_texture;
             uniform float normal_texture_strength;
             uniform int use_material_texture;
             uniform int use_height_texture;
+            uniform int use_relief_texture;
             uniform float diffuse_wrap_bias;
             uniform float diffuse_light_scale;
             uniform float normal_strength_cap;
             uniform float normal_strength_floor;
             uniform float height_effect_max;
+            uniform float height_sample_min;
+            uniform float height_sample_max;
+            uniform float height_sample_contrast;
+            uniform int height_relief_usable;
+            uniform int relief_source_code;
             uniform float cavity_clamp_min;
             uniform float cavity_clamp_max;
             uniform float specular_base;
@@ -3191,6 +3534,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             uniform sampler2D normal_texture;
             uniform sampler2D material_texture;
             uniform sampler2D height_texture;
+            uniform sampler2D relief_texture;
             vec4 apply_diffuse_swizzle(vec4 value, int mode) {
                 vec4 sample = clamp(value, 0.0, 1.0);
                 if (mode == 1) {
@@ -3233,6 +3577,30 @@ class ModelPreviewWidget(QOpenGLWidget):
                 vec3 hue = clamp(hint / hint_luma, vec3(0.35), vec3(1.85));
                 vec3 colored = clamp(max(base * 0.72, hue * max(base_luma, 0.10)), 0.0, 1.35);
                 return mix(base, colored, clamp(amount, 0.0, 1.0));
+            }
+            float calibrated_height_value(float raw_height) {
+                float range = max(height_sample_max - height_sample_min, 0.001);
+                float normalized = clamp((raw_height - height_sample_min) / range, 0.0, 1.0);
+                float contrast = max(height_sample_contrast, range);
+                float auto_gain = clamp(0.24 / max(contrast, 0.018), 1.0, 5.5);
+                float centered = (normalized - 0.5) * auto_gain;
+                return clamp(0.5 + centered, 0.0, 1.0);
+            }
+            float sample_relief_height(vec2 uv) {
+                float raw_height = 0.5;
+                if (relief_source_code == 1) {
+                    raw_height = texture2D(height_texture, uv).r;
+                } else if (relief_source_code == 2) {
+                    raw_height = texture2D(relief_texture, uv).r;
+                } else if (relief_source_code == 3) {
+                    float true_height = texture2D(height_texture, uv).r;
+                    float derived_detail = texture2D(relief_texture, uv).r - 0.5;
+                    raw_height = clamp(true_height + (derived_detail * 0.28), 0.0, 1.0);
+                }
+                if (height_relief_usable == 0) {
+                    return raw_height;
+                }
+                return calibrated_height_value(raw_height);
             }
             void decode_material_sample(
                 vec4 sample_value,
@@ -3332,6 +3700,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                 opacity_value = clamp(opacity_value, 0.0, 1.0);
             }
             void main() {
+                bool rich_lit = render_diagnostic_mode == 22;
                 if (render_diagnostic_mode == 1) {
                     gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
                     return;
@@ -3347,6 +3716,23 @@ class ModelPreviewWidget(QOpenGLWidget):
                     gl_FragColor = vec4(mix(vec3(0.08, 0.22, 0.72), vec3(0.95, 0.95, 0.18), checker), 1.0);
                     return;
                 }
+                if (render_diagnostic_mode == 24) {
+                    float relief_bar = clamp(height_effect_max, 0.0, 1.0);
+                    float shine_bar = clamp(specular_max, 0.0, 1.0);
+                    float contrast_bar = clamp((shininess_max - 1.0) / 255.0, 0.0, 1.0);
+                    vec2 cell = floor(gl_FragCoord.xy / vec2(18.0, 18.0));
+                    float checker = mod(cell.x + cell.y, 2.0) * 0.10;
+                    float scan = step(0.50, fract(gl_FragCoord.y / 54.0));
+                    vec3 control_color = vec3(
+                        mix(0.18, 1.00, relief_bar),
+                        mix(0.18, 1.00, shine_bar),
+                        mix(0.18, 1.00, contrast_bar)
+                    );
+                    control_color = max(control_color, vec3(0.22, 0.22, 0.22));
+                    control_color += checker + (scan * vec3(0.06, 0.03, 0.08));
+                    gl_FragColor = vec4(clamp(control_color, 0.0, 1.0), 1.0);
+                    return;
+                }
                 vec3 fallback_vertex_color = max(frag_color, vec3(0.0));
                 float fallback_luma = dot(fallback_vertex_color, vec3(0.2126, 0.7152, 0.0722));
                 if (fallback_luma <= 0.045) {
@@ -3354,6 +3740,8 @@ class ModelPreviewWidget(QOpenGLWidget):
                 }
                 vec4 base_color = vec4(fallback_vertex_color, 1.0);
                 vec2 sample_uv = disable_uv_scale != 0 ? frag_texcoord : frag_texcoord * base_texture_uv_scale;
+                float relief_self_shadow = 0.0;
+                float relief_parallax_amount = 0.0;
                 float sampled_base_luma = dot(base_color.rgb, vec3(0.2126, 0.7152, 0.0722));
                 vec3 protected_average = clamp(base_texture_average_color, 0.0, 1.0);
                 if (disable_tint == 0) {
@@ -3372,6 +3760,53 @@ class ModelPreviewWidget(QOpenGLWidget):
                     gl_FragColor = vec4(clamp((surface_normal * 0.5) + vec3(0.5), 0.0, 1.0), 1.0);
                     return;
                 }
+                vec3 preview_tangent = safe_normalize(frag_tangent, vec3(1.0, 0.0, 0.0));
+                vec3 preview_bitangent = safe_normalize(frag_bitangent, vec3(0.0, 1.0, 0.0));
+                if (rich_lit) {
+                    vec3 smoothed_preview_normal = safe_normalize(frag_smooth_normal, surface_normal);
+                    if (dot(surface_normal, smoothed_preview_normal) > 0.05) {
+                        surface_normal = safe_normalize(mix(surface_normal, smoothed_preview_normal, 0.72), surface_normal);
+                    }
+                }
+                if (rich_lit && use_high_quality != 0 && use_relief_texture != 0 && height_relief_usable != 0 && height_effect_max > 0.001) {
+                    vec3 preview_view_dir = safe_normalize(camera_position - frag_position, vec3(0.0, 0.0, 1.0));
+                    vec3 tangent_view = vec3(
+                        dot(preview_view_dir, preview_tangent),
+                        dot(preview_view_dir, preview_bitangent),
+                        max(dot(preview_view_dir, surface_normal), 0.18)
+                    );
+                    vec2 parallax_dir = tangent_view.xy / max(abs(tangent_view.z), 0.22);
+                    float parallax_scale = height_effect_max * mix(0.075, 0.220, clamp(height_effect_max, 0.0, 1.0));
+                    float layer_depth = 0.0;
+                    float layer_step = 1.0 / 8.0;
+                    vec2 uv_step = parallax_dir * parallax_scale * layer_step;
+                    vec2 relief_uv = sample_uv;
+                    float relief_height = sample_relief_height(relief_uv);
+                    float previous_height = relief_height;
+                    float parallax_valley = relief_height;
+                    for (int relief_step = 0; relief_step < 8; ++relief_step) {
+                        if (relief_height <= layer_depth) {
+                            break;
+                        }
+                        previous_height = relief_height;
+                        relief_uv -= uv_step;
+                        layer_depth += layer_step;
+                        relief_height = sample_relief_height(relief_uv);
+                        parallax_valley = min(parallax_valley, relief_height);
+                    }
+                    float after_depth = relief_height - layer_depth;
+                    float before_depth = previous_height - max(layer_depth - layer_step, 0.0);
+                    float relief_weight = before_depth / max(before_depth - after_depth, 0.001);
+                    vec2 parallax_uv = mix(relief_uv, relief_uv + uv_step, clamp(relief_weight, 0.0, 1.0));
+                    float parallax_height = sample_relief_height(parallax_uv);
+                    relief_parallax_amount = clamp(length(parallax_uv - sample_uv) / max(parallax_scale, 0.001), 0.0, 1.0);
+                    relief_self_shadow = clamp(
+                        ((parallax_height - parallax_valley) * 4.80 + abs(parallax_height - relief_height) * 2.25) * height_effect_max,
+                        0.0,
+                        0.88
+                    );
+                    sample_uv = parallax_uv;
+                }
                 if (render_diagnostic_mode == 6) {
                     gl_FragColor = vec4(fract(abs(sample_uv.x)), fract(abs(sample_uv.y)), 0.35, 1.0);
                     return;
@@ -3388,7 +3823,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                     if (
                         base_color.a <= 0.01
                         && alpha_handling_mode == 0
-                        && (render_diagnostic_mode == 0 || render_diagnostic_mode == 16)
+                        && (render_diagnostic_mode == 0 || render_diagnostic_mode == 16 || rich_lit)
                     ) {
                         discard;
                     }
@@ -3422,7 +3857,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                     float material_hint_sat = color_saturation(fallback_vertex_color);
                     float base_sat = color_saturation(base_color.rgb);
                     if (
-                        (render_diagnostic_mode == 0 || render_diagnostic_mode == 16)
+                        (render_diagnostic_mode == 0 || render_diagnostic_mode == 16 || rich_lit)
                         && material_hint_luma > 0.055
                         && material_hint_sat > 0.075
                         && sampled_base_luma > 0.045
@@ -3430,6 +3865,27 @@ class ModelPreviewWidget(QOpenGLWidget):
                     ) {
                         float colorize_amount = clamp((material_hint_sat - base_sat) * 1.25, 0.0, 0.48);
                         base_color.rgb = luma_preserving_colorize(base_color.rgb, fallback_vertex_color, colorize_amount);
+                        sampled_base_luma = dot(base_color.rgb, vec3(0.2126, 0.7152, 0.0722));
+                    }
+                    if (
+                        rich_lit
+                        && material_hint_luma > 0.045
+                        && material_hint_sat > 0.040
+                        && sampled_base_luma > 0.030
+                    ) {
+                        float low_authority_drive = base_texture_quality == 1 ? 1.0 : 0.0;
+                        float fallback_drive = base_texture_quality == 2 ? 1.0 : 0.0;
+                        float flat_base_drive = clamp((sampled_base_luma - 0.78) * 2.2, 0.0, 1.0);
+                        flat_base_drive = max(flat_base_drive, clamp((0.13 - base_sat) * 4.0, 0.0, 0.75));
+                        float rich_colorize = clamp(
+                            (low_authority_drive * 0.58)
+                            + (fallback_drive * 0.72)
+                            + (flat_base_drive * 0.36)
+                            + max(0.0, material_hint_sat - base_sat) * 0.50,
+                            0.0,
+                            0.78
+                        );
+                        base_color.rgb = luma_preserving_colorize(base_color.rgb, fallback_vertex_color, rich_colorize);
                         sampled_base_luma = dot(base_color.rgb, vec3(0.2126, 0.7152, 0.0722));
                     }
                 } else if (render_diagnostic_mode == 8 || render_diagnostic_mode == 9 || render_diagnostic_mode == 10 || render_diagnostic_mode == 14 || render_diagnostic_mode == 15 || render_diagnostic_mode == 21) {
@@ -3473,6 +3929,15 @@ class ModelPreviewWidget(QOpenGLWidget):
                     gl_FragColor = vec4(vec3(clamp(height_sample, 0.0, 1.0)), 1.0);
                     return;
                 }
+                if (render_diagnostic_mode == 23) {
+                    float height_sample = use_height_texture != 0 ? texture2D(height_texture, sample_uv).r : 0.0;
+                    float calibrated_sample = use_relief_texture != 0 && height_relief_usable != 0
+                        ? sample_relief_height(sample_uv)
+                        : height_sample;
+                    vec3 inactive_tint = height_relief_usable != 0 ? vec3(1.0) : vec3(0.70, 0.55, 0.92);
+                    gl_FragColor = vec4(clamp(vec3(calibrated_sample) * inactive_tint, 0.0, 1.0), 1.0);
+                    return;
+                }
                 float material_ao = 1.0;
                 float material_roughness = 0.58;
                 float material_metallic = 0.0;
@@ -3505,6 +3970,20 @@ class ModelPreviewWidget(QOpenGLWidget):
                     max(abs(material_sample.r - material_sample.g), abs(material_sample.g - material_sample.b)),
                     abs(material_sample.r - material_sample.b)
                 );
+                float effective_height_effect_max = rich_lit ? height_effect_max : 0.35;
+                float effective_specular_max = rich_lit ? specular_max : 0.18;
+                float effective_shininess_max = rich_lit ? shininess_max : 72.0;
+                float support_depth_drive = clamp(effective_height_effect_max, 0.0, 1.0);
+                float support_shine_drive = clamp(effective_specular_max, 0.0, 1.0);
+                float support_rough_drive = clamp((effective_shininess_max - 32.0) / 224.0, 0.0, 1.0);
+                if (rich_lit && use_high_quality != 0) {
+                    float rough_center = material_roughness - 0.5;
+                    float rough_contrast_gain = mix(0.45, 4.20, support_rough_drive);
+                    material_roughness = clamp(0.5 + (rough_center * rough_contrast_gain), 0.035, 1.0);
+                    material_specular = clamp(material_specular * mix(0.55, 3.60, support_shine_drive), 0.0, 1.0);
+                    material_metallic = clamp(material_metallic * mix(0.72, 2.10, support_shine_drive), 0.0, 1.0);
+                    material_cavity = clamp(material_cavity - (material_channel_variance * support_depth_drive * 0.48), 0.0, 1.0);
+                }
                 float material_raw_metal_hint = use_material_texture != 0
                     ? clamp(max(material_metallic, max(material_sample.b * 0.72, material_sample.r * 0.28)), 0.0, 1.0)
                     : material_metallic;
@@ -3513,26 +3992,29 @@ class ModelPreviewWidget(QOpenGLWidget):
                     : material_specular;
 
                 float height_value = 0.5;
-                if (use_height_texture != 0) {
-                    height_value = texture2D(height_texture, sample_uv).r;
+                if (use_relief_texture != 0) {
+                    height_value = (rich_lit && height_relief_usable != 0)
+                        ? sample_relief_height(sample_uv)
+                        : texture2D(relief_texture, sample_uv).r;
                 }
                 float relief = clamp((height_value - 0.5) * 2.0, -1.0, 1.0);
-                float height_effect = clamp(abs(relief) * height_effect_max, 0.0, height_effect_max);
-                float support_depth_drive = clamp(height_effect_max, 0.0, 1.0);
-                float support_shine_drive = clamp(specular_max, 0.0, 1.0);
-                float support_rough_drive = clamp((shininess_max - 32.0) / 224.0, 0.0, 1.0);
+                float height_effect = clamp(abs(relief) * effective_height_effect_max, 0.0, effective_height_effect_max);
                 float height_edge = 0.0;
                 float height_ridge = 0.5;
-                if (use_height_texture != 0) {
+                if (use_relief_texture != 0) {
                     vec2 height_gradient = vec2(dFdx(height_value), dFdy(height_value));
-                    height_edge = clamp(length(height_gradient) * mix(20.0, 115.0, support_depth_drive), 0.0, 1.0);
-                    height_ridge = clamp(0.5 + (relief * mix(0.32, 1.95, support_depth_drive)), 0.0, 1.0);
+                    float relief_gradient_gain = rich_lit && height_relief_usable != 0 ? 520.0 : 115.0;
+                    height_edge = clamp(length(height_gradient) * mix(20.0, relief_gradient_gain, support_depth_drive), 0.0, 1.0);
+                    height_ridge = clamp(0.5 + (relief * mix(0.32, rich_lit ? 5.10 : 1.95, support_depth_drive)), 0.0, 1.0);
                 }
+                float normal_detail_strength = 0.0;
+                float normal_light_delta = 0.0;
+                float normal_grazing_detail = 0.0;
 
                 if (render_diagnostic_mode == 17) {
                     float depth_drive = mix(0.12, 1.0, support_depth_drive);
-                    float relief_drive = use_height_texture != 0 ? relief : ((sampled_base_luma - 0.5) * 0.45);
-                    float ridge = use_height_texture != 0
+                    float relief_drive = use_relief_texture != 0 ? relief : ((sampled_base_luma - 0.5) * 0.45);
+                    float ridge = use_relief_texture != 0
                         ? height_ridge
                         : clamp(0.5 + (relief_drive * mix(0.22, 2.10, depth_drive)), 0.0, 1.0);
                     float relief_edge = max(
@@ -3585,6 +4067,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                 if (use_high_quality != 0 && use_normal_texture != 0) {
                     vec3 tangent = safe_normalize(frag_tangent, vec3(1.0, 0.0, 0.0));
                     vec3 bitangent = safe_normalize(frag_bitangent, vec3(0.0, 1.0, 0.0));
+                    vec3 unperturbed_normal = surface_normal;
                     vec3 sampled_normal = texture2D(normal_texture, sample_uv).xyz * 2.0 - 1.0;
                     sampled_normal.y = -sampled_normal.y;
                     float mapped_strength = clamp(
@@ -3593,17 +4076,52 @@ class ModelPreviewWidget(QOpenGLWidget):
                         normal_strength_cap
                     );
                     float strength_ratio = clamp(mapped_strength / max(normal_strength_cap, 0.001), 0.0, 1.0);
-                    sampled_normal.xy *= mix(0.75, 1.35, strength_ratio);
+                    float rich_normal_gain = rich_lit ? mix(1.05, 2.25, support_depth_drive) : 1.0;
+                    sampled_normal.xy *= mix(0.75, 1.35, strength_ratio) * rich_normal_gain;
                     sampled_normal.xy *= mapped_strength;
+                    vec2 normal_xy = sampled_normal.xy;
                     sampled_normal = safe_normalize(sampled_normal, vec3(0.0, 0.0, 1.0));
                     mat3 tbn = mat3(tangent, bitangent, surface_normal);
                     vec3 mapped_normal = safe_normalize(tbn * sampled_normal, surface_normal);
-                    surface_normal = safe_normalize(mix(surface_normal, mapped_normal, clamp(mapped_strength * 0.92, 0.0, 0.94)), surface_normal);
+                    vec3 normal_probe_light = safe_normalize(vec3(0.20, 0.45, 1.0), vec3(0.20, 0.45, 1.0));
+                    normal_detail_strength = clamp(length(normal_xy) * mix(0.55, rich_lit ? 1.45 : 1.05, strength_ratio), 0.0, 1.0);
+                    normal_light_delta = clamp(dot(mapped_normal, normal_probe_light) - dot(unperturbed_normal, normal_probe_light), -1.0, 1.0);
+                    normal_grazing_detail = clamp(length(mapped_normal - unperturbed_normal) * mix(0.45, rich_lit ? 1.35 : 0.95, strength_ratio), 0.0, 1.0);
+                    surface_normal = safe_normalize(
+                        mix(surface_normal, mapped_normal, clamp(mapped_strength * (rich_lit ? mix(1.05, 1.45, support_depth_drive) : 0.92), 0.0, 0.98)),
+                        surface_normal
+                    );
+                }
+                if (rich_lit && use_high_quality != 0 && use_relief_texture != 0 && height_relief_usable != 0) {
+                    vec2 relief_gradient = vec2(dFdx(height_value), dFdy(height_value));
+                    vec2 relief_texel = vec2(0.0025, 0.0025);
+                    vec2 relief_uv_gradient = vec2(
+                        sample_relief_height(sample_uv + vec2(relief_texel.x, 0.0)) - sample_relief_height(sample_uv - vec2(relief_texel.x, 0.0)),
+                        sample_relief_height(sample_uv + vec2(0.0, relief_texel.y)) - sample_relief_height(sample_uv - vec2(0.0, relief_texel.y))
+                    );
+                    relief_gradient += relief_uv_gradient * mix(5.0, 30.0, support_depth_drive);
+                    vec3 relief_normal = safe_normalize(
+                        surface_normal + vec3(-relief_gradient.x, -relief_gradient.y, height_edge * 0.32) * clamp(effective_height_effect_max * 1.90, 0.0, 1.90),
+                        surface_normal
+                    );
+                    surface_normal = safe_normalize(mix(surface_normal, relief_normal, clamp(effective_height_effect_max * 1.45, 0.0, 0.98)), surface_normal);
                 }
 
                 vec3 main_light = safe_normalize(light_direction, vec3(0.20, 0.45, 1.0));
                 vec3 fill_light = safe_normalize(vec3(-main_light.x * 0.35, 0.45, -main_light.z * 0.35), vec3(-0.25, 0.55, -0.25));
                 vec3 rim_light = safe_normalize(vec3(-0.10, 0.32, -1.0), vec3(-0.10, 0.32, -1.0));
+                if (rich_lit && use_high_quality != 0 && use_relief_texture != 0 && height_relief_usable != 0 && height_effect_max > 0.001) {
+                    vec2 light_relief_dir = vec2(dot(main_light, preview_tangent), dot(main_light, preview_bitangent));
+                    float light_relief_len = length(light_relief_dir);
+                    if (light_relief_len > 0.001) {
+                        light_relief_dir /= light_relief_len;
+                        float light_probe_height = sample_relief_height(sample_uv + light_relief_dir * height_effect_max * 0.120);
+                        relief_self_shadow = max(
+                            relief_self_shadow,
+                            clamp((height_value - light_probe_height) * effective_height_effect_max * 7.25, 0.0, 0.88)
+                        );
+                    }
+                }
                 float wrap_bias = max(0.0, diffuse_wrap_bias);
                 float primary_diffuse = wrapped_lambert(surface_normal, main_light, wrap_bias);
                 float fill_diffuse = wrapped_lambert(surface_normal, fill_light, wrap_bias * 0.65);
@@ -3617,7 +4135,8 @@ class ModelPreviewWidget(QOpenGLWidget):
 
                 if (use_high_quality != 0) {
                     float occlusion_drive = clamp(
-                        mix(material_ao, min(material_ao, material_cavity), 0.45) - (abs(relief) * (0.10 + (height_effect_max * 0.16))),
+                        mix(material_ao, min(material_ao, material_cavity), rich_lit ? 0.68 : 0.45)
+                        - (abs(relief) * (0.10 + (effective_height_effect_max * (rich_lit ? 0.34 : 0.16)))),
                         0.0,
                         1.0
                     );
@@ -3626,9 +4145,18 @@ class ModelPreviewWidget(QOpenGLWidget):
                         cavity_clamp_min,
                         cavity_clamp_max
                     );
-                    lighting *= mix(1.0, cavity_scale, (use_material_texture != 0 || use_height_texture != 0) ? 0.22 : 0.06);
-                    lighting += height_effect * (0.24 + (primary_diffuse * 0.18));
-                    lighting += height_edge * (0.05 + (support_depth_drive * 0.22));
+                    lighting *= mix(1.0, cavity_scale, (use_material_texture != 0 || use_relief_texture != 0) ? (rich_lit ? 0.58 : 0.22) : 0.06);
+                    lighting *= 1.0 - (relief_self_shadow * (rich_lit ? mix(0.70, 1.10, support_depth_drive) : 0.0));
+                    lighting += height_effect * (rich_lit ? 1.12 : 0.24) + height_effect * primary_diffuse * (rich_lit ? 0.92 : 0.18);
+                    lighting += relief_parallax_amount * support_depth_drive * (rich_lit ? 0.48 : 0.0);
+                    lighting += height_edge * ((rich_lit ? 0.34 : 0.05) + (support_depth_drive * (rich_lit ? 1.08 : 0.22)));
+                    if (use_normal_texture != 0) {
+                        float normal_shadow = max(0.0, -normal_light_delta);
+                        float normal_highlight = max(0.0, normal_light_delta);
+                        lighting *= clamp(1.0 - (normal_shadow * (rich_lit ? 0.56 : 0.34)), 0.42, 1.0);
+                        lighting += normal_highlight * (rich_lit ? 0.48 : 0.30);
+                        lighting += normal_detail_strength * (rich_lit ? 0.18 : 0.10);
+                    }
                 }
                 if (disable_lighting != 0) {
                     gl_FragColor = vec4(clamp(base_color.rgb, 0.0, 1.0), base_color.a);
@@ -3643,27 +4171,38 @@ class ModelPreviewWidget(QOpenGLWidget):
                 vec3 specular_color = vec3(1.0);
                 if (use_high_quality != 0) {
                     float material_shine = max(max(material_specular, material_metallic * 0.78), (1.0 - material_roughness) * 0.34);
+                    if (rich_lit) {
+                        float mask_detail = clamp(material_channel_variance * 0.78 + height_edge * 0.52, 0.0, 0.84);
+                        material_shine = clamp(
+                            material_shine
+                            + (material_raw_specular_hint * mix(0.08, 0.68, support_shine_drive))
+                            + mask_detail * mix(0.26, 1.05, support_shine_drive),
+                            0.0,
+                            1.0
+                        );
+                    }
                     float specular_mask = clamp(
-                        mix(specular_base, specular_max, material_shine),
+                        mix(specular_base, effective_specular_max, material_shine) * (rich_lit ? mix(0.85, 3.30, support_shine_drive) : 1.0),
                         specular_min,
-                        specular_max
+                        rich_lit ? min(1.0, max(effective_specular_max, 0.08) * 3.20) : effective_specular_max
                     );
                     float shininess = clamp(
-                        mix(shininess_max, shininess_min, material_roughness) + (height_effect * height_shininess_boost),
+                        mix(effective_shininess_max, shininess_min, material_roughness) + (height_effect * height_shininess_boost * (rich_lit ? 1.25 : 1.0)),
                         shininess_min,
-                        shininess_max
+                        effective_shininess_max
                     );
-                    float fresnel = pow(1.0 - view_facing, 4.0);
-                    float rim_response = pow(1.0 - view_facing, 2.4);
+                    float fresnel = pow(1.0 - view_facing, rich_lit ? 3.2 : 4.0);
+                    float rim_response = pow(1.0 - view_facing, rich_lit ? 2.0 : 2.4);
                     specular_color = mix(
                         vec3(1.0),
                         clamp((base_color.rgb * 1.15) + vec3(0.08), 0.0, 1.0),
                         material_metallic * 0.68
                     );
                     specular = pow(max(dot(surface_normal, half_dir), 0.0), shininess) * specular_mask;
-                    specular += fresnel * (0.035 + (material_specular * 0.22) + (material_metallic * 0.18));
-                    specular += pow(max(dot(surface_normal, view_dir), 0.0), max(4.0, shininess * 0.35)) * material_metallic * specular_mask * 0.24;
-                    rim_specular = rim_response * (0.025 + (material_specular * 0.08) + (material_metallic * 0.05));
+                    specular += fresnel * (0.035 + (material_specular * (rich_lit ? mix(0.10, 0.58, support_shine_drive) : 0.22)) + (material_metallic * (rich_lit ? mix(0.08, 0.42, support_shine_drive) : 0.18)));
+                    specular += pow(max(dot(surface_normal, view_dir), 0.0), max(4.0, shininess * 0.35)) * material_metallic * specular_mask * (rich_lit ? mix(0.12, 0.62, support_shine_drive) : 0.24);
+                    specular += height_edge * material_shine * (rich_lit ? mix(0.015, 0.12, support_shine_drive) : 0.0);
+                    rim_specular = rim_response * (0.025 + (material_specular * (rich_lit ? mix(0.04, 0.22, support_shine_drive) : 0.08)) + (material_metallic * (rich_lit ? mix(0.03, 0.13, support_shine_drive) : 0.05)));
                 }
                 if (render_diagnostic_mode == 19) {
                     float shine_drive = support_shine_drive;
@@ -3709,16 +4248,54 @@ class ModelPreviewWidget(QOpenGLWidget):
                         + (material_channel_variance * 0.18),
                         0.0,
                         1.0
-                    ) * (0.22 + (support_shine_drive * 1.20));
+                    ) * ((rich_lit ? 0.34 : 0.22) + (support_shine_drive * (rich_lit ? 1.55 : 1.20)));
                     broad_sheen = clamp(broad_sheen, 0.0, 1.0);
                 }
                 vec3 final_rgb = base_color.rgb * clamp(lighting, 0.72, 1.58);
                 if (use_high_quality != 0) {
                     float relief_tone = (height_ridge - 0.5) * support_depth_drive;
-                    final_rgb *= clamp(1.0 + (relief_tone * 0.26) + ((smoothness - 0.5) * support_rough_drive * 0.12), 0.72, 1.30);
-                    final_rgb += vec3(height_edge * support_depth_drive * 0.075);
-                    final_rgb += specular_color * broad_sheen * (0.030 + (primary_diffuse * 0.035) + (pow(1.0 - view_facing, 1.55) * 0.18));
-                    final_rgb = mix(final_rgb, luma_preserving_colorize(final_rgb, specular_color, broad_sheen * material_metallic * 0.22), support_shine_drive);
+                    final_rgb *= clamp(
+                        1.0
+                        + (relief_tone * (rich_lit ? 0.58 : 0.26))
+                        + ((smoothness - 0.5) * support_rough_drive * (rich_lit ? 0.18 : 0.12)),
+                        0.72,
+                        rich_lit ? 1.52 : 1.30
+                    );
+                    final_rgb += vec3(height_edge * support_depth_drive * (rich_lit ? 0.165 : 0.075));
+                    if (rich_lit) {
+                        float relief_detail = use_relief_texture != 0 && height_relief_usable != 0
+                            ? ((height_ridge - 0.5) * 2.0)
+                            : ((sampled_base_luma - base_texture_average_luma) * 1.35);
+                        float relief_visibility_gain = clamp(0.18 + (support_depth_drive * 0.76), 0.0, 0.94);
+                        vec3 relief_visual_rgb = final_rgb
+                            * clamp(1.0 + (relief_detail * mix(0.42, 1.12, support_depth_drive)), 0.42, 1.72);
+                        relief_visual_rgb -= vec3(relief_self_shadow * mix(0.20, 0.62, support_depth_drive));
+                        relief_visual_rgb += vec3(height_edge * mix(0.16, 0.46, support_depth_drive));
+                        relief_visual_rgb += vec3(relief_parallax_amount * support_depth_drive * 0.18);
+                        final_rgb = mix(final_rgb, relief_visual_rgb, relief_visibility_gain);
+                        final_rgb *= clamp(1.0 - (relief_self_shadow * mix(0.22, 0.58, support_depth_drive)), 0.42, 1.0);
+                        final_rgb += vec3(relief_parallax_amount * support_depth_drive * 0.12);
+                    }
+                    if (use_normal_texture != 0) {
+                        float normal_texture_contrast = normal_detail_strength * (rich_lit ? 0.36 : 0.22);
+                        float normal_ridge_light = max(0.0, normal_light_delta) * (rich_lit ? 0.34 : 0.22);
+                        float normal_micro_shadow = max(0.0, -normal_light_delta) * (rich_lit ? 0.42 : 0.26);
+                        vec3 normal_detail_rgb = final_rgb;
+                        normal_detail_rgb *= clamp(1.0 + (normal_light_delta * (rich_lit ? 0.72 : 0.46)), 0.48, 1.62);
+                        normal_detail_rgb *= clamp(1.0 - normal_micro_shadow, 0.52, 1.0);
+                        normal_detail_rgb += vec3((normal_texture_contrast * 0.10) + normal_ridge_light);
+                        final_rgb = mix(final_rgb, normal_detail_rgb, clamp(0.35 + normal_grazing_detail, 0.0, rich_lit ? 0.88 : 0.62));
+                    }
+                    final_rgb += specular_color * broad_sheen * (
+                        (rich_lit ? 0.045 : 0.030)
+                        + (primary_diffuse * (rich_lit ? 0.050 : 0.035))
+                        + (pow(1.0 - view_facing, 1.55) * (rich_lit ? 0.26 : 0.18))
+                    );
+                    final_rgb = mix(
+                        final_rgb,
+                        luma_preserving_colorize(final_rgb, specular_color, broad_sheen * material_metallic * (rich_lit ? 0.32 : 0.22)),
+                        support_shine_drive
+                    );
                 }
                 final_rgb += specular_color * specular;
                 final_rgb += specular_color * rim_specular;
@@ -3733,6 +4310,135 @@ class ModelPreviewWidget(QOpenGLWidget):
                         final_rgb += vec3(protected_luma - output_luma);
                     }
                 }
+                if (
+                    rich_lit
+                    && use_high_quality != 0
+                    && use_relief_texture != 0
+                    && height_relief_usable != 0
+                    && support_depth_drive > 0.001
+                ) {
+                    float relief_depth_drive = clamp(support_depth_drive, 0.0, 1.0);
+                    float relief_shine_drive = clamp(support_shine_drive, 0.0, 1.0);
+                    float relief_contrast_drive = clamp(support_rough_drive, 0.0, 1.0);
+                    vec2 fine_texel = vec2(mix(0.0014, 0.0048, relief_depth_drive));
+                    vec2 broad_texel = vec2(mix(0.0048, 0.0150, relief_depth_drive));
+                    float h_center = height_value;
+                    float h_left = sample_relief_height(sample_uv - vec2(fine_texel.x, 0.0));
+                    float h_right = sample_relief_height(sample_uv + vec2(fine_texel.x, 0.0));
+                    float h_down = sample_relief_height(sample_uv - vec2(0.0, fine_texel.y));
+                    float h_up = sample_relief_height(sample_uv + vec2(0.0, fine_texel.y));
+                    float h_left_b = sample_relief_height(sample_uv - vec2(broad_texel.x, 0.0));
+                    float h_right_b = sample_relief_height(sample_uv + vec2(broad_texel.x, 0.0));
+                    float h_down_b = sample_relief_height(sample_uv - vec2(0.0, broad_texel.y));
+                    float h_up_b = sample_relief_height(sample_uv + vec2(0.0, broad_texel.y));
+                    vec2 fine_gradient = vec2(h_right - h_left, h_up - h_down);
+                    vec2 broad_gradient = vec2(h_right_b - h_left_b, h_up_b - h_down_b);
+                    float fine_slope = length(fine_gradient);
+                    float broad_slope = length(broad_gradient);
+                    float relief_slope = clamp(
+                        (fine_slope * mix(5.0, 42.0, relief_depth_drive))
+                        + (broad_slope * mix(3.0, 24.0, relief_depth_drive)),
+                        0.0,
+                        1.0
+                    );
+                    float fine_curve = ((h_left + h_right + h_down + h_up) * 0.25) - h_center;
+                    float broad_curve = ((h_left_b + h_right_b + h_down_b + h_up_b) * 0.25) - h_center;
+                    vec2 relief_light_dir = vec2(dot(main_light, preview_tangent), dot(main_light, preview_bitangent));
+                    if (length(relief_light_dir) <= 0.001) {
+                        relief_light_dir = vec2(0.45, 0.70);
+                    }
+                    relief_light_dir = normalize(relief_light_dir);
+                    float directional_relief = dot(normalize((fine_gradient * 2.4) + broad_gradient + vec2(0.0001)), relief_light_dir);
+                    float relief_cavity = clamp(
+                        max(0.0, fine_curve * mix(4.0, 18.0, relief_depth_drive))
+                        + max(0.0, broad_curve * mix(3.0, 14.0, relief_depth_drive))
+                        + (relief_slope * mix(0.06, 0.32, relief_contrast_drive)),
+                        0.0,
+                        1.0
+                    );
+                    float relief_ridge = clamp(
+                        max(0.0, -fine_curve * mix(3.0, 15.0, relief_depth_drive))
+                        + max(0.0, directional_relief * mix(0.20, 1.05, relief_depth_drive))
+                        + (relief_slope * mix(0.03, 0.22, relief_shine_drive)),
+                        0.0,
+                        1.0
+                    );
+                    float relief_local_contrast = clamp(
+                        (h_center - 0.5) * mix(0.35, 1.55, relief_depth_drive) * mix(0.65, 1.55, relief_contrast_drive),
+                        -0.85,
+                        0.85
+                    );
+                    vec3 relief_emboss_rgb = final_rgb;
+                    relief_emboss_rgb *= clamp(1.0 + relief_local_contrast, 0.34, 1.92);
+                    relief_emboss_rgb *= clamp(1.0 - (relief_cavity * mix(0.26, 0.78, relief_depth_drive)), 0.26, 1.0);
+                    relief_emboss_rgb += vec3(relief_ridge * mix(0.10, 0.42, relief_depth_drive));
+                    relief_emboss_rgb += specular_color * relief_ridge * relief_shine_drive * mix(0.08, 0.56, relief_shine_drive);
+                    relief_emboss_rgb += specular_color * pow(clamp(relief_slope, 0.0, 1.0), mix(2.2, 0.65, relief_shine_drive)) * relief_shine_drive * 0.22;
+                    final_rgb = mix(final_rgb, relief_emboss_rgb, mix(0.32, 0.92, relief_depth_drive));
+                    final_rgb = max(final_rgb, base_visibility_floor * mix(0.82, 0.48, relief_depth_drive));
+                }
+                if (rich_lit && use_high_quality != 0) {
+                    float radical_depth = clamp(support_depth_drive, 0.0, 1.0);
+                    float radical_shine = clamp(support_shine_drive, 0.0, 1.0);
+                    float radical_contrast = clamp(support_rough_drive, 0.0, 1.0);
+                    float radical_center = use_relief_texture != 0 && height_relief_usable != 0
+                        ? height_value
+                        : clamp(sampled_base_luma, 0.0, 1.0);
+                    vec2 radical_texel = vec2(mix(0.0020, 0.0180, radical_depth));
+                    float radical_l = use_relief_texture != 0 && height_relief_usable != 0
+                        ? sample_relief_height(sample_uv - vec2(radical_texel.x, 0.0))
+                        : clamp(radical_center - dFdx(sampled_base_luma) * 3.0, 0.0, 1.0);
+                    float radical_r = use_relief_texture != 0 && height_relief_usable != 0
+                        ? sample_relief_height(sample_uv + vec2(radical_texel.x, 0.0))
+                        : clamp(radical_center + dFdx(sampled_base_luma) * 3.0, 0.0, 1.0);
+                    float radical_d = use_relief_texture != 0 && height_relief_usable != 0
+                        ? sample_relief_height(sample_uv - vec2(0.0, radical_texel.y))
+                        : clamp(radical_center - dFdy(sampled_base_luma) * 3.0, 0.0, 1.0);
+                    float radical_u = use_relief_texture != 0 && height_relief_usable != 0
+                        ? sample_relief_height(sample_uv + vec2(0.0, radical_texel.y))
+                        : clamp(radical_center + dFdy(sampled_base_luma) * 3.0, 0.0, 1.0);
+                    float radical_average = (radical_l + radical_r + radical_d + radical_u) * 0.25;
+                    vec2 radical_gradient = vec2(radical_r - radical_l, radical_u - radical_d);
+                    vec2 radical_light = vec2(dot(main_light, preview_tangent), dot(main_light, preview_bitangent));
+                    if (length(radical_light) <= 0.001) {
+                        radical_light = vec2(0.55, 0.80);
+                    }
+                    radical_light = normalize(radical_light);
+                    float radical_slope = clamp(length(radical_gradient) * mix(18.0, 125.0, radical_depth), 0.0, 1.0);
+                    float radical_direction = dot(normalize(radical_gradient + vec2(0.0001)), radical_light);
+                    float radical_cavity = clamp(
+                        max(0.0, radical_average - radical_center) * mix(10.0, 48.0, radical_depth)
+                        + radical_slope * mix(0.12, 0.62, radical_contrast),
+                        0.0,
+                        1.0
+                    );
+                    float radical_ridge = clamp(
+                        max(0.0, radical_center - radical_average) * mix(8.0, 38.0, radical_depth)
+                        + max(0.0, radical_direction) * mix(0.20, 1.20, radical_depth)
+                        + radical_slope * mix(0.10, 0.70, radical_shine),
+                        0.0,
+                        1.0
+                    );
+                    float radical_cut = smoothstep(
+                        mix(0.05, 0.28, radical_contrast),
+                        mix(0.18, 0.74, radical_contrast),
+                        radical_slope + abs(radical_center - 0.5) * radical_depth
+                    );
+                    float radical_luma = dot(final_rgb, vec3(0.2126, 0.7152, 0.0722));
+                    vec3 radical_chiseled = final_rgb;
+                    radical_chiseled *= clamp(1.0 - radical_cavity * mix(0.55, 1.55, radical_depth), 0.08, 1.0);
+                    radical_chiseled += vec3(radical_ridge * mix(0.28, 1.15, radical_depth));
+                    radical_chiseled = mix(
+                        vec3(radical_luma),
+                        radical_chiseled,
+                        mix(1.0, 1.85, radical_contrast)
+                    );
+                    radical_chiseled += specular_color * pow(max(radical_ridge, radical_slope), mix(2.2, 0.38, radical_shine)) * radical_shine * 0.95;
+                    radical_chiseled += vec3(radical_cut * radical_depth * mix(0.00, 0.42, radical_shine));
+                    float radical_mix = clamp(0.18 + radical_depth * 0.92, 0.0, 1.0);
+                    final_rgb = mix(final_rgb, radical_chiseled, radical_mix);
+                    final_rgb *= clamp(1.0 + (radical_center - 0.5) * mix(0.25, 1.65, radical_depth) * mix(0.8, 1.8, radical_contrast), 0.16, 2.25);
+                }
                 gl_FragColor = vec4(clamp(final_rgb, 0.0, 1.65), base_color.a);
             }
             """,
@@ -3744,6 +4450,7 @@ class ModelPreviewWidget(QOpenGLWidget):
         program.bindAttributeLocation("texcoord", 3)
         program.bindAttributeLocation("tangent", 4)
         program.bindAttributeLocation("bitangent", 5)
+        program.bindAttributeLocation("smooth_normal", 6)
         if not program.link():
             raise RuntimeError(f"Model preview shader link failed: {program.log()}")
 
@@ -3757,6 +4464,7 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._normal_texture_sampler_uniform_location = program.uniformLocation("normal_texture")
         self._material_texture_sampler_uniform_location = program.uniformLocation("material_texture")
         self._height_texture_sampler_uniform_location = program.uniformLocation("height_texture")
+        self._relief_texture_sampler_uniform_location = program.uniformLocation("relief_texture")
         self._use_texture_uniform_location = program.uniformLocation("use_texture")
         self._render_diagnostic_mode_uniform_location = program.uniformLocation("render_diagnostic_mode")
         self._alpha_handling_mode_uniform_location = program.uniformLocation("alpha_handling_mode")
@@ -3771,17 +4479,24 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._base_texture_uv_scale_uniform_location = program.uniformLocation("base_texture_uv_scale")
         self._base_texture_average_color_uniform_location = program.uniformLocation("base_texture_average_color")
         self._base_texture_average_luma_uniform_location = program.uniformLocation("base_texture_average_luma")
+        self._base_texture_quality_uniform_location = program.uniformLocation("base_texture_quality")
         self._use_high_quality_uniform_location = program.uniformLocation("use_high_quality")
         self._use_normal_texture_uniform_location = program.uniformLocation("use_normal_texture")
         self._normal_texture_strength_uniform_location = program.uniformLocation("normal_texture_strength")
         self._use_material_texture_uniform_location = program.uniformLocation("use_material_texture")
         self._material_decode_mode_uniform_location = program.uniformLocation("material_decode_mode")
         self._use_height_texture_uniform_location = program.uniformLocation("use_height_texture")
+        self._use_relief_texture_uniform_location = program.uniformLocation("use_relief_texture")
         self._diffuse_wrap_bias_uniform_location = program.uniformLocation("diffuse_wrap_bias")
         self._diffuse_light_scale_uniform_location = program.uniformLocation("diffuse_light_scale")
         self._normal_strength_cap_uniform_location = program.uniformLocation("normal_strength_cap")
         self._normal_strength_floor_uniform_location = program.uniformLocation("normal_strength_floor")
         self._height_effect_max_uniform_location = program.uniformLocation("height_effect_max")
+        self._height_sample_min_uniform_location = program.uniformLocation("height_sample_min")
+        self._height_sample_max_uniform_location = program.uniformLocation("height_sample_max")
+        self._height_sample_contrast_uniform_location = program.uniformLocation("height_sample_contrast")
+        self._height_relief_usable_uniform_location = program.uniformLocation("height_relief_usable")
+        self._relief_source_code_uniform_location = program.uniformLocation("relief_source_code")
         self._cavity_clamp_min_uniform_location = program.uniformLocation("cavity_clamp_min")
         self._cavity_clamp_max_uniform_location = program.uniformLocation("cavity_clamp_max")
         self._specular_base_uniform_location = program.uniformLocation("specular_base")
@@ -3872,6 +4587,7 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._program.setUniformValue(self._normal_texture_sampler_uniform_location, 1)
         self._program.setUniformValue(self._material_texture_sampler_uniform_location, 2)
         self._program.setUniformValue(self._height_texture_sampler_uniform_location, 3)
+        self._program.setUniformValue(self._relief_texture_sampler_uniform_location, 4)
         render_mode = str(getattr(settings, "render_diagnostic_mode", "lit") or "lit").strip().lower()
         render_mode_code = int(_RENDER_DIAGNOSTIC_MODE_CODES.get(render_mode, 0))
         self._program.setUniformValue(
@@ -3920,6 +4636,10 @@ class ModelPreviewWidget(QOpenGLWidget):
             )
             height_texture = self._texture_objects.get(
                 (batch.height_texture_key, batch.texture_wrap_repeat, batch.texture_flip_vertical)
+            )
+            derived_relief_key = self._batch_derived_relief_keys.get(batch_index, "")
+            derived_relief_texture = self._texture_objects.get(
+                (derived_relief_key, batch.texture_wrap_repeat, batch.texture_flip_vertical)
             )
             diagnostic_source = self._diffuse_probe_source_for_render_mode(settings, render_mode)
             diagnostic_texture = self._diagnostic_texture_for_source(
@@ -3975,13 +4695,6 @@ class ModelPreviewWidget(QOpenGLWidget):
                     and height_texture is not None
                 )
             )
-            use_high_quality_shading = int(
-                bool(
-                    self._high_quality_textures
-                    and batch.has_texture_coordinates
-                    and (use_texture or use_normal_texture or use_material_texture or use_height_texture)
-                )
-            )
             upload_key = (batch.texture_key, bool(batch.texture_wrap_repeat), bool(batch.texture_flip_vertical))
             upload_diagnostic = self._texture_upload_diagnostics.get(upload_key)
             normal_upload = self._texture_upload_diagnostics.get(
@@ -3999,7 +4712,31 @@ class ModelPreviewWidget(QOpenGLWidget):
             luma = self._batch_luma_diagnostics.get(batch_index)
             material_luma = self._batch_material_luma_diagnostics.get(batch_index)
             height_luma = self._batch_height_luma_diagnostics.get(batch_index)
+            derived_relief_luma = self._batch_derived_relief_luma_diagnostics.get(batch_index)
             normal_strength = self._batch_normal_strength_diagnostics.get(batch_index)
+            enhanced_state, enhanced_reason, enhanced_height_usable, relief_source = self._enhanced_relief_status(
+                render_mode_code=render_mode_code,
+                high_quality_enabled=bool(use_high_quality_maps),
+                support_maps_enabled=bool(support_maps_enabled),
+                support_maps_disabled=bool(batch.support_maps_disabled),
+                height_key=str(batch.height_texture_key or ""),
+                height_texture_available=bool(height_texture is not None),
+                height_luma=height_luma,
+                derived_relief_key=derived_relief_key,
+                derived_relief_texture_available=bool(derived_relief_texture is not None),
+                derived_relief_luma=derived_relief_luma,
+                height_map_disabled=bool(getattr(settings, "disable_height_map", False)),
+                height_effect_max=float(getattr(settings, "height_effect_max", 0.0) or 0.0),
+            )
+            relief_source_code = {"height-map": 1, "derived-base": 2, "height+derived-detail": 3}.get(relief_source, 0)
+            use_relief_texture = int(bool(enhanced_height_usable and relief_source_code > 0))
+            use_high_quality_shading = int(
+                bool(
+                    self._high_quality_textures
+                    and batch.has_texture_coordinates
+                    and (use_texture or use_normal_texture or use_material_texture or use_height_texture or use_relief_texture)
+                )
+            )
             image_loaded = bool(upload_diagnostic.image_loaded) if upload_diagnostic else False
             image_size = (
                 f"{upload_diagnostic.image_width}x{upload_diagnostic.image_height}"
@@ -4011,6 +4748,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             normal_texture_id = self._texture_id(normal_texture)
             material_texture_id = self._texture_id(material_texture)
             height_texture_id = self._texture_id(height_texture)
+            relief_texture_id = self._texture_id(derived_relief_texture if relief_source_code in {2, 3} else height_texture)
             prepared_size = (
                 f"{upload_diagnostic.prepared_width}x{upload_diagnostic.prepared_height}"
                 if upload_diagnostic and upload_diagnostic.prepared_width > 0 and upload_diagnostic.prepared_height > 0
@@ -4059,6 +4797,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                 normal_texture_id=normal_texture_id,
                 material_texture_id=material_texture_id,
                 height_texture_id=height_texture_id,
+                relief_texture_id=relief_texture_id,
                 diffuse_unit=int(diffuse_unit),
                 diffuse_sampler_location=int(self._texture_sampler_uniform_location),
                 render_mode_code=int(render_mode_code),
@@ -4066,6 +4805,9 @@ class ModelPreviewWidget(QOpenGLWidget):
                 texture_probe_source=diagnostic_source,
                 sampler_probe_mode=str(settings.sampler_probe_mode),
                 diffuse_swizzle_mode=str(settings.diffuse_swizzle_mode),
+                base_texture_quality=str(batch.base_texture_quality or ""),
+                material_decode_mode=int(batch.material_decode_mode or 0),
+                rich_material_response=bool(render_mode_code == 22),
                 prepared_image_size=prepared_size,
                 gl_error=str(upload_diagnostic.gl_error if upload_diagnostic else ""),
                 alpha_discard_risk=bool(luma and luma.alpha_dark_ratio >= 0.50),
@@ -4073,6 +4815,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                 use_normal=bool(use_normal_texture),
                 use_material=bool(use_material_texture),
                 use_height=bool(use_height_texture),
+                use_relief=bool(use_relief_texture),
                 normal_uploaded=bool(normal_texture is not None or (normal_upload and normal_upload.upload_success)),
                 material_uploaded=bool(material_texture is not None or (material_upload and material_upload.upload_success)),
                 height_uploaded=bool(height_texture is not None or (height_upload and height_upload.upload_success)),
@@ -4087,6 +4830,16 @@ class ModelPreviewWidget(QOpenGLWidget):
                 height_sampled_luma=height_luma.average_luma if height_luma else None,
                 height_sampled_dark_ratio=height_luma.dark_ratio if height_luma else None,
                 height_sampled_alpha=height_luma.average_alpha if height_luma else None,
+                height_sampled_min_luma=height_luma.min_luma if height_luma else None,
+                height_sampled_max_luma=height_luma.max_luma if height_luma else None,
+                height_sampled_contrast=height_luma.luma_contrast if height_luma else None,
+                derived_relief_sampled_luma=derived_relief_luma.average_luma if derived_relief_luma else None,
+                derived_relief_sampled_min_luma=derived_relief_luma.min_luma if derived_relief_luma else None,
+                derived_relief_sampled_max_luma=derived_relief_luma.max_luma if derived_relief_luma else None,
+                derived_relief_sampled_contrast=derived_relief_luma.luma_contrast if derived_relief_luma else None,
+                enhanced_relief_state=enhanced_state,
+                enhanced_relief_reason=enhanced_reason,
+                relief_source=relief_source,
                 normal_average_strength=normal_strength,
                 source_average_color=luma.average_color if luma else (),
                 normal_finite_ratio=float(batch.normal_finite_ratio),
@@ -4094,6 +4847,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                 tangent_finite_ratio=float(batch.tangent_finite_ratio),
                 bitangent_finite_ratio=float(batch.bitangent_finite_ratio),
                 uv_finite_ratio=float(batch.uv_finite_ratio),
+                smooth_normal_ratio=float(getattr(batch, "smooth_normal_ratio", 0.0) or 0.0),
                 texture_flip_vertical=bool(batch.texture_flip_vertical),
                 texture_wrap_repeat=bool(batch.texture_wrap_repeat),
                 texture_brightness=float(batch.texture_brightness or 1.0),
@@ -4138,6 +4892,8 @@ class ModelPreviewWidget(QOpenGLWidget):
             else:
                 source_average_color = QVector3D(0.0, 0.0, 0.0)
             source_average_luma = max(0.0, min(1.5, float(batch.source_average_luma or 0.0)))
+            base_texture_quality_code = int(_BASE_TEXTURE_QUALITY_CODES.get(str(batch.base_texture_quality or ""), 0))
+            relief_luma = height_luma if relief_source_code in {1, 3} else derived_relief_luma
             self._program.setUniformValue(self._use_texture_uniform_location, use_texture)
             self._program.setUniformValue(self._base_texture_tint_uniform_location, texture_tint)
             self._program.setUniformValue(
@@ -4150,6 +4906,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             )
             self._program.setUniformValue(self._base_texture_average_color_uniform_location, source_average_color)
             self._program.setUniformValue(self._base_texture_average_luma_uniform_location, source_average_luma)
+            self._program.setUniformValue(self._base_texture_quality_uniform_location, base_texture_quality_code)
             self._program.setUniformValue(self._texture_sampler_uniform_location, int(diffuse_unit))
             self._program.setUniformValue(self._use_high_quality_uniform_location, use_high_quality_shading)
             self._program.setUniformValue(self._use_normal_texture_uniform_location, use_normal_texture)
@@ -4163,11 +4920,26 @@ class ModelPreviewWidget(QOpenGLWidget):
                 int(batch.material_decode_mode if use_material_texture else self._MATERIAL_DECODE_GENERIC),
             )
             self._program.setUniformValue(self._use_height_texture_uniform_location, use_height_texture)
+            self._program.setUniformValue(self._use_relief_texture_uniform_location, use_relief_texture)
             self._program.setUniformValue(self._diffuse_wrap_bias_uniform_location, float(settings.diffuse_wrap_bias))
             self._program.setUniformValue(self._diffuse_light_scale_uniform_location, float(settings.diffuse_light_scale))
             self._program.setUniformValue(self._normal_strength_cap_uniform_location, float(settings.normal_strength_cap))
             self._program.setUniformValue(self._normal_strength_floor_uniform_location, float(settings.normal_strength_floor))
             self._program.setUniformValue(self._height_effect_max_uniform_location, float(settings.height_effect_max))
+            self._program.setUniformValue(
+                self._height_sample_min_uniform_location,
+                float(relief_luma.min_luma if relief_luma is not None else 0.0),
+            )
+            self._program.setUniformValue(
+                self._height_sample_max_uniform_location,
+                float(relief_luma.max_luma if relief_luma is not None else 1.0),
+            )
+            self._program.setUniformValue(
+                self._height_sample_contrast_uniform_location,
+                float(relief_luma.luma_contrast if relief_luma is not None else 1.0),
+            )
+            self._program.setUniformValue(self._height_relief_usable_uniform_location, int(bool(enhanced_height_usable)))
+            self._program.setUniformValue(self._relief_source_code_uniform_location, int(relief_source_code))
             self._program.setUniformValue(self._cavity_clamp_min_uniform_location, float(settings.cavity_clamp_min))
             self._program.setUniformValue(self._cavity_clamp_max_uniform_location, float(settings.cavity_clamp_max))
             self._program.setUniformValue(self._specular_base_uniform_location, float(settings.specular_base))
@@ -4177,6 +4949,10 @@ class ModelPreviewWidget(QOpenGLWidget):
             self._program.setUniformValue(self._shininess_min_uniform_location, float(settings.shininess_min))
             self._program.setUniformValue(self._shininess_max_uniform_location, float(settings.shininess_max))
             self._program.setUniformValue(self._height_shininess_boost_uniform_location, float(settings.height_shininess_boost))
+            self._program.setUniformValue(
+                self._render_diagnostic_mode_uniform_location,
+                int(render_mode_code),
+            )
             bind_error = ""
             if use_texture and diffuse_draw_texture is not None:
                 try:
@@ -4189,6 +4965,11 @@ class ModelPreviewWidget(QOpenGLWidget):
                 material_texture.bind(2)
             if use_height_texture and height_texture is not None:
                 height_texture.bind(3)
+            if use_relief_texture:
+                if relief_source_code in {2, 3} and derived_relief_texture is not None:
+                    derived_relief_texture.bind(4)
+                elif relief_source_code == 1 and height_texture is not None:
+                    height_texture.bind(4)
             self._functions.glDrawArrays(_GL_TRIANGLES, batch.first_vertex, batch.vertex_count)
             draw_error = self._gl_error_text()
             if bind_error or draw_error:
@@ -4201,16 +4982,24 @@ class ModelPreviewWidget(QOpenGLWidget):
                 self._release_texture_unit(material_texture, 2)
             if use_height_texture and height_texture is not None:
                 self._release_texture_unit(height_texture, 3)
+            if use_relief_texture:
+                if relief_source_code in {2, 3} and derived_relief_texture is not None:
+                    self._release_texture_unit(derived_relief_texture, 4)
+                elif relief_source_code == 1 and height_texture is not None:
+                    self._release_texture_unit(height_texture, 4)
         self._vertex_array.release()
         self._program.release()
         previous_framebuffer_diagnostic = self._framebuffer_visibility_diagnostic
-        try:
-            self._framebuffer_visibility_diagnostic = self._sample_framebuffer_visibility(
-                self.grabFramebuffer(),
-                self._background_color,
-            )
-        except Exception:
-            self._framebuffer_visibility_diagnostic = _FramebufferVisibilitySample()
+        now = time.monotonic()
+        if now - self._framebuffer_visibility_sampled_at >= 0.50:
+            self._framebuffer_visibility_sampled_at = now
+            try:
+                self._framebuffer_visibility_diagnostic = self._sample_framebuffer_visibility(
+                    self.grabFramebuffer(),
+                    self._background_color,
+                )
+            except Exception:
+                self._framebuffer_visibility_diagnostic = _FramebufferVisibilitySample()
         if (
             runtime_diagnostics != self._batch_render_diagnostics
             or previous_framebuffer_diagnostic != self._framebuffer_visibility_diagnostic
@@ -4830,7 +5619,7 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._vertex_array.bind()
         self._vertex_buffer.bind()
         self._vertex_buffer.allocate(self._vertex_blob, len(self._vertex_blob))
-        stride = 17 * 4
+        stride = 20 * 4
         self._program.enableAttributeArray(0)
         self._program.setAttributeBuffer(0, _GL_FLOAT, 0, 3, stride)
         self._program.enableAttributeArray(1)
@@ -4843,6 +5632,8 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._program.setAttributeBuffer(4, _GL_FLOAT, 11 * 4, 3, stride)
         self._program.enableAttributeArray(5)
         self._program.setAttributeBuffer(5, _GL_FLOAT, 14 * 4, 3, stride)
+        self._program.enableAttributeArray(6)
+        self._program.setAttributeBuffer(6, _GL_FLOAT, 17 * 4, 3, stride)
         self._vertex_buffer.release()
         self._vertex_array.release()
         self._program.release()
@@ -5040,6 +5831,83 @@ class ModelPreviewWidget(QOpenGLWidget):
             bitangents.append((bx, by, bz))
         return tangents, bitangents
 
+    @staticmethod
+    def _smooth_normal_position_key(position: Tuple[float, float, float]) -> Tuple[int, int, int]:
+        return (
+            int(round(float(position[0]) * 100000.0)),
+            int(round(float(position[1]) * 100000.0)),
+            int(round(float(position[2]) * 100000.0)),
+        )
+
+    @classmethod
+    def _build_preview_smoothed_normals(
+        cls,
+        positions: Sequence[Tuple[float, float, float]],
+        normals: Sequence[Tuple[float, float, float]],
+        indices: Sequence[int],
+    ) -> Tuple[List[Tuple[float, float, float]], float]:
+        vertex_count = len(positions)
+        if vertex_count <= 0 or len(normals) != vertex_count:
+            return list(normals), 0.0
+        accum_by_position: Dict[Tuple[int, int, int], List[float]] = {}
+        for triangle_index in range(0, len(indices) - 2, 3):
+            a = indices[triangle_index]
+            b = indices[triangle_index + 1]
+            c = indices[triangle_index + 2]
+            if (
+                a < 0
+                or b < 0
+                or c < 0
+                or a >= vertex_count
+                or b >= vertex_count
+                or c >= vertex_count
+            ):
+                continue
+            ax, ay, az = positions[a]
+            bx, by, bz = positions[b]
+            cx, cy, cz = positions[c]
+            ab = (bx - ax, by - ay, bz - az)
+            ac = (cx - ax, cy - ay, cz - az)
+            face = (
+                (ab[1] * ac[2]) - (ab[2] * ac[1]),
+                (ab[2] * ac[0]) - (ab[0] * ac[2]),
+                (ab[0] * ac[1]) - (ab[1] * ac[0]),
+            )
+            face_length = math.sqrt((face[0] * face[0]) + (face[1] * face[1]) + (face[2] * face[2]))
+            if face_length <= 1e-12 or not math.isfinite(face_length):
+                continue
+            for vertex_index in (a, b, c):
+                key = cls._smooth_normal_position_key(positions[vertex_index])
+                accum = accum_by_position.setdefault(key, [0.0, 0.0, 0.0])
+                accum[0] += face[0]
+                accum[1] += face[1]
+                accum[2] += face[2]
+
+        smoothed: List[Tuple[float, float, float]] = []
+        changed = 0
+        for vertex_index, original in enumerate(normals):
+            key = cls._smooth_normal_position_key(positions[vertex_index])
+            accum = accum_by_position.get(key)
+            if accum is None:
+                smoothed.append(original)
+                continue
+            candidate, repaired = cls._sanitize_vector3(
+                accum,
+                fallback=original,
+                normalize=True,
+            )
+            if repaired:
+                smoothed.append(original)
+                continue
+            dot = (original[0] * candidate[0]) + (original[1] * candidate[1]) + (original[2] * candidate[2])
+            if dot <= 0.05:
+                smoothed.append(original)
+                continue
+            if dot < 0.995:
+                changed += 1
+            smoothed.append(candidate)
+        return smoothed, changed / float(max(1, vertex_count))
+
     @classmethod
     def _build_vertex_blob(cls, model) -> Tuple[bytes, int, List[_ModelPreviewDrawBatch]]:
         meshes = getattr(model, "meshes", None)
@@ -5075,6 +5943,11 @@ class ModelPreviewWidget(QOpenGLWidget):
                 if repaired:
                     normal_repair_count += 1
             normals = sanitized_normals
+            smoothed_normals, smooth_normal_ratio = cls._build_preview_smoothed_normals(
+                positions,
+                normals,
+                indices,
+            )
             raw_texture_coordinates = list(getattr(mesh, "texture_coordinates", []) or [])
             texture_coordinates: List[Tuple[float, float]] = []
             uv_repair_count = 0
@@ -5155,6 +6028,11 @@ class ModelPreviewWidget(QOpenGLWidget):
                         tu, tv = 0.0, 0.0
                     tx, ty, tz = tangents[vertex_index] if vertex_index < len(tangents) else (1.0, 0.0, 0.0)
                     bx, by, bz = bitangents[vertex_index] if vertex_index < len(bitangents) else (0.0, 1.0, 0.0)
+                    sx, sy, sz = (
+                        smoothed_normals[vertex_index]
+                        if vertex_index < len(smoothed_normals)
+                        else (nx, ny, nz)
+                    )
                     vertex_data.extend(
                         (
                             px,
@@ -5174,6 +6052,9 @@ class ModelPreviewWidget(QOpenGLWidget):
                             bx,
                             by,
                             bz,
+                            sx,
+                            sy,
+                            sz,
                         )
                     )
                 vertex_count += 3
@@ -5202,6 +6083,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                 for channel in (getattr(mesh, "preview_material_texture_packed_channels", ()) or ())
                 if str(channel or "").strip()
             )
+            base_texture_quality = str(getattr(mesh, "preview_base_texture_quality", "") or "").strip().lower()
             texture_tint_values = tuple(getattr(mesh, "preview_texture_tint", ()) or ())[:3]
             texture_tint = tuple(
                 max(0.0, min(2.0, cls._finite_float(value, 1.0)))
@@ -5242,6 +6124,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                     has_texture_coordinates=has_texture_coordinates,
                     texture_wrap_repeat=texture_wrap_repeat,
                     texture_flip_vertical=texture_flip_vertical,
+                    base_texture_quality=base_texture_quality,
                     texture_brightness=max(
                         0.1,
                         min(3.0, cls._finite_float(getattr(mesh, "preview_texture_brightness", 1.0), 1.0)),
@@ -5253,6 +6136,7 @@ class ModelPreviewWidget(QOpenGLWidget):
                     tangent_finite_ratio=max(0.0, 1.0 - (float(tangent_repair_count) / float(vertex_total))),
                     bitangent_finite_ratio=max(0.0, 1.0 - (float(bitangent_repair_count) / float(vertex_total))),
                     uv_finite_ratio=max(0.0, 1.0 - (float(uv_repair_count) / float(vertex_total))) if has_texture_coordinates else 0.0,
+                    smooth_normal_ratio=max(0.0, min(1.0, float(smooth_normal_ratio))),
                 )
             )
         return vertex_data.tobytes(), vertex_count, batches
@@ -5404,6 +6288,14 @@ class ModelPreviewWidget(QOpenGLWidget):
         self._batch_material_luma_diagnostics.clear()
         self._batch_height_luma_diagnostics.clear()
         self._batch_normal_strength_diagnostics.clear()
+        self._batch_derived_relief_luma_diagnostics.clear()
+        self._batch_derived_relief_keys.clear()
+        settings = self.render_settings()
+        build_derived_relief = bool(
+            self._render_mode_uses_derived_relief(settings)
+            and self._use_textures
+            and self._high_quality_textures
+        )
         for batch in self._mesh_batches:
             batch.source_average_color = ()
             batch.source_average_luma = 0.0
@@ -5428,11 +6320,19 @@ class ModelPreviewWidget(QOpenGLWidget):
                         continue
                     source_images[texture_key] = texture_image
         for batch_index, batch in enumerate(self._mesh_batches):
+            derived_relief_key = (
+                self._derived_relief_texture_key(batch_index, batch)
+                if build_derived_relief
+                else ""
+            )
+            if derived_relief_key:
+                self._batch_derived_relief_keys[batch_index] = derived_relief_key
             batch_texture_keys = (
                 batch.texture_key,
                 batch.normal_texture_key,
                 batch.material_texture_key,
                 batch.height_texture_key,
+                derived_relief_key,
             )
             for texture_key in batch_texture_keys:
                 if not texture_key:
@@ -5447,6 +6347,16 @@ class ModelPreviewWidget(QOpenGLWidget):
                     texture_image = self._load_gl_texture_image(texture_key)
                     if texture_image is not None:
                         source_images[texture_key] = texture_image
+                if texture_image is None and texture_key == derived_relief_key and batch.texture_key:
+                    base_image = source_images.get(batch.texture_key)
+                    if base_image is None:
+                        base_image = self._load_gl_texture_image(batch.texture_key)
+                        if base_image is not None:
+                            source_images[batch.texture_key] = base_image
+                    if base_image is not None:
+                        texture_image = self._derive_relief_image_from_base(base_image)
+                        if texture_image is not None:
+                            source_images[texture_key] = texture_image
                 if texture_image is None:
                     upload_diagnostic.image_loaded = False
                     upload_diagnostic.failure_reason = f"DDS preview PNG missing or unreadable: {texture_key}"
@@ -5484,6 +6394,14 @@ class ModelPreviewWidget(QOpenGLWidget):
                         )
                         if luma is not None:
                             self._batch_height_luma_diagnostics[batch_index] = luma
+                    elif texture_key == derived_relief_key:
+                        luma = self._sample_base_texture_visibility(
+                            texture_image,
+                            getattr(mesh, "texture_coordinates", ()) or (),
+                            flip_vertical=bool(batch.texture_flip_vertical),
+                        )
+                        if luma is not None:
+                            self._batch_derived_relief_luma_diagnostics[batch_index] = luma
                     elif texture_key == batch.normal_texture_key:
                         normal_strength = self._sample_normal_map_average_strength(
                             texture_image,
@@ -6715,6 +7633,7 @@ _QUICK_START_HTML_ES = """
 <p><b>Crimson Desert Mod Workbench</b> es una herramienta de archivos y archivos sueltos para Crimson Desert. Cubre extraccion, investigacion, edicion, reconstruccion DDS, escalado opcional, comparacion y exportacion suelta lista para mods.</p>
 <ul>
   <li><b>Explorador de archivos</b>: escanear .pamt/.paz, previsualizar recursos compatibles, filtrar, clasificar y extraer a carpetas sueltas.</li>
+  <li><b>Acciones de malla</b>: exportar OBJ/FBX, probar <b>Importar vista de malla</b>, probar texturas con <b>Vista previa de importar DDS</b>, ejecutar <b>Importar malla</b>, alinear reemplazos estaticos y usar <b>Intercambiar con malla del juego</b> cuando otra malla del archivo deba ser el origen.</li>
   <li><b>Flujo de texturas</b>: escanear DDS sueltos, convertir DDS a PNG si hace falta, escalar opcionalmente, reconstruir DDS, comparar resultados y exportar salida mod-ready.</li>
   <li><b>Editor de texturas</b>: abrir imagenes para edicion visible por capas y enviar la salida plana al flujo de reconstruccion.</li>
   <li><b>Asistente de reemplazo</b>: tomar PNG/DDS editados, asociarlos con el DDS original del juego, reconstruir la salida corregida y preparar carpetas mod-ready.</li>
@@ -6735,7 +7654,17 @@ _QUICK_START_HTML_ES = """
   <li>Usa <b>Vista de politica</b> antes de <b>Iniciar</b> para revisar la accion planeada por textura.</li>
   <li>Ejecuta un subconjunto pequeno primero y revisa el resultado en <b>Comparar</b>.</li>
   <li>Si ya editaste una textura fuera de la app, usa <b>Asistente de reemplazo</b>.</li>
+  <li>Para mallas, empieza en <b>Explorador de archivos</b>: selecciona una malla .pam/.pamlod/.pac, usa <b>Importar vista de malla</b> para probar sin escribir y usa <b>Importar malla</b> solo cuando la alineacion y las texturas se vean correctas.</li>
 </ol>
+<h3>Guia rapida de mallas</h3>
+<ul>
+  <li><b>Exportar OBJ/FBX</b>: util para inspeccionar o editar externamente. OBJ es la base de round-trip cuando la app puede escribir los metadatos necesarios.</li>
+  <li><b>Importar vista de malla</b>: abre la revision y <b>Alineacion de reemplazo de malla</b> sin escribir salida.</li>
+  <li><b>Vista previa de importar DDS</b>: prueba una textura DDS en el modelo seleccionado sin escribir salida.</li>
+  <li><b>Importar malla</b>: despues de revisar, permite exportar salida suelta mod-ready o parchear archivos donde sea compatible.</li>
+  <li><b>Intercambiar con malla del juego</b>: primero marca la malla seleccionada como destino, luego selecciona otra malla del archivo como origen. La app abre la misma alineacion de reemplazo y puede incluir texturas, sidecars, esqueletos o animaciones relacionadas cuando corresponda.</li>
+  <li><b>GLB/glTF/DAE</b>: se tratan como fuentes estaticas. No convierten skins, huesos, animaciones ni grafos PBR complejos a datos nativos del juego.</li>
+</ul>
 <h3>Areas principales</h3>
 <ul>
   <li><b>Configuracion / Setup</b>: creacion de workspace, herramientas externas, enlaces de ayuda e importadores.</li>
@@ -6764,6 +7693,7 @@ _QUICK_START_HTML_DE = """
 <p><b>Crimson Desert Mod Workbench</b> ist ein Archiv- und Loose-File-Werkzeug fuer Crimson Desert. Es deckt Extraktion, Research, Bearbeitung, DDS-Neuaufbau, optionales Upscaling, Vergleich und mod-fertigen Loose-Export ab.</p>
 <ul>
   <li><b>Archiv-Browser</b>: .pamt/.paz scannen, unterstuetzte Assets anzeigen, filtern, klassifizieren und in lose Ordner extrahieren.</li>
+  <li><b>Mesh-Aktionen</b>: OBJ/FBX exportieren, <b>Mesh-Importvorschau</b> testen, Texturen mit <b>DDS-Importvorschau</b> pruefen, <b>Mesh importieren</b> ausfuehren, statische Ersetzungen ausrichten und <b>Mit Ingame-Mesh tauschen</b> nutzen, wenn eine andere Archiv-Mesh als Quelle dienen soll.</li>
   <li><b>Textur-Workflow</b>: lose DDS scannen, DDS bei Bedarf zu PNG konvertieren, optional hochskalieren, DDS neu erstellen, Ergebnisse vergleichen und mod-fertige Ausgabe exportieren.</li>
   <li><b>Textur-Editor</b>: Bilder fuer sichtbare Ebenenbearbeitung oeffnen und die flache Ausgabe zurueck in den Neuaufbau senden.</li>
   <li><b>Ersetzungsassistent</b>: bearbeitete PNG/DDS mit dem Original-DDS abgleichen, korrigierte Ausgabe neu erstellen und mod-fertige Ordner vorbereiten.</li>
@@ -6784,7 +7714,17 @@ _QUICK_START_HTML_DE = """
   <li>Nutze <b>Richtlinienvorschau</b> vor <b>Start</b>, um die geplante Aktion pro Textur zu pruefen.</li>
   <li>Fuehre zuerst eine kleine Auswahl aus und pruefe das Ergebnis in <b>Vergleichen</b>.</li>
   <li>Wenn du eine Textur bereits extern bearbeitet hast, nutze den <b>Ersetzungsassistent</b>.</li>
+  <li>Fuer Meshes im <b>Archiv-Browser</b> starten: .pam/.pamlod/.pac waehlen, mit <b>Mesh-Importvorschau</b> ohne Schreiben testen und <b>Mesh importieren</b> erst nutzen, wenn Ausrichtung und Texturen korrekt aussehen.</li>
 </ol>
+<h3>Schnellguide fuer Meshes</h3>
+<ul>
+  <li><b>OBJ/FBX exportieren</b>: nuetzlich fuer Inspektion oder externe Bearbeitung. OBJ ist die Roundtrip-Basis, wenn die App die noetigen Metadaten schreiben kann.</li>
+  <li><b>Mesh-Importvorschau</b>: oeffnet Review und <b>Mesh-Ersetzungsausrichtung</b>, ohne Ausgabe zu schreiben.</li>
+  <li><b>DDS-Importvorschau</b>: testet eine DDS-Textur am gewaehlten Modell, ohne Ausgabe zu schreiben.</li>
+  <li><b>Mesh importieren</b>: nach der Pruefung mod-fertige Loose-Ausgabe oder Patch schreiben, wo kompatibel.</li>
+  <li><b>Mit Ingame-Mesh tauschen</b>: zuerst die ausgewaehlte Mesh als Ziel markieren, dann eine andere Archiv-Mesh als Quelle waehlen. Die App oeffnet dieselbe Ersetzungsausrichtung und kann passende Texturen, Sidecars, Skelette oder Animationen einschliessen.</li>
+  <li><b>GLB/glTF/DAE</b>: werden als statische Quellen behandelt. Skins, Knochen, Animationen und komplexe PBR-Graphen werden nicht in native Spieldaten konvertiert.</li>
+</ul>
 <h3>Hauptbereiche</h3>
 <ul>
   <li><b>Einstellungen / Einrichtung</b>: Workspace-Erstellung, externe Tools, Hilfelinks und Importhelfer.</li>
@@ -6842,6 +7782,7 @@ class QuickStartDialog(QDialog):
             <p><b>Crimson Desert Mod Workbench</b> is a read-only archive and loose-file workflow tool for Crimson Desert. It is built around extraction, research, editing, DDS rebuild, optional upscaling, comparison, and mod-ready loose export.</p>
             <ul>
               <li><b>Archive Browser</b>: scan <b>.pamt/.paz</b>, preview supported assets, filter, classify, and extract to loose folders.</li>
+              <li><b>Mesh Actions</b>: export OBJ/FBX, test <b>Import Mesh Preview</b>, preview texture overrides with <b>Import DDS Preview</b>, run <b>Import Mesh</b>, align static replacements, and use <b>Swap With In-Game Mesh</b> when another loaded archive mesh should become the source.</li>
               <li><b>Texture Workflow</b>: scan loose DDS files, convert DDS to PNG when needed, optionally upscale, rebuild DDS, compare results, and export loose mod output.</li>
               <li><b>Texture Editor</b>: open images directly for layered visible-texture editing and send flattened output back into the rebuild flow.</li>
               <li><b>Replace Assistant</b>: take edited PNG/DDS files, match them to the original game DDS, rebuild corrected output, and prepare mod-ready folders.</li>
@@ -6864,10 +7805,21 @@ class QuickStartDialog(QDialog):
               <li>Run a small subset first, then review the output in <b>Compare</b> before trying a larger batch.</li>
               <li>If you already edited a texture outside the app, use <b>Replace Assistant</b> instead of the batch workflow.</li>
               <li>If you want to edit visible textures inside the app, open them in <b>Texture Editor</b> and then send the flattened result back into <b>Replace Assistant</b> or <b>Texture Workflow</b>.</li>
+              <li>For mesh work, start in <b>Archive Browser</b>: select a <b>.pam</b>, <b>.pamlod</b>, or <b>.pac</b>, use <b>Import Mesh Preview</b> to test without writing, and use <b>Import Mesh</b> only after alignment and texture choices look correct.</li>
             </ol>
+            <h3>Mesh Quick Guide</h3>
+            <ul>
+              <li><b>Export OBJ/FBX</b>: use this for inspection or external editing. OBJ is the round-trip baseline when the app can write the companion metadata needed for import.</li>
+              <li><b>Import Mesh Preview</b>: opens review and <b>Mesh Replacement Alignment</b> without writing archive or loose output.</li>
+              <li><b>Import DDS Preview</b>: tests a DDS texture override on the selected model without writing output.</li>
+              <li><b>Import Mesh</b>: after review, writes a supported replacement as mod-ready loose output or an archive patch where that workflow is available.</li>
+              <li><b>Swap With In-Game Mesh</b>: first mark the selected archive mesh as the target, then choose another loaded archive mesh as the source. The app opens the same replacement alignment flow and can carry related textures, sidecars, skeletons, or animations when appropriate.</li>
+              <li><b>GLB/glTF/DAE</b>: treated as static replacement sources. Skins, bones, animations, and complex PBR material graphs are not converted into native game material data.</li>
+            </ul>
             <h3>Pick The Right Starting Path</h3>
             <ul>
               <li><b>I want to look inside the game files</b>: open <b>Archive Browser</b>, choose a package root, scan, filter, preview, and extract selected files.</li>
+              <li><b>I want to replace a model</b>: use <b>Archive Browser</b> mesh actions, start with <b>Import Mesh Preview</b>, then continue to <b>Import Mesh</b> or <b>Swap With In-Game Mesh</b> after checking alignment.</li>
               <li><b>I want to batch-process loose DDS files</b>: use <b>Texture Workflow</b> with a small folder first, then review in <b>Compare</b>.</li>
               <li><b>I already edited one texture</b>: use <b>Replace Assistant</b> so the original DDS controls format, dimensions, mips, and output path.</li>
               <li><b>I want to edit inside the app</b>: use <b>Texture Editor</b>, save a project if you need layers later, then export or send the flattened PNG onward.</li>
@@ -6876,106 +7828,16 @@ class QuickStartDialog(QDialog):
             </ul>
             <h3>Sidecar Cache Note</h3>
             <p>Building the global sidecar cache is intentionally optional because it can be expensive on large archives. It improves DDS related-file discovery, reverse references, mesh texture connections, and material-sidecar lookup. If you enable it, let the first run finish even when it takes a long time. Configure sidecar indexing and worker count in <b>Settings &gt; Archive Browser Performance</b>.</p>
-            <h3>Simple Guides</h3>
-            <h4>Scan and extract from archives</h4>
-            <ol>
-              <li>Open <b>Archive Browser</b> and set the package root that contains the Crimson Desert archives.</li>
-              <li>Click <b>Scan</b>. Use cache on repeat scans unless you know the files changed.</li>
-              <li>Filter by package, path, role, extension, previewable state, or search text.</li>
-              <li>Preview the selected item. Use <b>Referenced Files</b> when a mesh or sidecar exposes related textures and metadata.</li>
-              <li>Use <b>Export Selected</b>, <b>Export All</b>, or workflow-specific export actions when you want loose files.</li>
-            </ol>
-            <h4>Batch rebuild or upscale textures</h4>
-            <ol>
-              <li>Set <b>Original DDS root</b>, <b>PNG root</b>, <b>Output root</b>, and <b>texconv.exe</b>.</li>
-              <li>Choose a safer <b>Texture Policy</b> and review <b>Profiles, Rules &amp; Matches</b>.</li>
-              <li>Pick <b>Disabled</b> for DDS rebuild testing, <b>Real-ESRGAN NCNN</b> for direct upscale, or <b>chaiNNer</b> for a known-good external chain.</li>
-              <li>Click <b>Preview Policy</b>, then <b>Scan</b>, then run a small batch with <b>Start</b>.</li>
-              <li>Open <b>Compare</b> and check color, alpha, detail, size, mips, and technical channels before scaling up.</li>
-            </ol>
-            <h4>Replace one edited texture</h4>
-            <ol>
-              <li>Open <b>Replace Assistant</b> and import the edited PNG or DDS.</li>
-              <li>Let the app match the original DDS, or choose the original manually.</li>
-              <li>Review the detected dimensions, format hints, original path, and output plan.</li>
-              <li>Build the result and inspect it before placing the loose folder into a mod manager.</li>
-            </ol>
-            <h4>Edit a visible texture in the app</h4>
-            <ol>
-              <li>Open an image or supported DDS in <b>Texture Editor</b>.</li>
-              <li>Use layers, masks, selections, brushes, clone/heal, gradients, patch, smudge, or adjustments.</li>
-              <li>Save a project if you need to return to the editable layered state.</li>
-              <li>Export or send the flattened PNG to <b>Replace Assistant</b>, <b>Texture Workflow</b>, or <b>Compare</b>.</li>
-            </ol>
-            <h3>Main Workflow Areas</h3>
-            <ul>
-              <li><b>Settings / Setup</b>: workspace creation, external tools, app links, and optional downloads/import helpers.</li>
-              <li><b>Settings / Paths</b>: source, staging, PNG, output, and mod-ready export roots.</li>
-              <li><b>DDS Output</b>: global format, size, mip, and staging behavior used unless a workflow profile overrides them.</li>
-              <li><b>Profiles, Rules &amp; Matches</b>: reusable per-file workflow profiles, ordered matching rules, and a live matched DDS table.</li>
-              <li><b>Upscaling</b>: backend choice, policy preset, direct NCNN controls, and backend-specific notes.</li>
-              <li><b>Compare</b>: side-by-side original/output review for the current loose output set.</li>
-            </ul>
-            <h3>Profiles, Rules &amp; Matches</h3>
-            <p>This area controls per-file planning inside Texture Workflow.</p>
-            <ul>
-              <li><b>Workflow Profiles</b>: reusable named override sets for DDS output and direct NCNN behavior.</li>
-              <li><b>Ordered Rules</b>: top-to-bottom match list with last-match-wins behavior. Rules can assign a workflow profile and also override semantic, planner profile, colorspace, alpha policy, and planner path.</li>
-              <li><b>Matched Files</b>: live list of files under the current Original DDS root and folder/file filter. You can multi-select rows and create exact-path rules with <b>Assign Profile</b>.</li>
-              <li>Starter profiles are meant as sensible baselines, not universal best answers. Technical maps often need preserve-first handling.</li>
-            </ul>
-            <h3>Backend Choice</h3>
-            <p><b>Run Summary</b> gives you a read-only overview of the current sources, backend, texture policy, direct-backend settings, and export behavior before you start.</p>
-            <ul>
-              <li><b>Disabled</b>: rebuild DDS from existing PNGs or test DDS output settings without upscaling.</li>
-              <li><b>Real-ESRGAN NCNN</b>: direct in-app route if you want scale, tile, retry, and optional post correction controlled inside the app.</li>
-              <li><b>chaiNNer</b>: use only with a tested chain. The chain remains the source of truth; direct NCNN controls do not override it.</li>
-            </ul>
-            <h3>Technical Texture Warning</h3>
+            <h3>Safety Reminders</h3>
             <p>Visible color textures are not the same as technical maps. Height, displacement, normals, masks, vectors, and other precision-sensitive DDS files are riskier to push through PNG intermediates.</p>
             <ul>
               <li>Start with a safer preset.</li>
               <li>Keep automatic rules enabled.</li>
-              <li>Review planner profiles and planner paths before forcing technical maps through the visible PNG path.</li>
-              <li>Source Match correction only applies to direct NCNN runs and only where the app decides it is appropriate.</li>
+              <li>Use preview-only paths before writing mesh or archive output.</li>
+              <li>Open Documentation for detailed field references, recipes, troubleshooting, and FAQs.</li>
             </ul>
-            <h3>Other App Areas</h3>
-            <ul>
-              <li><b>Archive Browser</b>: read-only scan, filter, preview, extract, send DDS to workflow, or open matching files in Texture Editor/Research.</li>
-              <li><b>Texture Editor</b>: layered visible-texture editing with selections, masks, channels, brushes, gradients, clone/heal/smudge, patch, dodge/burn, and compare handoff.</li>
-              <li><b>Replace Assistant</b>: best route for one-off edited replacements and mod-ready folder output.</li>
-              <li><b>Research</b>: grouped texture families, DDS QA and metadata, unknown resolver, reports, references, and notes.</li>
-              <li><b>Text Search</b>: archive or loose text search with preview and export.</li>
-            </ul>
-            <h3>Compare and Review</h3>
-            <p><b>Compare</b> is the review step before larger runs.</p>
-            <ul>
-              <li>Use <b>Preview size</b> to scale both panes together.</li>
-              <li>Use the mouse wheel while hovering a preview to zoom.</li>
-              <li>Drag to pan when a preview is larger than the viewport.</li>
-              <li>Use <b>Sync Pan</b> to keep both previews aligned.</li>
-            </ul>
-            <h3>Common Failure Causes</h3>
-            <ul>
-              <li><b>Missing texconv</b>: previews, DDS-to-PNG conversion, compare previews, and DDS rebuild all depend on <b>texconv.exe</b>.</li>
-              <li><b>Missing NCNN models</b>: the direct NCNN backend needs a working executable plus compatible models.</li>
-              <li><b>No matching PNG outputs</b>: if a chain or backend produces no usable PNG output, DDS rebuild has nothing to convert.</li>
-              <li><b>Wrong chaiNNer paths</b>: hardcoded chain folders can make chaiNNer read from or write to the wrong place.</li>
-              <li><b>Brightness drift</b>: review in <b>Compare</b>, try a different model, or test a Source Match correction mode.</li>
-            </ul>
-            <h3>FAQ</h3>
-            <p><b>Do I need texconv?</b><br/>Yes for DDS preview, DDS-to-PNG conversion, Compare previews, and DDS rebuild. Configure it before judging workflow failures.</p>
-            <p><b>Should I upscale every texture?</b><br/>No. Start with visible color, UI, or emissive textures. Normals, masks, packed maps, vectors, height, and displacement data should usually stay preserve-first until you understand the file family.</p>
-            <p><b>When should I use Replace Assistant instead of Texture Workflow?</b><br/>Use Replace Assistant for one-off edited PNG/DDS replacements. Use Texture Workflow for batch conversion, batch rebuild, or batch upscale of a loose DDS tree.</p>
-            <p><b>What is the safest first backend?</b><br/>Use <b>Disabled</b> to prove paths and DDS rebuild settings first. Then test direct <b>Real-ESRGAN NCNN</b> or a known-good <b>chaiNNer</b> chain on a small subset.</p>
-            <p><b>Why did my output look too bright, too dark, or too sharp?</b><br/>Upscale models and color correction can shift luma, contrast, and detail. Compare against the original, try a different model, reduce aggressive settings, or test Source Match correction for visible textures.</p>
-            <p><b>Can the app edit archive files directly?</b><br/>Only for supported patch workflows, and those flows use explicit confirmation and backup/restore support. Normal browsing, previewing, and extraction are read-only.</p>
-            <p><b>Where are settings and cache stored?</b><br/>Settings and archive cache are stored beside the executable or local checkout, so portable builds keep their local state near the app.</p>
-            <p><b>Why does Documentation have many topics?</b><br/>The documentation window is topic-based. Search by feature, field, file type, backend, or error symptom, then open the focused topic instead of reading one long page.</p>
-            <h3>Documentation</h3>
-            <p>The top-level <b>Documentation</b> menu opens a topic-based, searchable in-app documentation browser. Use it for deeper guides, field references, advanced planner behavior, troubleshooting, and FAQs.</p>
-            <h3>Local State</h3>
-            <p>The app auto-saves its settings beside the EXE and also stores archive scan cache beside it.</p>
+            <h3>Where Details Live</h3>
+            <p>The <b>Documentation</b> menu is topic-based and searchable. Use it for mesh import/swap steps, archive guides, Texture Workflow profiles and rules, Texture Editor tools, Replace Assistant packaging, Research, Text Search, settings, troubleshooting, and FAQs.</p>
             """
         )
         self.browser.setFont(self.font())

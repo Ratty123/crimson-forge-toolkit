@@ -118,6 +118,10 @@ def _texture_path_text(path_value: object) -> str:
     return str(path_value or "").replace("\\", "/")
 
 
+def _normalized_parameter_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
 @dataclass(slots=True, frozen=True)
 class TextureSidecarBinding:
     texture_path: str
@@ -137,6 +141,81 @@ class TextureSidecarBinding:
     brightness: float = 1.0
     uv_scale: float = 1.0
     tile_type: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class MaterialSidecarParameter:
+    parameter_name: str
+    tag_name: str
+    string_item_id: str = ""
+    item_id: str = ""
+    index: int = -1
+    value: str = ""
+    texture_path: str = ""
+    color_value: Tuple[float, float, float] = ()
+    numeric_value: Optional[float] = None
+
+
+@dataclass(slots=True, frozen=True)
+class MaterialSidecarSlot:
+    part_name: str
+    material_name: str = ""
+    shader_family: str = ""
+    wrapper_item_id: str = ""
+    texture_parameters: Tuple[MaterialSidecarParameter, ...] = ()
+    color_parameters: Tuple[MaterialSidecarParameter, ...] = ()
+    float_parameters: Tuple[MaterialSidecarParameter, ...] = ()
+    flag_parameters: Tuple[MaterialSidecarParameter, ...] = ()
+    byte4_parameters: Tuple[MaterialSidecarParameter, ...] = ()
+
+    @property
+    def visible_texture_count(self) -> int:
+        count = 0
+        for parameter in self.texture_parameters:
+            key = _normalized_parameter_key(parameter.parameter_name)
+            if any(token in key for token in ("mask", "material", "normal", "height", "displacement")):
+                continue
+            if any(token in key for token in ("base", "color", "diffuse", "albedo", "overlay", "emissive")):
+                count += 1
+        return count
+
+    @property
+    def is_emissive(self) -> bool:
+        return "emissive" in _normalized_parameter_key(self.shader_family) or any(
+            "emissive" in _normalized_parameter_key(parameter.parameter_name)
+            for parameter in (*self.texture_parameters, *self.color_parameters, *self.float_parameters)
+        )
+
+    def parameter_value(self, parameter_name: str) -> str:
+        wanted = _normalized_parameter_key(parameter_name)
+        for parameter in (*self.flag_parameters, *self.byte4_parameters, *self.float_parameters, *self.color_parameters):
+            if _normalized_parameter_key(parameter.parameter_name) == wanted:
+                return parameter.value
+        return ""
+
+
+@dataclass(slots=True, frozen=True)
+class MaterialSidecarProfile:
+    sidecar_path: str
+    sidecar_kind: str
+    linked_mesh_path: str = ""
+    materials: Tuple[MaterialSidecarSlot, ...] = ()
+
+    @property
+    def shader_families(self) -> Tuple[str, ...]:
+        seen: set[str] = set()
+        result: List[str] = []
+        for material in self.materials:
+            shader = str(material.shader_family or "").strip()
+            key = shader.lower()
+            if shader and key not in seen:
+                seen.add(key)
+                result.append(shader)
+        return tuple(result)
+
+    @property
+    def texture_count(self) -> int:
+        return sum(len(material.texture_parameters) for material in self.materials)
 
 
 @dataclass(slots=True)
@@ -358,6 +437,180 @@ def _parse_sidecar_color_attrs(element: ET.Element) -> Tuple[float, float, float
     if len(values) >= 3:
         return tuple(max(0.0, min(2.0, value)) for value in values[:3])  # type: ignore[return-value]
     return _parse_sidecar_color(_first_attr(element, ("Value", "_value", "value")))
+
+
+def _sidecar_parameter_name(parameter: ET.Element) -> str:
+    return _first_attr(
+        parameter,
+        (
+            "_name",
+            "StringItemID",
+            "ParameterName",
+            "parameterName",
+            "_parameterName",
+            "Name",
+            "name",
+            "ID",
+            "id",
+        ),
+    )
+
+
+def _sidecar_parameter_index(parameter: ET.Element) -> int:
+    raw = _first_attr(parameter, ("Index", "index", "_index"))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _sidecar_parameter_value(parameter: ET.Element) -> str:
+    return _first_attr(parameter, ("Value", "_value", "value", "_path", "path", "Path", "File", "file", "Texture", "texture"))
+
+
+def _iter_sidecar_texture_paths(parameter: ET.Element) -> Iterable[str]:
+    direct_value = _sidecar_parameter_value(parameter)
+    if _looks_like_texture_sidecar_reference(direct_value):
+        yield direct_value.replace("\\", "/")
+    for resource in parameter.iter():
+        if resource is parameter:
+            continue
+        resource_tag = _strip_texture_sidecar_xml_namespace(resource.tag)
+        normalized_resource_tag = _normalized_parameter_key(resource_tag)
+        tag_can_hold_texture = (
+            resource_tag == "ResourceReferencePath_ITexture"
+            or resource_tag == "TextureRef"
+            or normalized_resource_tag == "textureref"
+            or ("resourcereferencepath" in normalized_resource_tag and "texture" in normalized_resource_tag)
+            or ("texture" in normalized_resource_tag and any(token in normalized_resource_tag for token in ("resource", "reference", "path", "file")))
+        )
+        if not tag_can_hold_texture:
+            continue
+        texture_path = _first_attr(resource, ("_path", "path", "Path", "_value", "Value", "value", "File", "file", "Texture", "texture"))
+        if _looks_like_texture_sidecar_reference(texture_path):
+            yield texture_path.replace("\\", "/")
+
+
+def _material_parameter_record(parameter: ET.Element, *, texture_path: str = "") -> MaterialSidecarParameter:
+    value = _sidecar_parameter_value(parameter)
+    parsed_float: Optional[float] = None
+    if value:
+        try:
+            parsed_float = float(str(value).strip())
+        except (TypeError, ValueError):
+            parsed_float = None
+    return MaterialSidecarParameter(
+        parameter_name=_sidecar_parameter_name(parameter),
+        tag_name=_strip_texture_sidecar_xml_namespace(parameter.tag),
+        string_item_id=_first_attr(parameter, ("StringItemID", "stringItemID", "_stringItemID")),
+        item_id=_first_attr(parameter, ("ItemID", "itemID", "_itemID")),
+        index=_sidecar_parameter_index(parameter),
+        value=value,
+        texture_path=texture_path.replace("\\", "/"),
+        color_value=_parse_sidecar_color_attrs(parameter),
+        numeric_value=parsed_float,
+    )
+
+
+@lru_cache(maxsize=512)
+def _parse_material_sidecar_profile_cached(sidecar_text_value: str, sidecar_path: str) -> MaterialSidecarProfile:
+    sidecar_text = str(sidecar_text_value or "").replace("\ufeff", "").replace("\x00", "").strip()
+    sidecar_kind = _texture_sidecar_kind(sidecar_path, sidecar_text)
+    linked_mesh_path = _linked_mesh_path_from_sidecar(sidecar_path, sidecar_kind)
+    if not sidecar_text:
+        return MaterialSidecarProfile(sidecar_path=sidecar_path, sidecar_kind=sidecar_kind, linked_mesh_path=linked_mesh_path)
+    sidecar_text = re.sub(r"^\s*<\?xml[^>]*\?>", "", sidecar_text, count=1, flags=re.IGNORECASE)
+    try:
+        root = ET.fromstring(f"<Root>{sidecar_text}</Root>")
+    except ET.ParseError:
+        return MaterialSidecarProfile(sidecar_path=sidecar_path, sidecar_kind=sidecar_kind, linked_mesh_path=linked_mesh_path)
+
+    materials: List[MaterialSidecarSlot] = []
+    wrapper_tags = {"SkinnedMeshMaterialWrapper"} if sidecar_kind == "pac_xml" else {"Material"}
+    if sidecar_kind not in {"pac_xml", "pami"}:
+        wrapper_tags = {"SkinnedMeshMaterialWrapper", "Material"}
+
+    for wrapper in root.iter():
+        wrapper_tag = _strip_texture_sidecar_xml_namespace(wrapper.tag)
+        if wrapper_tag not in wrapper_tags:
+            continue
+        if sidecar_kind != "pac_xml" and wrapper_tag == "Material":
+            part_name = _first_attr(wrapper, ("PrimitiveName", "primitiveName", "_subMeshName", "SubMeshName", "subMeshName", "Name", "name"))
+        else:
+            part_name = _first_attr(wrapper, ("_subMeshName", "subMeshName", "SubMeshName", "PrimitiveName", "primitiveName", "Name", "name"))
+        shader_family = ""
+        material_name = part_name
+        for child in wrapper.iter():
+            child_tag = _strip_texture_sidecar_xml_namespace(child.tag)
+            if child_tag == "Material":
+                shader_family = _first_attr(child, ("_materialName", "MaterialName", "materialName", "Name", "name"))
+                if not material_name:
+                    material_name = _first_attr(child, ("PrimitiveName", "primitiveName", "SubMeshName", "subMeshName", "Name", "name"))
+                if shader_family:
+                    break
+            elif child_tag == "Common":
+                shader_family = _first_attr(child, ("MaterialName", "materialName", "_materialName", "Name", "name"))
+                if shader_family:
+                    break
+
+        texture_parameters: List[MaterialSidecarParameter] = []
+        color_parameters: List[MaterialSidecarParameter] = []
+        float_parameters: List[MaterialSidecarParameter] = []
+        flag_parameters: List[MaterialSidecarParameter] = []
+        byte4_parameters: List[MaterialSidecarParameter] = []
+        for parameter in wrapper.iter():
+            parameter_tag = _strip_texture_sidecar_xml_namespace(parameter.tag)
+            if not parameter_tag.startswith("MaterialParameter"):
+                continue
+            if parameter_tag == "MaterialParameterTexture":
+                texture_paths = tuple(_iter_sidecar_texture_paths(parameter))
+                if texture_paths:
+                    for texture_path in texture_paths:
+                        texture_parameters.append(_material_parameter_record(parameter, texture_path=texture_path))
+                else:
+                    texture_parameters.append(_material_parameter_record(parameter))
+            elif parameter_tag == "MaterialParameterColor":
+                color_parameters.append(_material_parameter_record(parameter))
+            elif parameter_tag == "MaterialParameterFloat":
+                float_parameters.append(_material_parameter_record(parameter))
+            elif parameter_tag == "MaterialParameterBitFlag32":
+                flag_parameters.append(_material_parameter_record(parameter))
+            elif parameter_tag == "MaterialParameterByte4":
+                byte4_parameters.append(_material_parameter_record(parameter))
+        order_key = lambda record: (record.index if record.index >= 0 else 999_999, record.parameter_name.lower(), record.texture_path.lower())
+        if any((texture_parameters, color_parameters, float_parameters, flag_parameters, byte4_parameters)):
+            materials.append(
+                MaterialSidecarSlot(
+                    part_name=part_name or material_name or "Material",
+                    material_name=material_name or part_name,
+                    shader_family=shader_family,
+                    wrapper_item_id=_first_attr(wrapper, ("ItemID", "itemID", "_itemID")),
+                    texture_parameters=tuple(sorted(texture_parameters, key=order_key)),
+                    color_parameters=tuple(sorted(color_parameters, key=order_key)),
+                    float_parameters=tuple(sorted(float_parameters, key=order_key)),
+                    flag_parameters=tuple(sorted(flag_parameters, key=order_key)),
+                    byte4_parameters=tuple(sorted(byte4_parameters, key=order_key)),
+                )
+            )
+    return MaterialSidecarProfile(
+        sidecar_path=sidecar_path,
+        sidecar_kind=sidecar_kind,
+        linked_mesh_path=linked_mesh_path,
+        materials=tuple(materials),
+    )
+
+
+def parse_material_sidecar_profile(sidecar_text: str, *, sidecar_path: str = "") -> MaterialSidecarProfile:
+    if isinstance(sidecar_text, Path):
+        try:
+            text_value = sidecar_text.read_text(errors="ignore")
+        except OSError:
+            text_value = ""
+        if not sidecar_path:
+            sidecar_path = str(sidecar_text)
+    else:
+        text_value = str(sidecar_text or "")
+    return _parse_material_sidecar_profile_cached(text_value, str(sidecar_path or ""))
 
 
 @lru_cache(maxsize=512)

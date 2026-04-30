@@ -14,7 +14,7 @@ from cdmw.core.material_sidecar_editor import (
     discover_material_sidecar_values,
     export_material_sidecar_mod_package,
 )
-from cdmw.core.upscale_profiles import parse_texture_sidecar_bindings
+from cdmw.core.upscale_profiles import parse_material_sidecar_profile, parse_texture_sidecar_bindings
 from cdmw.models import ArchiveEntry, ArchiveModelTextureReference, ModPackageInfo
 
 
@@ -227,6 +227,40 @@ class MaterialSidecarEditorTests(unittest.TestCase):
         self.assertLess(overrides[0].tint_color[0], 0.06)
         self.assertIn("dye", overrides[0].reason.lower())
         self.assertLess(bindings[0].tint_color[0], 0.06)
+
+    def test_material_profile_preserves_pac_xml_shader_parameters(self) -> None:
+        text = """
+        <SkinnedMeshMaterialWrapper ItemID="1192" _subMeshName="blade">
+          <Material Name="_resourceMaterial" _materialName="SkinnedMeshEmissive_Ver2">
+            <Vector Name="_parameters">
+              <MaterialParameterBitFlag32 StringItemID="_renderSettingFlag" ItemID="8" _name="_renderSettingFlag" _value="6" Index="0"/>
+              <MaterialParameterTexture StringItemID="_normalTexture" ItemID="6" _name="_normalTexture" Index="1">
+                <ResourceReferencePath_ITexture Name="_value" _path="character/texture/blade_n.dds"/>
+              </MaterialParameterTexture>
+              <MaterialParameterTexture StringItemID="_emissiveIntensityTexture" ItemID="1638159983050750" _name="_emissiveIntensityTexture" Index="2">
+                <ResourceReferencePath_ITexture Name="_value" _path="character/texture/blade_emi.dds"/>
+              </MaterialParameterTexture>
+              <MaterialParameterColor StringItemID="_emissiveColor" _name="_emissiveColor" _value="#05ff9fff" Index="3"/>
+              <MaterialParameterFloat StringItemID="_emissiveIntensity" _name="_emissiveIntensity" _value="1.25" Index="4"/>
+              <MaterialParameterBitFlag32 StringItemID="_colorBlendingFlag" _name="_colorBlendingFlag" _value="4095" Index="5"/>
+            </Vector>
+          </Material>
+        </SkinnedMeshMaterialWrapper>
+        """
+        profile = parse_material_sidecar_profile(text, sidecar_path="character/modelproperty/example.pac_xml")
+
+        self.assertEqual("pac_xml", profile.sidecar_kind)
+        self.assertEqual("character/model/example.pac", profile.linked_mesh_path)
+        self.assertEqual(("SkinnedMeshEmissive_Ver2",), profile.shader_families)
+        self.assertEqual(1, len(profile.materials))
+        material = profile.materials[0]
+        self.assertEqual("blade", material.part_name)
+        self.assertTrue(material.is_emissive)
+        self.assertEqual("6", material.parameter_value("_renderSettingFlag"))
+        self.assertEqual("4095", material.parameter_value("_colorBlendingFlag"))
+        self.assertEqual(("character/texture/blade_n.dds", "character/texture/blade_emi.dds"), tuple(parameter.texture_path for parameter in material.texture_parameters))
+        self.assertEqual("_emissiveColor", material.color_parameters[0].parameter_name)
+        self.assertAlmostEqual(1.25, material.float_parameters[0].numeric_value)
 
     def test_preview_overrides_for_edits_ignore_unedited_dark_sidecar_colors(self) -> None:
         text = """

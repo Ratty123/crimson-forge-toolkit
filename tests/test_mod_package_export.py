@@ -41,8 +41,13 @@ class ModPackageExportTests(unittest.TestCase):
 
             for key in ("title", "version", "author", "description", "nexus_url", "game", "generator", "files_dir", "manager_targets"):
                 self.assertEqual(manifest.get(key), info_json.get(key), key)
-                self.assertEqual(manifest.get(key), modinfo.get(key), key)
                 self.assertEqual(manifest.get(key), mod_json.get(key), key)
+            self.assertEqual(manifest.get("manager_targets"), ["universal"])
+            self.assertEqual(modinfo.get("name"), "Example")
+            self.assertEqual(modinfo.get("version"), "1.2")
+            self.assertEqual(modinfo.get("author"), "Author")
+            self.assertEqual(modinfo.get("description"), "Desc")
+            self.assertNotIn("manager_targets", modinfo)
             self.assertEqual(manifest.get("files_dir"), ".")
             self.assertNotIn("files_root", manifest)
             self.assertNotIn("new_paths", manifest)
@@ -74,6 +79,69 @@ class ModPackageExportTests(unittest.TestCase):
             self.assertEqual(manifest.get("new_paths"), ["object/texture/new.dds"])
             self.assertEqual(manifest.get("manager_targets"), ["cdumm"])
 
+    def test_cdumm_modinfo_uses_documented_fields_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "CdummMod"
+            payload = root / "object" / "texture" / "sample.dds"
+            payload.parent.mkdir(parents=True)
+            payload.write_bytes(b"DDS ")
+
+            write_mod_package_manifest(
+                root,
+                ModPackageInfo(title="CDUMM Example", version="2.0", author="Author", description="Desc"),
+                kind="dds_loose_mod",
+                export_options=ModPackageExportOptions(
+                    manager_targets=("cdumm",),
+                    structure="files_wrapper",
+                    conflict_mode="override",
+                    target_language="ko",
+                ),
+            )
+
+            modinfo = json.loads((root / "modinfo.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(modinfo),
+                {"name", "version", "author", "description", "conflict_mode", "target_language"},
+            )
+            self.assertEqual(modinfo["conflict_mode"], "override")
+            self.assertEqual(modinfo["target_language"], "ko")
+
+    def test_dmm_texture_profile_writes_texture_folder_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "DmmTextureMod"
+            payload = root / "character" / "texture" / "sample.dds"
+            payload.parent.mkdir(parents=True)
+            payload.write_bytes(b"DDS ")
+
+            returned_path = write_mod_package_manifest(
+                root,
+                ModPackageInfo(title="DMM Texture", version="1.0", author="Author", description="Desc"),
+                kind="dds_loose_mod",
+                export_options=ModPackageExportOptions(
+                    manager_targets=("dmm",),
+                    structure="dmm_texture",
+                    create_manifest_json=False,
+                    create_mod_json=False,
+                    create_info_json=False,
+                    create_no_encrypt_file=False,
+                ),
+            )
+
+            self.assertTrue((root / "character" / "texture" / "sample.dds").exists())
+            self.assertTrue((root / "modinfo.json").exists())
+            self.assertFalse((root / "files").exists())
+            self.assertFalse((root / "manifest.json").exists())
+            self.assertFalse((root / "mod.json").exists())
+            self.assertFalse((root / "info.json").exists())
+            self.assertFalse((root / ".no_encrypt").exists())
+            self.assertEqual(returned_path.name, "modinfo.json")
+            modinfo = json.loads((root / "modinfo.json").read_text(encoding="utf-8"))
+            self.assertEqual(set(modinfo), {"name", "version", "author", "description"})
+            readme_text = (root / "README.txt").read_text(encoding="utf-8")
+            self.assertIn("mods/_textures/", readme_text)
+            self.assertNotIn("Preferred manager", readme_text)
+            self.assertNotIn("nexusmods.com/crimsondesert/mods/113", readme_text)
+
     def test_custom_compact_paths_uses_files_wrapper_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "CompactMod"
@@ -96,6 +164,26 @@ class ModPackageExportTests(unittest.TestCase):
             self.assertEqual(manifest.get("structure"), "custom_compact_paths")
             self.assertEqual(manifest.get("files_dir"), "files")
             self.assertEqual(manifest.get("files_root"), "files")
+
+    def test_mesh_loose_mod_coerces_dmm_texture_structure_to_mesh_safe_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "MeshDmmSafe"
+            payload = root / "character" / "sample.pac"
+            payload.parent.mkdir(parents=True)
+            payload.write_bytes(b"PAC ")
+
+            finalize_mod_package_export(
+                root,
+                ModPackageInfo(title="Mesh DMM Safe"),
+                kind="mesh_loose_mod",
+                payload_paths=("character/sample.pac",),
+                options=ModPackageExportOptions(manager_targets=("dmm",), structure="dmm_texture"),
+            )
+
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue((root / "character" / "sample.pac").exists())
+            self.assertEqual(manifest.get("structure"), "game_relative")
+            self.assertEqual(manifest.get("files_dir"), ".")
 
     def test_no_encrypt_toggle_and_ready_zip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -185,7 +273,14 @@ class ModPackageExportTests(unittest.TestCase):
             readme_text = (root / "README.txt").read_text(encoding="utf-8")
             self.assertIn("Crimson Desert Mod Workbench", readme_text)
             self.assertIn("Generated Loose Mod Package", readme_text)
+            self.assertIn("::::::::::::-------------::---::-----:---------::::::::::", readme_text)
+            self.assertIn("========     ===       ===  =====  ==  ====  ====  ======", readme_text)
+            self.assertIn("+=======================================================+", readme_text)
+            self.assertIn("PACKAGE\n=========================================================", readme_text)
             self.assertIn("Loose files        1", readme_text)
+            self.assertNotIn("Preferred manager", readme_text)
+            self.assertNotIn("preferred mod manager", readme_text)
+            self.assertNotIn("nexusmods.com/crimsondesert/mods/113", readme_text)
             for expected in ("manifest.json", "mod.json", "modinfo.json", "info.json", ".no_encrypt", "ReadmeMod.zip"):
                 self.assertIn(expected, readme_text)
             with zipfile.ZipFile(root.with_suffix(".zip")) as archive:

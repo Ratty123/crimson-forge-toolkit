@@ -12,6 +12,7 @@ from cdmw.core.archive import (
 from cdmw.core.item_index import (
     ArchiveItemRecord,
     _ITEMINFO_MARKER,
+    _build_archive_item_search_index_from_records,
     _build_archive_model_hash_table_from_entries,
     _parse_archive_iteminfo_data,
     _parse_stringinfo_model_icon_hashes_from_data,
@@ -461,6 +462,51 @@ class ItemNameArchiveSearchTests(unittest.TestCase):
         )
 
         self.assertEqual([entry.path for entry in filtered], ["character/model/cd_weapon_king_halberd.pac"])
+
+    def test_item_index_separates_exact_and_related_display_names(self) -> None:
+        exact_hash = hashlittle(b"cd_phm_01_sword_0166", 0xC5EDE)
+        exact_record = ArchiveItemRecord(
+            item_id=1000,
+            internal_name="Item_OneHandSword_Exact",
+            display_name="Sword of the Lord",
+            prefab_hashes=[exact_hash],
+        )
+        related_record = ArchiveItemRecord(
+            item_id=1001,
+            internal_name="Item_OneHandSword_Related",
+            display_name="Icon Linked Sword",
+            model_stems=["cd_phm_01_sword_0279"],
+        )
+
+        index = _build_archive_item_search_index_from_records(
+            [exact_record, related_record],
+            [
+                _entry("character/model/cd_phm_01_sword_0166.pac"),
+                _entry("character/model/cd_phm_01_sword_0279.pac"),
+            ],
+        )
+
+        self.assertEqual(index.model_base_exact_display_names, {"cd_phm_01_sword_0166": "Sword of the Lord"})
+        self.assertEqual(index.model_base_related_display_names, {"cd_phm_01_sword_0279": "Icon Linked Sword"})
+        self.assertEqual(index.model_base_display_names["cd_phm_01_sword_0166"], "Sword of the Lord")
+        self.assertEqual(index.model_base_display_names["cd_phm_01_sword_0279"], "Icon Linked Sword")
+
+    def test_exact_display_name_stays_on_hash_resolved_variant_stem(self) -> None:
+        exact_hash = hashlittle(b"cd_phm_01_sword_0166_index01_r", 0xC5EDE)
+        record = ArchiveItemRecord(
+            item_id=1000,
+            internal_name="Item_OneHandSword_Exact",
+            display_name="Sword of the Lord",
+            prefab_hashes=[exact_hash],
+        )
+
+        index = _build_archive_item_search_index_from_records(
+            [record],
+            [_entry("character/model/cd_phm_01_sword_0166.pac")],
+        )
+
+        self.assertEqual(index.model_base_exact_display_names, {"cd_phm_01_sword_0166_index01_r": "Sword of the Lord"})
+        self.assertEqual(index.model_base_display_names, {"cd_phm_01_sword_0166": "Sword of the Lord"})
 
 
 if __name__ == "__main__":

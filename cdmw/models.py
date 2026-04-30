@@ -838,6 +838,7 @@ class ModelPreviewMesh:
     preview_height_texture_default_name: str = ""
     preview_texture_flip_vertical: Optional[bool] = None
     preview_base_texture_source: str = ""
+    preview_base_texture_quality: str = ""
     preview_sidecar_material_primitive: str = ""
     preview_sidecar_shader_family: str = ""
     preview_texture_brightness: float = 1.0
@@ -900,6 +901,7 @@ class PreparedModelPreviewBatch:
     preview_material_texture_path: str = ""
     preview_height_texture_path: str = ""
     preview_texture_flip_vertical: Optional[bool] = None
+    preview_base_texture_quality: str = ""
     preview_texture_brightness: float = 1.0
     preview_texture_tint: Tuple[float, float, float] = ()
     preview_texture_uv_scale: Tuple[float, float] = ()
@@ -992,6 +994,7 @@ MODEL_PREVIEW_VISIBLE_TEXTURE_MODE_LABELS: Dict[str, str] = {
 
 MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODES: Tuple[str, ...] = (
     "lit",
+    "rich_lit",
     "white_uniform",
     "shader_marker",
     "fragcoord_checker",
@@ -1005,6 +1008,8 @@ MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODES: Tuple[str, ...] = (
     "normal_raw",
     "material_raw",
     "height_raw",
+    "height_calibrated",
+    "relief_control_test",
     "sampler_swap_base_on_unit2",
     "sampler_swap_material_on_unit0",
     "base_color",
@@ -1017,6 +1022,7 @@ MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODES: Tuple[str, ...] = (
 
 MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODE_LABELS: Dict[str, str] = {
     "lit": "Lit",
+    "rich_lit": "Enhanced Relief Preview",
     "white_uniform": "White Uniform",
     "shader_marker": "Shader Marker",
     "fragcoord_checker": "FragCoord Checker",
@@ -1030,6 +1036,8 @@ MODEL_PREVIEW_RENDER_DIAGNOSTIC_MODE_LABELS: Dict[str, str] = {
     "normal_raw": "Normal Raw",
     "material_raw": "Material Raw",
     "height_raw": "Height Raw",
+    "height_calibrated": "Height Calibrated",
+    "relief_control_test": "Relief Control Test",
     "sampler_swap_base_on_unit2": "Base On Unit 2",
     "sampler_swap_material_on_unit0": "Material On Unit 0",
     "base_color": "Base Color Guarded",

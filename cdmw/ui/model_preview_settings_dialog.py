@@ -144,6 +144,12 @@ class ModelPreviewSettingsDialog(QDialog):
         intro_label.setObjectName("HintLabel")
         intro_label.setWordWrap(True)
         root_layout.addWidget(intro_label)
+        advanced_warning_label = QLabel(
+            "Advanced diagnostics and render options can be expensive, visually incorrect, asset-dependent, or have no visible effect on some previews. Use them for inspection rather than as guaranteed final rendering."
+        )
+        advanced_warning_label.setObjectName("WarningText")
+        advanced_warning_label.setWordWrap(True)
+        root_layout.addWidget(advanced_warning_label)
 
         self.tabs = QTabWidget()
         root_layout.addWidget(self.tabs, stretch=1)
@@ -163,12 +169,7 @@ class ModelPreviewSettingsDialog(QDialog):
         general_form.setHorizontalSpacing(12)
         general_form.setVerticalSpacing(10)
         self.use_textures_checkbox = QCheckBox("Use textures when available")
-        self.high_quality_checkbox = QCheckBox("Enable high-quality shading")
-        self.alignment_final_preview_checkbox = QCheckBox("Use Final Output Preview in Mesh Replacement Alignment")
-        self.alignment_final_preview_checkbox.setToolTip(
-            "When enabled, the replacement pane stays on the authoritative rebuilt package preview after it is ready. "
-            "When disabled, the pane stays on the faster live mapping preview and the Final Output Preview button opens the final view."
-        )
+        self.high_quality_checkbox = QCheckBox("Use support-map preview shading")
         self.visible_texture_mode_combo = QComboBox()
         for mode in MODEL_PREVIEW_VISIBLE_TEXTURE_MODES:
             self.visible_texture_mode_combo.addItem(
@@ -183,12 +184,11 @@ class ModelPreviewSettingsDialog(QDialog):
             )
         general_form.addRow("", self.use_textures_checkbox)
         general_form.addRow("", self.high_quality_checkbox)
-        general_form.addRow("", self.alignment_final_preview_checkbox)
         general_form.addRow("Visible texture mode", self.visible_texture_mode_combo)
         general_form.addRow("Diagnostic render mode", self.render_diagnostic_mode_combo)
         general_layout.addLayout(general_form)
         general_hint = QLabel(
-            "Use textures applies resolved preview DDS files when available. High-quality enables richer shaded preview when normal, material, or height support maps can be resolved for the selected model. Visible texture mode controls how aggressively sidecar-visible layers are allowed to replace the mesh-derived base texture. Diagnostic render mode applies globally to every 3D preview window."
+            "Use textures applies resolved preview DDS files when available. Support-map preview shading can sample resolved normal, material, or height maps for an approximate asset-dependent preview. Visible texture mode controls how aggressively sidecar-visible layers are allowed to replace the mesh-derived base texture."
         )
         general_hint.setObjectName("HintLabel")
         general_hint.setWordWrap(True)
@@ -274,27 +274,6 @@ class ModelPreviewSettingsDialog(QDialog):
             "pan_sensitivity",
             step=0.05,
             decimals=2,
-        )
-        self._add_slider_row(
-            controls_form,
-            "Depth strength",
-            "height_effect_max",
-            step=0.01,
-            decimals=2,
-        )
-        self._add_slider_row(
-            controls_form,
-            "Material shine",
-            "specular_max",
-            step=0.01,
-            decimals=2,
-        )
-        self._add_slider_row(
-            controls_form,
-            "Roughness contrast",
-            "shininess_max",
-            step=1.0,
-            decimals=0,
         )
         invert_widget = QWidget()
         invert_layout = QVBoxLayout(invert_widget)
@@ -389,7 +368,6 @@ class ModelPreviewSettingsDialog(QDialog):
         for checkbox in (
             self.use_textures_checkbox,
             self.high_quality_checkbox,
-            self.alignment_final_preview_checkbox,
             self.invert_orbit_x_checkbox,
             self.invert_orbit_y_checkbox,
             self.invert_pan_x_checkbox,
@@ -471,7 +449,6 @@ class ModelPreviewSettingsDialog(QDialog):
         current = clamp_model_preview_render_settings(self._base_settings)
         current.use_textures_by_default = self.use_textures_checkbox.isChecked()
         current.high_quality_by_default = self.high_quality_checkbox.isChecked()
-        current.alignment_use_final_output_preview = self.alignment_final_preview_checkbox.isChecked()
         current.visible_texture_mode = str(self.visible_texture_mode_combo.currentData() or current.visible_texture_mode)
         current.render_diagnostic_mode = str(
             self.render_diagnostic_mode_combo.currentData() or current.render_diagnostic_mode
@@ -522,7 +499,6 @@ class ModelPreviewSettingsDialog(QDialog):
         try:
             self.use_textures_checkbox.setChecked(clamped.use_textures_by_default)
             self.high_quality_checkbox.setChecked(clamped.high_quality_by_default)
-            self.alignment_final_preview_checkbox.setChecked(clamped.alignment_use_final_output_preview)
             visible_texture_mode_index = self.visible_texture_mode_combo.findData(clamped.visible_texture_mode)
             self.visible_texture_mode_combo.setCurrentIndex(max(0, visible_texture_mode_index))
             render_diagnostic_mode_index = self.render_diagnostic_mode_combo.findData(clamped.render_diagnostic_mode)
@@ -580,6 +556,7 @@ class ModelPreviewSettingsDialog(QDialog):
     def _emit_settings_changed(self, *_args) -> None:
         if self._applying_settings:
             return
+        self._sync_probe_controls_enabled()
         self.settings_changed.emit(self.current_settings())
 
     def _handle_render_diagnostic_mode_changed(self, *_args) -> None:
@@ -611,6 +588,22 @@ class ModelPreviewSettingsDialog(QDialog):
             self.texture_probe_source_combo.setToolTip(
                 "Selecting a value switches Diagnostic render mode to Selected Texture Probe, where this control directly changes the preview."
             )
+        relief_control_modes = {"rich_lit", "height_calibrated", "relief_control_test"}
+        relief_controls_enabled = bool(
+            mode in relief_control_modes
+            and self.use_textures_checkbox.isChecked()
+            and self.high_quality_checkbox.isChecked()
+        )
+        relief_tooltip = (
+            "Controls Enhanced Relief Preview using true height maps or base-derived relief."
+            if relief_controls_enabled
+            else "Select Enhanced Relief Preview or a relief diagnostic mode, then enable textures plus support-map preview shading."
+        )
+        for key in ("height_effect_max", "specular_max", "shininess_max"):
+            control = self._slider_controls.get(key)
+            if control is not None:
+                control.setEnabled(relief_controls_enabled)
+                control.setToolTip(relief_tooltip)
 
     def _handle_archive_performance_changed(self, *_args) -> None:
         manual = int(self.sidecar_worker_mode_combo.currentData() or 0) == 1

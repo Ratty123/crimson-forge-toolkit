@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from array import array
 import math
+from pathlib import Path
 import unittest
 
 from PySide6.QtGui import QColor, QImage
@@ -24,6 +25,8 @@ from cdmw.ui.widgets import (
     _BatchRenderDiagnostic,
     _FramebufferVisibilitySample,
     _ModelPreviewDrawBatch,
+    _RENDER_DIAGNOSTIC_MODE_CODES,
+    _TextureVisibilitySample,
 )
 
 
@@ -120,6 +123,160 @@ class ModelPreviewRenderSafetyTests(unittest.TestCase):
         self.assertTrue(settings.force_nearest_no_mipmaps)
         self.assertEqual(3, settings.solo_batch_index)
 
+    def test_rich_lit_is_opt_in_and_lit_keeps_compatibility_code(self) -> None:
+        defaults = clamp_model_preview_render_settings(ModelPreviewRenderSettings())
+
+        self.assertEqual("lit", defaults.render_diagnostic_mode)
+        self.assertEqual(0, _RENDER_DIAGNOSTIC_MODE_CODES["lit"])
+        self.assertEqual(22, _RENDER_DIAGNOSTIC_MODE_CODES["rich_lit"])
+        self.assertEqual(23, _RENDER_DIAGNOSTIC_MODE_CODES["height_calibrated"])
+        self.assertEqual(24, _RENDER_DIAGNOSTIC_MODE_CODES["relief_control_test"])
+
+    def test_derived_relief_texture_generation_is_relief_mode_only(self) -> None:
+        self.assertFalse(
+            ModelPreviewWidget._render_mode_uses_derived_relief(
+                ModelPreviewRenderSettings(render_diagnostic_mode="lit")
+            )
+        )
+        self.assertFalse(
+            ModelPreviewWidget._render_mode_uses_derived_relief(
+                ModelPreviewRenderSettings(render_diagnostic_mode="base_raw")
+            )
+        )
+        self.assertFalse(
+            ModelPreviewWidget._render_mode_uses_derived_relief(
+                ModelPreviewRenderSettings(render_diagnostic_mode="relief_control_test")
+            )
+        )
+        self.assertTrue(
+            ModelPreviewWidget._render_mode_uses_derived_relief(
+                ModelPreviewRenderSettings(render_diagnostic_mode="rich_lit")
+            )
+        )
+        self.assertTrue(
+            ModelPreviewWidget._render_mode_uses_derived_relief(
+                ModelPreviewRenderSettings(render_diagnostic_mode="height_calibrated")
+            )
+        )
+
+    def test_height_visibility_sampling_reports_relief_contrast(self) -> None:
+        image = QImage(3, 1, QImage.Format_RGBA8888)
+        image.setPixelColor(0, 0, QColor(32, 32, 32, 255))
+        image.setPixelColor(1, 0, QColor(128, 128, 128, 255))
+        image.setPixelColor(2, 0, QColor(224, 224, 224, 255))
+
+        sample = ModelPreviewWidget._sample_base_texture_visibility(
+            image,
+            [(0.0, 0.0), (0.5, 0.0), (0.99, 0.0)],
+            flip_vertical=False,
+            max_samples=8,
+        )
+
+        self.assertIsNotNone(sample)
+        assert sample is not None
+        self.assertLess(sample.min_luma, sample.average_luma)
+        self.assertGreater(sample.max_luma, sample.average_luma)
+        self.assertGreater(sample.luma_contrast, 0.70)
+
+    def test_derived_relief_generation_uses_base_texture_detail(self) -> None:
+        image = QImage(4, 4, QImage.Format_RGBA8888)
+        for y in range(4):
+            for x in range(4):
+                value = 40 if (x + y) % 2 == 0 else 220
+                image.setPixelColor(x, y, QColor(value, value, value, 255))
+
+        relief = ModelPreviewWidget._derive_relief_image_from_base(image)
+
+        self.assertIsNotNone(relief)
+        assert relief is not None
+        sample = ModelPreviewWidget._sample_base_texture_visibility(
+            relief,
+            [(0.0, 0.0), (0.33, 0.0), (0.66, 0.0), (0.99, 0.0)],
+            flip_vertical=False,
+            max_samples=8,
+        )
+        self.assertIsNotNone(sample)
+        assert sample is not None
+        self.assertGreater(sample.luma_contrast, 0.10)
+
+    def test_derived_relief_generation_ignores_flat_base_texture(self) -> None:
+        image = QImage(4, 4, QImage.Format_RGBA8888)
+        image.fill(QColor(120, 120, 120, 255))
+
+        self.assertIsNone(ModelPreviewWidget._derive_relief_image_from_base(image))
+
+    def test_enhanced_relief_status_reports_true_and_derived_sources(self) -> None:
+        active_state, active_reason, active_usable, active_source = ModelPreviewWidget._enhanced_relief_status(
+            render_mode_code=22,
+            high_quality_enabled=True,
+            support_maps_enabled=True,
+            support_maps_disabled=False,
+            height_key="height.png",
+            height_texture_available=True,
+            height_luma=_TextureVisibilitySample(
+                average_color=(0.5, 0.5, 0.5),
+                average_luma=0.5,
+                dark_ratio=0.0,
+                min_luma=0.20,
+                max_luma=0.80,
+                luma_contrast=0.60,
+            ),
+            height_map_disabled=False,
+            height_effect_max=0.7,
+        )
+        derived_state, derived_reason, derived_usable, derived_source = ModelPreviewWidget._enhanced_relief_status(
+            render_mode_code=22,
+            high_quality_enabled=True,
+            support_maps_enabled=False,
+            support_maps_disabled=True,
+            height_key="",
+            height_texture_available=False,
+            height_luma=None,
+            derived_relief_key="derived_relief:0:base.png",
+            derived_relief_texture_available=True,
+            derived_relief_luma=_TextureVisibilitySample(
+                average_color=(0.5, 0.5, 0.5),
+                average_luma=0.5,
+                dark_ratio=0.0,
+                min_luma=0.15,
+                max_luma=0.85,
+                luma_contrast=0.70,
+            ),
+            height_map_disabled=True,
+            height_effect_max=0.7,
+        )
+        flat_state, flat_reason, flat_usable, flat_source = ModelPreviewWidget._enhanced_relief_status(
+            render_mode_code=22,
+            high_quality_enabled=True,
+            support_maps_enabled=True,
+            support_maps_disabled=False,
+            height_key="height.png",
+            height_texture_available=True,
+            height_luma=_TextureVisibilitySample(
+                average_color=(0.5, 0.5, 0.5),
+                average_luma=0.5,
+                dark_ratio=0.0,
+                min_luma=0.50,
+                max_luma=0.505,
+                luma_contrast=0.005,
+            ),
+            height_map_disabled=False,
+            height_effect_max=0.7,
+        )
+
+        self.assertEqual("active", active_state)
+        self.assertIn("Calibrated", active_reason)
+        self.assertTrue(active_usable)
+        self.assertEqual("height-map", active_source)
+        self.assertEqual("active", derived_state)
+        self.assertIn("Derived", derived_reason)
+        self.assertTrue(derived_usable)
+        self.assertEqual("derived-base", derived_source)
+        self.assertEqual("inactive", flat_state)
+        self.assertIn("nearly flat", flat_reason)
+        self.assertFalse(flat_usable)
+        self.assertEqual("inactive", flat_source)
+
     def test_render_settings_clamp_invalid_diagnostic_controls(self) -> None:
         settings = clamp_model_preview_render_settings(
             ModelPreviewRenderSettings(
@@ -208,6 +365,26 @@ class ModelPreviewRenderSafetyTests(unittest.TestCase):
         self.assertFalse(defaults.disable_all_support_maps)
         self.assertGreater(defaults.height_effect_max, 0.0)
         self.assertGreater(defaults.specular_max, 0.0)
+
+    def test_enhanced_relief_shader_path_is_gated(self) -> None:
+        source = Path("cdmw/ui/widgets.py").read_text(encoding="utf-8")
+
+        self.assertIn("bool rich_lit = render_diagnostic_mode == 22;", source)
+        self.assertIn("for (int relief_step = 0; relief_step < 8; ++relief_step)", source)
+        self.assertIn("height_relief_usable != 0", source)
+        self.assertIn("effective_height_effect_max = rich_lit ? height_effect_max : 0.35", source)
+        self.assertIn("relief_source_code == 2", source)
+        self.assertIn("render_diagnostic_mode == 24", source)
+        self.assertIn("control_color = max(control_color, vec3(0.22, 0.22, 0.22))", source)
+        self.assertIn('MODEL_PREVIEW_RENDER_BUILD_ID = "2026-04-29-radical-relief-v7"', source)
+        self.assertIn("relief_emboss_rgb", source)
+        self.assertIn("relief_local_contrast", source)
+        self.assertIn("radical_chiseled", source)
+        self.assertIn("radical_cavity", source)
+        self.assertIn("normal_detail_strength", source)
+        self.assertIn("normal_light_delta", source)
+        self.assertIn("self._batch_render_diagnostics = {}", source)
+        self.assertIn("Diagnostics pending repaint:", source)
 
     def test_black_output_triage_distinguishes_missing_base_from_support_only(self) -> None:
         framebuffer = _FramebufferVisibilitySample(visible_pixels=100, average_luma=0.02, dark_ratio=0.95)
@@ -309,6 +486,77 @@ class ModelPreviewRenderSafetyTests(unittest.TestCase):
         first_normal = tuple(values[3:6])
         self.assertAlmostEqual(1.0, math.sqrt(sum(component * component for component in first_normal)))
 
+    def test_vertex_blob_includes_preview_smoothed_normals_for_rich_lighting(self) -> None:
+        mesh = ModelPreviewMesh(
+            positions=[
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ],
+            normals=[
+                (0.0, 0.0, 1.0),
+                (0.0, 0.0, 1.0),
+                (0.0, 0.0, 1.0),
+                (1.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+            ],
+            texture_coordinates=[
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (0.0, 1.0),
+                (0.0, 0.0),
+                (0.0, 1.0),
+                (1.0, 1.0),
+            ],
+            indices=[0, 1, 2, 3, 4, 5],
+            preview_texture_path="example.png",
+        )
+        model = ModelPreviewData(meshes=[mesh])
+
+        vertex_blob, _vertex_count, batches = ModelPreviewWidget._build_vertex_blob(model)
+        values = array("f")
+        values.frombytes(vertex_blob)
+
+        self.assertGreater(batches[0].smooth_normal_ratio, 0.0)
+        first_smooth_normal = tuple(values[17:20])
+        self.assertGreater(first_smooth_normal[0], 0.2)
+        self.assertGreater(first_smooth_normal[2], 0.2)
+
+    def test_base_texture_quality_reaches_prepared_preview_batches(self) -> None:
+        mesh = ModelPreviewMesh(
+            material_name="mat",
+            texture_name="base.dds",
+            preview_base_texture_quality="low_authority_overlay",
+            positions=[
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+            ],
+            texture_coordinates=[
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (0.0, 1.0),
+            ],
+            normals=[
+                (0.0, 0.0, 1.0),
+                (0.0, 0.0, 1.0),
+                (0.0, 0.0, 1.0),
+            ],
+            indices=[0, 1, 2],
+            preview_texture_path="base.png",
+        )
+        model = ModelPreviewData(meshes=[mesh])
+
+        _clone, prepared = ModelPreviewWidget.prepare_model_preview(model)
+
+        self.assertIsNotNone(prepared)
+        assert prepared is not None
+        self.assertEqual("low_authority_overlay", prepared.batches[0].preview_base_texture_quality)
+
     def test_texture_visibility_sampling_reports_luma_dark_ratio_and_alpha(self) -> None:
         image = QImage(2, 1, QImage.Format_RGBA8888)
         image.setPixelColor(0, 0, QColor(0, 0, 0, 128))
@@ -344,6 +592,21 @@ class ModelPreviewRenderSafetyTests(unittest.TestCase):
         self.assertGreaterEqual(sample.visible_pixels, 1)
         self.assertGreater(sample.background_ratio, 0.5)
         self.assertGreater(sample.average_luma, 0.5)
+
+    def test_enabling_textures_rebuilds_derived_relief_textures(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "cdmw" / "ui" / "widgets.py").read_text(encoding="utf-8")
+        self.assertIn("def set_use_textures", source)
+        self.assertIn("previous != self._use_textures", source)
+        self.assertIn("self._render_mode_uses_derived_relief(self._render_settings)", source)
+        self.assertIn("self._clear_gl_textures()", source)
+        self.assertIn("self._rebuild_gl_textures()", source)
+
+    def test_framebuffer_visibility_probe_is_throttled(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "cdmw" / "ui" / "widgets.py").read_text(encoding="utf-8")
+        self.assertIn("_framebuffer_visibility_sampled_at", source)
+        self.assertIn("time.monotonic()", source)
+        self.assertIn(">= 0.50", source)
+        self.assertIn("self.grabFramebuffer()", source)
 
     def test_render_sampling_diagnostics_include_geometry_and_output_buckets(self) -> None:
         widget = ModelPreviewWidget.__new__(ModelPreviewWidget)
@@ -384,6 +647,7 @@ class ModelPreviewRenderSafetyTests(unittest.TestCase):
 
         self.assertIn("Diagnostic Render Mode: Base Color", text)
         self.assertIn("Framebuffer probe:", text)
+        self.assertIn("rich_material=no", text)
         self.assertIn("normals=67% repaired=1", text)
         self.assertIn("tangent=100%", text)
         self.assertIn("final_bucket=invalid normals repaired", text)

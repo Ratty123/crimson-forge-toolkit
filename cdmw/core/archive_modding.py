@@ -44,6 +44,7 @@ from cdmw.modding.mesh_importer import (
 from cdmw.modding.mesh_parser import ParsedMesh, SubMesh, parse_mesh
 from cdmw.modding.scene_importer import (
     SCENE_TEXTURE_SOURCE_EXTENSIONS,
+    SceneImportResult,
     discover_scene_texture_files,
     import_scene_mesh,
     import_scene_mesh_with_report,
@@ -698,9 +699,10 @@ class HkxPreviewResult:
 
 
 class _VfsPathResolver:
-    def __init__(self, name_block: bytes) -> None:
+    def __init__(self, name_block: bytes, *, max_cache_entries: int = 200_000) -> None:
         self._name_block = name_block
         self._path_cache: Dict[int, str] = {0xFFFFFFFF: ""}
+        self._max_cache_entries = max(1, int(max_cache_entries))
 
     def get_full_path(self, offset: int) -> str:
         if offset == 0xFFFFFFFF or offset >= len(self._name_block):
@@ -711,7 +713,11 @@ class _VfsPathResolver:
         parts: List[Tuple[int, str]] = []
         current_offset = offset
         base = ""
+        seen_offsets: set[int] = set()
         while current_offset != 0xFFFFFFFF:
+            if current_offset in seen_offsets:
+                break
+            seen_offsets.add(current_offset)
             cached = self._path_cache.get(current_offset)
             if cached is not None:
                 base = cached
@@ -731,7 +737,8 @@ class _VfsPathResolver:
         built = base
         for part_offset, part in reversed(parts):
             built = f"{built}{part}"
-            self._path_cache[part_offset] = built
+            if len(self._path_cache) < self._max_cache_entries:
+                self._path_cache[part_offset] = built
         return self._path_cache.get(offset, built)
 
 
@@ -1461,7 +1468,9 @@ def _parse_mutable_pamt(pamt_path: Path) -> _MutablePamt:
     folder_count = struct.unpack_from("<I", data, off)[0]
     off += 4
     folder_table_size = folder_count * 16
-    folders = list(struct.iter_unpack("<IIII", data[off : off + folder_table_size]))
+    if off + folder_table_size > len(data):
+        raise ValueError(f"{pamt_path.name} folder table is truncated.")
+    folder_table = memoryview(data)[off : off + folder_table_size]
     off += folder_table_size
 
     if off + 4 > len(data):
@@ -1470,24 +1479,26 @@ def _parse_mutable_pamt(pamt_path: Path) -> _MutablePamt:
     off += 4
     file_table_offset = off
     file_table_size = file_count * struct.calcsize("<IIIIHH")
-    raw_file_records = list(struct.iter_unpack("<IIIIHH", data[file_table_offset : file_table_offset + file_table_size]))
+    if file_table_offset + file_table_size > len(data):
+        raise ValueError(f"{pamt_path.name} file table is truncated.")
+    file_table = memoryview(data)[file_table_offset : file_table_offset + file_table_size]
 
     resolver = _VfsPathResolver(file_names)
-    dir_resolver = _VfsPathResolver(directory_data)
+    dir_resolver = _VfsPathResolver(directory_data, max_cache_entries=50_000)
     folder_ranges = sorted(
         (
             file_start_index,
             file_start_index + folder_file_count,
             dir_resolver.get_full_path(name_offset).replace("\\", "/").strip("/"),
         )
-        for _folder_hash, name_offset, file_start_index, folder_file_count in folders
+        for _folder_hash, name_offset, file_start_index, folder_file_count in struct.iter_unpack("<IIII", folder_table)
         if folder_file_count > 0
     )
 
     file_records: Dict[str, _MutableFileRecord] = {}
     folder_cursor = 0
     record_stride = struct.calcsize("<IIIIHH")
-    for entry_index, (name_offset, paz_offset, comp_size, orig_size, paz_index, flags) in enumerate(raw_file_records):
+    for entry_index, (name_offset, paz_offset, comp_size, orig_size, paz_index, flags) in enumerate(struct.iter_unpack("<IIIIHH", file_table)):
         relative_path = resolver.get_full_path(name_offset).replace("\\", "/").strip("/")
         guessed_dir = ""
         while folder_cursor < len(folder_ranges) and entry_index >= folder_ranges[folder_cursor][1]:
@@ -1952,6 +1963,7 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
     primary_entry: ArchiveEntry,
     preview_result: MeshImportPreviewResult,
     source_obj_path: Path,
+    source_display_label: str = "",
     parent_root: Path,
     package_info: ModPackageInfo,
     export_options: Optional["ModPackageExportOptions"] = None,
@@ -1982,7 +1994,7 @@ def export_archive_mesh_payloads_to_mod_ready_loose(
 
     written_files: List[Path] = []
     file_rows: List[MeshLooseModFile] = []
-    source_obj_display = source_obj_path.expanduser().resolve().as_posix()
+    source_obj_display = source_display_label.strip() or source_obj_path.expanduser().resolve().as_posix()
     paired_lod_path = (preview_result.paired_lod_path or "").strip().replace("\\", "/")
     primary_path = primary_entry.path.replace("\\", "/")
     primary_manifest_path = _mesh_loose_export_payload_path(primary_path, export_options)
@@ -3209,6 +3221,8 @@ def build_mesh_import_preview(
     *,
     import_mode: str = "roundtrip",
     static_replacement_options: Optional[StaticMeshReplacementOptions] = None,
+    scene_import_result: Optional[SceneImportResult] = None,
+    source_display_label: str = "",
     archive_entries_by_normalized_path: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
     texconv_path: Optional[Path] = None,
     texture_entries_by_normalized_path: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
@@ -3226,11 +3240,16 @@ def build_mesh_import_preview(
         read_archive_entry_data,
     )
 
-    scene_import_result = import_scene_mesh_with_report(obj_path)
+    if scene_import_result is None:
+        scene_import_result = import_scene_mesh_with_report(obj_path)
     imported_mesh = scene_import_result.mesh
     imported_mesh.path = entry.path
     imported_mesh.format = entry.extension.lstrip(".").lower()
-    manifest_payload = _load_obj_roundtrip_sidecar(str(obj_path)) if obj_path.suffix.lower() == ".obj" else None
+    manifest_payload = (
+        _load_obj_roundtrip_sidecar(str(obj_path))
+        if obj_path.suffix.lower() == ".obj" and obj_path.expanduser().is_file()
+        else None
+    )
     original_baseline = read_archive_entry_baseline_data(entry, read_entry_data=read_archive_entry_data)
     original_data = original_baseline.data
     original_mesh = parse_mesh(original_data, entry.path)
@@ -3279,6 +3298,8 @@ def build_mesh_import_preview(
         f"Submeshes: {len(parsed_mesh.submeshes):,}",
         f"Rebuilt size: {len(rebuilt_data):,} bytes",
     ]
+    if source_display_label.strip():
+        summary_lines.append(f"Replacement source: {source_display_label.strip()}")
     if original_baseline.message:
         summary_lines.append(f"Original mesh donor: {original_baseline.message}")
     if scene_import_result.diagnostics:
@@ -3313,7 +3334,11 @@ def build_mesh_import_preview(
             path
             for path in tuple(scene_import_result.discovered_texture_files)
             + tuple(scene_import_result.extracted_embedded_files)
-            + tuple(discover_scene_texture_files(obj_path, imported_mesh))
+            + (
+                tuple(discover_scene_texture_files(obj_path, imported_mesh))
+                if obj_path.expanduser().is_file()
+                else ()
+            )
             if path.is_file()
         )
         if auto_scene_texture_files:

@@ -30,6 +30,8 @@ class ArchiveItemSearchIndex:
     pac_to_items: Dict[str, List[ArchiveItemRecord]]
     model_base_aliases: Dict[str, str]
     model_base_display_names: Dict[str, str]
+    model_base_exact_display_names: Dict[str, str]
+    model_base_related_display_names: Dict[str, str]
 
 
 @dataclass(slots=True)
@@ -513,6 +515,108 @@ def build_archive_model_hash_table(entries: Sequence[ArchiveEntry]) -> Dict[int,
     return _build_archive_model_hash_table_from_entries(sources.model_entries)
 
 
+def _add_display_name(display_names: Dict[str, str], base: str, display_name: str) -> None:
+    normalized_base = str(base or "").strip().lower()
+    normalized_name = str(display_name or "").strip()
+    if not normalized_base or not normalized_name:
+        return
+    existing_display = display_names.get(normalized_base, "")
+    if not existing_display:
+        display_names[normalized_base] = normalized_name
+    elif normalized_name not in existing_display.split(" / "):
+        display_names[normalized_base] = f"{existing_display} / {normalized_name}"
+
+
+def _build_archive_item_search_index_from_records(
+    items: Sequence[ArchiveItemRecord],
+    model_entries: Sequence[ArchiveEntry],
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> ArchiveItemSearchIndex:
+    hash_table = _build_archive_model_hash_table_from_entries(model_entries)
+    if on_log is not None:
+        on_log(f"Item-name search: indexed {len(hash_table):,} model hash candidate(s).")
+
+    pac_to_items: Dict[str, List[ArchiveItemRecord]] = {}
+    model_base_aliases: Dict[str, str] = {}
+    model_base_display_names: Dict[str, str] = {}
+    model_base_exact_display_names: Dict[str, str] = {}
+    model_base_related_display_names: Dict[str, str] = {}
+    items_with_models: List[ArchiveItemRecord] = []
+
+    for item in items:
+        exact_model_names: List[str] = []
+        related_model_names: List[str] = []
+        for prefab_hash in item.prefab_hashes:
+            resolved = hash_table.get(prefab_hash)
+            if not resolved:
+                continue
+            if resolved not in exact_model_names:
+                exact_model_names.append(resolved)
+        for model_stem in item.model_stems:
+            normalized_model_stem = _normalize_item_icon_model_stem(model_stem)
+            if (
+                normalized_model_stem
+                and normalized_model_stem not in exact_model_names
+                and normalized_model_stem not in related_model_names
+            ):
+                related_model_names.append(normalized_model_stem)
+
+        for resolved, match_kind in (
+            *((value, "exact") for value in exact_model_names),
+            *((value, "related") for value in related_model_names),
+        ):
+            base = _strip_archive_model_variant_suffix(resolved)
+            pac_name = base + ".pac"
+            if pac_name not in item.pac_files:
+                item.pac_files.append(pac_name)
+            pac_to_items.setdefault(pac_name, []).append(item)
+            terms = " ".join(
+                token
+                for token in (
+                    item.display_name.lower(),
+                    " ".join(name.lower() for name in item.localized_names),
+                    item.internal_name.lower(),
+                    base.lower(),
+                    pac_name.lower(),
+                    resolved.lower(),
+                )
+                if token
+            )
+            if terms:
+                existing = model_base_aliases.get(base, "")
+                model_base_aliases[base] = f"{existing} {terms}".strip() if existing else terms
+            if item.display_name:
+                _add_display_name(model_base_display_names, base, item.display_name)
+                if match_kind == "exact":
+                    exact_key = _normalize_item_icon_model_stem(resolved)
+                    _add_display_name(model_base_exact_display_names, exact_key, item.display_name)
+                    if exact_key == base:
+                        _add_display_name(model_base_exact_display_names, base, item.display_name)
+                else:
+                    _add_display_name(model_base_related_display_names, base, item.display_name)
+        if item.display_name and item.pac_files:
+            items_with_models.append(item)
+
+    if on_log is not None:
+        exact_count = len(model_base_exact_display_names)
+        related_count = len(model_base_related_display_names)
+        on_log(
+            "Item-name search: "
+            f"linked {len(items_with_models):,} item(s) to model asset(s); "
+            f"{exact_count:,} exact name key(s), {related_count:,} related/inferred name key(s)."
+        )
+
+    return ArchiveItemSearchIndex(
+        items=items_with_models,
+        pac_to_items=pac_to_items,
+        model_base_aliases=model_base_aliases,
+        model_base_display_names=model_base_display_names,
+        model_base_exact_display_names=model_base_exact_display_names,
+        model_base_related_display_names=model_base_related_display_names,
+    )
+
+
 def build_archive_item_search_index(
     entries: Sequence[ArchiveEntry],
     *,
@@ -548,68 +652,11 @@ def build_archive_item_search_index(
             )
         if on_log is not None:
             on_log(f"Item-name search: parsed {len(items):,} item database record(s).")
-        hash_table = _build_archive_model_hash_table_from_entries(sources.model_entries)
-        if on_log is not None:
-            on_log(f"Item-name search: indexed {len(hash_table):,} model hash candidate(s).")
     except RunCancelled:
         raise
 
-    pac_to_items: Dict[str, List[ArchiveItemRecord]] = {}
-    model_base_aliases: Dict[str, str] = {}
-    model_base_display_names: Dict[str, str] = {}
-    items_with_models: List[ArchiveItemRecord] = []
-
-    for item in items:
-        resolved_model_names: List[str] = []
-        for prefab_hash in item.prefab_hashes:
-            resolved = hash_table.get(prefab_hash)
-            if not resolved:
-                continue
-            if resolved not in resolved_model_names:
-                resolved_model_names.append(resolved)
-        for model_stem in item.model_stems:
-            normalized_model_stem = _normalize_item_icon_model_stem(model_stem)
-            if normalized_model_stem and normalized_model_stem not in resolved_model_names:
-                resolved_model_names.append(normalized_model_stem)
-
-        for resolved in resolved_model_names:
-            base = _strip_archive_model_variant_suffix(resolved)
-            pac_name = base + ".pac"
-            if pac_name not in item.pac_files:
-                item.pac_files.append(pac_name)
-            pac_to_items.setdefault(pac_name, []).append(item)
-            terms = " ".join(
-                token
-                for token in (
-                    item.display_name.lower(),
-                    " ".join(name.lower() for name in item.localized_names),
-                    item.internal_name.lower(),
-                    base.lower(),
-                    pac_name.lower(),
-                    resolved.lower(),
-                )
-                if token
-            )
-            if not terms:
-                continue
-            existing = model_base_aliases.get(base, "")
-            model_base_aliases[base] = f"{existing} {terms}".strip() if existing else terms
-            display_name = item.display_name.strip()
-            if display_name:
-                existing_display = model_base_display_names.get(base, "")
-                if not existing_display:
-                    model_base_display_names[base] = display_name
-                elif display_name not in existing_display.split(" / "):
-                    model_base_display_names[base] = f"{existing_display} / {display_name}"
-        if item.display_name and item.pac_files:
-            items_with_models.append(item)
-
-    if on_log is not None:
-        on_log(f"Item-name search: linked {len(items_with_models):,} item(s) to model asset(s).")
-
-    return ArchiveItemSearchIndex(
-        items=items_with_models,
-        pac_to_items=pac_to_items,
-        model_base_aliases=model_base_aliases,
-        model_base_display_names=model_base_display_names,
+    return _build_archive_item_search_index_from_records(
+        items,
+        sources.model_entries,
+        on_log=on_log,
     )

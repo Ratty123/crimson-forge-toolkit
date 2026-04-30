@@ -9,21 +9,53 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
-## Unreleased
+## [0.9.0-beta.1] - 2026-04-30
 
 ### Added
-- Added an Archive Browser material-sidecar editor for recognized `.pac_xml`, `.pam_xml`, `.pamlod_xml`, and `.pami` color/float/texture-path values, with reviewed related-file inclusion and mod-ready package export.
-- Added an approximate model preview panel to the material-sidecar editor for associated `.pac`, `.pam`, and `.pamlod` meshes, including live color/scalar refresh and cloak dye-color approximations.
-- Added `new_paths` metadata to generated mesh loose-mod manifests when included supplemental files are brand-new archive paths instead of replacements.
-- Added a central mod-package finalizer for mod-ready exports, with shared metadata output for `manifest.json`, `mod.json`, `modinfo.json`, `info.json`, optional `files/` wrapping, and optional ready `.zip` creation.
-- Added mod-manager export profile choices to the Archive Browser mesh loose-export dialog for universal, JSON Mod Manager, CDUMM, Definitive Mod Manager, and Crimson Sharp / Crimson Browser targets.
-- Added the same mod-package structure, metadata, and zip export choices to Texture Workflow and Replace Assistant mod-ready package output.
+- Added an Archive Browser material-sidecar editor for recognized `.pac_xml`, `.pam_xml`, `.pamlod_xml`, and `.pami` color, float, and texture-path values, with reviewed related-file inclusion, approximate model preview, live material refresh, and mod-ready package export.
+- Added the Mesh Replacement Alignment workflow for supported archive meshes, including side-by-side original/replacement preview, transform controls, part/source mapping, texture-plan review, original-part retention controls, and sidecar-aware replacement options such as `Patch material sidecar` and cautious missing base/color injection.
+- Added a Mesh Import Setup and preflight step before replacement alignment, with source-mesh stats, compatibility guidance, supplemental file selection, texture assignment review, and safer continuation into the live alignment workspace.
+- Added an in-dialog `Test Build Preview` action for Mesh Replacement Alignment. It builds the current replacement in memory, uses the final package-preview model path and archive DDS resolvers, keeps the original reference visible, and can return to the live alignment preview without writing a package.
+- Added static mesh replacement support for selected `.pac`, `.pam`, and `.pamlod` mesh payloads, including mapping reports, replacement transforms, material/part mapping, source-part controls, and skinned-target record cloning where the recovered layout supports it.
+- Added broader scene import for mesh replacement sources, including OBJ, DAE, glTF, and GLB-style uncompressed triangle geometry, with discovered texture files offered as supplemental import candidates.
+- Added an in-game mesh swap flow so one loaded archive mesh can be used as the replacement source for another compatible archive mesh while carrying compatible sidecar and texture context into alignment.
+- Added a final package preview pipeline for mesh loose exports and test builds, including generated/copied/original DDS resolution, sidecar validation, and clearer warnings when final preview texture bindings cannot be resolved.
+- Added a central mod-package finalizer for mod-ready exports across Archive Browser, Texture Workflow, and Replace Assistant, with shared metadata output for `manifest.json`, `mod.json`, `modinfo.json`, `info.json`, optional `files/` wrapping, optional ready `.zip` creation, and `new_paths` metadata for brand-new archive paths.
+- Added mod-manager export profile choices for universal loose files, JSON Mod Manager, CDUMM, Definitive Mod Manager, and Crimson Sharp / Crimson Browser targets, including manager-facing conflict and language metadata where supported.
+- Added archive item-name indexing and search support so exact item names, inferred aliases, localization-backed names, and display-name evidence can help find related archive entries.
+- Added the floating `3D Preview Settings` dialog with render diagnostics, texture probes, support-map preview shading, support-map toggles, preview disclaimers, and asset-dependent material/relief diagnostic modes.
+- Added Archive Performance controls for sidecar indexing, preview cache behavior, quick/full preview behavior, and preview texture limits so heavy archive sessions can be tuned without editing config files.
+- Added compact Archive Preview controls, a collapsible referenced-file pane, loose-file preview toggling, 3D preview settings access, support-map toggles, and dark-preview controls.
+- Added startup/progress and crash-reporting infrastructure for archive-heavy sessions, including heartbeat reports, native fault logs, previous-session unclean-exit detection, and hang-watchdog breadcrumbs.
+- Added built-in Spanish and German UI translations, custom language import/export support, and additional themes including Midnight Ember, Glacier, Black Gold, Pine, Violet Steel, Nord, One Dark, Tokyo Night, Solarized Dark, Catppuccin Mocha, GitHub Dark, Dracula, Everforest, and Crimson Desert.
 - Added shared generated-file descriptions and wrapped `?` help buttons for mod-package export options.
 
 ### Changed
+- Renamed the public app surface from `Crimson Forge Toolkit` to `Crimson Desert Mod Workbench`, including package/module names, executable naming, README text, and release metadata.
+- Reworked Archive Browser mesh workflows from OBJ/FBX export/import helpers into a fuller preview, replacement, material, sidecar, and package-building surface while keeping archive mutation explicit and confirm-before-write.
 - Changed archive package root detection to also recognize PAZ/PAMT layouts nested under a `game_files/` subfolder.
-- Clarified mod-package output cleanup versus manager conflict metadata, and moved `.no_encrypt` into the generated-artifacts controls.
-- Updated generated mod-package README files to list the actual metadata artifacts written for the selected export options.
+- Changed archive scanning, cache reuse, derived indexes, and sidecar indexing to do less UI-thread work during large archive sessions, with better cancellation and progress/status breadcrumbs.
+- Changed archive preview texture handling to separate visible/base textures from technical support maps, preserve support-map role information, and allow support-map preview shading to be toggled as an approximate inspection mode.
+- Changed mesh loose exports so final preview paths, generated DDS payloads, copied supplemental files, and original archive DDS references are validated through the same final package preview logic used by the Archive Browser.
+- Changed mod-package output so generated readmes list the actual artifacts written for the selected export options, and clarified cleanup behavior separately from manager conflict metadata.
+- Changed `.no_encrypt` handling into the generated-artifacts controls instead of mixing it with unrelated package metadata.
+- Changed the Archive Preview layout to be denser and more resilient at narrower widths, with compact action rows and a referenced-file pane that can collapse before it overlaps the model preview.
+- Changed preview/settings wording to use softer support-map preview wording, since these modes are approximate, asset-dependent, and sometimes diagnostic rather than final-render accurate.
+- Changed Settings and preview dialogs to synchronize more safely across floating and embedded controls.
+- Expanded automated coverage around Archive Browser cache/indexing, final package preview, material-sidecar editing, mesh import/replacement, model preview settings, package export, localization, themes, and preview diagnostics.
+
+### Fixed
+- Fixed high-risk Archive Browser shutdown behavior by making close/cancel paths wait for active scan, preview, sidecar-index, and cache-writer workers instead of tearing down running background Qt worker threads.
+- Fixed crash-reporting reliability so previous heartbeats survive quick relaunches unless the previous process is confirmed alive, and background exception hooks avoid reading live Qt widgets outside the GUI thread.
+- Fixed false missing/grey final-preview warnings by resolving original and copied archive DDS files through archive path and basename indexes while still preferring generated DDS payloads when present.
+- Fixed mesh loose export profile handling so DMM texture layouts are not applied to mesh packages where a mesh-safe layout is required.
+- Fixed Archive Preview referenced-file layout overlap at narrow widths by letting the side pane collapse before it covers preview controls.
+- Fixed loose-file preview toggling so archive/loose preview state remains a real two-state action and respects loose-preview asset arguments during preview refresh.
+
+### Docs
+- Updated release version references from `0.7.0-beta.4` to `0.9.0-beta.1` in the README, changelog, and app version metadata.
+- Updated in-app documentation and guidance around Archive Browser search, mesh replacement alignment, Live Alignment Preview, Replacement Preview placement, material/sidecar limitations, and final package preview expectations.
+- Expanded the top-level release summary from a direct comparison with `v0.7.0-beta.4`, focusing on the final public behavior in this beta.
 
 ## [0.7.0-beta.4] - 2026-04-21
 
@@ -85,7 +117,7 @@ The format is intentionally simple:
 - Fixed the archive extension filter/drop-down regressions so supported extensions are populated again from the archive contents instead of forcing manual entry for some workflows.
 - Fixed archive DDS preview regressions where selecting `.dds` entries could get stuck on details, fail to switch to the preview tab correctly, or become noticeably slower after later archive-browser changes.
 - Fixed `.pami` preview stability and presentation so decoded text no longer opens with mismatched styling and is less likely to leave the browser in a stuck `Preparing archive preview...` state.
-- Fixed a long list of `.pam`, `.pamlod`, and `.pac` geometry-recovery problems, including better companion PAMLOD fallback usage, better submesh preservation during companion fallback, additional partial/zero-padded recovery paths, more helpful failure text, and fewer cases where previews stall or degrade into obviously scrambled geometry.
+- Fixed a broad set of `.pam`, `.pamlod`, and `.pac` geometry-recovery failures, including better companion PAMLOD fallback usage, better submesh preservation during companion fallback, additional partial/zero-padded recovery paths, more helpful failure text, and fewer cases where previews stall or degrade into obviously scrambled geometry.
 - Fixed more textured-model issues, including missing referenced DDS rows, overly narrow texture-reference columns, companion-preview texture loss, PAC texture availability in preview/export, and incorrect vertical texture orientation on assets such as the shield atlas that were previously mapped into opaque black atlas space.
 - Fixed archive-browser responsiveness issues around large extension switches, archive-cache reuse, background preview cancellation, and long-running per-file preview work so the UI spends less time in `Not Responding` during heavy archive browsing.
 - Fixed `Texture Editor` grid-state handling so the archive/browser-driven editor path no longer throws `AttributeError: 'TextureEditorTab' object has no attribute '_grid_color'`.
@@ -127,7 +159,7 @@ The format is intentionally simple:
 - Fixed classification/local-approval clarity issues so the app better distinguishes inferred roles from saved local approvals, routes workflow review to the correct DDS more reliably, and provides faster per-file local-save actions.
 - Fixed more `Texture Editor` issues around guide clearing, document metadata sizing, hidden tab close buttons, image/atlas action layout, light-theme tool icon visibility, grid visibility, and font consistency across the left and right editor panes.
 - Fixed a `Texture Editor` custom-brush preset runtime bug where `json` serialization/deserialization paths were used without the required import, which could break preset load/save behavior in the shipped build.
-- Fixed several settings/runtime problems, including slow font-size stepping, typed font-size editing, missing imports and startup crashes, DDS-details exceptions, more accurate DDS surface estimates for arrays/cubemaps, and other late-cycle packaging/runtime errors.
+- Fixed several settings and runtime failures, including slow font-size stepping, typed font-size editing, missing imports and startup crashes, DDS-details exceptions, more accurate DDS surface estimates for arrays/cubemaps, and late-cycle packaging/runtime errors.
 - Fixed another `Archive Browser` DDS preview hang where rapidly browsing many archive textures could eventually leave the app stuck in `Not Responding`, by avoiding eager loose-preview generation and reducing heavy per-click archive selection recomputation on the UI thread.
 - Fixed direct `Real-ESRGAN NCNN` runs that could silently accept invalid flat PNG output or Vulkan/OOM-like failures at large tile sizes, by validating the output and retrying smaller tile sizes automatically before DDS rebuild continues.
 - Fixed starter workflow profile defaults that could previously force unsafe per-profile NCNN scales or generic visible-path handling for technical maps, which could lead to broken mixed-batch results or black/flat rebuilt DDS output.

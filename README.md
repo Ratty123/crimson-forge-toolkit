@@ -4,11 +4,11 @@ Windows desktop tool for **Crimson Desert texture workflows**, **archive browsin
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-Latest release: `0.7.0-beta.4`
+Latest release: `0.9.0-beta.1`
 
-- keeps the `0.7.x` archive patching, mesh preview/modding, media preview, and sidecar-aware texture workflows introduced in the previous betas
-- adds a broader `Referenced Files` surface in `Archive Browser`, so mesh previews can now expose related `.dds`, `.xml`, `.pami`, `.meshinfo`, `.pab`, `.paa`, and similar companion files with direct open/export actions
-- improves OBJ/FBX mesh workflows so export/import can carry selected supplemental files, loose mesh packages are described more clearly, and PAC-side texture preview orientation is more reliable for sidecar-backed previews
+- completes the public rename from `Crimson Forge Toolkit` to `Crimson Desert Mod Workbench`
+- expands `Archive Browser` mesh modding with live replacement alignment, in-game mesh swap, material-sidecar editing, final test-build preview, richer referenced-file handling, and mod-ready package profiles
+- improves archive-browser stability, package/export validation, preview diagnostics, localization, themes, and compact preview layout while keeping archive writes explicit and confirm-before-write
 
 Project guidelines:
 

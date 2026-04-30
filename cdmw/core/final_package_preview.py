@@ -659,6 +659,7 @@ def build_final_package_preview(
     sidecars: Dict[str, Tuple[str, MeshImportSupplementalFileSpec]] = {}
     dds_by_path: Dict[str, _FinalPayload] = {}
     dds_by_basename: Dict[str, List[_FinalPayload]] = {}
+    generated_sidecar_count = 0
     for spec in specs:
         if not isinstance(spec, MeshImportSupplementalFileSpec):
             continue
@@ -673,6 +674,8 @@ def build_final_package_preview(
             text = _spec_payload_text(spec)
             if text.strip():
                 sidecars[final_key] = (final_path, spec)
+                if str(getattr(spec, "kind", "") or "").strip().lower() == "sidecar_generated":
+                    generated_sidecar_count += 1
             continue
         if _is_dds_spec(spec):
             payload_data = bytes(getattr(spec, "payload_data", b"") or b"")
@@ -880,6 +883,7 @@ def build_final_package_preview(
     summary_lines = [
         "Final Output Preview",
         f"Parsed sidecar payloads: {len(sidecars):,}",
+        f"Patched sidecar payloads: {generated_sidecar_count:,}",
         f"Generated/copied DDS payloads: {len(dds_by_path):,}",
         f"Ready material(s): {ready_materials:,}/{len(material_statuses):,}",
     ]

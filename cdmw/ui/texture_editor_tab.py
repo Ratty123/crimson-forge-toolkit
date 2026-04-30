@@ -1678,6 +1678,7 @@ class TextureEditorTab(QWidget):
         self.get_original_dds_root = get_original_dds_root or (lambda: "")
         self.get_archive_entries = get_archive_entries or (lambda: [])
         self.get_current_config = get_current_config or (lambda: None)
+        self._translate_ui_text: Callable[[str], str] = lambda text: str(text or "")
         self.workspace_root = make_texture_editor_workspace_root(base_dir)
         self.document: Optional[TextureEditorDocument] = None
         self.layer_pixels: Dict[str, np.ndarray] = {}
@@ -3928,9 +3929,18 @@ class TextureEditorTab(QWidget):
 
     def _set_status(self, message: str, error: bool) -> None:
         sidebar_scroll = self._capture_left_sidebar_scroll()
-        self.status_label.setText(message)
+        source_message = str(message or "")
+        translated_message = self._translate_ui_text(source_message)
+        self.status_label.setProperty("_i18n_source_text", source_message)
+        self.status_label.setText(translated_message)
         self._schedule_left_sidebar_scroll_restore(*sidebar_scroll)
-        self.status_message_requested.emit(message, error)
+        self.status_message_requested.emit(translated_message, error)
+
+    def set_ui_translator(self, translator: Callable[[str], str]) -> None:
+        self._translate_ui_text = translator if callable(translator) else (lambda text: str(text or ""))
+        source_message = self.status_label.property("_i18n_source_text")
+        if isinstance(source_message, str) and source_message:
+            self.status_label.setText(self._translate_ui_text(source_message))
 
     def _document_composite_revision(self) -> int:
         if self.document is None:

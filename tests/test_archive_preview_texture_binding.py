@@ -132,6 +132,7 @@ class ArchivePreviewTextureBindingTests(unittest.TestCase):
             )
 
         self.assertEqual((0.62, 0.31, 0.14), model.meshes[0].preview_color)
+        self.assertEqual("low_authority_overlay", model.meshes[0].preview_base_texture_quality)
         self.assertIn("low-detail overlay/default", model.meshes[0].preview_texture_approximation_note)
 
     def test_sidecar_material_color_survives_missing_visible_dds(self) -> None:
@@ -164,6 +165,7 @@ class ArchivePreviewTextureBindingTests(unittest.TestCase):
 
         self.assertEqual((0.22, 0.26, 0.42), model.meshes[0].preview_color)
         self.assertEqual("", model.meshes[0].preview_texture_path)
+        self.assertEqual("material_color_fallback", model.meshes[0].preview_base_texture_quality)
         self.assertIn("material color fallback", "\n".join(lines))
 
     def test_anonymous_meshes_use_ordered_sidecar_support_bindings(self) -> None:

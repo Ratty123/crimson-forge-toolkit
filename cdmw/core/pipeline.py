@@ -1206,7 +1206,7 @@ def build_mod_package_export_options_from_config(config: AppConfig) -> ModPackag
     profile = str(getattr(config, "mod_ready_manager_profile", "universal") or "universal").strip() or "universal"
     defaults = mod_package_export_options_for_manager(profile)
     structure = str(getattr(config, "mod_ready_package_structure", "") or "").strip().lower()
-    if structure not in {"game_relative", "files_wrapper", "custom_compact_paths"}:
+    if structure not in {"game_relative", "files_wrapper", "custom_compact_paths", "dmm_texture"}:
         structure = defaults.structure
     conflict_mode = str(getattr(config, "mod_ready_conflict_mode", "") or "").strip().lower()
     if conflict_mode not in {"", "override"}:

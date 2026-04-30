@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import gc
 import hashlib
 import html
 import json
@@ -71,7 +72,7 @@ _ARCHIVE_SIDECAR_CACHE_MAGIC = b"CTFSIDE1"
 _ARCHIVE_SIDECAR_CACHE_VERSION = 9
 _ARCHIVE_SIDECAR_ENTRY_SIGNATURE_FORMAT = 1
 _ARCHIVE_DERIVED_INDEX_CACHE_MAGIC = b"CTFDERI1"
-_ARCHIVE_DERIVED_INDEX_CACHE_VERSION = 2
+_ARCHIVE_DERIVED_INDEX_CACHE_VERSION = 3
 _ARCHIVE_DERIVED_INDEX_CACHE_MAX_SAFE_BYTES = 64 * 1024 * 1024
 _INITIAL_MODEL_PREVIEW_RENDER_SETTINGS = clamp_model_preview_render_settings()
 # Keep visible base textures closer to their source resolution in the 3D preview.
@@ -435,7 +436,7 @@ _ARCHIVE_STRUCTURED_BINARY_PREVIEW_EXTENSIONS: Tuple[str, ...] = (
 )
 _ARCHIVE_SCAN_CACHE_SUPPORTED_VERSIONS = {1, 2}
 _ARCHIVE_SIDECAR_CACHE_SUPPORTED_VERSIONS = {8, 9}
-_ARCHIVE_DERIVED_INDEX_CACHE_SUPPORTED_VERSIONS = {2}
+_ARCHIVE_DERIVED_INDEX_CACHE_SUPPORTED_VERSIONS = {3}
 CHACHA20_HASH_INITVAL = 0x000C5EDE
 CHACHA20_IV_XOR = 0x60616263
 CHACHA20_XOR_DELTAS = (
@@ -1359,6 +1360,7 @@ def scan_archive_entries_cached(
     force_refresh: bool = False,
     on_log: Optional[Callable[[str], None]] = None,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
+    on_breadcrumb: Optional[Callable[[Mapping[str, object]], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> Tuple[List[ArchiveEntry], str, Optional[Path], Dict[str, float]]:
     started_at = time.perf_counter()
@@ -1389,6 +1391,7 @@ def scan_archive_entries_cached(
         package_root,
         on_log=on_log,
         on_progress=on_progress,
+        on_breadcrumb=on_breadcrumb,
         stop_event=stop_event,
     )
     _record_timing(timings, "archive_scan_s", scan_started_at)
@@ -1721,9 +1724,10 @@ def autodetect_archive_package_roots(
 
 
 class VfsPathResolver:
-    def __init__(self, name_block: bytes) -> None:
+    def __init__(self, name_block: bytes, *, max_cache_entries: int = 200_000) -> None:
         self._name_block = name_block
         self._path_cache: Dict[int, str] = {0xFFFFFFFF: ""}
+        self._max_cache_entries = max(1, int(max_cache_entries))
 
     def get_full_path(self, offset: int) -> str:
         if offset == 0xFFFFFFFF or offset >= len(self._name_block):
@@ -1734,7 +1738,11 @@ class VfsPathResolver:
         parts: List[Tuple[int, str]] = []
         current_offset = offset
         base = ""
+        seen_offsets: set[int] = set()
         while current_offset != 0xFFFFFFFF:
+            if current_offset in seen_offsets:
+                break
+            seen_offsets.add(current_offset)
             cached = self._path_cache.get(current_offset)
             if cached is not None:
                 base = cached
@@ -1754,11 +1762,23 @@ class VfsPathResolver:
         built = base
         for part_offset, part in reversed(parts):
             built = f"{built}{part}"
-            self._path_cache[part_offset] = built
+            if len(self._path_cache) < self._max_cache_entries:
+                self._path_cache[part_offset] = built
         return self._path_cache.get(offset, built)
 
 
 def parse_archive_pamt(pamt_path: Path, paz_dir: Optional[Path] = None) -> List[ArchiveEntry]:
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        return _parse_archive_pamt(pamt_path, paz_dir=paz_dir)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+def _parse_archive_pamt(pamt_path: Path, paz_dir: Optional[Path] = None) -> List[ArchiveEntry]:
     data = pamt_path.read_bytes()
     resolved_paz_dir = paz_dir if paz_dir is not None else pamt_path.parent
     size = len(data)
@@ -1772,7 +1792,6 @@ def parse_archive_pamt(pamt_path: Path, paz_dir: Optional[Path] = None) -> List[
     paz_table_size = paz_count * 12
     if off + paz_table_size > size:
         raise ValueError(f"{pamt_path.name} paz table is truncated.")
-    paz_indices = list(range(paz_count))
     off += paz_table_size
 
     if off + 4 > size:
@@ -1800,7 +1819,7 @@ def parse_archive_pamt(pamt_path: Path, paz_dir: Optional[Path] = None) -> List[
     folder_table_size = folder_count * 16
     if off + folder_table_size > size:
         raise ValueError(f"{pamt_path.name} folder table is truncated.")
-    folders = list(struct.iter_unpack("<IIII", data[off : off + folder_table_size]))
+    folder_table = memoryview(data)[off : off + folder_table_size]
     off += folder_table_size
 
     if off + 4 > size:
@@ -1810,24 +1829,24 @@ def parse_archive_pamt(pamt_path: Path, paz_dir: Optional[Path] = None) -> List[
     file_table_size = file_count * struct.calcsize("<IIIIHH")
     if off + file_table_size > size:
         raise ValueError(f"{pamt_path.name} file table is truncated.")
-    files = list(struct.iter_unpack("<IIIIHH", data[off : off + file_table_size]))
+    file_table = memoryview(data)[off : off + file_table_size]
 
     resolver = VfsPathResolver(file_names)
-    dir_resolver = VfsPathResolver(directory_data)
+    dir_resolver = VfsPathResolver(directory_data, max_cache_entries=50_000)
     folder_ranges = sorted(
         (
             file_start_index,
             file_start_index + folder_file_count,
             dir_resolver.get_full_path(name_offset).replace("\\", "/").strip("/"),
         )
-        for _folder_hash, name_offset, file_start_index, folder_file_count in folders
+        for _folder_hash, name_offset, file_start_index, folder_file_count in struct.iter_unpack("<IIII", folder_table)
         if folder_file_count > 0
     )
-    paz_files = [resolved_paz_dir / f"{paz_indices[index]}.paz" for index in range(len(paz_indices))]
+    paz_files = [resolved_paz_dir / f"{index}.paz" for index in range(paz_count)]
 
     entries: List[ArchiveEntry] = []
     folder_cursor = 0
-    for entry_index, (name_offset, paz_offset, comp_size, orig_size, paz_index, flags) in enumerate(files):
+    for entry_index, (name_offset, paz_offset, comp_size, orig_size, paz_index, flags) in enumerate(struct.iter_unpack("<IIIIHH", file_table)):
         relative_path = resolver.get_full_path(name_offset).replace("\\", "/").strip("/")
         guessed_dir = ""
         while folder_cursor < len(folder_ranges) and entry_index >= folder_ranges[folder_cursor][1]:
@@ -1860,6 +1879,7 @@ def scan_archive_entries(
     *,
     on_log: Optional[Callable[[str], None]] = None,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
+    on_breadcrumb: Optional[Callable[[Mapping[str, object]], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> List[ArchiveEntry]:
     pamt_files = discover_pamt_files(package_root)
@@ -1883,8 +1903,20 @@ def scan_archive_entries(
             on_log(f"[{index}/{total_pmts}] Parsing {relative_label}...")
 
         parse_started = time.monotonic()
-        heartbeat_stop = threading.Event()
-        heartbeat_thread: Optional[threading.Thread] = None
+        if on_breadcrumb is not None:
+            on_breadcrumb(
+                {
+                    "phase": "parse_archive_pamt",
+                    "status": "starting",
+                    "package_root": str(package_root),
+                    "pamt_path": str(pamt_path),
+                    "relative_label": relative_label,
+                    "index": index,
+                    "total": total_pmts,
+                    "entries_found_before": len(all_entries),
+                    "timestamp": time.time(),
+                }
+            )
 
         if on_progress:
             on_progress(
@@ -1893,29 +1925,47 @@ def scan_archive_entries(
                 f"Parsing {index} / {total_pmts}: {relative_label} | {len(all_entries):,} entries found",
             )
 
-            def emit_parse_heartbeat() -> None:
-                while not heartbeat_stop.wait(1.0):
-                    elapsed = max(1, int(time.monotonic() - parse_started))
-                    on_progress(
-                        index - 1,
-                        total_pmts,
-                        f"Parsing {index} / {total_pmts}: {relative_label} | {len(all_entries):,} entries found | still working ({elapsed}s elapsed)",
-                    )
-
-            heartbeat_thread = threading.Thread(target=emit_parse_heartbeat, daemon=True)
-            heartbeat_thread.start()
-
         try:
             entries = parse_archive_pamt(pamt_path)
-        finally:
-            heartbeat_stop.set()
-            if heartbeat_thread is not None:
-                heartbeat_thread.join(timeout=0.2)
+        except Exception as exc:
+            if on_breadcrumb is not None:
+                on_breadcrumb(
+                    {
+                        "phase": "parse_archive_pamt",
+                        "status": "failed",
+                        "package_root": str(package_root),
+                        "pamt_path": str(pamt_path),
+                        "relative_label": relative_label,
+                        "index": index,
+                        "total": total_pmts,
+                        "entries_found_before": len(all_entries),
+                        "elapsed_seconds": round(time.monotonic() - parse_started, 3),
+                        "error": str(exc),
+                        "timestamp": time.time(),
+                    }
+                )
+            raise
 
         all_entries.extend(entries)
         parse_elapsed = time.monotonic() - parse_started
         if on_log:
             on_log(f"[{index}/{total_pmts}] Parsed {relative_label} -> {len(entries):,} entries in {parse_elapsed:.1f}s")
+        if on_breadcrumb is not None:
+            on_breadcrumb(
+                {
+                    "phase": "parse_archive_pamt",
+                    "status": "completed",
+                    "package_root": str(package_root),
+                    "pamt_path": str(pamt_path),
+                    "relative_label": relative_label,
+                    "index": index,
+                    "total": total_pmts,
+                    "parsed_entries": len(entries),
+                    "entries_found_total": len(all_entries),
+                    "elapsed_seconds": round(parse_elapsed, 3),
+                    "timestamp": time.time(),
+                }
+            )
         if on_progress:
             on_progress(
                 index,
@@ -2421,7 +2471,8 @@ def build_archive_entry_path_index(entries: Sequence[ArchiveEntry]) -> Dict[str,
 def build_archive_entry_basename_index(entries: Sequence[ArchiveEntry]) -> Dict[str, List[ArchiveEntry]]:
     index: Dict[str, List[ArchiveEntry]] = {}
     for archive_entry in entries:
-        basename = PurePosixPath(archive_entry.path.replace("\\", "/")).name.strip().lower()
+        normalized_path = archive_entry.path.replace("\\", "/").strip()
+        basename = normalized_path.rsplit("/", 1)[-1].strip().lower()
         if not basename:
             continue
         index.setdefault(basename, []).append(archive_entry)
@@ -2445,6 +2496,8 @@ def save_archive_derived_index_cache(
     *,
     item_search_aliases: Optional[Mapping[str, str]] = None,
     item_display_names: Optional[Mapping[str, str]] = None,
+    item_exact_display_names: Optional[Mapping[str, str]] = None,
+    item_related_display_names: Optional[Mapping[str, str]] = None,
     path_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
     basename_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
     extension_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
@@ -2462,6 +2515,8 @@ def save_archive_derived_index_cache(
         "entry_count": len(entries),
         "item_search_aliases": dict(item_search_aliases or {}),
         "item_display_names": dict(item_display_names or {}),
+        "item_exact_display_names": dict(item_exact_display_names or {}),
+        "item_related_display_names": dict(item_related_display_names or {}),
     }
     _write_raw_pickle_cache_payload_to_path(
         cache_path,
@@ -2538,6 +2593,14 @@ def load_archive_derived_index_cache(
             "item_display_names": {
                 str(key): str(value)
                 for key, value in (data.get("item_display_names", {}) or {}).items()
+            },
+            "item_exact_display_names": {
+                str(key): str(value)
+                for key, value in (data.get("item_exact_display_names", {}) or {}).items()
+            },
+            "item_related_display_names": {
+                str(key): str(value)
+                for key, value in (data.get("item_related_display_names", {}) or {}).items()
             },
             "cache_path": str(cache_path),
         }
@@ -6803,6 +6866,15 @@ def _is_low_authority_model_base_texture(texture_path: str) -> bool:
     return False
 
 
+def _model_preview_base_texture_quality(texture_path: str, *, fallback_only: bool = False) -> str:
+    if fallback_only:
+        return "material_color_fallback"
+    if _is_low_authority_model_base_texture(texture_path):
+        return "low_authority_overlay"
+    normalized = _normalize_model_texture_reference(texture_path)
+    return "resolved_base" if normalized else ""
+
+
 def _mesh_existing_base_is_sidecar_identity(
     mesh: ModelPreviewMesh,
     parsed_submesh: Optional[object],
@@ -6862,6 +6934,7 @@ def _apply_model_sidecar_base_preview(
     mesh.preview_texture_uv_scale = _model_preview_sidecar_uv_scale(binding)
     material_color = _model_preview_sidecar_material_color(binding)
     low_authority_base = _is_low_authority_model_base_texture(texture_entry.path)
+    mesh.preview_base_texture_quality = _model_preview_base_texture_quality(texture_entry.path)
     if material_color:
         mesh.preview_color = material_color
     if (
@@ -7260,6 +7333,8 @@ def _attach_model_sidecar_texture_preview_paths(
                 continue
             if tuple(existing_preview_color[:3]) != tuple(material_color):
                 mesh.preview_color = material_color
+                if not existing_preview_path:
+                    mesh.preview_base_texture_quality = "material_color_fallback"
                 material_color_fallback_count += 1
                 if not existing_preview_path:
                     mesh.preview_texture_approximation_note = (
@@ -7397,6 +7472,7 @@ def _attach_model_texture_preview_paths(
         if str(getattr(mesh, "preview_texture_path", "") or "").strip() != preview_path_text:
             mesh.preview_texture_path = preview_path_text
             mesh.preview_texture_image = None
+        mesh.preview_base_texture_quality = _model_preview_base_texture_quality(texture_entry.path)
         if force_unflipped_preview:
             mesh.preview_texture_flip_vertical = False
         current_texture_name = str(getattr(mesh, "texture_name", "") or "").strip()

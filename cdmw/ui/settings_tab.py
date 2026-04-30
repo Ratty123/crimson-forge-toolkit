@@ -309,7 +309,7 @@ class SettingsTab(QWidget):
         preview_layout.setHorizontalSpacing(12)
         preview_layout.setVerticalSpacing(10)
         self.model_preview_use_textures_checkbox = QCheckBox("Use textures by default when available")
-        self.model_preview_high_quality_checkbox = QCheckBox("Enable high-quality shading by default")
+        self.model_preview_high_quality_checkbox = QCheckBox("Use support-map preview shading by default")
         preview_layout.addRow("", self.model_preview_use_textures_checkbox)
         preview_layout.addRow("", self.model_preview_high_quality_checkbox)
         self.visible_texture_mode_combo = QComboBox()
@@ -581,7 +581,10 @@ class SettingsTab(QWidget):
         self.confirm_workflow_cleanup_checkbox = QCheckBox("Confirm clearing PNG / DDS output folders before Start")
         self.confirm_archive_cleanup_checkbox = QCheckBox("Confirm clearing archive extraction target")
         self.capture_crash_details_checkbox = QCheckBox(
-            "Capture crash details to local report files on unhandled exceptions"
+            "Include extra local context in diagnostic reports"
+        )
+        self.capture_crash_details_checkbox.setToolTip(
+            "Fatal startup, crash, and hang reports are always written locally. Enable this to also save additional context for recoverable preview/worker errors."
         )
         safety_layout.addWidget(self.confirm_workflow_cleanup_checkbox)
         safety_layout.addWidget(self.confirm_archive_cleanup_checkbox)
