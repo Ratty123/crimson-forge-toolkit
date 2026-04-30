@@ -386,40 +386,6 @@ It only opens external pages in your browser when you explicitly trigger actions
 - `Open Real-ESRGAN NCNN Download Page`
 - `Open Model Pages` in the NCNN model catalog
 
-## Screenshots
-
-### Texture Workflow
-
-![Texture Workflow](<docs/screenshots/cdmw-texture-workflow.png>)
-
-### Archive Browser
-
-![Archive Browser](<docs/screenshots/cdmw-archive-browser.png>)
-
-### Texture Editor
-
-![Texture Editor](<docs/screenshots/cdmw-texture-editor.png>)
-
-### Replace Assistant
-
-![Replace Assistant](<docs/screenshots/cdmw-replace-assistant.png>)
-
-### Research: References
-
-![Research References](<docs/screenshots/cdmw-research-references.png>)
-
-### Research: Classification Review
-
-![Research Classification Review](<docs/screenshots/cdmw-research-classification-review.png>)
-
-### Text Search
-
-![Text Search](<docs/screenshots/cdmw-text-search.png>)
-
-### Settings
-
-![Settings](<docs/screenshots/cdmw-settings.png>)
-
 ## Dependencies
 
 ### Python packages used by the app
