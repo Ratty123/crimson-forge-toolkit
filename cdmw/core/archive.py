@@ -4350,6 +4350,7 @@ def extract_archive_entries(
     *,
     collision_mode: str = "overwrite",
     on_log: Optional[Callable[[str], None]] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> Dict[str, int]:
     output_root.mkdir(parents=True, exist_ok=True)
@@ -4360,7 +4361,26 @@ def extract_archive_entries(
     duplicate_targets: Dict[str, int] = defaultdict(int)
     renamed = 0
     used_targets: set[str] = set()
+    last_progress_emit_at = 0.0
+    progress_interval = max(total // 200, 1) if total > 0 else 1
 
+    def emit_progress(current: int, detail: str, *, force: bool = False) -> None:
+        nonlocal last_progress_emit_at
+        if on_progress is None:
+            return
+        current = min(max(int(current), 0), total)
+        now = time.monotonic()
+        if (
+            force
+            or current == 0
+            or current >= total
+            or current % progress_interval == 0
+            or now - last_progress_emit_at >= 0.25
+        ):
+            last_progress_emit_at = now
+            on_progress(current, total, detail)
+
+    emit_progress(0, f"Preparing to extract {total:,} archive file(s)...", force=True)
     for entry in entries:
         try:
             target_path = sanitize_archive_entry_output_path(entry, output_root)
@@ -4374,6 +4394,8 @@ def extract_archive_entries(
             f"Warning: {duplicate_count} extracted path(s) are duplicated across selected archive entries. "
             "Later entries will overwrite earlier extracted files."
         )
+    if total:
+        emit_progress(0, f"Extracting 0 / {total:,} archive file(s)...", force=True)
 
     for index, entry in enumerate(entries, start=1):
         raise_if_cancelled(stop_event)
@@ -4400,11 +4422,14 @@ def extract_archive_entries(
                     flags.append("Renamed")
                 extra = f" [{' '.join(flags)}]" if flags else ""
                 on_log(f"[{index}/{total}] EXTRACT {entry.path}{extra} -> {out_path}")
+            emit_progress(index, f"Extracted {index:,} / {total:,}: {entry.path}")
         except Exception as exc:
             failed += 1
             if on_log:
                 on_log(f"[{index}/{total}] FAIL {entry.path} -> {exc}")
+            emit_progress(index, f"Extracted {index:,} / {total:,} with {failed:,} failure(s): {entry.path}")
 
+    emit_progress(total, f"Archive extraction complete: {extracted:,} extracted, {failed:,} failed.", force=True)
     return {
         "total": total,
         "extracted": extracted,

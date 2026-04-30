@@ -1174,6 +1174,40 @@ def _normalized_label(value: str) -> str:
     return " ".join(_semantic_tokens(value))
 
 
+def infer_static_replacement_part_role(text: str) -> str:
+    """Return a compact, human-facing role hint for replacement routing tables."""
+    tokens = _semantic_tokens(text)
+
+    def has_any(*needles: str) -> bool:
+        return any(needle in tokens for needle in needles)
+
+    if has_any("hand", "glove", "gauntlet", "forearm", "arm"):
+        return "hand/arm"
+    if has_any("head", "face", "eye", "eyes", "mouth", "jaw"):
+        return "head/face"
+    if has_any("hair", "beard", "moustache", "mustache"):
+        return "hair"
+    if has_any("foot", "feet", "boot", "boots", "shoe", "shoes", "leg"):
+        return "foot/leg"
+    if has_any("nude", "body", "torso", "chest", "upperbody", "lowerbody", "upper", "lower", "ub", "lb"):
+        return "body"
+    if has_any("helmet", "helm", "mask"):
+        return "helmet"
+    if has_any("cloth", "cape", "fabric", "cloak", "mantle", "skirt", "sleeve"):
+        return "cloth"
+    if has_any("armor", "armour", "plate", "mail"):
+        return "armor/body"
+    if has_any("blade", "edge", "tip", "sword", "cuchilla", "hoja"):
+        return "blade"
+    if has_any("handle", "hilt", "grip", "pommel", "shaft", "mango", "empunadura"):
+        return "handle"
+    if has_any("guard", "crossguard", "handguard", "protector", "soporte"):
+        return "guard"
+    if has_any("acc", "accessory", "detail", "trim", "spike", "ornament", "accent", "horn"):
+        return "accessory/detail"
+    return "unknown"
+
+
 def _semantic_tokens(text: str) -> set[str]:
     normalized = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())
     tokens: set[str] = set()

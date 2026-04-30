@@ -66,6 +66,15 @@ from cdmw.core.archive_modding import (
     parsed_mesh_to_preview_model,
     restore_archive_patch_backup,
 )
+from cdmw.core.archive_relationships import (
+    ARCHIVE_REL_INCLUDE_RECOMMENDED,
+    ARCHIVE_REL_INCLUDE_REQUIRED,
+    SWAP_SCOPE_BODY_HEAD,
+    ArchiveRelationEdge,
+    build_archive_relationship_plan,
+    build_character_swap_plan,
+    resolve_material_texture_graph,
+)
 from cdmw.core.final_package_preview import (
     FinalPackagePreviewResult,
     TEXTURE_PLAN_STATUS_IGNORED_ADVANCED,
@@ -101,6 +110,7 @@ from cdmw.modding.static_mesh_replacer import (
     StaticTextureSlotOverride,
     build_static_replacement_preview_mesh,
     describe_static_placement_context,
+    infer_static_replacement_part_role,
     suggest_static_submesh_mappings,
     _semantic_tokens,
     _transformed_replacement_sources,
@@ -163,6 +173,8 @@ class MeshImportSetupSelection:
 class InGameMeshSwapScopeSelection:
     prefer_generated_sidecar: bool = True
     replace_target_sidecar_with_source: bool = False
+    replace_target_appearance_with_source: bool = False
+    use_character_swap_plan: bool = False
     companion_entries: Tuple[ArchiveEntry, ...] = ()
 
 
@@ -1610,18 +1622,23 @@ def run_gui() -> int:
 
     class UtilityWorker(QObject):
         log_message = Signal(str)
+        progress_changed = Signal(int, int, str)
         completed = Signal(object)
         error = Signal(str)
         finished = Signal()
 
-        def __init__(self, task: Callable[[Callable[[str], None]], object]):
+        def __init__(self, task: Callable[..., object], *, task_accepts_progress: bool = False):
             super().__init__()
             self.task = task
+            self.task_accepts_progress = task_accepts_progress
 
         @Slot()
         def run(self) -> None:
             try:
-                result = self.task(self.log_message.emit)
+                if self.task_accepts_progress:
+                    result = self.task(self.log_message.emit, self.progress_changed.emit)
+                else:
+                    result = self.task(self.log_message.emit)
                 self.completed.emit(result)
             except Exception as exc:
                 self.error.emit(str(exc))
@@ -4139,6 +4156,10 @@ def run_gui() -> int:
             self.archive_preview_loose_toggle_button = QPushButton("Loose File")
             self.archive_preview_loose_toggle_button.setToolTip("Switch between the archive preview and the matching loose file preview.")
             self.archive_preview_loose_toggle_button.setVisible(False)
+            self.archive_preview_loose_toggle_button.setMinimumWidth(86)
+            self.archive_preview_loose_toggle_button.setMinimumHeight(24)
+            self.archive_preview_loose_toggle_button.setMaximumHeight(28)
+            self.archive_preview_loose_toggle_button.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
             self.archive_preview_zoom_out_button = QPushButton("-")
             self.archive_preview_zoom_out_button.setToolTip("Zoom out.")
             self.archive_preview_zoom_fit_button = QPushButton("Fit")
@@ -4220,6 +4241,7 @@ def run_gui() -> int:
             )
             archive_preview_title_row.addWidget(self.archive_preview_title_label, stretch=1)
             archive_preview_title_row.addWidget(self.archive_preview_warning_badge)
+            archive_preview_title_row.addWidget(self.archive_preview_loose_toggle_button)
             archive_preview_title_row.addWidget(self.archive_model_preview_settings_button)
 
             archive_preview_toolbar = QWidget()
@@ -5416,12 +5438,12 @@ def run_gui() -> int:
                     <h4>In-game mesh swap</h4>
                     <ol>
                       <li>Select the archive mesh you want to replace and click <b>Swap With In-Game Mesh</b> or use the context menu to start the swap target.</li>
-                      <li>Choose what related files may be included, such as textures, material sidecars, skeletons, or animations. Skeleton and animation replacement is intentionally explicit because incompatible rigs or physics data can break assets.</li>
+                      <li>Choose what related files may be included, such as textures, material sidecars, appearance descriptors, prefabdata, skeletons, or animations. Use <b>Character Swap Plan</b> for experimental full-character/body swaps; it selects the discovered appearance graph and enables source <code>.app_xml</code> replacement. Material sidecars control shader/texture bindings; appearance descriptors can redirect character prefabs, customization metadata, scale values, skeleton variations, sockets, and prefabdata references. Skeleton and animation replacement is intentionally explicit because incompatible rigs or physics data can break assets.</li>
                       <li>Select another loaded archive mesh as the source and use it as the swap source.</li>
                       <li>Review placement and texture mapping in <b>Mesh Replacement Alignment</b>.</li>
                       <li>Use preview first. Only write loose output or patch archives after the result is visually and structurally plausible.</li>
                     </ol>
-                    <div class="doc-callout doc-warning"><b>Mesh limits:</b> static replacement can retarget geometry and compatible material sidecars, but it does not convert every external rig, animation, skin, or complex DCC material graph into native game data.</div>
+                    <div class="doc-callout doc-warning"><b>Mesh limits:</b> static replacement can retarget geometry and compatible material sidecars, but it does not convert every external rig, animation, character appearance graph, skin, or complex DCC material graph into native game data. Full character/body swaps often require matching <code>.app_xml</code>, <code>.prefabdata_xml</code>, skeleton variation, physics, socket, customization, and texture references.</div>
                     <h4>Audio, video, and text-like media</h4>
                     <ul>
                       <li>Preview supported audio/video where the local system codecs allow it.</li>
@@ -9810,9 +9832,10 @@ def run_gui() -> int:
             self,
             *,
             status_message: str,
-            task: Callable[[Callable[[str], None]], object],
+            task: Callable[..., object],
             on_complete: Optional[Callable[[object], None]] = None,
             show_archive_progress: bool = False,
+            task_accepts_progress: bool = False,
         ) -> None:
             if self._background_task_active():
                 if self.worker_thread is not None:
@@ -9831,12 +9854,13 @@ def run_gui() -> int:
                 self.archive_scan_progress_bar.setFormat("Working...")
                 self.append_archive_log(status_message)
 
-            worker = UtilityWorker(task)
+            worker = UtilityWorker(task, task_accepts_progress=task_accepts_progress)
             thread = QThread(self)
             worker.moveToThread(thread)
 
             thread.started.connect(worker.run)
             worker.log_message.connect(self._handle_utility_log_message)
+            worker.progress_changed.connect(self._handle_utility_progress_changed)
             worker.completed.connect(self._handle_utility_completed)
             worker.error.connect(self._handle_worker_error)
             worker.finished.connect(thread.quit)
@@ -9854,9 +9878,10 @@ def run_gui() -> int:
             self,
             *,
             status_message: str,
-            task: Callable[[Callable[[str], None]], object],
+            task: Callable[..., object],
             on_complete: Optional[Callable[[object], None]] = None,
             show_archive_progress: bool = False,
+            task_accepts_progress: bool = False,
             attempt: int = 0,
         ) -> None:
             if self.worker_thread is None:
@@ -9865,6 +9890,7 @@ def run_gui() -> int:
                     task=task,
                     on_complete=on_complete,
                     show_archive_progress=show_archive_progress,
+                    task_accepts_progress=task_accepts_progress,
                 )
                 return
             if attempt == 0:
@@ -9885,6 +9911,7 @@ def run_gui() -> int:
                     task=task,
                     on_complete=on_complete,
                     show_archive_progress=show_archive_progress,
+                    task_accepts_progress=task_accepts_progress,
                     attempt=attempt + 1,
                 ),
             )
@@ -9893,11 +9920,28 @@ def run_gui() -> int:
             self.append_log(message)
             if not self._utility_updates_archive_progress:
                 return
+            if message.startswith("[") and ("] EXTRACT " in message or "] FAIL " in message):
+                return
             self.archive_scan_progress_label.setText(message)
             self.archive_scan_progress_bar.setRange(0, 0)
             self.archive_scan_progress_bar.setFormat("Working...")
             self.append_archive_log(message)
             self.set_status_message(message)
+
+        def _handle_utility_progress_changed(self, current: int, total: int, detail: str) -> None:
+            if not self._utility_updates_archive_progress:
+                return
+            detail_text = str(detail or "").strip() or "Working..."
+            self.archive_scan_progress_label.setText(detail_text)
+            if total > 0:
+                bounded_current = min(max(int(current), 0), int(total))
+                self.archive_scan_progress_bar.setRange(0, int(total))
+                self.archive_scan_progress_bar.setValue(bounded_current)
+                self.archive_scan_progress_bar.setFormat("Archive files: %v / %m")
+            else:
+                self.archive_scan_progress_bar.setRange(0, 0)
+                self.archive_scan_progress_bar.setFormat(detail_text)
+            self.set_status_message(detail_text)
 
         def _directory_has_contents(self, path: Path) -> bool:
             try:
@@ -16670,25 +16714,40 @@ def run_gui() -> int:
         def _archive_entry_is_material_sidecar(entry: ArchiveEntry) -> bool:
             extension = str(entry.extension or "").strip().lower()
             basename = PurePosixPath(entry.path.replace("\\", "/")).name.lower()
-            return extension in {".xml", ".pami", ".pac_xml", ".pam_xml", ".pamlod_xml", ".app_xml", ".prefabdata_xml"} or basename.endswith(
-                (".pac_xml", ".pam_xml", ".pamlod_xml", ".prefabdata_xml")
-            )
+            return _is_material_sidecar_extension(extension, basename)
+
+        @staticmethod
+        def _archive_entry_is_appearance_descriptor(entry: ArchiveEntry) -> bool:
+            extension = str(entry.extension or "").strip().lower()
+            basename = PurePosixPath(entry.path.replace("\\", "/")).name.lower()
+            return extension == ".app_xml" or basename.endswith((".app.xml", ".app_xml"))
+
+        @staticmethod
+        def _archive_entry_is_prefab_descriptor(entry: ArchiveEntry) -> bool:
+            extension = str(entry.extension or "").strip().lower()
+            basename = PurePosixPath(entry.path.replace("\\", "/")).name.lower()
+            return extension == ".prefabdata_xml" or basename.endswith((".prefabdata.xml", ".prefabdata_xml"))
 
         @staticmethod
         def _archive_entry_swap_companion_group(entry: ArchiveEntry) -> str:
             extension = str(entry.extension or "").strip().lower()
             basename = PurePosixPath(entry.path.replace("\\", "/")).name.lower()
-            is_sidecar = extension in {".xml", ".pami", ".pac_xml", ".pam_xml", ".pamlod_xml", ".app_xml", ".prefabdata_xml"} or basename.endswith(
-                (".pac_xml", ".pam_xml", ".pamlod_xml", ".prefabdata_xml")
-            )
-            if is_sidecar:
+            if _is_material_sidecar_extension(extension, basename):
                 return "Material sidecar"
+            if extension == ".app_xml" or basename.endswith((".app.xml", ".app_xml")):
+                return "Appearance descriptor"
+            if extension == ".prefabdata_xml" or basename.endswith((".prefabdata.xml", ".prefabdata_xml")):
+                return "Prefab data"
             if extension == ".dds":
                 return "Texture"
-            if extension == ".pab":
+            if extension in {".pab", ".pabc", ".pabv"}:
                 return "Skeleton"
-            if extension == ".hkx":
+            if extension in {".hkx", ".hkt"}:
+                return "Physics"
+            if extension in {".paa", ".papr", ".motionblending"}:
                 return "Animation"
+            if extension == ".paccd":
+                return "Customization"
             if extension in ARCHIVE_MESH_EXTENSIONS:
                 return "Mesh companion"
             return "Other"
@@ -16703,11 +16762,134 @@ def run_gui() -> int:
 
             return _find_archive_model_sidecar_entries(entry, dict(self.archive_entries_by_basename))
 
+        def _archive_character_appearance_entries_for_swap(self, entry: ArchiveEntry) -> Tuple[ArchiveEntry, ...]:
+            normalized_entry_path = str(getattr(entry, "path", "") or "").replace("\\", "/").strip().lower()
+            if "/character/" not in normalized_entry_path:
+                return ()
+            source_stem = PurePosixPath(normalized_entry_path).stem.lower()
+            source_tokens = {
+                token
+                for token in _semantic_tokens(source_stem)
+                if token not in {"cd", "pc", "phm", "phw", "ptm", "head", "nude", "armor", "weapon"}
+                and not token.isdigit()
+            }
+            class_tokens = tuple(
+                token
+                for token in re.findall(r"/1_pc/[^/]+|/2_mon/[^/]+|/3_npc/[^/]+|/4_riding/[^/]+", normalized_entry_path)
+                if token
+            )
+            scored: List[Tuple[int, ArchiveEntry]] = []
+            for candidate in tuple(getattr(self, "archive_entries", ()) or ()):
+                if not isinstance(candidate, ArchiveEntry) or not self._archive_entry_is_appearance_descriptor(candidate):
+                    continue
+                candidate_path = candidate.path.replace("\\", "/").strip().lower()
+                if "/character/appearance/" not in candidate_path:
+                    continue
+                score = 0
+                if source_stem and source_stem in candidate_path:
+                    score += 60
+                for token in source_tokens:
+                    if token and token in candidate_path:
+                        score += 20
+                for class_token in class_tokens:
+                    if class_token and class_token in candidate_path:
+                        score += 8
+                try:
+                    data, _decompressed, _note = read_archive_entry_data(candidate)
+                    text = (try_decode_text_like_archive_data(data) or "").lower()
+                except Exception:
+                    text = ""
+                if source_stem and source_stem in text:
+                    score += 120
+                for token in source_tokens:
+                    if token and token in text:
+                        score += 12
+                if score > 0:
+                    scored.append((score, candidate))
+            scored.sort(key=lambda item: (item[0], -len(item[1].path)), reverse=True)
+            result: List[ArchiveEntry] = []
+            seen: set[str] = set()
+            for _score, candidate in scored:
+                key = self._archive_entry_identity_key(candidate)
+                if key and key not in seen:
+                    result.append(candidate)
+                    seen.add(key)
+                if len(result) >= 8:
+                    break
+            return tuple(result)
+
+        def _resolve_archive_entries_for_reference_basenames(self, basenames: Sequence[str]) -> Tuple[ArchiveEntry, ...]:
+            result: List[ArchiveEntry] = []
+            seen: set[str] = set()
+            for basename in basenames:
+                normalized_basename = PurePosixPath(str(basename or "").replace("\\", "/")).name.lower()
+                if not normalized_basename:
+                    continue
+                for candidate in tuple(self.archive_entries_by_basename.get(normalized_basename, ()) or ()):
+                    key = self._archive_entry_identity_key(candidate)
+                    if key and key not in seen:
+                        result.append(candidate)
+                        seen.add(key)
+            return tuple(result)
+
+        def _archive_character_app_graph_entries_for_swap(self, entry: ArchiveEntry) -> Tuple[ArchiveEntry, ...]:
+            appearance_entries = self._archive_character_appearance_entries_for_swap(entry)
+            if not appearance_entries:
+                return ()
+            result: List[ArchiveEntry] = []
+            seen: set[str] = set()
+
+            def _add_entry(candidate: Optional[ArchiveEntry]) -> None:
+                if not isinstance(candidate, ArchiveEntry):
+                    return
+                key = self._archive_entry_identity_key(candidate)
+                if key and key not in seen:
+                    result.append(candidate)
+                    seen.add(key)
+
+            for appearance_entry in appearance_entries:
+                _add_entry(appearance_entry)
+                try:
+                    relationship_plan = build_archive_relationship_plan(
+                        appearance_entry,
+                        self.archive_entries,
+                        mode="swap_source",
+                    )
+                except Exception:
+                    continue
+                for edge in relationship_plan.edges:
+                    _add_entry(edge.related_entry)
+            return tuple(result[:96])
+
+        def _archive_character_app_graph_texture_entries_for_swap(self, entry: ArchiveEntry) -> Tuple[ArchiveEntry, ...]:
+            graph_entries = self._archive_character_app_graph_entries_for_swap(entry)
+            if not graph_entries:
+                return ()
+            texture_entries_by_key: Dict[str, ArchiveEntry] = {}
+
+            def _add_texture(texture_entry: Optional[ArchiveEntry]) -> None:
+                if not isinstance(texture_entry, ArchiveEntry):
+                    return
+                if str(getattr(texture_entry, "extension", "") or "").strip().lower() != ".dds":
+                    return
+                key = self._archive_entry_identity_key(texture_entry)
+                if key and key not in texture_entries_by_key:
+                    texture_entries_by_key[key] = texture_entry
+
+            for graph_entry in graph_entries:
+                try:
+                    relationship_plan = resolve_material_texture_graph(graph_entry, self.archive_entries)
+                except Exception:
+                    relationship_plan = None
+                for edge in tuple(getattr(relationship_plan, "edges", ()) or ()):
+                    _add_texture(edge.related_entry)
+            return tuple(texture_entries_by_key.values())
+
         def _archive_model_source_texture_entries_for_swap(self, entry: ArchiveEntry) -> Tuple[ArchiveEntry, ...]:
             from cdmw.core.archive import _extract_archive_sidecar_texture_lookup_paths
 
-            texture_entries_by_basename: "OrderedDict[str, ArchiveEntry]" = OrderedDict()
-            texture_entry_scores_by_basename: Dict[str, int] = {}
+            texture_entries_by_key: "OrderedDict[str, ArchiveEntry]" = OrderedDict()
+            texture_entry_scores_by_key: Dict[str, int] = {}
             source_path_text = entry.path.replace("\\", "/").strip().lower()
             source_root = PurePosixPath(source_path_text).parts[0] if PurePosixPath(source_path_text).parts else ""
             source_stem_tokens = _semantic_tokens(PurePosixPath(source_path_text).stem)
@@ -16737,14 +16919,21 @@ def run_gui() -> int:
                     return
                 if str(candidate.extension or "").strip().lower() != ".dds":
                     return
-                basename = PurePosixPath(candidate.path.replace("\\", "/")).name.lower()
-                if not basename:
+                key = self._archive_entry_identity_key(candidate)
+                if not key:
                     return
                 score = _source_texture_relevance_score(candidate, referenced_path)
-                previous = texture_entries_by_basename.get(basename)
-                if previous is None or score > texture_entry_scores_by_basename.get(basename, -9999):
-                    texture_entries_by_basename[basename] = candidate
-                    texture_entry_scores_by_basename[basename] = score
+                previous = texture_entries_by_key.get(key)
+                if previous is None or score > texture_entry_scores_by_key.get(key, -9999):
+                    texture_entries_by_key[key] = candidate
+                    texture_entry_scores_by_key[key] = score
+
+            try:
+                relationship_plan = resolve_material_texture_graph(entry, self.archive_entries)
+                for edge in relationship_plan.edges:
+                    _add_texture(edge.related_entry, referenced_path=edge.related_path)
+            except Exception:
+                pass
 
             try:
                 (
@@ -16792,7 +16981,7 @@ def run_gui() -> int:
                         for candidate in self.archive_entries_by_basename.get(basename, ()):
                             _add_texture(candidate, referenced_path=raw_texture_path)
 
-            return tuple(texture_entries_by_basename.values())
+            return tuple(texture_entries_by_key.values())
 
         def _build_archive_swap_source_texture_evidence(
             self,
@@ -16997,27 +17186,86 @@ def run_gui() -> int:
                 return f"{target_stem}.pamlod_xml", None
             return f"{target_stem}.xml", None
 
+        def _target_appearance_path_for_source_appearance(
+            self,
+            target_entry: ArchiveEntry,
+            source_appearance_entry: ArchiveEntry,
+        ) -> Tuple[str, Optional[ArchiveEntry]]:
+            target_appearances = list(self._archive_character_appearance_entries_for_swap(target_entry))
+            if not target_appearances:
+                return "", None
+            source_basename = PurePosixPath(source_appearance_entry.path.replace("\\", "/")).name.lower()
+            source_variant_match = re.search(r"_(\d{5})\.app", source_basename)
+            source_variant = source_variant_match.group(1) if source_variant_match else ""
+            if source_variant:
+                for target_appearance in target_appearances:
+                    target_basename = PurePosixPath(target_appearance.path.replace("\\", "/")).name.lower()
+                    if f"_{source_variant}.app" in target_basename:
+                        return target_appearance.path, target_appearance
+            return target_appearances[0].path, target_appearances[0]
+
         def _prompt_archive_in_game_mesh_swap_scope(
             self,
             target_entry: ArchiveEntry,
             source_entry: ArchiveEntry,
         ) -> Optional[InGameMeshSwapScopeSelection]:
             source_related_entries_by_key: Dict[str, ArchiveEntry] = {}
+            relationship_edges_by_key: Dict[str, ArchiveRelationEdge] = {}
+            unresolved_relationship_edges: List[ArchiveRelationEdge] = []
+            try:
+                character_relationship_plan = build_character_swap_plan(
+                    target_entry,
+                    source_entry,
+                    self.archive_entries,
+                    swap_scope=SWAP_SCOPE_BODY_HEAD,
+                )
+            except Exception:
+                character_relationship_plan = None
 
             def _add_related_entry(entry: ArchiveEntry) -> None:
                 key = self._archive_entry_identity_key(entry)
                 if key and key not in source_related_entries_by_key:
                     source_related_entries_by_key[key] = entry
 
+            def _add_relationship_edge(edge: ArchiveRelationEdge) -> None:
+                if edge.unresolved:
+                    unresolved_relationship_edges.append(edge)
+                    return
+                entry = edge.related_entry
+                if not isinstance(entry, ArchiveEntry):
+                    return
+                key = self._archive_entry_identity_key(entry)
+                if not key:
+                    return
+                _add_related_entry(entry)
+                current = relationship_edges_by_key.get(key)
+                current_rank = 0
+                if current is not None:
+                    current_rank = 3 if current.include_policy == ARCHIVE_REL_INCLUDE_REQUIRED else 2 if current.include_policy == ARCHIVE_REL_INCLUDE_RECOMMENDED else 1
+                rank = 3 if edge.include_policy == ARCHIVE_REL_INCLUDE_REQUIRED else 2 if edge.include_policy == ARCHIVE_REL_INCLUDE_RECOMMENDED else 1
+                if current is None or rank > current_rank:
+                    relationship_edges_by_key[key] = edge
+
             for related_entry in self._archive_model_related_entries_for_swap(source_entry):
                 _add_related_entry(related_entry)
+            for edge in tuple(getattr(character_relationship_plan, "edges", ()) or ()):
+                _add_relationship_edge(edge)
+            for related_entry in self._archive_character_app_graph_entries_for_swap(source_entry):
+                _add_related_entry(related_entry)
+            for texture_entry in self._archive_character_app_graph_texture_entries_for_swap(source_entry):
+                _add_related_entry(texture_entry)
             for texture_entry in self._archive_model_source_texture_entries_for_swap(source_entry):
                 _add_related_entry(texture_entry)
             source_related_entries = list(source_related_entries_by_key.values())
             source_sidecar_paths = {entry.path for entry in self._archive_model_sidecar_entries_for_swap(source_entry)}
+            source_appearance_paths = {
+                entry.path for entry in self._archive_character_appearance_entries_for_swap(source_entry)
+            }
             for related_entry in source_related_entries:
                 if self._archive_entry_is_material_sidecar(related_entry):
                     source_sidecar_paths.add(related_entry.path)
+                if self._archive_entry_is_appearance_descriptor(related_entry):
+                    source_appearance_paths.add(related_entry.path)
             source_related_entries.sort(
                 key=lambda entry: (
                     self._archive_entry_swap_companion_group(entry),
@@ -17048,8 +17296,28 @@ def run_gui() -> int:
             replace_source_sidecar_checkbox.setToolTip(
                 "Copies selected source .pac_xml/.pami/.xml bytes into the target material sidecar path. Review carefully."
             )
+            replace_source_appearance_checkbox = QCheckBox("Replace target appearance descriptor with selected source .app_xml")
+            replace_source_appearance_checkbox.setChecked(False)
+            replace_source_appearance_checkbox.setToolTip(
+                "Experimental character swap path. Copies the selected source Appearance XML into the matching target Appearance XML path, "
+                "so the game can follow source prefab, customization, scale, skeleton-variation, and socket references."
+            )
+            character_swap_plan_checkbox = QCheckBox("Use Character Swap Plan (experimental)")
+            character_swap_plan_checkbox.setChecked(bool(getattr(character_relationship_plan, "patched_target_app_xml", b"")))
+            character_swap_plan_checkbox.setToolTip(
+                "Builds a surgical target appearance patch from the selected source: body/head by default, while preserving target hair, armor, skeleton, and physics."
+            )
             layout.addWidget(generated_sidecar_checkbox)
             layout.addWidget(replace_source_sidecar_checkbox)
+            layout.addWidget(replace_source_appearance_checkbox)
+            layout.addWidget(character_swap_plan_checkbox)
+            scope_help_row = QHBoxLayout()
+            scope_help_row.setContentsMargins(0, 0, 0, 0)
+            scope_help_button = QPushButton("Help: what should I choose?")
+            scope_help_button.setToolTip("Explain the swap-scope options and safe defaults.")
+            scope_help_row.addWidget(scope_help_button)
+            scope_help_row.addStretch(1)
+            layout.addLayout(scope_help_row)
 
             companion_label = QLabel("Source companion files")
             companion_label.setObjectName("SectionTitle")
@@ -17057,7 +17325,7 @@ def run_gui() -> int:
 
             companion_tree = QTreeWidget()
             companion_tree.setColumnCount(4)
-            companion_tree.setHeaderLabels(["Include", "Type", "Replacement behavior", "Source path"])
+            companion_tree.setHeaderLabels(["Include", "Type", "What this row means", "Source path"])
             companion_tree.setRootIsDecorated(False)
             companion_tree.setAlternatingRowColors(True)
             companion_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -17073,12 +17341,30 @@ def run_gui() -> int:
                 return f"{entry.pamt_path.resolve()}::{normalized_path}"
 
             def _behavior_text(entry: ArchiveEntry) -> str:
+                edge = relationship_edges_by_key.get(_entry_key(entry))
+                if edge is not None:
+                    if edge.risk:
+                        label = "Manual/risky"
+                    elif edge.include_policy == ARCHIVE_REL_INCLUDE_REQUIRED:
+                        label = "Planned output"
+                    elif edge.include_policy == ARCHIVE_REL_INCLUDE_RECOMMENDED:
+                        label = "Detected reference"
+                    else:
+                        label = "Manual option"
+                    return f"{label}: {edge.reason or edge.relation_kind}."
                 if self._archive_entry_is_material_sidecar(entry):
                     target_path, _target_sidecar = self._target_sidecar_path_for_source_sidecar(target_entry, entry)
                     return f"Can replace target sidecar: {target_path}"
+                if self._archive_entry_is_appearance_descriptor(entry):
+                    target_path, _target_appearance = self._target_appearance_path_for_source_appearance(target_entry, entry)
+                    if target_path:
+                        return f"Can replace target appearance descriptor: {target_path}"
+                    return "Source appearance descriptor; no matching target appearance XML was found automatically"
+                if self._archive_entry_is_prefab_descriptor(entry):
+                    return "Prefab metadata referenced by appearance XML; copy only when the source asset is not already available in game"
                 if entry.extension == ".dds":
                     return "Override DDS at this archive path while the mod is enabled"
-                if entry.extension in {".pab", ".hkx"}:
+                if entry.extension in {".pab", ".pabc", ".pabv", ".hkx", ".hkt"}:
                     return "REPLACES this game file while enabled; rig/physics-sensitive"
                 return "Override companion at this archive path while enabled"
 
@@ -17096,11 +17382,32 @@ def run_gui() -> int:
                 item.setData(0, Qt.UserRole, key)
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 default_checked = False
+                edge = relationship_edges_by_key.get(key)
+                if edge is not None and edge.include_policy in {ARCHIVE_REL_INCLUDE_REQUIRED, ARCHIVE_REL_INCLUDE_RECOMMENDED} and not edge.risk:
+                    # Safe graph rows are selected only when the surgical character plan is active.
+                    default_checked = bool(character_swap_plan_checkbox.isChecked()) and related_entry.extension == ".dds"
                 if related_entry.path in source_sidecar_paths and self._archive_entry_is_material_sidecar(related_entry):
                     default_checked = False
+                if related_entry.path in source_appearance_paths and self._archive_entry_is_appearance_descriptor(related_entry):
+                    default_checked = False
                 item.setCheckState(0, Qt.Checked if default_checked else Qt.Unchecked)
-                if related_entry.extension in {".pab", ".hkx"}:
+                if related_entry.extension in {".pab", ".pabc", ".pabv", ".hkx", ".hkt"}:
                     item.setForeground(1, QBrush(QColor("#facc15")))
+                if self._archive_entry_is_appearance_descriptor(related_entry):
+                    item.setForeground(1, QBrush(QColor("#79c0ff")))
+                companion_tree.addTopLevelItem(item)
+
+            for edge in unresolved_relationship_edges[:48]:
+                item = QTreeWidgetItem(
+                    [
+                        "",
+                        "Unresolved",
+                        edge.reason or "Referenced file was not found in the loaded archive indexes.",
+                        edge.related_path,
+                    ]
+                )
+                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
+                item.setForeground(1, QBrush(QColor("#facc15")))
                 companion_tree.addTopLevelItem(item)
 
             if companion_tree.topLevelItemCount() == 0:
@@ -17111,8 +17418,10 @@ def run_gui() -> int:
             helper = QLabel(
                 "Use source sidecar replacement only when you want the source material wrapper copied onto the target sidecar path. "
                 "Select source DDS files too if that sidecar references source textures. "
-                ".pab skeleton and .hkx animation/physics rows are not merged: if checked, the mod overrides that archive file while enabled. "
-                "For cloth or physics-heavy swaps this may be required, but it should be tested in game."
+                "Appearance descriptors are separate from material sidecars: for character body swaps they can redirect the target character to source prefabs, "
+                "customization metadata, scale values, skeleton variations, sockets, and prefabdata references. "
+                ".pab/.pabc skeleton and .hkx/.hkt physics rows are not merged: if checked, the mod overrides that archive file while enabled. "
+                "For full character swaps this may be required, but it should be tested in game."
             )
             helper.setWordWrap(True)
             helper.setObjectName("HintLabel")
@@ -17121,9 +17430,14 @@ def run_gui() -> int:
             button_row = QHBoxLayout()
             select_textures_button = QPushButton("Select Textures")
             select_sidecars_button = QPushButton("Select Sidecars")
+            select_appearance_button = QPushButton("Select Graph Textures")
+            select_appearance_button.setToolTip(
+                "Select only the safe DDS texture rows resolved from the character appearance graph. Risky app, sidecar, skeleton, and physics rows remain manual."
+            )
             clear_button = QPushButton("Clear")
             button_row.addWidget(select_textures_button)
             button_row.addWidget(select_sidecars_button)
+            button_row.addWidget(select_appearance_button)
             button_row.addWidget(clear_button)
             button_row.addStretch(1)
             cancel_button = QPushButton("Cancel")
@@ -17142,11 +17456,66 @@ def run_gui() -> int:
                     if entry is not None and predicate(entry):
                         item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
 
+            def _select_character_graph_entries() -> None:
+                selected_count = 0
+                for index in range(companion_tree.topLevelItemCount()):
+                    item = companion_tree.topLevelItem(index)
+                    if item is None or not (item.flags() & Qt.ItemIsUserCheckable):
+                        continue
+                    entry = entries_by_key.get(str(item.data(0, Qt.UserRole) or ""))
+                    if entry is None:
+                        continue
+                    entry_key = self._archive_entry_identity_key(entry)
+                    edge = relationship_edges_by_key.get(entry_key)
+                    should_select = (
+                        edge is not None
+                        and edge.include_policy in {ARCHIVE_REL_INCLUDE_REQUIRED, ARCHIVE_REL_INCLUDE_RECOMMENDED}
+                        and not edge.risk
+                        and entry.extension == ".dds"
+                    )
+                    if should_select:
+                        item.setCheckState(0, Qt.Checked)
+                        selected_count += 1
+                if selected_count:
+                    character_swap_plan_checkbox.blockSignals(True)
+                    character_swap_plan_checkbox.setChecked(True)
+                    character_swap_plan_checkbox.blockSignals(False)
+
             select_textures_button.clicked.connect(lambda: _set_checked_by_predicate(lambda entry: entry.extension == ".dds", True))
             select_sidecars_button.clicked.connect(lambda: _set_checked_by_predicate(self._archive_entry_is_material_sidecar, True))
+            select_appearance_button.clicked.connect(_select_character_graph_entries)
             clear_button.clicked.connect(lambda: _set_checked_by_predicate(lambda _entry: True, False))
             cancel_button.clicked.connect(dialog.reject)
             continue_button.clicked.connect(dialog.accept)
+
+            def _show_swap_scope_help() -> None:
+                QMessageBox.information(
+                    dialog,
+                    "In-Game Swap Scope Help",
+                    (
+                        "Recommended character/body swap defaults:\n"
+                        "- Keep generated/retargeted material sidecar enabled.\n"
+                        "- Leave direct source material sidecar replacement off.\n"
+                        "- Leave full source .app_xml replacement off.\n"
+                        "- Use Character Swap Plan when swapping character body/head assets.\n\n"
+                        "Generated/retargeted material sidecar means the later alignment step patches the target .pac_xml/.pami from the reviewed mapping and texture plan. "
+                        "This is usually safer than copying the source .pac_xml because source and target submesh wrappers can differ.\n\n"
+                        "Replace target material sidecar copies selected source sidecar bytes onto the target sidecar path. Use this only for manual experiments.\n\n"
+                        "Replace target appearance descriptor copies the full source .app_xml. This can redirect hair, armor, customization, scale, sockets, prefab data, and other character graph links.\n\n"
+                        "Character Swap Plan creates a surgical target .app_xml patch for body/head references while preserving target hair, armor, skeleton, and physics by default.\n\n"
+                        "Checked table rows are written as loose replacement payloads. Rows marked as detected references are shown for context and manual selection; they are not automatically required just because they were found.\n\n"
+                        "Select Graph Textures selects only safe DDS texture rows from the character graph. Sidecars, skeleton, physics, and full appearance descriptors remain explicit manual choices."
+                    ),
+                )
+
+            scope_help_button.clicked.connect(_show_swap_scope_help)
+
+            def _character_swap_plan_toggled(checked: bool) -> None:
+                if not checked:
+                    return
+                _select_character_graph_entries()
+
+            character_swap_plan_checkbox.toggled.connect(_character_swap_plan_toggled)
 
             if dialog.exec() != QDialog.Accepted:
                 return None
@@ -17159,9 +17528,23 @@ def run_gui() -> int:
                 entry = entries_by_key.get(str(item.data(0, Qt.UserRole) or ""))
                 if entry is not None:
                     selected_entries.append(entry)
+            if character_swap_plan_checkbox.isChecked():
+                selected_keys = {self._archive_entry_identity_key(entry) for entry in selected_entries}
+                for edge in tuple(getattr(character_relationship_plan, "edges", ()) or ()):
+                    if edge.risk or edge.include_policy not in {ARCHIVE_REL_INCLUDE_REQUIRED, ARCHIVE_REL_INCLUDE_RECOMMENDED}:
+                        continue
+                    entry = edge.related_entry
+                    if not isinstance(entry, ArchiveEntry) or entry.extension != ".dds":
+                        continue
+                    key = self._archive_entry_identity_key(entry)
+                    if key and key not in selected_keys:
+                        selected_entries.append(entry)
+                        selected_keys.add(key)
             return InGameMeshSwapScopeSelection(
                 prefer_generated_sidecar=bool(generated_sidecar_checkbox.isChecked()),
                 replace_target_sidecar_with_source=bool(replace_source_sidecar_checkbox.isChecked()),
+                replace_target_appearance_with_source=bool(replace_source_appearance_checkbox.isChecked()),
+                use_character_swap_plan=bool(character_swap_plan_checkbox.isChecked()),
                 companion_entries=tuple(selected_entries),
             )
 
@@ -17173,6 +17556,34 @@ def run_gui() -> int:
         ) -> Tuple[MeshImportSupplementalFileSpec, ...]:
             specs: List[MeshImportSupplementalFileSpec] = []
             selected_entries = list(scope.companion_entries or ())
+            if scope.use_character_swap_plan:
+                try:
+                    character_plan = build_character_swap_plan(
+                        target_entry,
+                        source_entry,
+                        self.archive_entries,
+                        swap_scope=SWAP_SCOPE_BODY_HEAD,
+                    )
+                except Exception:
+                    character_plan = None
+                patched_payload = bytes(getattr(character_plan, "patched_target_app_xml", b"") or b"")
+                patched_target_path = str(getattr(character_plan, "patched_target_app_path", "") or "").strip()
+                if patched_payload and patched_target_path:
+                    target_app = None
+                    for candidate in tuple(self.archive_entries_by_normalized_path.get(patched_target_path.lower(), ()) or ()):
+                        target_app = candidate
+                        break
+                    specs.append(
+                        MeshImportSupplementalFileSpec(
+                            source_path=Path(PurePosixPath(patched_target_path).name),
+                            target_path=patched_target_path,
+                            kind="file",
+                            target_entry=target_app,
+                            used_for_preview=False,
+                            payload_data=patched_payload,
+                            note="Surgical Character Swap Plan appearance patch: body/head source prefabs with target hair/armor preserved",
+                        )
+                    )
             if scope.replace_target_sidecar_with_source:
                 selected_sidecars = [entry for entry in selected_entries if self._archive_entry_is_material_sidecar(entry)]
                 if not selected_sidecars:
@@ -17199,8 +17610,43 @@ def run_gui() -> int:
                 for spec in specs
                 if spec.kind == "sidecar"
             }
+            if scope.replace_target_appearance_with_source:
+                selected_appearances = [
+                    entry for entry in selected_entries if self._archive_entry_is_appearance_descriptor(entry)
+                ]
+                if not selected_appearances:
+                    selected_appearances = list(self._archive_character_appearance_entries_for_swap(source_entry))[:1]
+                for source_appearance in selected_appearances:
+                    try:
+                        payload_data, _decompressed, _note = read_archive_entry_data(source_appearance)
+                    except Exception:
+                        continue
+                    target_path, target_appearance = self._target_appearance_path_for_source_appearance(
+                        target_entry,
+                        source_appearance,
+                    )
+                    if not target_path:
+                        continue
+                    specs.append(
+                        MeshImportSupplementalFileSpec(
+                            source_path=Path(PurePosixPath(source_appearance.path.replace("\\", "/")).name),
+                            target_path=target_path,
+                            kind="file",
+                            target_entry=target_appearance,
+                            used_for_preview=False,
+                            payload_data=payload_data,
+                            note=f"Source appearance descriptor copied from {source_appearance.path}",
+                        )
+                    )
+            replaced_source_appearance_paths = {
+                str(getattr(spec, "note", "") or "").replace("Source appearance descriptor copied from ", "")
+                for spec in specs
+                if "Source appearance descriptor copied from " in str(getattr(spec, "note", "") or "")
+            }
             for source_companion in selected_entries:
                 if source_companion.path in replaced_source_sidecar_paths:
+                    continue
+                if source_companion.path in replaced_source_appearance_paths:
                     continue
                 try:
                     payload_data, _decompressed, _note = read_archive_entry_data(source_companion)
@@ -19432,22 +19878,16 @@ def run_gui() -> int:
                 )
 
             def _mapping_role_hint(label: str) -> str:
-                tokens = _semantic_tokens(label)
-                ordered_roles = (
-                    ("blade", ("blade", "body", "edge", "tip")),
-                    ("handle", ("handle", "hilt", "grip")),
-                    ("guard", ("guard", "crossguard", "support")),
-                    ("accessory/detail", ("acc", "accessory", "detail", "trim", "spike")),
-                    ("cloth", ("cloth", "cape", "fabric")),
-                    ("armor/body", ("armor", "plate", "body")),
-                )
-                for role, role_tokens in ordered_roles:
-                    if any(token in tokens for token in role_tokens):
-                        return role
-                return "unknown"
+                return infer_static_replacement_part_role(label)
 
             source_role_choices = (
                 ("Auto / inferred", ""),
+                ("Head / face", "head/face"),
+                ("Hair", "hair"),
+                ("Body / nude", "body"),
+                ("Hand / arm", "hand/arm"),
+                ("Foot / leg", "foot/leg"),
+                ("Helmet / mask", "helmet"),
                 ("Blade", "blade"),
                 ("Handle / grip", "handle"),
                 ("Guard / crossguard", "guard"),
@@ -20762,6 +21202,21 @@ def run_gui() -> int:
                     except Exception:
                         local_key = local_path_text.lower()
                     source_texture_evidence_by_local_path.setdefault(local_key, []).append(evidence)
+                texture_files_by_basename: Dict[str, Path] = {}
+                texture_files_by_normalized_source_path: Dict[str, Path] = {}
+                for texture_file in texture_files_for_mapping:
+                    texture_files_by_basename.setdefault(texture_file.name.lower(), texture_file)
+                    try:
+                        texture_key = str(texture_file.expanduser().resolve()).lower()
+                    except Exception:
+                        texture_key = str(texture_file).lower()
+                    for evidence in source_texture_evidence_by_local_path.get(texture_key, ()):
+                        for evidence_key in ("archive_path", "texture_path", "resolved_archive_path"):
+                            normalized_evidence_path = normalize_texture_reference_for_sidecar_lookup(
+                                str(evidence.get(evidence_key) or "")
+                            )
+                            if normalized_evidence_path:
+                                texture_files_by_normalized_source_path.setdefault(normalized_evidence_path, texture_file)
 
                 def _important_tokens(value: str) -> set[str]:
                     return _semantic_tokens(value) & {
@@ -20774,12 +21229,38 @@ def run_gui() -> int:
                         "edge",
                         "guard",
                         "handle",
+                        "hand",
+                        "arm",
+                        "forearm",
+                        "head",
+                        "face",
+                        "hair",
+                        "foot",
+                        "feet",
+                        "leg",
+                        "boot",
+                        "nude",
                         "helmet",
                         "hilt",
                         "plate",
                         "spike",
                         "trim",
                     }
+
+                def _part_specific_tokens(value: str) -> set[str]:
+                    tokens = _semantic_tokens(value)
+                    result: set[str] = set()
+                    if tokens & {"hand", "glove", "gauntlet", "arm", "forearm"}:
+                        result.add("hand")
+                    if tokens & {"head", "face", "eye", "mouth", "jaw"}:
+                        result.add("head")
+                    if tokens & {"hair", "beard"}:
+                        result.add("hair")
+                    if tokens & {"foot", "feet", "boot", "boots", "shoe", "leg"}:
+                        result.add("foot")
+                    if not result and tokens & {"body", "torso", "nude", "skin", "chest", "waist"}:
+                        result.add("body")
+                    return result
 
                 def _binding_matches_target(binding: object, target_name: str) -> bool:
                     target_key = str(target_name or "").strip().lower()
@@ -20811,6 +21292,12 @@ def run_gui() -> int:
                 ) -> str:
                     parameter_classification = classify_texture_binding(parameter_name, target_texture_path)
                     parameter_subtype = str(getattr(parameter_classification, "semantic_subtype", "") or "").strip().lower()
+                    normalized_target_texture_path = normalize_texture_reference_for_sidecar_lookup(target_texture_path)
+                    exact_source_path = texture_files_by_normalized_source_path.get(normalized_target_texture_path)
+                    if exact_source_path is None:
+                        exact_source_path = texture_files_by_basename.get(PurePosixPath(target_texture_path.replace("\\", "/")).name.lower())
+                    if exact_source_path is not None:
+                        return str(exact_source_path)
                     if parameter_subtype == "emissive":
                         best_emissive_path = ""
                         best_emissive_score = 0.0
@@ -20843,6 +21330,10 @@ def run_gui() -> int:
                     if len(candidates) == 1 and slot_kind in {"base", "normal", "height"}:
                         target_important = _important_tokens(target_name)
                         candidate_important = _important_tokens(candidates[0].stem)
+                        target_specific = _part_specific_tokens(f"{target_name} {target_texture_path}")
+                        candidate_specific = _part_specific_tokens(candidates[0].stem)
+                        if target_specific and candidate_specific and not (target_specific & candidate_specific):
+                            return ""
                         if (
                             len(tuple(source_indices or ())) == 1
                             or not target_important
@@ -20855,6 +21346,7 @@ def run_gui() -> int:
                     parameter_compact = re.sub(r"[^a-z0-9]+", "", str(parameter_name or "").lower())
                     target_tokens = _semantic_tokens(target_name)
                     target_important = _important_tokens(target_name)
+                    target_part_specific = _part_specific_tokens(f"{target_name} {target_texture_path}")
                     desired_terms = {
                         token
                         for token in (
@@ -20901,6 +21393,7 @@ def run_gui() -> int:
                         best_score = 0.0
                         parameter_tokens = _semantic_tokens(parameter_name)
                         target_path_tokens = _semantic_tokens(PurePosixPath(target_texture_path.replace("\\", "/")).stem)
+                        target_path_specific = _part_specific_tokens(target_texture_path)
                         target_shader_key = re.sub(r"[^a-z0-9]+", "", str(target_shader_family or "").lower())
                         for evidence in evidence_rows:
                             evidence_slot_kind = str(evidence.get("slot_kind") or "").strip().lower()
@@ -20925,6 +21418,7 @@ def run_gui() -> int:
                             )
                             evidence_tokens = _semantic_tokens(evidence_text)
                             evidence_important = _important_tokens(evidence_text)
+                            evidence_specific = _part_specific_tokens(evidence_text)
                             evidence_shader_key = re.sub(
                                 r"[^a-z0-9]+",
                                 "",
@@ -20936,6 +21430,14 @@ def run_gui() -> int:
                                 str(evidence.get("material_profile_parameter") or evidence.get("parameter_name") or "").lower(),
                             )
                             score = 0.0
+                            required_specific = target_part_specific or target_path_specific
+                            if required_specific:
+                                if evidence_specific and not (required_specific & evidence_specific):
+                                    score -= 80.0
+                                elif not evidence_specific:
+                                    score -= 90.0
+                                elif required_specific & evidence_specific:
+                                    score += 48.0
                             if evidence_slot_kind == slot_kind:
                                 score += 42.0
                             elif evidence_slot_kind:
@@ -20969,12 +21471,20 @@ def run_gui() -> int:
                     for texture_file in texture_files_for_mapping:
                         file_tokens = _semantic_tokens(texture_file.stem)
                         file_important = _important_tokens(texture_file.stem)
+                        file_part_specific = _part_specific_tokens(texture_file.stem)
                         file_compact = re.sub(r"[^a-z0-9]+", "", texture_file.stem.lower())
                         file_classification = classify_texture_binding("", texture_file.name)
                         if slot_kind in {"base", "normal", "height"} and file_classification.slot_kind != slot_kind:
                             continue
                         standalone_pbr = slot_kind == "material" and _looks_like_standalone_pbr_source(texture_file)
                         score = 0.0
+                        if target_part_specific:
+                            if file_part_specific and not (target_part_specific & file_part_specific):
+                                continue
+                            if not file_part_specific:
+                                score -= 60.0
+                            else:
+                                score += 42.0
                         if file_classification.slot_kind == slot_kind and not standalone_pbr:
                             score += 30.0
                         if file_classification.semantic_subtype == parameter_classification.semantic_subtype:
@@ -25394,13 +25904,23 @@ def run_gui() -> int:
                 return
             clear_root, collision_mode = extract_options
 
-            def task(on_log: Callable[[str], None]) -> Dict[str, object]:
+            def task(
+                on_log: Callable[[str], None],
+                on_progress: Callable[[int, int, str], None],
+            ) -> Dict[str, object]:
                 if clear_root:
                     output_root.mkdir(parents=True, exist_ok=True)
                     on_log(f"Clearing extract root contents under {output_root}")
+                    on_progress(0, 0, f"Clearing extract root contents under {output_root}...")
                     clear_directory_contents(output_root)
                 on_log(f"Extracting {len(entries):,} archive entries to {output_root}")
-                stats = extract_archive_entries(entries, output_root, collision_mode=collision_mode, on_log=on_log)
+                stats = extract_archive_entries(
+                    entries,
+                    output_root,
+                    collision_mode=collision_mode,
+                    on_log=on_log,
+                    on_progress=on_progress,
+                )
                 return {
                     "output_root": str(output_root),
                     "stats": stats,
@@ -25461,6 +25981,8 @@ def run_gui() -> int:
                 status_message=description,
                 task=task,
                 on_complete=on_complete,
+                show_archive_progress=True,
+                task_accepts_progress=True,
             )
 
         def extract_selected_archive_entries(self) -> None:

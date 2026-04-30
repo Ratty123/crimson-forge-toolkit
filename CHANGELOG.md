@@ -9,6 +9,35 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.9.0-beta.2] - 2026-04-30
+
+### Added
+- Added a shared archive relationship resolver for model, material, appearance, prefab, texture, skeleton, and physics links across `.pac`, `.pam`, `.pamlod`, `.pac_xml`, `.pami`, `.app_xml`, `.prefabdata_xml`, `.dds`, `.hkx`, and `.pab`-style entries.
+- Added safer character/body swap planning that can patch target appearance body/head references while preserving target hair, armor, skeleton, and physics by default.
+- Added in-game swap-scope help explaining generated/retargeted sidecars, direct source sidecar replacement, full source `.app_xml` replacement, and the Character Swap Plan.
+- Added visible unresolved relationship rows for missing appearance/prefab references so files such as `.pabc`, `.pabv`, `.papr`, or `.hkt` are not silently ignored.
+- Added determinate Archive Browser extraction progress for selected/filtered archive exports.
+
+### Changed
+- Changed in-game swap related-file discovery to prefer graph references and exact archive paths before basename heuristics.
+- Changed source texture deduplication to use normalized archive identity instead of DDS basename, so duplicate names in different folders are preserved.
+- Changed texture-slot suggestion priority so exact original DDS path/name matches win before role, body/hand, sidecar-evidence, or token heuristics.
+- Changed body/hand/head/foot texture suggestion rules so hand-specific textures are no longer auto-suggested for body/nude slots, and vice versa.
+- Changed the swap-scope table wording from replacement instructions to contextual labels such as `Detected reference`, `Planned output`, and `Manual/risky`.
+- Renamed `Select Character Graph` to `Select Graph Textures` because the safe bulk action only selects resolved DDS texture rows, while sidecars, skeletons, physics, and full appearance descriptors remain manual.
+
+### Fixed
+- Fixed a GUI freeze when choosing an in-game swap source on large archive sets by caching resolver indexes and avoiding broad `.app_xml` payload scans on the UI thread.
+- Fixed a stray top-level `Loose File` popup in Archive Browser by adding the loose-preview toggle button to the preview header layout.
+- Fixed texture override suggestions that could map `cd_phw_00_nude_00_0001_hand.dds` onto `cd_phw_00_nude_00_0001.dds`.
+- Fixed texture override suggestions that could map a generic body normal such as `cd_phw_00_nude_00_0001_n.dds` onto an exact hand normal slot such as `cd_phw_00_nude_00_0001_hand_n.dds`.
+- Fixed source sidecar and character graph rows being presented too strongly as recommended include targets when they are often contextual or risky manual choices.
+- Fixed narrow Archive Preview overlap cases around compact controls and the referenced-file pane.
+
+### Docs
+- Updated release version references from `0.9.0-beta.1` to `0.9.0-beta.2` in the README, changelog, and app version metadata.
+- Clarified in-app guidance for in-game mesh swap scope, Character Swap Plan behavior, and when direct source `.pac_xml` or source `.app_xml` replacement should be treated as advanced/manual.
+
 ## [0.9.0-beta.1] - 2026-04-30
 
 ### Added

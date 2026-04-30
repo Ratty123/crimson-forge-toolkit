@@ -4,11 +4,11 @@ Windows desktop tool for **Crimson Desert texture workflows**, **archive browsin
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-Latest release: `0.9.0-beta.1`
+Latest release: `0.9.0-beta.2`
 
-- completes the public rename from `Crimson Forge Toolkit` to `Crimson Desert Mod Workbench`
-- expands `Archive Browser` mesh modding with live replacement alignment, in-game mesh swap, material-sidecar editing, final test-build preview, richer referenced-file handling, and mod-ready package profiles
-- improves archive-browser stability, package/export validation, preview diagnostics, localization, themes, and compact preview layout while keeping archive writes explicit and confirm-before-write
+- improves in-game character/body swap planning with shared archive relationship discovery for `.pac`, `.pac_xml`, `.app_xml`, `.prefabdata_xml`, DDS, skeleton, and physics links
+- makes swap texture-slot suggestions safer by preferring exact original DDS paths/names before heuristics and avoiding body/hand cross-assignment
+- fixes Archive Browser swap-scope freezes, loose-preview toggle popups, export progress visibility, and clarifies advanced swap-scope options while keeping risky sidecar/skeleton/physics replacement explicit
 
 Project guidelines:
 

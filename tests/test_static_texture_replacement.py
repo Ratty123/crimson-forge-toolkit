@@ -27,7 +27,7 @@ from cdmw.modding.material_replacer import (
     is_shared_material_layer_texture,
 )
 from cdmw.modding.mesh_parser import ParsedMesh, SubMesh
-from cdmw.modding.static_mesh_replacer import StaticSubmeshMapping
+from cdmw.modding.static_mesh_replacer import StaticSubmeshMapping, StaticTextureSlotOverride
 
 
 def _entry(path: str, root: Path) -> ArchiveEntry:
@@ -652,6 +652,133 @@ class StaticTextureReplacementTests(unittest.TestCase):
             self.assertIn("character/texture/cd_phm_01_sword_0278_handle_002_basecolor.dds", patched_sidecar)
             self.assertTrue(
                 any(mapping.slot_kind == "base" and mapping.output_texture_path.endswith("handle_002_basecolor.dds") for mapping in report.slot_mappings)
+            )
+
+    def test_pac_driven_sidecar_honors_manual_texture_slot_overrides_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            texconv = root / "texconv.exe"
+            texconv.write_bytes(b"fake")
+            base_source = root / "CD_PHW_00_Nude_0001.dds"
+            normal_source = root / "CD_PHW_00_Nude_0001_n.dds"
+            base_source.write_bytes(_fake_dds_bytes(1024, 1024, mips=11))
+            normal_source.write_bytes(_fake_dds_bytes(1024, 1024, mips=11))
+            template_base = root / "template_base.dds"
+            template_normal = root / "template_normal.dds"
+            template_base.write_bytes(_fake_dds_bytes(2048, 2048, mips=12))
+            template_normal.write_bytes(_fake_dds_bytes(1024, 2048, mips=12))
+            base_entry = _entry("character/texture/cd_phw_00_nude_00_0001.dds", root)
+            normal_entry = _entry("character/texture/cd_phw_00_nude_00_0001_n.dds", root)
+            sidecar_entry = _entry("character/modelproperty/1_pc/2_phw/nude/cd_phw_00_nude_00_0001_damian.pac_xml", root)
+            original_refs = (
+                ArchiveModelTextureReference(
+                    reference_name=base_entry.path,
+                    material_name="CD_PHW_00_Nude_00_0001",
+                    sidecar_parameter_name="_overlayColorTexture",
+                    resolved_archive_path=base_entry.path,
+                    resolved_entry=base_entry,
+                ),
+                ArchiveModelTextureReference(
+                    reference_name=normal_entry.path,
+                    material_name="CD_PHW_00_Nude_00_0001",
+                    sidecar_parameter_name="_normalTexture",
+                    resolved_archive_path=normal_entry.path,
+                    resolved_entry=normal_entry,
+                ),
+            )
+            sidecar_text = (
+                '<Root><CDMaterialWrapper _subMeshName="CD_PHW_00_Nude_00_0001"><Vector Name="_parameters">'
+                '<MaterialParameterTexture StringItemID="_overlayColorTexture" _name="_overlayColorTexture" Index="0">'
+                '<ResourceReferencePath_ITexture Name="_value" _path="character/texture/cd_phw_00_nude_00_0001.dds"/>'
+                '</MaterialParameterTexture>'
+                '<MaterialParameterTexture StringItemID="_normalTexture" _name="_normalTexture" Index="1">'
+                '<ResourceReferencePath_ITexture Name="_value" _path="character/texture/cd_phw_00_nude_00_0001_n.dds"/>'
+                '</MaterialParameterTexture>'
+                "</Vector></CDMaterialWrapper></Root>"
+            )
+            replacement_mesh = ParsedMesh(
+                submeshes=[
+                    SubMesh(
+                        name="CD_PHW_00_Nude_0001",
+                        material="CD_PHW_00_Nude_0001",
+                        vertices=[(0.0, 0.0, 0.0)],
+                        faces=[(0, 0, 0)],
+                    )
+                ]
+            )
+            rebuilt_mesh = ParsedMesh(
+                submeshes=[
+                    SubMesh(
+                        name="CD_PHW_00_Nude_00_0001",
+                        material="CD_PHW_00_Nude_00_0001",
+                        vertices=[(0.0, 0.0, 0.0)],
+                        faces=[(0, 0, 0)],
+                    )
+                ]
+            )
+            mappings = (
+                StaticSubmeshMapping(
+                    target_submesh_index=0,
+                    target_submesh_name="CD_PHW_00_Nude_00_0001",
+                    source_submesh_indices=[0],
+                    target_material_slot_index=0,
+                ),
+            )
+
+            with patch("cdmw.core.common.run_process_with_cancellation") as fake_texconv:
+                fake_texconv.return_value = (0, "", "")
+                payloads, report = build_texture_replacement_payloads(
+                    obj_mesh=replacement_mesh,
+                    rebuilt_mesh=rebuilt_mesh,
+                    texture_files=(base_source, normal_source),
+                    original_texture_refs=original_refs,
+                    original_sidecars=((sidecar_entry, sidecar_text),),
+                    submesh_mappings=mappings,
+                    texconv_path=None,
+                    read_original_texture_bytes=lambda entry: template_base.read_bytes() if entry is base_entry else template_normal.read_bytes(),
+                    original_texture_source_path=lambda entry: template_base if entry is base_entry else template_normal,
+                    texture_slot_overrides=(
+                        StaticTextureSlotOverride(
+                            target_texture_path=base_entry.path,
+                            source_path=str(base_source),
+                            slot_kind="base",
+                            target_material_name="CD_PHW_00_Nude_00_0001",
+                        ),
+                        StaticTextureSlotOverride(
+                            target_texture_path=normal_entry.path,
+                            source_path=str(normal_source),
+                            slot_kind="normal",
+                            target_material_name="CD_PHW_00_Nude_00_0001",
+                        ),
+                    ),
+                    pac_driven_sidecar=True,
+                )
+
+            payloads_by_path = {payload.target_path: payload for payload in payloads}
+            self.assertIn(base_entry.path, payloads_by_path)
+            self.assertIn(normal_entry.path, payloads_by_path)
+            self.assertIn("Applied 2 manual texture slot override(s).", report.warnings)
+            self.assertTrue(
+                any(
+                    mapping.target_texture_path == base_entry.path
+                    and mapping.output_texture_path == base_entry.path
+                    and mapping.slot_kind == "base"
+                    for mapping in report.slot_mappings
+                )
+            )
+            self.assertTrue(
+                any(
+                    mapping.target_texture_path == normal_entry.path
+                    and mapping.output_texture_path == normal_entry.path
+                    and mapping.slot_kind == "normal"
+                    for mapping in report.slot_mappings
+                )
+            )
+            self.assertNotIn(sidecar_entry.path, payloads_by_path)
+            self.assertIn(
+                "PAC-driven texture payloads were built, but no .pac_xml sidecar changes were applied. "
+                "This is expected only when texture paths are overwritten in-place.",
+                report.warnings,
             )
 
 

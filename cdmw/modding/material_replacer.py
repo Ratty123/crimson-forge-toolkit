@@ -593,21 +593,22 @@ def _build_rebuilt_pac_driven_payloads(
         report.warnings.append("PAC-driven material sidecar had no rebuilt draw sections with geometry to bind.")
         return []
 
-    source_driven_payloads = _build_source_driven_pac_material_payloads(
-        texture_sets=texture_sets,
-        original_texture_refs=original_texture_refs,
-        original_sidecars=original_sidecars,
-        active_target_names=active_target_names,
-        target_to_source_material=target_to_source_material,
-        texconv_path=texconv_path,
-        read_original_texture_bytes=read_original_texture_bytes,
-        original_texture_source_path=original_texture_source_path,
-        report=report,
-        on_log=on_log,
-        texture_output_size_mode=texture_output_size_mode,
-    )
-    if source_driven_payloads:
-        return source_driven_payloads
+    if not texture_slot_overrides:
+        source_driven_payloads = _build_source_driven_pac_material_payloads(
+            texture_sets=texture_sets,
+            original_texture_refs=original_texture_refs,
+            original_sidecars=original_sidecars,
+            active_target_names=active_target_names,
+            target_to_source_material=target_to_source_material,
+            texconv_path=texconv_path,
+            read_original_texture_bytes=read_original_texture_bytes,
+            original_texture_source_path=original_texture_source_path,
+            report=report,
+            on_log=on_log,
+            texture_output_size_mode=texture_output_size_mode,
+        )
+        if source_driven_payloads:
+            return source_driven_payloads
 
     payloads: list[TextureReplacementPayload] = []
     sidecar_replacements_by_path: dict[str, str] = {}

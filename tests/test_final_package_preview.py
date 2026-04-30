@@ -21,7 +21,7 @@ from cdmw.core.final_package_preview import (
     texture_plan_control_description,
 )
 from cdmw.core.mod_package import ModPackageExportOptions
-from cdmw.models import ModelPreviewData, ModelPreviewMesh
+from cdmw.models import ArchiveModelTextureReference, ModelPreviewData, ModelPreviewMesh
 from cdmw.modding.material_replacer import ReplacementTextureSet, ReplacementTextureSlot
 from cdmw.modding.mesh_parser import ParsedMesh
 
@@ -163,6 +163,123 @@ class FinalPackagePreviewTests(unittest.TestCase):
             self.assertEqual(FINAL_PREVIEW_BINDING_ORIGINAL, result.binding_rows[0].binding_source)
             self.assertIn("blade_base.dds", result.preview_model.meshes[0].preview_texture_path)
             self.assertNotIn("could not be decoded", "\n".join(result.warnings))
+
+    def test_replaced_dds_at_kept_original_sidecar_path_binds_from_texture_references(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            preview = _preview(material_name="CD_PHW_00_Nude_00_0001")
+            preview.texture_references = (
+                ArchiveModelTextureReference(
+                    reference_name="character/texture/cd_phw_00_nude_00_0001.dds",
+                    material_name="CD_PHW_00_Nude_00_0001",
+                    sidecar_parameter_name="_overlayColorTexture",
+                    resolved_archive_path="character/texture/cd_phw_00_nude_00_0001.dds",
+                ),
+                ArchiveModelTextureReference(
+                    reference_name="character/texture/cd_phw_00_nude_00_0001_n.dds",
+                    material_name="CD_PHW_00_Nude_00_0001",
+                    sidecar_parameter_name="_normalTexture",
+                    resolved_archive_path="character/texture/cd_phw_00_nude_00_0001_n.dds",
+                ),
+            )
+            specs = (
+                MeshImportSupplementalFileSpec(
+                    source_path=root / "body.dds",
+                    target_path="character/texture/cd_phw_00_nude_00_0001.dds",
+                    kind="texture_generated",
+                    payload_data=b"DDS body",
+                ),
+                MeshImportSupplementalFileSpec(
+                    source_path=root / "body_n.dds",
+                    target_path="character/texture/cd_phw_00_nude_00_0001_n.dds",
+                    kind="texture_generated",
+                    payload_data=b"DDS normal",
+                ),
+            )
+
+            result = build_final_package_preview(preview, supplemental_file_specs=specs)
+
+            self.assertEqual([], result.likely_grey_materials)
+            self.assertEqual(FINAL_PREVIEW_READY, result.material_statuses[0].status)
+            self.assertIn("cd_phw_00_nude_00_0001", result.preview_model.meshes[0].preview_texture_path)
+            self.assertIn("cd_phw_00_nude_00_0001_n", result.preview_model.meshes[0].preview_normal_texture_path)
+
+    def test_final_preview_matches_character_materials_with_extra_numeric_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            preview = _preview(material_name="CD_PHW_00_Nude_00_0001")
+            specs = (
+                MeshImportSupplementalFileSpec(
+                    source_path=root / "body.dds",
+                    target_path="character/texture/cd_phw_00_nude_00_0001.dds",
+                    kind="texture_generated",
+                    payload_data=b"DDS body",
+                ),
+                MeshImportSupplementalFileSpec(
+                    source_path=root / "body.pac_xml",
+                    target_path="character/modelproperty/body.pac_xml",
+                    kind="sidecar_generated",
+                    payload_data=_sidecar(
+                        "character/texture/cd_phw_00_nude_00_0001.dds",
+                        material="CD_PHW_00_Nude_0001",
+                    ),
+                ),
+            )
+
+            result = build_final_package_preview(preview, supplemental_file_specs=specs)
+
+            self.assertEqual([], result.likely_grey_materials)
+            self.assertEqual(FINAL_PREVIEW_READY, result.material_statuses[0].status)
+            self.assertIn("cd_phw_00_nude_00_0001", result.preview_model.meshes[0].preview_texture_path)
+
+    def test_final_preview_uses_order_fallback_when_material_names_do_not_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            preview = MeshImportPreviewResult(
+                rebuilt_data=b"not a parsed mesh in this focused test",
+                parsed_mesh=ParsedMesh(path="character/model/test_character.pac", format="pac"),
+                preview_model=ModelPreviewData(
+                    path="character/model/test_character.pac",
+                    meshes=[
+                        ModelPreviewMesh(
+                            material_name="Target_Slot_One",
+                            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+                            texture_coordinates=[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+                            indices=[0, 1, 2],
+                        ),
+                        ModelPreviewMesh(
+                            material_name="Target_Slot_Two",
+                            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+                            texture_coordinates=[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+                            indices=[0, 1, 2],
+                        ),
+                    ],
+                ),
+                summary_lines=[],
+            )
+            specs = (
+                MeshImportSupplementalFileSpec(
+                    source_path=root / "source_body.dds",
+                    target_path="character/texture/source_body.dds",
+                    kind="texture_generated",
+                    payload_data=b"DDS source",
+                ),
+                MeshImportSupplementalFileSpec(
+                    source_path=root / "source.pac_xml",
+                    target_path="character/modelproperty/source.pac_xml",
+                    kind="sidecar_generated",
+                    payload_data=_sidecar(
+                        "character/texture/source_body.dds",
+                        material="Completely_Different_Source_Material",
+                    ),
+                ),
+            )
+
+            result = build_final_package_preview(preview, supplemental_file_specs=specs)
+
+            self.assertIn("source_body", result.preview_model.meshes[0].preview_texture_path)
+            self.assertTrue(any("draw-order fallback" in warning for warning in result.warnings))
+            self.assertIn("Target_Slot_One", result.likely_grey_materials)
 
     def test_basename_fallback_is_diagnostic_not_exact_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

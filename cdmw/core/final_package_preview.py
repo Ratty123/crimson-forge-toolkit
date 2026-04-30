@@ -125,6 +125,15 @@ class _FinalPayload:
     kind: str = ""
 
 
+@dataclass(slots=True, frozen=True)
+class _FinalTextureBinding:
+    texture_path: str
+    parameter_name: str = ""
+    material_name: str = ""
+    part_name: str = ""
+    submesh_name: str = ""
+
+
 def _normalize_final_path(path_value: object) -> str:
     normalized = str(path_value or "").replace("\\", "/").strip().strip("/")
     return PurePosixPath(normalized).as_posix().lower() if normalized else ""
@@ -529,6 +538,11 @@ def _material_key(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
 
+def _material_loose_key(value: object) -> str:
+    key = _material_key(value)
+    return re.sub(r"\d+", lambda match: str(int(match.group(0) or "0")), key)
+
+
 def _binding_material_name(binding: object) -> str:
     return (
         str(getattr(binding, "material_name", "") or "").strip()
@@ -555,6 +569,22 @@ def _candidate_mesh_indices(preview_model: ModelPreviewData, binding: object) ->
                 for attribute_name in ("material_name", "texture_name")
             ]
             if any(candidate and candidate in mesh_candidates for candidate in binding_candidates):
+                matched.append(index)
+    if matched:
+        return tuple(matched)
+    loose_binding_candidates = {
+        _material_loose_key(getattr(binding, attribute_name, ""))
+        for attribute_name in ("material_name", "part_name", "submesh_name")
+        if _material_loose_key(getattr(binding, attribute_name, ""))
+    }
+    if loose_binding_candidates:
+        for index, mesh in enumerate(meshes):
+            loose_mesh_candidates = {
+                _material_loose_key(getattr(mesh, attribute_name, ""))
+                for attribute_name in ("material_name", "texture_name")
+                if _material_loose_key(getattr(mesh, attribute_name, ""))
+            }
+            if loose_binding_candidates & loose_mesh_candidates:
                 matched.append(index)
     if matched:
         return tuple(matched)
@@ -625,6 +655,40 @@ def _assign_row_to_meshes(
             mesh.preview_material_texture_type = semantic_type
             mesh.preview_material_texture_subtype = semantic_subtype
             mesh.preview_material_texture_packed_channels = tuple(packed_channels)
+
+
+def _assign_unmatched_visible_textures_by_order(
+    preview_model: ModelPreviewData,
+    binding_rows: Sequence[FinalPackageBindingRow],
+) -> int:
+    ready_visible_rows = [
+        row
+        for row in binding_rows
+        if row.role in {"Base / Color", "Emissive"}
+        and row.status == FINAL_PREVIEW_READY
+        and row.confidence == "exact"
+        and str(row.preview_texture_path or "").strip()
+    ]
+    if not ready_visible_rows:
+        return 0
+    unmatched_meshes = [
+        (index, mesh)
+        for index, mesh in enumerate(getattr(preview_model, "meshes", []) or [])
+        if not str(getattr(mesh, "preview_texture_path", "") or "").strip()
+    ]
+    assigned_count = 0
+    for (mesh_index, _mesh), row in zip(unmatched_meshes, ready_visible_rows):
+        _assign_row_to_meshes(
+            preview_model,
+            (mesh_index,),
+            "base",
+            row.preview_texture_path,
+            PurePosixPath(row.resolved_texture_path or row.texture_path).name,
+            parameter_name=row.parameter_name,
+            texture_path=row.texture_path,
+        )
+        assigned_count += 1
+    return assigned_count
 
 
 def _dedupe(values: Iterable[str]) -> List[str]:
@@ -705,10 +769,36 @@ def build_final_package_preview(
         material_display_by_key.setdefault(key, material_name)
         mesh_indices_by_material.setdefault(key, []).append(index)
 
+    binding_sources: List[Tuple[str, object]] = []
     for sidecar_path, spec in sidecars.values():
         sidecar_text = _spec_payload_text(spec)
-        parsed_bindings = parse_texture_sidecar_bindings(sidecar_text, sidecar_path=sidecar_path)
-        for binding in parsed_bindings:
+        for binding in parse_texture_sidecar_bindings(sidecar_text, sidecar_path=sidecar_path):
+            binding_sources.append((sidecar_path, binding))
+    if not binding_sources:
+        for reference in tuple(getattr(preview_result, "texture_references", ()) or ()):
+            if str(getattr(reference, "reference_kind", "texture") or "texture").strip().lower() != "texture":
+                continue
+            texture_path = str(
+                getattr(reference, "resolved_archive_path", "")
+                or getattr(reference, "reference_name", "")
+                or ""
+            ).replace("\\", "/").strip()
+            if not texture_path.lower().endswith(".dds"):
+                continue
+            binding_sources.append(
+                (
+                    "kept original sidecar bindings",
+                    _FinalTextureBinding(
+                        texture_path=texture_path,
+                        parameter_name=str(getattr(reference, "sidecar_parameter_name", "") or ""),
+                        material_name=str(getattr(reference, "material_name", "") or ""),
+                        part_name=str(getattr(reference, "part_name", "") or ""),
+                        submesh_name=str(getattr(reference, "material_name", "") or ""),
+                    ),
+                )
+            )
+
+    for sidecar_path, binding in binding_sources:
             texture_path = str(getattr(binding, "texture_path", "") or "").replace("\\", "/").strip()
             if not texture_path.lower().endswith(".dds"):
                 continue
@@ -825,6 +915,13 @@ def build_final_package_preview(
             for target_key in target_keys:
                 rows_by_material.setdefault(target_key, []).append(row)
 
+    fallback_assignment_count = _assign_unmatched_visible_textures_by_order(preview_model, binding_rows)
+    if fallback_assignment_count:
+        warnings.append(
+            "Final preview assigned visible textures by draw-order fallback for "
+            f"{fallback_assignment_count:,} unmatched mesh batch(es). This is preview-only; material names did not match final sidecar bindings exactly."
+        )
+
     material_statuses: List[FinalPackageMaterialStatus] = []
     likely_grey_materials: List[str] = []
     all_material_keys = (set(material_display_by_key) if sidecars else set()) | set(rows_by_material)
@@ -876,13 +973,13 @@ def build_final_package_preview(
             + ", ".join(likely_grey_materials[:8])
             + (" ..." if len(likely_grey_materials) > 8 else "")
         )
-    if not sidecars:
+    if not sidecars and not binding_sources:
         warnings.append("No generated/copied material sidecar payloads were available for final package texture validation.")
 
     ready_materials = sum(1 for status in material_statuses if status.status == FINAL_PREVIEW_READY)
     summary_lines = [
         "Final Output Preview",
-        f"Parsed sidecar payloads: {len(sidecars):,}",
+        f"Parsed sidecar payloads: {len(sidecars):,}" + ("; using kept original sidecar bindings" if binding_sources and not sidecars else ""),
         f"Patched sidecar payloads: {generated_sidecar_count:,}",
         f"Generated/copied DDS payloads: {len(dds_by_path):,}",
         f"Ready material(s): {ready_materials:,}/{len(material_statuses):,}",
