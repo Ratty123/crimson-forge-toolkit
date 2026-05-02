@@ -28,7 +28,7 @@ Crimson Desert Mod Workbench is built for modders who want one place to:
 - inspect texture sets, references, classification, DDS QA results, and notes in `Research`
 - search archive or loose text-like files such as `.xml`, `.json`, `.cfg`, and `.lua`
 - preview `.pam`, `.pamlod`, and `.pac` meshes in 3D with orbit/zoom, optional textures, referenced-texture actions, OBJ/FBX export, and OBJ import preview / patch workflows
-- preview `.wem` audio, `.mp4` / `.bk2` video, `.bnk` soundbank structure, `.pab` skeleton summaries, and richer text/binary archive formats without leaving the browser
+- preview `.wem` audio, `.mp4` video, `.bnk` soundbank structure summaries, `.pab` skeleton summaries, and richer text/binary archive formats without leaving the browser
 
 The app still keeps archive mutation explicit and separate from normal browsing. Loose-file DDS workflows remain available, while supported archive mesh/audio replacement paths now run through confirm-before-write patch flows with backup/restore support instead of silent in-place edits.
 
@@ -51,7 +51,7 @@ The app still keeps archive mutation explicit and separate from normal browsing.
 - archive cache for faster repeated scans
 - real 3D archive preview for supported `.pam`, `.pamlod`, and `.pac` meshes, including optional textured shading and referenced-texture inspection/actions
 - mesh export/import workflows for supported archive meshes, including OBJ export/import preview, FBX export, backup/restore, and paired PAM/PAMLOD handling where possible
-- archive media preview for `.wem`, `.wav`, `.ogg`, `.mp3`, `.mp4`, and `.bk2`, plus Wwise soundbank summaries for `.bnk`
+- archive media preview for `.wem` and `.mp4`, plus Wwise soundbank summaries for `.bnk`
 - DDS-to-PNG conversion with `texconv`
 - DDS rebuild with configurable format, size, and mip behavior
 - direct backend support for `Real-ESRGAN NCNN`
