@@ -7,7 +7,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from cdmw.core.archive import hashlittle, read_archive_entry_data
+from cdmw.core.archive import hashlittle, iter_archive_character_equipment_root_alias_stems, read_archive_entry_data
 from cdmw.core.common import raise_if_cancelled
 from cdmw.models import ArchiveEntry
 from cdmw.models import RunCancelled
@@ -586,8 +586,14 @@ def _build_archive_item_search_index_from_records(
             if terms:
                 existing = model_base_aliases.get(base, "")
                 model_base_aliases[base] = f"{existing} {terms}".strip() if existing else terms
+                for root_alias in iter_archive_character_equipment_root_alias_stems(base):
+                    existing = model_base_aliases.get(root_alias, "")
+                    model_base_aliases[root_alias] = f"{existing} {terms}".strip() if existing else terms
             if item.display_name:
                 _add_display_name(model_base_display_names, base, item.display_name)
+                for root_alias in iter_archive_character_equipment_root_alias_stems(base):
+                    _add_display_name(model_base_display_names, root_alias, item.display_name)
+                    _add_display_name(model_base_related_display_names, root_alias, item.display_name)
                 if match_kind == "exact":
                     exact_key = _normalize_item_icon_model_stem(resolved)
                     _add_display_name(model_base_exact_display_names, exact_key, item.display_name)

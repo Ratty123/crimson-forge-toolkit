@@ -2656,7 +2656,8 @@ class ModelPreviewWidget(QOpenGLWidget):
         derived_relief_available = bool(
             texture_objects.get((derived_relief_key, bool(batch.texture_wrap_repeat), bool(batch.texture_flip_vertical)))
         )
-        render_mode_code = int(_RENDER_DIAGNOSTIC_MODE_CODES.get(str(getattr(settings, "render_diagnostic_mode", "lit")), 0))
+        render_mode = str(getattr(settings, "render_diagnostic_mode", "lit") or "lit").strip().lower()
+        render_mode_code = int(_RENDER_DIAGNOSTIC_MODE_CODES.get(render_mode, 0))
         enhanced_state, enhanced_reason, enhanced_usable, relief_source = self._enhanced_relief_status(
             render_mode_code=render_mode_code,
             high_quality_enabled=bool(self._high_quality_textures and batch.has_texture_coordinates),
@@ -2902,7 +2903,8 @@ class ModelPreviewWidget(QOpenGLWidget):
             self._batch_render_diagnostics.get(index) or self._diagnostic_for_unpainted_batch(index, batch)
             for index, batch in enumerate(self._mesh_batches)
         ]
-        current_mode_code = int(_RENDER_DIAGNOSTIC_MODE_CODES.get(str(self.render_settings().render_diagnostic_mode), 0))
+        current_render_mode = str(getattr(self.render_settings(), "render_diagnostic_mode", "lit") or "lit").strip().lower()
+        current_mode_code = int(_RENDER_DIAGNOSTIC_MODE_CODES.get(current_render_mode, 0))
         stale_mode_count = sum(
             1
             for item in diagnostics
@@ -3188,6 +3190,27 @@ class ModelPreviewWidget(QOpenGLWidget):
         ]
         if disabled_slots:
             support_gate_reasons.append("disabled slots: " + "/".join(disabled_slots))
+        low_authority_count = sum(
+            1
+            for mesh in meshes
+            if str(getattr(mesh, "preview_base_texture_quality", "") or "").strip().lower() == "low_authority_overlay"
+        )
+        low_authority_note = ""
+        if low_authority_count > 0:
+            disabled_adjustments = [
+                label
+                for enabled, label in (
+                    (getattr(settings, "disable_tint", False), "tint"),
+                    (getattr(settings, "disable_brightness", False), "brightness"),
+                    (getattr(settings, "disable_uv_scale", False), "UV scale"),
+                )
+                if bool(enabled)
+            ]
+            low_authority_note = (
+                f"Low-authority overlay base on {low_authority_count:,} batch(es); "
+                "preview color is approximated from sidecar material colors and support maps"
+                + (f" while {'/'.join(disabled_adjustments)} adjustment(s) are disabled." if disabled_adjustments else ".")
+            )
         self._debug_overlay_lines = (
             f"Visible Mode: {self._visible_texture_mode_label()}",
         )
@@ -3207,6 +3230,7 @@ class ModelPreviewWidget(QOpenGLWidget):
             ),
             f"Base Source: {self._summarize_overlay_values(base_sources)}",
             f"Base Quality: {self._summarize_overlay_values(base_qualities)}",
+            *(("Base Approximation: " + low_authority_note,) if low_authority_note else ()),
             (
                 f"Preview Approximation: {sidecar_approximation_count:,} sidecar material parameter set(s)"
                 if sidecar_approximation_count
@@ -3863,7 +3887,16 @@ class ModelPreviewWidget(QOpenGLWidget):
                         && sampled_base_luma > 0.045
                         && base_sat < material_hint_sat * 0.65
                     ) {
-                        float colorize_amount = clamp((material_hint_sat - base_sat) * 1.25, 0.0, 0.48);
+                        float low_authority_drive = base_texture_quality == 1 ? 1.0 : 0.0;
+                        float fallback_drive = base_texture_quality == 2 ? 1.0 : 0.0;
+                        float approximate_base_drive = max(low_authority_drive, fallback_drive);
+                        float colorize_cap = mix(0.48, 0.86, approximate_base_drive);
+                        float colorize_amount = clamp(
+                            ((material_hint_sat - base_sat) * mix(1.25, 2.20, approximate_base_drive))
+                            + (approximate_base_drive * 0.32),
+                            0.0,
+                            colorize_cap
+                        );
                         base_color.rgb = luma_preserving_colorize(base_color.rgb, fallback_vertex_color, colorize_amount);
                         sampled_base_luma = dot(base_color.rgb, vec3(0.2126, 0.7152, 0.0722));
                     }

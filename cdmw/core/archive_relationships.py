@@ -14,7 +14,7 @@ from cdmw.core.archive import (
     try_decode_text_like_archive_data,
 )
 from cdmw.core.archive_modding import ARCHIVE_MESH_EXTENSIONS
-from cdmw.core.upscale_profiles import normalize_texture_reference_for_sidecar_lookup
+from cdmw.core.upscale_profiles import normalize_texture_reference_for_sidecar_lookup, parse_texture_sidecar_bindings
 from cdmw.models import ArchiveEntry
 
 
@@ -242,6 +242,18 @@ def _candidate_basenames_for_xml_reference(raw_value: str, attr_name: str) -> Tu
     return tuple(dict.fromkeys(candidate for candidate in candidates if candidate))
 
 
+def _score_xml_reference_candidate(source_path: str, entry: ArchiveEntry) -> Tuple[int, int, int]:
+    source_parts = [part for part in PurePosixPath(_normalized_archive_path(source_path)).parts if part]
+    entry_parts = [part for part in PurePosixPath(_normalized_archive_path(entry.path)).parts if part]
+    shared_prefix = 0
+    for source_part, entry_part in zip(source_parts, entry_parts):
+        if source_part != entry_part:
+            break
+        shared_prefix += 1
+    same_package_depth = 1 if source_parts[:1] and source_parts[:1] == entry_parts[:1] else 0
+    return shared_prefix, same_package_depth, -len(entry.path)
+
+
 def _relation_kind_for_entry(entry: ArchiveEntry) -> str:
     extension = str(entry.extension or "").lower()
     path = _normalized_archive_path(entry.path)
@@ -261,7 +273,9 @@ def _relation_kind_for_entry(entry: ArchiveEntry) -> str:
         return "physics"
     if extension in _ANIMATION_EXTENSIONS or "/animation/" in path:
         return "animation"
-    if extension in _MATERIAL_SIDECAR_EXTENSIONS and ("modelproperty/" in path or extension in {".pac_xml", ".pami"}):
+    if extension in _MATERIAL_SIDECAR_EXTENSIONS and (
+        "modelproperty/" in path or extension in {".pac_xml", ".pam_xml", ".pamlod_xml", ".pami"}
+    ):
         return "material_sidecar"
     if extension in _XML_DESCRIPTOR_EXTENSIONS:
         return "descriptor"
@@ -282,15 +296,44 @@ def _resolve_basenames(
     raw_value: str,
     attr_name: str,
     basename_index: Mapping[str, Sequence[ArchiveEntry]],
+    *,
+    source_path: str = "",
+    path_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
 ) -> Tuple[ArchiveEntry, ...]:
     result: List[ArchiveEntry] = []
     seen: set[str] = set()
-    for basename in _candidate_basenames_for_xml_reference(raw_value, attr_name):
-        for entry in tuple(basename_index.get(str(basename).lower(), ()) or ()):
+
+    def add_entries(candidates: Sequence[ArchiveEntry]) -> None:
+        ordered_candidates = list(candidates)
+        if source_path:
+            ordered_candidates.sort(key=lambda entry: _score_xml_reference_candidate(source_path, entry), reverse=True)
+            if len(ordered_candidates) > 1:
+                best_prefix = _score_xml_reference_candidate(source_path, ordered_candidates[0])[0]
+                if best_prefix > 0:
+                    ordered_candidates = [
+                        entry
+                        for entry in ordered_candidates
+                        if _score_xml_reference_candidate(source_path, entry)[0] == best_prefix
+                    ]
+        for entry in ordered_candidates:
             key = _entry_key(entry)
             if key and key not in seen:
                 result.append(entry)
                 seen.add(key)
+
+    value = html.unescape(str(raw_value or "")).replace("\\", "/").strip()
+    if value and "/" in value and path_index is not None:
+        path_candidates: List[ArchiveEntry] = []
+        for basename in _candidate_basenames_for_xml_reference(raw_value, attr_name):
+            candidate_path = value
+            if PurePosixPath(value).name != basename:
+                parent = str(PurePosixPath(value).parent).strip(".")
+                candidate_path = f"{parent}/{basename}" if parent else basename
+            path_candidates.extend(tuple(path_index.get(_normalized_archive_path(candidate_path), ()) or ()))
+        add_entries(path_candidates)
+
+    for basename in _candidate_basenames_for_xml_reference(raw_value, attr_name):
+        add_entries(tuple(basename_index.get(str(basename).lower(), ()) or ()))
     return tuple(result)
 
 
@@ -348,18 +391,38 @@ def _dedupe_edges(edges: Iterable[ArchiveRelationEdge]) -> Tuple[ArchiveRelation
 
 def _resolve_sidecar_texture_edges(
     sidecar_entry: ArchiveEntry,
-    archive_entries: Sequence[ArchiveEntry],
     *,
     source_path: str,
+    archive_entries: Sequence[ArchiveEntry] = (),
+    path_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    basename_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
 ) -> Tuple[ArchiveRelationEdge, ...]:
-    path_index = _build_path_index(archive_entries)
-    basename_index = _build_basename_index(archive_entries)
+    if path_index is None:
+        path_index = _build_path_index(archive_entries)
+    if basename_index is None:
+        basename_index = _build_basename_index(archive_entries)
     try:
         text = _read_entry_text(sidecar_entry)
     except Exception:
         return ()
     edges: List[ArchiveRelationEdge] = []
-    for raw_texture_path in _extract_archive_sidecar_texture_lookup_paths(text):
+    structured_bindings = tuple(parse_texture_sidecar_bindings(text, sidecar_path=sidecar_entry.path))
+    structured_paths: List[Tuple[str, str]] = []
+    seen_structured: set[Tuple[str, str]] = set()
+    for binding in structured_bindings:
+        raw_texture_path = str(getattr(binding, "texture_path", "") or "").strip()
+        if not raw_texture_path:
+            continue
+        parameter_name = str(getattr(binding, "parameter_name", "") or "").strip()
+        key = (normalize_texture_reference_for_sidecar_lookup(raw_texture_path), parameter_name.lower())
+        if key in seen_structured:
+            continue
+        seen_structured.add(key)
+        structured_paths.append((raw_texture_path, parameter_name))
+    if not structured_paths:
+        structured_paths = [(raw_texture_path, "") for raw_texture_path in _extract_archive_sidecar_texture_lookup_paths(text)]
+
+    for raw_texture_path, parameter_name in structured_paths:
         normalized = normalize_texture_reference_for_sidecar_lookup(raw_texture_path)
         exact_candidates = tuple(path_index.get(normalized, ()) or ())
         if exact_candidates:
@@ -369,7 +432,7 @@ def _resolve_sidecar_texture_edges(
                         _edge_for_entry(
                             source_path,
                             candidate,
-                            role="texture",
+                            role=parameter_name or "texture",
                             confidence="exact_path",
                             reason=f"Texture path referenced by {sidecar_entry.basename}",
                         )
@@ -384,7 +447,7 @@ def _resolve_sidecar_texture_edges(
                         related_path=candidate.path.replace("\\", "/"),
                         related_entry=candidate,
                         relation_kind="texture",
-                        role="texture",
+                        role=parameter_name or "texture",
                         confidence="basename_fallback",
                         reason=f"Texture basename referenced by {sidecar_entry.basename}",
                         include_policy=ARCHIVE_REL_INCLUDE_MANUAL,
@@ -411,16 +474,22 @@ def _read_sidecar_submesh_names(entry: ArchiveEntry) -> Tuple[str, ...]:
 
 def resolve_material_texture_graph(
     model_or_sidecar_entry: ArchiveEntry,
-    archive_entries: Sequence[ArchiveEntry],
+    archive_entries: Sequence[ArchiveEntry] = (),
+    *,
+    path_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    basename_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
 ) -> ArchiveRelationshipPlan:
-    basename_index = _build_basename_index(archive_entries)
+    if basename_index is None:
+        basename_index = _build_basename_index(archive_entries)
+    if path_index is None:
+        path_index = _build_path_index(archive_entries)
     source_path = model_or_sidecar_entry.path.replace("\\", "/")
     edges: List[ArchiveRelationEdge] = []
     sidecar_entries: Tuple[ArchiveEntry, ...]
     if _relation_kind_for_entry(model_or_sidecar_entry) == "material_sidecar":
         sidecar_entries = (model_or_sidecar_entry,)
     else:
-        sidecar_entries = _find_archive_model_sidecar_entries(model_or_sidecar_entry, dict(basename_index))
+        sidecar_entries = _find_archive_model_sidecar_entries(model_or_sidecar_entry, basename_index)
 
     for sidecar_entry in sidecar_entries:
         edges.append(
@@ -432,23 +501,43 @@ def resolve_material_texture_graph(
                 reason="Material sidecar matched by model basename/path",
             )
         )
-        edges.extend(_resolve_sidecar_texture_edges(sidecar_entry, archive_entries, source_path=source_path))
+        edges.extend(
+            _resolve_sidecar_texture_edges(
+                sidecar_entry,
+                source_path=source_path,
+                archive_entries=archive_entries,
+                path_index=path_index,
+                basename_index=basename_index,
+            )
+        )
     return ArchiveRelationshipPlan(source_path=source_path, mode="material_texture_graph", edges=_dedupe_edges(edges))
 
 
 def _expand_prefabdata_graph(
     source_path: str,
     prefab_entry: ArchiveEntry,
-    archive_entries: Sequence[ArchiveEntry],
+    archive_entries: Sequence[ArchiveEntry] = (),
+    *,
+    basename_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    path_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
 ) -> Tuple[ArchiveRelationEdge, ...]:
-    basename_index = _build_basename_index(archive_entries)
+    if basename_index is None:
+        basename_index = _build_basename_index(archive_entries)
+    if path_index is None:
+        path_index = _build_path_index(archive_entries)
     try:
         text = _read_entry_text(prefab_entry)
     except Exception:
         return ()
     edges: List[ArchiveRelationEdge] = []
     for attr_name, raw_value in parse_prefabdata_xml(text):
-        resolved = _resolve_basenames(raw_value, attr_name, basename_index)
+        resolved = _resolve_basenames(
+            raw_value,
+            attr_name,
+            basename_index,
+            source_path=prefab_entry.path,
+            path_index=path_index,
+        )
         if resolved:
             for entry in resolved:
                 edges.append(
@@ -475,17 +564,28 @@ def _expand_prefabdata_graph(
 
 def build_archive_relationship_plan(
     entry: ArchiveEntry,
-    archive_entries: Sequence[ArchiveEntry],
+    archive_entries: Sequence[ArchiveEntry] = (),
     mode: str = "inspect",
+    *,
+    path_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
+    basename_index: Optional[Mapping[str, Sequence[ArchiveEntry]]] = None,
 ) -> ArchiveRelationshipPlan:
     source_path = entry.path.replace("\\", "/")
     relation_kind = _relation_kind_for_entry(entry)
     edges: List[ArchiveRelationEdge] = []
     warnings: List[str] = []
-    basename_index = _build_basename_index(archive_entries)
+    if basename_index is None:
+        basename_index = _build_basename_index(archive_entries)
+    if path_index is None:
+        path_index = _build_path_index(archive_entries)
 
     if relation_kind in {"model", "material_sidecar"}:
-        material_plan = resolve_material_texture_graph(entry, archive_entries)
+        material_plan = resolve_material_texture_graph(
+            entry,
+            archive_entries,
+            path_index=path_index,
+            basename_index=basename_index,
+        )
         edges.extend(material_plan.edges)
 
     if relation_kind == "appearance":
@@ -494,7 +594,13 @@ def build_archive_relationship_plan(
         except Exception:
             descriptor = _AppDescriptor()
         for attr_name, raw_value in descriptor.descriptor_values:
-            resolved = _resolve_basenames(raw_value, attr_name, basename_index)
+            resolved = _resolve_basenames(
+                raw_value,
+                attr_name,
+                basename_index,
+                source_path=entry.path,
+                path_index=path_index,
+            )
             if not resolved:
                 edges.append(
                     _unresolved_edge(
@@ -516,7 +622,13 @@ def build_archive_relationship_plan(
                     )
                 )
         for prefab in descriptor.prefabs:
-            resolved = _resolve_basenames(prefab.name, "Name", basename_index)
+            resolved = _resolve_basenames(
+                prefab.name,
+                "Name",
+                basename_index,
+                source_path=entry.path,
+                path_index=path_index,
+            )
             if not resolved:
                 edges.append(
                     _unresolved_edge(
@@ -540,12 +652,35 @@ def build_archive_relationship_plan(
                     )
                 )
                 if _relation_kind_for_entry(related) == "prefab_data":
-                    edges.extend(_expand_prefabdata_graph(source_path, related, archive_entries))
+                    edges.extend(
+                        _expand_prefabdata_graph(
+                            source_path,
+                            related,
+                            archive_entries,
+                            basename_index=basename_index,
+                            path_index=path_index,
+                        )
+                    )
                 if _relation_kind_for_entry(related) in {"model", "material_sidecar"}:
-                    edges.extend(resolve_material_texture_graph(related, archive_entries).edges)
+                    edges.extend(
+                        resolve_material_texture_graph(
+                            related,
+                            archive_entries,
+                            path_index=path_index,
+                            basename_index=basename_index,
+                        ).edges
+                    )
 
     if relation_kind == "prefab_data":
-        edges.extend(_expand_prefabdata_graph(source_path, entry, archive_entries))
+        edges.extend(
+            _expand_prefabdata_graph(
+                source_path,
+                entry,
+                archive_entries,
+                basename_index=basename_index,
+                path_index=path_index,
+            )
+        )
 
     # Follow direct models/sidecars discovered from XML once so app graphs include textures.
     expanded: List[ArchiveRelationEdge] = []
@@ -554,7 +689,14 @@ def build_archive_relationship_plan(
         if edge.related_entry is None:
             continue
         if _relation_kind_for_entry(edge.related_entry) in {"model", "material_sidecar"}:
-            expanded.extend(resolve_material_texture_graph(edge.related_entry, archive_entries).edges)
+            expanded.extend(
+                resolve_material_texture_graph(
+                    edge.related_entry,
+                    archive_entries,
+                    path_index=path_index,
+                    basename_index=basename_index,
+                ).edges
+            )
     return ArchiveRelationshipPlan(source_path=source_path, mode=mode, edges=_dedupe_edges(expanded), warnings=tuple(warnings))
 
 

@@ -9,6 +9,34 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.9.0-beta.3] - 2026-05-02
+
+### Added
+- Added broader Archive Browser search relevance and alias handling so character/equipment root aliases can find related model components without hardcoding a specific outfit or character name.
+- Added `.dds` item-name discovery through related model and material-sidecar graph sources while still keeping selected extension filters enforced for final result rows.
+- Added richer Referenced Files resolution for `.app_xml`, `.prefabdata_xml`, model entries, and material sidecars using the archive relationship resolver.
+- Added structured Archive Browser inspectors for high-value binary formats including `.prefab`, `.levelinfo`, `.palevel`, `.roadsector`, `.road`, `.nav`, `.pabc`, `.pabv`, `.pabgb`, and `.pabgh`.
+- Added simplified value summaries above raw XML/text previews for text-like archive entries such as `.pac_xml`, `.pam_xml`, `.pamlod_xml`, `.pami`, `.app_xml`, `.prefabdata_xml`, and `.xml`.
+- Added HKX/Havok metadata preview improvements and focused regression coverage for archive patch preflight and structured asset previews.
+
+### Changed
+- Changed Archive Browser search expansion so package, folder, role, size, previewable, exclude, and extension filters remain authoritative after item-name expansion.
+- Changed Archive Browser search ordering so direct basename/path matches and exact model aliases appear before lower-confidence inferred sidecars or texture rows.
+- Changed model texture binding so sidecar DDS rows are listed more completely while visible base previews avoid promoting technical normal/material/height maps as color textures.
+- Changed WEM patch confirmation wording to clarify that audio replacement is best-effort and not a full Wwise-authoring rebuild.
+- Removed the failed Experimental Layer Composite preview mode and kept saved settings falling back to the existing Mesh Base First / Lit path.
+
+### Fixed
+- Fixed extension-filter leakage where item-name searches could return unrelated extensions after related-file expansion.
+- Fixed missing or incomplete Referenced Files rows for direct `.pam_xml` / `.pamlod_xml` sidecars and app/prefab/model/material graph references.
+- Fixed texture preview/reference regressions where support maps could be hidden or over-promoted instead of being listed as normal/material/height support slots.
+- Fixed archive patch safety by validating the existing PAPGT/PAMT checksum chain, target PAMT records, PAZ paths, package roots, and compression support before writing.
+- Fixed archive patch failure recovery tests around append-only PAZ writes, backup restore, and stale target entries.
+
+### Docs
+- Updated release version references from `0.9.0-beta.2` to `0.9.0-beta.3` in the README, changelog, and app version metadata.
+- Documented the beta scope decision to keep full direct repacking, Wwise rebuilds, overlay mod-manager workflows, PATHC registration, and conflict detection as future work rather than adding them to this beta.
+
 ## [0.9.0-beta.2] - 2026-04-30
 
 ### Added

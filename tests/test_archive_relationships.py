@@ -10,6 +10,11 @@ from cdmw.core.archive_relationships import (
     build_character_swap_plan,
     resolve_material_texture_graph,
 )
+from cdmw.core.archive import (
+    build_archive_entry_basename_index,
+    build_archive_entry_path_index,
+    build_archive_preview_result,
+)
 from cdmw.models import ArchiveEntry
 
 
@@ -80,6 +85,180 @@ class ArchiveRelationshipTests(unittest.TestCase):
         self.assertIn("character/modelproperty/body_a.pac_xml", paths)
         self.assertIn("character/texture/body_a.dds", paths)
         self.assertIn("character/customization/meshparam_a.xml", paths)
+
+    def test_app_xml_preview_referenced_files_uses_relationship_graph(self):
+        entries = self._entries(
+            (
+                ("character/appearance/a.app_xml", '<Appearance><Nude Name="body_a" /><Customization MeshParamFile="meshparam_a" /></Appearance>'),
+                ("character/prefab/body_a.prefabdata_xml", '<Prefab FileName="body_a.pac" />'),
+                ("character/model/body_a.pac", b"PAR "),
+                ("character/modelproperty/body_a.pac_xml", '<ResourceReferencePath_ITexture value="character/texture/body_a.dds"/>'),
+                ("character/texture/body_a.dds", b"DDS "),
+                ("character/customization/meshparam_a.xml", "<MeshParam />"),
+            )
+        )
+
+        result = build_archive_preview_result(
+            None,
+            entries[0],
+            texture_entries_by_normalized_path=build_archive_entry_path_index(entries),
+            texture_entries_by_basename=build_archive_entry_basename_index(entries),
+        )
+        paths = {reference.resolved_archive_path for reference in result.model_texture_references}
+
+        self.assertIn("character/prefab/body_a.prefabdata_xml", paths)
+        self.assertIn("character/model/body_a.pac", paths)
+        self.assertIn("character/modelproperty/body_a.pac_xml", paths)
+        self.assertIn("character/texture/body_a.dds", paths)
+        self.assertIn("character/customization/meshparam_a.xml", paths)
+
+    def test_prefabdata_preview_referenced_files_resolves_model_skeleton_and_physics(self):
+        entries = self._entries(
+            (
+                (
+                    "character/prefab/body_a.prefabdata_xml",
+                    '<Prefab FileName="body_a.pac" SkeletonName="identityskeleton.pab" RagdollName="body_a.hkx" />',
+                ),
+                ("character/model/body_a.pac", b"PAR "),
+                ("character/modelproperty/body_a.pac_xml", '<ResourceReferencePath_ITexture value="character/texture/body_a.dds"/>'),
+                ("character/texture/body_a.dds", b"DDS "),
+                ("character/identityskeleton.pab", b"PAB"),
+                ("character/bin/body_a.hkx", b"HKX"),
+            )
+        )
+
+        result = build_archive_preview_result(
+            None,
+            entries[0],
+            texture_entries_by_normalized_path=build_archive_entry_path_index(entries),
+            texture_entries_by_basename=build_archive_entry_basename_index(entries),
+        )
+        paths = {reference.resolved_archive_path for reference in result.model_texture_references}
+
+        self.assertIn("character/model/body_a.pac", paths)
+        self.assertIn("character/modelproperty/body_a.pac_xml", paths)
+        self.assertIn("character/texture/body_a.dds", paths)
+        self.assertIn("character/identityskeleton.pab", paths)
+        self.assertIn("character/bin/body_a.hkx", paths)
+
+    def test_material_sidecar_preview_referenced_files_dedupes_graph_texture(self):
+        entries = self._entries(
+            (
+                ("character/model/body_a.pac", b"PAR "),
+                ("character/modelproperty/body_a.pac_xml", '<ResourceReferencePath_ITexture value="character/texture/body_a.dds"/>'),
+                ("character/texture/body_a.dds", b"DDS "),
+            )
+        )
+
+        result = build_archive_preview_result(
+            None,
+            entries[1],
+            texture_entries_by_normalized_path=build_archive_entry_path_index(entries),
+            texture_entries_by_basename=build_archive_entry_basename_index(entries),
+        )
+        paths = [reference.resolved_archive_path for reference in result.model_texture_references]
+
+        self.assertEqual(paths.count("character/texture/body_a.dds"), 1)
+
+    def test_direct_pam_and_pamlod_sidecar_previews_resolve_dds(self):
+        for sidecar_path in (
+            "character/modelproperty/body_a.pam_xml",
+            "character/modelproperty/body_a.pamlod_xml",
+        ):
+            with self.subTest(sidecar_path=sidecar_path):
+                entries = self._entries(
+                    (
+                        (
+                            sidecar_path,
+                            '<MaterialParameterTexture _name="_baseColorTexture">'
+                            '<ResourceReferencePath_ITexture value="character/texture/body_a_d.dds"/>'
+                            "</MaterialParameterTexture>",
+                        ),
+                        ("character/texture/body_a_d.dds", b"DDS "),
+                    )
+                )
+
+                result = build_archive_preview_result(
+                    None,
+                    entries[0],
+                    texture_entries_by_normalized_path=build_archive_entry_path_index(entries),
+                    texture_entries_by_basename=build_archive_entry_basename_index(entries),
+                )
+                paths = {reference.resolved_archive_path for reference in result.model_texture_references}
+
+                self.assertIn("character/texture/body_a_d.dds", paths)
+
+    def test_sidecar_graph_preserves_distinct_texture_parameter_roles(self):
+        entries = self._entries(
+            (
+                (
+                    "character/modelproperty/body_a.pac_xml",
+                    '<SkinnedMeshMaterialWrapper _subMeshName="Body">'
+                    '<MaterialParameterTexture _name="_baseColorTexture"><ResourceReferencePath_ITexture value="character/texture/body_a_d.dds"/></MaterialParameterTexture>'
+                    '<MaterialParameterTexture _name="_normalTexture"><ResourceReferencePath_ITexture value="character/texture/body_a_n.dds"/></MaterialParameterTexture>'
+                    '<MaterialParameterTexture _name="_materialTexture"><ResourceReferencePath_ITexture value="character/texture/body_a_ma.dds"/></MaterialParameterTexture>'
+                    '<MaterialParameterTexture _name="_heightTexture"><ResourceReferencePath_ITexture value="character/texture/body_a_disp.dds"/></MaterialParameterTexture>'
+                    '<MaterialParameterTexture _name="_maskTexture"><ResourceReferencePath_ITexture value="character/texture/body_a_mask.dds"/></MaterialParameterTexture>'
+                    "</SkinnedMeshMaterialWrapper>",
+                ),
+                ("character/texture/body_a_d.dds", b"DDS "),
+                ("character/texture/body_a_n.dds", b"DDS "),
+                ("character/texture/body_a_ma.dds", b"DDS "),
+                ("character/texture/body_a_disp.dds", b"DDS "),
+                ("character/texture/body_a_mask.dds", b"DDS "),
+            )
+        )
+
+        result = build_archive_preview_result(
+            None,
+            entries[0],
+            texture_entries_by_normalized_path=build_archive_entry_path_index(entries),
+            texture_entries_by_basename=build_archive_entry_basename_index(entries),
+        )
+        by_path = {reference.resolved_archive_path: reference for reference in result.model_texture_references}
+
+        self.assertEqual(
+            {
+                "character/texture/body_a_d.dds",
+                "character/texture/body_a_n.dds",
+                "character/texture/body_a_ma.dds",
+                "character/texture/body_a_disp.dds",
+                "character/texture/body_a_mask.dds",
+            },
+            set(by_path),
+        )
+        self.assertEqual(by_path["character/texture/body_a_d.dds"].semantic_label, "Base Color Texture")
+        self.assertEqual(by_path["character/texture/body_a_n.dds"].semantic_label, "Normal Texture")
+
+    def test_app_xml_duplicate_basename_prefers_path_local_graph(self):
+        entries = self._entries(
+            (
+                ("character/a/appearance/body.app_xml", '<Appearance><Nude Name="body" /></Appearance>'),
+                ("character/a/prefab/body.prefabdata_xml", '<Prefab FileName="body.pac" />'),
+                ("character/a/model/body.pac", b"PAR "),
+                ("character/a/modelproperty/body.pac_xml", '<ResourceReferencePath_ITexture value="character/a/texture/body.dds"/>'),
+                ("character/a/texture/body.dds", b"DDS A"),
+                ("character/b/prefab/body.prefabdata_xml", '<Prefab FileName="body.pac" />'),
+                ("character/b/model/body.pac", b"PAR "),
+                ("character/b/modelproperty/body.pac_xml", '<ResourceReferencePath_ITexture value="character/b/texture/body.dds"/>'),
+                ("character/b/texture/body.dds", b"DDS B"),
+            )
+        )
+
+        result = build_archive_preview_result(
+            None,
+            entries[0],
+            texture_entries_by_normalized_path=build_archive_entry_path_index(entries),
+            texture_entries_by_basename=build_archive_entry_basename_index(entries),
+        )
+        paths = {reference.resolved_archive_path for reference in result.model_texture_references}
+
+        self.assertIn("character/a/prefab/body.prefabdata_xml", paths)
+        self.assertIn("character/a/model/body.pac", paths)
+        self.assertIn("character/a/texture/body.dds", paths)
+        self.assertNotIn("character/b/prefab/body.prefabdata_xml", paths)
+        self.assertNotIn("character/b/model/body.pac", paths)
+        self.assertNotIn("character/b/texture/body.dds", paths)
 
     def test_character_swap_patch_changes_body_and_head_only(self):
         entries = self._entries(

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from cdmw.core.archive import (
     _ArchiveModelSidecarTextureBinding,
     _attach_model_sidecar_texture_preview_paths,
+    _attach_model_texture_preview_paths,
     _attach_model_support_texture_preview_paths,
     _iter_model_sidecar_binding_submesh_keys,
     normalize_texture_reference_for_sidecar_lookup,
@@ -135,6 +136,290 @@ class ArchivePreviewTextureBindingTests(unittest.TestCase):
         self.assertEqual("low_authority_overlay", model.meshes[0].preview_base_texture_quality)
         self.assertIn("low-detail overlay/default", model.meshes[0].preview_texture_approximation_note)
 
+    def test_layer_visible_sidecar_texture_replaces_low_authority_overlay_base(self) -> None:
+        source_entry = _entry("character/model/cd_test_model.pac")
+        by_normalized, by_basename = _texture_maps(
+            "character/texture/cd_common_default_overlay_old.dds",
+            "character/texture/cd_texturelayer_001_0001.dds",
+        )
+        model = ModelPreviewData(
+            path=source_entry.path,
+            meshes=[ModelPreviewMesh(material_name="CD_Test_Handle", texture_name="CD_Test_Handle")],
+        )
+        bindings = (
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="character/texture/cd_common_default_overlay_old.dds",
+                parameter_name="_overlayColorTexture",
+                submesh_name="CD_Test_Handle",
+                sidecar_kind="pac_xml",
+            ),
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="character/texture/cd_texturelayer_001_0001.dds",
+                parameter_name="_detailDiffuseMaskR",
+                submesh_name="CD_Test_Handle",
+                sidecar_kind="pac_xml",
+            ),
+        )
+
+        with patch(
+            "cdmw.core.archive._ensure_archive_model_texture_preview_path",
+            side_effect=lambda _texconv, texture_entry, **_kwargs: f"preview://{texture_entry.path}",
+        ):
+            _attach_model_sidecar_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                parsed_mesh=None,
+                sidecar_texture_bindings=bindings,
+                visible_texture_mode="mesh_base_first",
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+            )
+            lines = _attach_model_sidecar_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                parsed_mesh=None,
+                sidecar_texture_bindings=bindings,
+                visible_texture_mode="layer_aware_visible",
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+                fallback_only=True,
+            )
+
+        self.assertEqual("character/texture/cd_texturelayer_001_0001.dds", model.meshes[0].texture_name)
+        self.assertEqual(
+            "preview://character/texture/cd_texturelayer_001_0001.dds",
+            model.meshes[0].preview_texture_path,
+        )
+        self.assertEqual("resolved_base", model.meshes[0].preview_base_texture_quality)
+        self.assertIn("Promoted 1 sidecar visible layer texture preview", "\n".join(lines))
+
+    def test_detail_layer_visible_texture_beats_grime_layer_for_promoted_base(self) -> None:
+        source_entry = _entry("character/model/cd_test_model.pac")
+        by_normalized, by_basename = _texture_maps(
+            "character/texture/cd_common_default_overlay_old.dds",
+            "character/texture/cd_texturelayer_003_0102.dds",
+            "character/texture/cd_texturelayer_001_0034.dds",
+        )
+        model = ModelPreviewData(
+            path=source_entry.path,
+            meshes=[ModelPreviewMesh(material_name="CD_Test_Shield", texture_name="CD_Test_Shield")],
+        )
+        bindings = (
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="character/texture/cd_common_default_overlay_old.dds",
+                parameter_name="_overlayColorTexture",
+                submesh_name="CD_Test_Shield",
+                sidecar_kind="pac_xml",
+            ),
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="character/texture/cd_texturelayer_003_0102.dds",
+                parameter_name="_grimeDiffuseTextureR",
+                submesh_name="CD_Test_Shield",
+                sidecar_kind="pac_xml",
+            ),
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="character/texture/cd_texturelayer_001_0034.dds",
+                parameter_name="_detailDiffuseMaskR",
+                submesh_name="CD_Test_Shield",
+                sidecar_kind="pac_xml",
+            ),
+        )
+
+        with patch(
+            "cdmw.core.archive._ensure_archive_model_texture_preview_path",
+            side_effect=lambda _texconv, texture_entry, **_kwargs: f"preview://{texture_entry.path}",
+        ):
+            _attach_model_sidecar_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                parsed_mesh=None,
+                sidecar_texture_bindings=bindings,
+                visible_texture_mode="mesh_base_first",
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+            )
+            lines = _attach_model_sidecar_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                parsed_mesh=None,
+                sidecar_texture_bindings=bindings,
+                visible_texture_mode="layer_aware_visible",
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+                fallback_only=True,
+            )
+
+        self.assertEqual("character/texture/cd_texturelayer_001_0034.dds", model.meshes[0].texture_name)
+        self.assertEqual(
+            "preview://character/texture/cd_texturelayer_001_0034.dds",
+            model.meshes[0].preview_texture_path,
+        )
+        self.assertIn("Promoted 1 sidecar visible layer texture preview", "\n".join(lines))
+
+    def test_technical_sidecar_texture_does_not_replace_low_authority_overlay_base(self) -> None:
+        source_entry = _entry("character/model/cd_test_model.pac")
+        by_normalized, by_basename = _texture_maps(
+            "character/texture/cd_common_default_overlay_old.dds",
+            "character/texture/cd_test_handle_n.dds",
+        )
+        model = ModelPreviewData(
+            path=source_entry.path,
+            meshes=[ModelPreviewMesh(material_name="CD_Test_Handle", texture_name="CD_Test_Handle")],
+        )
+        bindings = (
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="character/texture/cd_common_default_overlay_old.dds",
+                parameter_name="_overlayColorTexture",
+                submesh_name="CD_Test_Handle",
+                sidecar_kind="pac_xml",
+            ),
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="character/texture/cd_test_handle_n.dds",
+                parameter_name="_normalTexture",
+                submesh_name="CD_Test_Handle",
+                sidecar_kind="pac_xml",
+            ),
+        )
+
+        with patch(
+            "cdmw.core.archive._ensure_archive_model_texture_preview_path",
+            side_effect=lambda _texconv, texture_entry, **_kwargs: f"preview://{texture_entry.path}",
+        ):
+            _attach_model_sidecar_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                parsed_mesh=None,
+                sidecar_texture_bindings=bindings,
+                visible_texture_mode="mesh_base_first",
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+            )
+            lines = _attach_model_sidecar_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                parsed_mesh=None,
+                sidecar_texture_bindings=bindings,
+                visible_texture_mode="layer_aware_visible",
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+                fallback_only=True,
+            )
+
+        self.assertEqual("character/texture/cd_common_default_overlay_old.dds", model.meshes[0].texture_name)
+        self.assertEqual(
+            "preview://character/texture/cd_common_default_overlay_old.dds",
+            model.meshes[0].preview_texture_path,
+        )
+        self.assertEqual("low_authority_overlay", model.meshes[0].preview_base_texture_quality)
+        self.assertNotIn("Promoted", "\n".join(lines))
+
+    def test_placeholder_none_texture_does_not_become_visible_base(self) -> None:
+        source_entry = _entry("character/model/cd_test_model.pac")
+        by_normalized, by_basename = _texture_maps("texture/nonetexture0x00000000.dds")
+        model = ModelPreviewData(
+            path=source_entry.path,
+            meshes=[ModelPreviewMesh(material_name="CD_Test_Handle", texture_name="CD_Test_Handle")],
+        )
+        bindings = (
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="texture/nonetexture0x00000000.dds",
+                parameter_name="_diffuseTexture",
+                submesh_name="CD_Test_Handle",
+                sidecar_kind="pac_xml",
+                tint_color=(0.5, 0.49, 0.48),
+            ),
+        )
+
+        with patch(
+            "cdmw.core.archive._ensure_archive_model_texture_preview_path",
+            side_effect=lambda _texconv, texture_entry, **_kwargs: f"preview://{texture_entry.path}",
+        ):
+            lines = _attach_model_sidecar_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                parsed_mesh=None,
+                sidecar_texture_bindings=bindings,
+                visible_texture_mode="layer_aware_visible",
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+            )
+
+        self.assertEqual("", model.meshes[0].preview_texture_path)
+        self.assertEqual("CD_Test_Handle", model.meshes[0].texture_name)
+        self.assertEqual("material_color_fallback", model.meshes[0].preview_base_texture_quality)
+        self.assertIn("material color fallback", "\n".join(lines))
+
+    def test_placeholder_none_texture_is_skipped_when_promoting_layer_base(self) -> None:
+        source_entry = _entry("character/model/cd_test_model.pac")
+        by_normalized, by_basename = _texture_maps(
+            "character/texture/cd_common_default_overlay_old.dds",
+            "texture/nonetexture0x00000000.dds",
+            "character/texture/cd_texturelayer_003_0005.dds",
+        )
+        model = ModelPreviewData(
+            path=source_entry.path,
+            meshes=[ModelPreviewMesh(material_name="CD_Test_Handle", texture_name="CD_Test_Handle")],
+        )
+        bindings = (
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="character/texture/cd_common_default_overlay_old.dds",
+                parameter_name="_overlayColorTexture",
+                submesh_name="CD_Test_Handle",
+                sidecar_kind="pac_xml",
+            ),
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="texture/nonetexture0x00000000.dds",
+                parameter_name="_grimeDiffuseTextureR",
+                submesh_name="CD_Test_Handle",
+                sidecar_kind="pac_xml",
+            ),
+            _ArchiveModelSidecarTextureBinding(
+                texture_path="character/texture/cd_texturelayer_003_0005.dds",
+                parameter_name="_detailDiffuseMaskR",
+                submesh_name="CD_Test_Handle",
+                sidecar_kind="pac_xml",
+            ),
+        )
+
+        with patch(
+            "cdmw.core.archive._ensure_archive_model_texture_preview_path",
+            side_effect=lambda _texconv, texture_entry, **_kwargs: f"preview://{texture_entry.path}",
+        ):
+            _attach_model_sidecar_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                parsed_mesh=None,
+                sidecar_texture_bindings=bindings,
+                visible_texture_mode="mesh_base_first",
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+            )
+            _attach_model_sidecar_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                parsed_mesh=None,
+                sidecar_texture_bindings=bindings,
+                visible_texture_mode="layer_aware_visible",
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+                fallback_only=True,
+            )
+
+        self.assertEqual("character/texture/cd_texturelayer_003_0005.dds", model.meshes[0].texture_name)
+        self.assertEqual(
+            "preview://character/texture/cd_texturelayer_003_0005.dds",
+            model.meshes[0].preview_texture_path,
+        )
+
     def test_sidecar_material_color_survives_missing_visible_dds(self) -> None:
         source_entry = _entry("character/model/cd_test_model.pac")
         by_normalized, by_basename = _texture_maps()
@@ -167,6 +452,55 @@ class ArchivePreviewTextureBindingTests(unittest.TestCase):
         self.assertEqual("", model.meshes[0].preview_texture_path)
         self.assertEqual("material_color_fallback", model.meshes[0].preview_base_texture_quality)
         self.assertIn("material color fallback", "\n".join(lines))
+
+    def test_material_name_base_fallback_uses_visible_sibling_dds(self) -> None:
+        source_entry = _entry("character/model/cd_test_model.pac")
+        by_normalized, by_basename = _texture_maps(
+            "character/texture/part_a_d.dds",
+            "character/texture/part_a_n.dds",
+        )
+        model = ModelPreviewData(
+            path=source_entry.path,
+            meshes=[ModelPreviewMesh(material_name="part_a", texture_name="part_a")],
+        )
+
+        with patch(
+            "cdmw.core.archive._ensure_archive_model_texture_preview_path",
+            side_effect=lambda _texconv, texture_entry, **_kwargs: f"preview://{texture_entry.path}",
+        ):
+            _attach_model_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+            )
+
+        self.assertEqual("character/texture/part_a_d.dds", model.meshes[0].texture_name)
+        self.assertEqual("preview://character/texture/part_a_d.dds", model.meshes[0].preview_texture_path)
+
+    def test_technical_sibling_dds_is_not_promoted_to_visible_base(self) -> None:
+        source_entry = _entry("character/model/cd_test_model.pac")
+        by_normalized, by_basename = _texture_maps("character/texture/part_a_n.dds")
+        model = ModelPreviewData(
+            path=source_entry.path,
+            meshes=[ModelPreviewMesh(material_name="part_a", texture_name="part_a")],
+        )
+
+        with patch(
+            "cdmw.core.archive._ensure_archive_model_texture_preview_path",
+            side_effect=lambda _texconv, texture_entry, **_kwargs: f"preview://{texture_entry.path}",
+        ):
+            _attach_model_texture_preview_paths(
+                Path("texconv.exe"),
+                source_entry,
+                model,
+                texture_entries_by_normalized_path=by_normalized,
+                texture_entries_by_basename=by_basename,
+            )
+
+        self.assertEqual("part_a", model.meshes[0].texture_name)
+        self.assertEqual("", model.meshes[0].preview_texture_path)
 
     def test_anonymous_meshes_use_ordered_sidecar_support_bindings(self) -> None:
         source_entry = _entry("character/model/cd_test_model.pac")

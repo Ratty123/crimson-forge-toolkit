@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -38,6 +39,33 @@ def _encrypted_entry(path: str) -> ArchiveEntry:
     entry = _entry(path)
     entry.flags = 3 << 4
     return entry
+
+
+def _entries_with_payloads(payloads):
+    tempdir = tempfile.TemporaryDirectory()
+    root = Path(tempdir.name)
+    paz_path = root / "0.paz"
+    pamt_path = root / "0.pamt"
+    entries = []
+    offset = 0
+    with paz_path.open("wb") as handle:
+        for path, payload in payloads:
+            data = payload if isinstance(payload, bytes) else str(payload).encode("utf-8")
+            handle.write(data)
+            entries.append(
+                ArchiveEntry(
+                    path=path,
+                    pamt_path=pamt_path,
+                    paz_file=paz_path,
+                    offset=offset,
+                    comp_size=len(data),
+                    orig_size=len(data),
+                    flags=0,
+                    paz_index=0,
+                )
+            )
+            offset += len(data)
+    return tempdir, tuple(entries)
 
 
 class ItemNameArchiveSearchTests(unittest.TestCase):
@@ -198,6 +226,189 @@ class ItemNameArchiveSearchTests(unittest.TestCase):
             [
                 "character/model/cd_m0001_00_carta_hel_0001.pac",
                 "character/modelproperty/cd_m0001_00_carta_hel_0001.pac_xml",
+            ],
+        )
+
+    def test_archive_filter_keeps_extension_filter_for_item_alias_related_entries(self) -> None:
+        entries = [
+            _entry("character/model/cd_m0001_00_skullknight_ub_0003.pac"),
+            _entry("character/modelproperty/cd_m0001_00_skullknight_ub_0003.pac_xml"),
+            _entry("character/texture/cd_m0001_00_skullknight_vest_0003_n.dds"),
+        ]
+
+        filtered = filter_archive_entries(
+            entries,
+            filter_text="Righteous Virtue",
+            exclude_filter_text="",
+            extension_filter=".pac",
+            package_filter_text="",
+            structure_filter="",
+            role_filter="all",
+            exclude_common_technical_suffixes=False,
+            min_size_kb=0,
+            previewable_only=False,
+            item_search_aliases={
+                "cd_m0001_00_skullknight_ub_0003": (
+                    "righteous virtue frost curse cd_m0001_00_skullknight_ub_0003.pac"
+                ),
+            },
+        )
+
+        self.assertEqual(
+            [entry.path for entry in filtered],
+            ["character/model/cd_m0001_00_skullknight_ub_0003.pac"],
+        )
+
+    def test_archive_filter_matches_character_equipment_root_item_alias(self) -> None:
+        entries = [
+            _entry("character/model/cd_m0001_00_skullknight_ub_0003.pac"),
+            _entry("character/modelproperty/cd_m0001_00_skullknight_ub_0003.pac_xml"),
+            _entry("character/model/cd_m0001_00_other_ub_0003.pac"),
+        ]
+
+        filtered = filter_archive_entries(
+            entries,
+            filter_text="Righteous Virtue",
+            exclude_filter_text="",
+            extension_filter=".pac",
+            package_filter_text="",
+            structure_filter="",
+            role_filter="all",
+            exclude_common_technical_suffixes=False,
+            min_size_kb=0,
+            previewable_only=False,
+            item_search_aliases={
+                "cd_m0001_00_skullknight": "righteous virtue frost curse cd_m0001_00_skullknight",
+            },
+        )
+
+        self.assertEqual(
+            [entry.path for entry in filtered],
+            ["character/model/cd_m0001_00_skullknight_ub_0003.pac"],
+        )
+
+    def test_archive_filter_orders_exact_model_alias_before_related_sidecar(self) -> None:
+        entries = [
+            _entry("character/modelproperty/cd_m0001_00_skullknight_ub_0003.pac_xml"),
+            _entry("character/model/cd_m0001_00_skullknight_ub_0003.pac"),
+        ]
+
+        filtered = filter_archive_entries(
+            entries,
+            filter_text="Righteous Virtue",
+            exclude_filter_text="",
+            extension_filter="*",
+            package_filter_text="",
+            structure_filter="",
+            role_filter="all",
+            exclude_common_technical_suffixes=False,
+            min_size_kb=0,
+            previewable_only=False,
+            item_search_aliases={
+                "cd_m0001_00_skullknight_ub_0003": (
+                    "righteous virtue frost curse cd_m0001_00_skullknight_ub_0003.pac"
+                ),
+            },
+        )
+
+        self.assertEqual(
+            [entry.path for entry in filtered],
+            [
+                "character/model/cd_m0001_00_skullknight_ub_0003.pac",
+                "character/modelproperty/cd_m0001_00_skullknight_ub_0003.pac_xml",
+            ],
+        )
+
+    def test_archive_filter_excluded_alias_source_does_not_expand_related_files(self) -> None:
+        entries = [
+            _entry("character/model/cd_m0001_00_skullknight_ub_0003.pac"),
+            _entry("character/modelproperty/cd_m0001_00_skullknight_ub_0003.pac.xml"),
+        ]
+
+        filtered = filter_archive_entries(
+            entries,
+            filter_text="Righteous Virtue",
+            exclude_filter_text="character/model/cd_m0001_00_skullknight_ub_0003.pac",
+            extension_filter="*",
+            package_filter_text="",
+            structure_filter="",
+            role_filter="all",
+            exclude_common_technical_suffixes=False,
+            min_size_kb=0,
+            previewable_only=False,
+            item_search_aliases={
+                "cd_m0001_00_skullknight_ub_0003": (
+                    "righteous virtue frost curse cd_m0001_00_skullknight_ub_0003.pac"
+                ),
+            },
+        )
+
+        self.assertEqual([entry.path for entry in filtered], [])
+
+    def test_archive_filter_dds_extension_uses_hidden_item_alias_graph_source(self) -> None:
+        tempdir, entries = _entries_with_payloads(
+            (
+                ("character/model/cd_m0001_00_skullknight_ub_0003.pac", b"PAR "),
+                (
+                    "character/modelproperty/cd_m0001_00_skullknight_ub_0003.pac_xml",
+                    '<MaterialParameterTexture _name="_baseColorTexture">'
+                    '<ResourceReferencePath_ITexture value="character/texture/skull_base.dds"/>'
+                    "</MaterialParameterTexture>",
+                ),
+                ("character/texture/skull_base.dds", b"DDS "),
+            )
+        )
+        self.addCleanup(tempdir.cleanup)
+
+        filtered = filter_archive_entries(
+            entries,
+            filter_text="Righteous Virtue",
+            exclude_filter_text="",
+            extension_filter=".dds",
+            package_filter_text="",
+            structure_filter="",
+            role_filter="all",
+            exclude_common_technical_suffixes=False,
+            min_size_kb=0,
+            previewable_only=False,
+            item_search_aliases={
+                "cd_m0001_00_skullknight_ub_0003": (
+                    "righteous virtue frost curse cd_m0001_00_skullknight_ub_0003.pac"
+                ),
+            },
+        )
+
+        self.assertEqual([entry.path for entry in filtered], ["character/texture/skull_base.dds"])
+
+    def test_archive_filter_orders_exact_model_alias_before_sidecar_for_multi_pattern_search(self) -> None:
+        entries = [
+            _entry("character/modelproperty/cd_m0001_00_skullknight_ub_0003.pac_xml"),
+            _entry("character/model/cd_m0001_00_skullknight_ub_0003.pac"),
+        ]
+
+        filtered = filter_archive_entries(
+            entries,
+            filter_text="not-present;Righteous Virtue",
+            exclude_filter_text="",
+            extension_filter="*",
+            package_filter_text="",
+            structure_filter="",
+            role_filter="all",
+            exclude_common_technical_suffixes=False,
+            min_size_kb=0,
+            previewable_only=False,
+            item_search_aliases={
+                "cd_m0001_00_skullknight_ub_0003": (
+                    "righteous virtue frost curse cd_m0001_00_skullknight_ub_0003.pac"
+                ),
+            },
+        )
+
+        self.assertEqual(
+            [entry.path for entry in filtered],
+            [
+                "character/model/cd_m0001_00_skullknight_ub_0003.pac",
+                "character/modelproperty/cd_m0001_00_skullknight_ub_0003.pac_xml",
             ],
         )
 
@@ -507,6 +718,22 @@ class ItemNameArchiveSearchTests(unittest.TestCase):
 
         self.assertEqual(index.model_base_exact_display_names, {"cd_phm_01_sword_0166_index01_r": "Sword of the Lord"})
         self.assertEqual(index.model_base_display_names, {"cd_phm_01_sword_0166": "Sword of the Lord"})
+
+    def test_item_index_adds_character_equipment_root_aliases(self) -> None:
+        record = ArchiveItemRecord(
+            item_id=1000,
+            internal_name="Item_Righteous_Virtue",
+            display_name="Righteous Virtue",
+            model_stems=["cd_m0001_00_skullknight_ub_0003"],
+        )
+
+        index = _build_archive_item_search_index_from_records(
+            [record],
+            [_entry("character/model/cd_m0001_00_skullknight_ub_0003.pac")],
+        )
+
+        self.assertIn("cd_m0001_00_skullknight", index.model_base_aliases)
+        self.assertIn("righteous virtue", index.model_base_aliases["cd_m0001_00_skullknight"])
 
 
 if __name__ == "__main__":

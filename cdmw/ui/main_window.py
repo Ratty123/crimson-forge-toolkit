@@ -35,6 +35,7 @@ from cdmw.core.archive import (
     _parse_archive_model_sidecar_texture_bindings,
     _resolve_model_texture_semantic_details,
     _strip_archive_model_family_variant_suffix,
+    iter_archive_character_equipment_root_alias_stems,
     iter_archive_equipment_model_alias_stems,
     read_archive_entry_data,
 )
@@ -11362,6 +11363,8 @@ def run_gui() -> int:
             family_stem = _strip_archive_model_family_variant_suffix(stem)
             if family_stem:
                 add(family_stem, "related")
+            for alias_stem in iter_archive_character_equipment_root_alias_stems(stem):
+                add(alias_stem, "related")
             for alias_stem in iter_archive_equipment_model_alias_stems(stem):
                 add(alias_stem, "related")
             return tuple(matches)
@@ -25163,12 +25166,19 @@ def run_gui() -> int:
             if not source_path:
                 return
 
+            warning_text = "A backup of the touched archive files will be created before anything is written."
+            if entry.extension == ".wem":
+                warning_text += (
+                    "\n\nWEM patching is best-effort: this rebuilds a simple replacement stream from the selected "
+                    "audio, not a full Wwise-authoring rebuild. Some original Wwise codec/container variants may "
+                    "not behave the same in-game."
+                )
             confirmation = QMessageBox.question(
                 self,
                 "Patch Audio To Game",
                 (
                     f"Patch {entry.path} using {Path(source_path).name}?\n\n"
-                    "A backup of the touched archive files will be created before anything is written."
+                    f"{warning_text}"
                 ),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,

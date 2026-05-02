@@ -4,7 +4,7 @@ Windows desktop tool for **Crimson Desert texture workflows**, **archive browsin
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-Latest release: `0.9.0-beta.2`
+Latest release: `0.9.0-beta.3`
 
 - improves in-game character/body swap planning with shared archive relationship discovery for `.pac`, `.pac_xml`, `.app_xml`, `.prefabdata_xml`, DDS, skeleton, and physics links
 - makes swap texture-slot suggestions safer by preferring exact original DDS paths/names before heuristics and avoiding body/hand cross-assignment

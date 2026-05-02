@@ -129,6 +129,7 @@ ARCHIVE_TEXT_EXTENSIONS = {
     ".mtl",
     ".obj",
     ".paloc",
+    ".app_xml",
     ".pami",
     ".pac_xml",
     ".pam_xml",
@@ -169,7 +170,7 @@ APP_REPOSITORY_URL = "https://github.com/Ratty123/crimson-desert-mod-workbench"
 APP_KOFI_URL = "https://ko-fi.com/ratrider"
 PREFERRED_CRIMSON_DESERT_MOD_MANAGER_URL = "https://www.nexusmods.com/crimsondesert/mods/113"
 LEGACY_APP_NAMES = ("DDSRebuildApp",)
-APP_VERSION = "0.9.0-beta.2"
+APP_VERSION = "0.9.0-beta.3"
 CRIMSON_DESERT_STEAM_APP_ID = "3321460"
 DEFAULT_UI_THEME = "graphite"
 DEFAULT_UI_FONT_FAMILY = "Segoe UI"

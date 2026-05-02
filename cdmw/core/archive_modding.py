@@ -1535,6 +1535,7 @@ def _crypt_archive_payload(data: bytes, basename: str) -> bytes:
 
 
 def _compress_archive_payload(data: bytes, compression_type: int) -> bytes:
+    _validate_archive_patch_compression_type(compression_type)
     if compression_type in {0, 1}:
         return data
     if compression_type == 2:
@@ -1542,6 +1543,52 @@ def _compress_archive_payload(data: bytes, compression_type: int) -> bytes:
             raise ValueError("LZ4 support is not available in this build.")
         return lz4_block.compress(data, store_size=False)
     raise ValueError(f"Archive patching does not support compression type {compression_type} yet.")
+
+
+def _validate_archive_patch_compression_type(compression_type: int) -> None:
+    if int(compression_type) not in {0, 1, 2}:
+        raise ValueError(f"Archive patching does not support compression type {compression_type} yet.")
+
+
+def _preflight_archive_patch_requests(
+    papgt_path: Path,
+    grouped_requests: Mapping[Path, Sequence[ArchivePatchRequest]],
+) -> Dict[Path, _MutablePamt]:
+    for pamt_path in grouped_requests:
+        if not pamt_path.is_file():
+            raise FileNotFoundError(f"Could not find archive metadata file {pamt_path}.")
+    _verify_crc_chain(papgt_path, grouped_requests.keys())
+
+    mutable_by_pamt: Dict[Path, _MutablePamt] = {}
+    for pamt_path, group_requests in grouped_requests.items():
+        mutable = _parse_mutable_pamt(pamt_path)
+        mutable_by_pamt[pamt_path] = mutable
+
+        for request in group_requests:
+            _validate_archive_patch_compression_type(request.entry.compression_type)
+            normalized_path = _normalize_virtual_path(request.entry.path)
+            mutable_record = mutable.file_records.get(normalized_path)
+            if mutable_record is None:
+                raise ValueError(f"Could not locate {request.entry.path} inside {pamt_path.name}.")
+            if int(mutable_record.paz_index) != int(request.entry.paz_index):
+                raise ValueError(
+                    f"Archive entry {request.entry.path} no longer points at PAZ index {request.entry.paz_index}; "
+                    f"current PAMT record points at PAZ index {mutable_record.paz_index}."
+                )
+            if mutable_record.paz_index not in mutable.paz_records:
+                raise ValueError(f"PAMT {pamt_path.name} is missing PAZ table entry {mutable_record.paz_index}.")
+
+            expected_paz_path = (pamt_path.parent / f"{mutable_record.paz_index}.paz").resolve()
+            entry_paz_path = request.entry.paz_file.resolve()
+            if entry_paz_path != expected_paz_path:
+                raise ValueError(
+                    f"Archive entry {request.entry.path} points at {entry_paz_path.name}, "
+                    f"but the current PAMT record expects {expected_paz_path.name}."
+                )
+            if not expected_paz_path.is_file():
+                raise FileNotFoundError(f"Could not find archive payload file {expected_paz_path}.")
+
+    return mutable_by_pamt
 
 
 def _write_bytes_preserve_timestamps(path: Path, data: bytes) -> None:
@@ -2242,6 +2289,11 @@ def patch_archive_entries(
     for request in requests:
         grouped_requests.setdefault(request.entry.pamt_path.resolve(), []).append(request)
 
+    mutable_by_pamt = _preflight_archive_patch_requests(
+        papgt_path=papgt_path,
+        grouped_requests=grouped_requests,
+    )
+
     backup_targets: List[Path] = [papgt_path]
     for pamt_path, group_requests in grouped_requests.items():
         backup_targets.append(pamt_path)
@@ -2261,7 +2313,7 @@ def patch_archive_entries(
         papgt_raw = bytearray(papgt_path.read_bytes())
 
         for pamt_path, group_requests in grouped_requests.items():
-            mutable = _parse_mutable_pamt(pamt_path)
+            mutable = mutable_by_pamt[pamt_path]
             touched_paz_indices: set[int] = set()
             group_name = pamt_path.parent.name
             _safe_log(on_log, f"Updating {group_name}/{pamt_path.name} ({len(group_requests)} entrie(s))...")
@@ -2285,7 +2337,7 @@ def patch_archive_entries(
                 struct.pack_into("<I", mutable.raw, mutable_record.record_offset + 4, new_offset)
                 struct.pack_into("<I", mutable.raw, mutable_record.record_offset + 8, len(processed_payload))
                 struct.pack_into("<I", mutable.raw, mutable_record.record_offset + 12, len(request.payload_data))
-                touched_paz_indices.add(int(request.entry.paz_index))
+                touched_paz_indices.add(int(mutable_record.paz_index))
 
             for paz_index in sorted(touched_paz_indices):
                 paz_record = mutable.paz_records.get(paz_index)
@@ -3998,19 +4050,98 @@ def build_pab_preview(data: bytes, virtual_path: str) -> SkeletonPreviewResult:
     return SkeletonPreviewResult(preview_text="\n".join(lines), detail_lines=detail_lines)
 
 
-def build_hkx_preview(data: bytes, virtual_path: str) -> HkxPreviewResult:
+_HKX_PRINTABLE_SCAN_LIMIT = 262_144
+_HKX_PRINTABLE_STRING_LIMIT = 160
+_HKX_KNOWN_TAG_SECTIONS = ("TAG0", "SDKV", "DATA", "TYPE", "TNA1", "TPAD", "INDX", "ITEM")
+_HKX_TYPE_NAME_RE = re.compile(r"hk[a-zA-Z][a-zA-Z0-9_:]*")
+_HKX_FAMILY_LABELS = (
+    ("hknp", "Modern Havok Physics"),
+    ("hkp", "Legacy Havok Physics"),
+    ("hka", "Animation"),
+    ("hkb", "Behavior"),
+    ("hkai", "AI / navigation"),
+    ("hkcd", "Collision detection"),
+    ("hkx", "Container"),
+)
+
+
+def _hkx_sdk_version_label(version: str) -> str:
+    if len(version) == 8 and version.isdigit():
+        year = int(version[:4])
+        major = int(version[4:6])
+        patch = int(version[6:8])
+        if 1999 <= year <= 2100:
+            return f"{year}.{major}.{patch}"
+    return version
+
+
+def _extract_hkx_printable_strings(data: bytes) -> List[str]:
     printable = []
     current = bytearray()
-    for value in data[:262144]:
+    for value in data[:_HKX_PRINTABLE_SCAN_LIMIT]:
         if 32 <= value <= 126:
             current.append(value)
             continue
         if len(current) >= 4:
             printable.append(current.decode("ascii", errors="ignore"))
-            if len(printable) >= 96:
+            if len(printable) >= _HKX_PRINTABLE_STRING_LIMIT:
                 break
         current.clear()
-    class_names = sorted({item for item in printable if item.startswith("hk") or item.startswith("hka") or item.startswith("hkp")})
+    if len(current) >= 4 and len(printable) < _HKX_PRINTABLE_STRING_LIMIT:
+        printable.append(current.decode("ascii", errors="ignore"))
+    return printable
+
+
+def _extract_hkx_type_names(printable: Sequence[str]) -> List[str]:
+    names: set[str] = set()
+    for text in printable:
+        for match in _HKX_TYPE_NAME_RE.finditer(text):
+            names.add(match.group(0))
+    return sorted(names)
+
+
+def _detect_hkx_tag_sections(data: bytes) -> List[str]:
+    return [section for section in _HKX_KNOWN_TAG_SECTIONS if section.encode("ascii") in data[:_HKX_PRINTABLE_SCAN_LIMIT]]
+
+
+def _detect_hkx_sdk_version(data: bytes, printable: Sequence[str]) -> str:
+    match = re.search(rb"SDKV([0-9]{8})", data[:4096])
+    if match:
+        return match.group(1).decode("ascii", errors="ignore")
+    for text in printable[:16]:
+        match_text = re.search(r"SDKV([0-9]{8})", text)
+        if match_text:
+            return match_text.group(1)
+    return ""
+
+
+def _detect_hkx_declared_size(data: bytes) -> Optional[int]:
+    if len(data) < 4:
+        return None
+    declared_size = int.from_bytes(data[:4], "big", signed=False)
+    if declared_size == len(data):
+        return declared_size
+    return None
+
+
+def _summarize_hkx_type_families(class_names: Sequence[str]) -> List[str]:
+    counts: Counter[str] = Counter()
+    for name in class_names:
+        for prefix, label in _HKX_FAMILY_LABELS:
+            if name.startswith(prefix):
+                counts[label] += 1
+                break
+    return [f"{label}: {count:,}" for label, count in counts.most_common()]
+
+
+def build_hkx_preview(data: bytes, virtual_path: str) -> HkxPreviewResult:
+    printable = _extract_hkx_printable_strings(data)
+    class_names = _extract_hkx_type_names(printable)
+    sdk_version = _detect_hkx_sdk_version(data, printable)
+    tag0_offset = data[:64].find(b"TAG0")
+    tag_sections = _detect_hkx_tag_sections(data)
+    declared_size = _detect_hkx_declared_size(data)
+    type_families = _summarize_hkx_type_families(class_names)
     asset_references = []
     seen_asset_references: set[str] = set()
     for text in printable:
@@ -4036,11 +4167,37 @@ def build_hkx_preview(data: bytes, virtual_path: str) -> HkxPreviewResult:
             asset_references.append(normalized)
     markers = [
         marker
-        for marker in ("hkRootLevelContainer", "hkaAnimation", "hkaSkeleton", "hkaAnimationBinding", "hkpPhysicsData")
-        if any(marker in item for item in printable)
+        for marker in (
+            "hkRootLevelContainer",
+            "hkaAnimation",
+            "hkaSkeleton",
+            "hkaAnimationBinding",
+            "hkpPhysicsData",
+            "hknpPhysicsSystem",
+            "hknpCompoundShape",
+            "hknpShapeInstance",
+        )
+        if marker in class_names or any(marker in item for item in printable)
     ]
     lines = [f"HKX tagfile preview for {virtual_path}", ""]
     detail_lines = ["Structured Havok tagfile or binary animation metadata detected."]
+    if tag0_offset >= 0 or sdk_version or tag_sections:
+        lines.append("Format summary:")
+        if declared_size is not None:
+            lines.append(f"- Declared size: {declared_size:,} bytes")
+            detail_lines.append(f"Declared HKX size matches payload size ({declared_size:,} bytes).")
+        if tag0_offset >= 0:
+            lines.append(f"- TAG0 header offset: {tag0_offset}")
+        if sdk_version:
+            lines.append(f"- Havok SDK version: {sdk_version} ({_hkx_sdk_version_label(sdk_version)})")
+            detail_lines.append(f"Detected Havok SDK version {sdk_version}.")
+        if tag_sections:
+            lines.append("- Detected tag sections: " + ", ".join(tag_sections))
+        if type_families:
+            lines.append("- Type families: " + "; ".join(type_families[:6]))
+            if any(name.startswith("hknp") for name in class_names):
+                detail_lines.append("Detected modern Havok Physics (hknp) type markers.")
+        lines.append("")
     if class_names:
         detail_lines.append(f"Detected {len(class_names):,} Havok class/type marker(s).")
         lines.append("Detected classes/types:")
@@ -4060,7 +4217,7 @@ def build_hkx_preview(data: bytes, virtual_path: str) -> HkxPreviewResult:
         lines.extend(printable[:64])
     else:
         lines.append("No readable Havok strings were recovered from the preview sample.")
-    if len(printable) >= 96:
+    if len(printable) >= _HKX_PRINTABLE_STRING_LIMIT:
         lines.append("")
         lines.append("String scan truncated to keep the preview responsive.")
     return HkxPreviewResult(preview_text="\n".join(lines), detail_lines=detail_lines)
